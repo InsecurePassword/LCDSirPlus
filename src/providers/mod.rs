@@ -7,6 +7,7 @@ pub mod clock;
 pub mod cpu;
 pub mod discord;
 pub mod gpu;
+pub mod hang;
 pub mod headset;
 pub mod lhm;
 pub mod memory;

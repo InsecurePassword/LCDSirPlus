@@ -450,6 +450,7 @@ fn build_snapshot(
         headset: telemetry.headset.clone(),
         controller: telemetry.controller.clone(),
         discord: discord.clone(),
+        hung: telemetry.hung.clone(),
         ..Default::default()
     };
 

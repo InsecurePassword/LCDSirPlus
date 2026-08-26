@@ -265,8 +265,12 @@ pub struct Alert {
     pub acknowledged: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HungTarget {
+    pub hwnd: usize,
+    pub pid: u32,
+    pub creation_time: u64,
+    pub image_path: String,
     pub process_name: String,
     pub title: String,
 }

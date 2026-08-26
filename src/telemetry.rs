@@ -7,8 +7,10 @@ use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::Config;
-use crate::model::{ControllerBattery, Freshness, GameStats, HeadsetBattery, Metric, Reading};
-use crate::providers::{audio, gpu, headset, lhm, netif, presentmon, xinput};
+use crate::model::{
+    ControllerBattery, Freshness, GameStats, HeadsetBattery, HungTarget, Metric, Reading,
+};
+use crate::providers::{audio, gpu, hang, headset, lhm, netif, presentmon, xinput};
 
 const DEFAULT_LHM_URL: &str = "http://127.0.0.1:8085/data.json";
 const TICK: Duration = Duration::from_millis(50);
@@ -24,6 +26,7 @@ pub struct Update {
     pub gpu_temp: Metric,
     pub gpu_readings: Vec<Reading>,
     pub game: GameStats,
+    pub hung: Vec<HungTarget>,
     /// Per-provider health: (name, last poll succeeded).
     pub providers: Vec<(String, bool)>,
 }
@@ -33,12 +36,16 @@ pub struct Telemetry {
     config: Arc<RwLock<Config>>,
     shutdown: Arc<AtomicBool>,
     presentmon_thread: Option<std::thread::JoinHandle<()>>,
+    hang_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Telemetry {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         if let Some(thread) = self.presentmon_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.hang_thread.take() {
             let _ = thread.join();
         }
     }
@@ -69,6 +76,7 @@ struct Worker {
     audio_attempt: Option<Instant>,
     net_attempt: Option<Instant>,
     presentmon_rx: mpsc::Receiver<presentmon::Update>,
+    hang_rx: mpsc::Receiver<hang::Update>,
     temps_need_refresh: Arc<AtomicBool>,
     native_gpu_temp: Metric,
     lhm_gpu_temp: Metric,
@@ -162,6 +170,13 @@ impl Worker {
             self.set_provider("presentmon", update.available);
             if !update.available && !update.detail.is_empty() {
                 crate::log_debug!("PresentMon unavailable: {}", update.detail);
+            }
+        }
+        while let Ok(update) = self.hang_rx.try_recv() {
+            self.update.hung = update.targets;
+            self.set_provider("Hung window detector", update.available);
+            if let Some(error) = update.error {
+                crate::log_debug!("hung-window detector unavailable: {}", error);
             }
         }
 
@@ -504,6 +519,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
     spawn_gpu(Arc::clone(&config), Arc::clone(&shutdown), slow_tx);
     let (presentmon_rx, presentmon_thread) =
         presentmon::spawn(Arc::clone(&config), Arc::clone(&shutdown));
+    let (hang_rx, hang_thread) = hang::spawn(Arc::clone(&config), Arc::clone(&shutdown));
 
     let worker = Worker {
         config: Arc::clone(&config),
@@ -518,6 +534,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
         audio_attempt: None,
         net_attempt: None,
         presentmon_rx,
+        hang_rx,
         temps_need_refresh,
         native_gpu_temp: Metric::default(),
         lhm_gpu_temp: Metric::default(),
@@ -545,6 +562,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
         config,
         shutdown,
         presentmon_thread: Some(presentmon_thread),
+        hang_thread: Some(hang_thread),
     }
 }
 
@@ -656,6 +674,7 @@ mod tests {
             config: Arc::clone(&shared),
             shutdown: Arc::new(AtomicBool::new(false)),
             presentmon_thread: None,
+            hang_thread: None,
         };
         let changed = Config {
             audio_enabled: false,

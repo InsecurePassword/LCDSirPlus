@@ -25,6 +25,7 @@ src\
 │   ├── memory.rs       GlobalMemoryStatusEx
 │   ├── ccd.rs          L3/NUMA topology + CPUID cache-size labeling
 │   ├── gpu.rs          trusted NVAPI/ADLX loading + canonical GPU metrics
+│   ├── hang.rs         bounded WM_NULL probes + exact process identity tracker
 │   ├── lhm.rs          optional loopback temperatures-only fallback
 │   └── presentmon.rs   owned console capture + CSV frame statistics
 ├── telemetry.rs        provider workers, cadence, stale state, health
@@ -48,6 +49,7 @@ src\
 | telemetry | fast native polls, stale state, provider health | snapshot channel |
 | telemetry-gpu | read-only NVAPI/ADLX calls | event channel |
 | telemetry-presentmon | target/capture lifecycle | update channel |
+| telemetry-hang | visible-window probes and continuous-failure tracker | update channel |
 | lcdforge-discord | verified pipe, authentication, subscriptions, reconnect | snapshot channel |
 | telemetry-lhm/headset | bounded blocking HTTP/HID | event channel |
 
@@ -88,6 +90,15 @@ Backend button reports flow back: `parse_input` → `ButtonTracker.observe`
   canceled button releases so no press is ever stuck.
 - Providers: absent data renders explicit `N/A`/`STALE` states — the fixed
   bars read only canonical readings, never legacy projections.
+- Hung detector: query-only visible top-level-window enumeration captures
+  HWND/PID/creation-time/image identity, applies configured and Windows-directory
+  exclusions, and requires consecutive bounded `WM_NULL` failures plus minimum
+  elapsed time. Recovery, absence, identity change, disable, and safe mode clear
+  targets immediately. This phase has no process-termination capability.
+  The hidden bounded smoke mode copies the same executable under a disposable
+  non-ignored basename, creates one visible window that intentionally stops
+  pumping messages, detects only that child PID, waits for its natural exit,
+  and removes the temporary copy.
 - Vendor DLLs are loaded by name only from System32. GPU APIs are read-only,
   versioned, and bounded to vendor maximums. Automatically discovered
   PresentMon is canonically contained beside LCDForge; arguments are passed

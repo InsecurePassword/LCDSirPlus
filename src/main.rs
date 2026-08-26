@@ -55,6 +55,8 @@ struct Cli {
     hardware_discover: bool,
     discord_authorize: bool,
     discord_clear_token: bool,
+    hang_test_harness: bool,
+    hang_detector_smoke: bool,
     backend: backends::BackendKind,
     duration: Duration,
     safe_mode: bool,
@@ -72,6 +74,8 @@ fn parse_args() -> Result<Cli, String> {
         hardware_discover: false,
         discord_authorize: false,
         discord_clear_token: false,
+        hang_test_harness: false,
+        hang_detector_smoke: false,
         backend: backends::BackendKind::Hid,
         duration: Duration::from_secs(30),
         safe_mode: false,
@@ -95,6 +99,8 @@ fn parse_args() -> Result<Cli, String> {
             "--hardware-discover" => cli.hardware_discover = true,
             "--discord-authorize" => cli.discord_authorize = true,
             "--discord-clear-token" => cli.discord_clear_token = true,
+            "--hang-test-harness" => cli.hang_test_harness = true,
+            "--hang-detector-smoke" => cli.hang_detector_smoke = true,
             "--backend" => {
                 i += 1;
                 match args.get(i).map(|s| s.as_str()) {
@@ -157,6 +163,8 @@ fn main() {
         cli.hardware_discover,
         cli.discord_authorize,
         cli.discord_clear_token,
+        cli.hang_test_harness,
+        cli.hang_detector_smoke,
     ]
     .into_iter()
     .filter(|selected| *selected)
@@ -164,6 +172,13 @@ fn main() {
     if command_count > 1 {
         eprintln!("error: select only one command");
         std::process::exit(2);
+    }
+
+    if cli.hang_test_harness {
+        std::process::exit(providers::hang::run_harness(cli.duration));
+    }
+    if cli.hang_detector_smoke {
+        std::process::exit(providers::hang::run_smoke());
     }
 
     if cli.validate {

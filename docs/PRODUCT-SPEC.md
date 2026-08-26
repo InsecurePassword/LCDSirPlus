@@ -80,6 +80,16 @@ README.md and enforced in `src/backends/g13.rs` + `src/backends/hid.rs`.
 - Bounded histories/logs/protocol inputs.
 - Single static native binary; no runtime installation.
 
+## Hung-window detector
+
+The query-only detector considers visible, titled top-level windows outside the
+Windows directory and configured ignore list. A target appears only after its
+exact HWND, PID, creation time, and normalized image path fail consecutive
+bounded `WM_NULL` probes for the configured minimum duration. Responsiveness,
+absence, identity replacement, safe mode, or disabling the detector removes it
+immediately. Guarded process termination is a later Phase 4 action and is not
+present in the detector.
+
 ## Non-goals
 
 - G19 color LCD; direct Logitech SDK/LCore support.
