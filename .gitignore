@@ -2,4 +2,4 @@
 Cargo.lock.orig
 *.log
 artifacts/
-lcdforge.local.txt
+lcdsirplus.local.txt

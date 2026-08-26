@@ -2,12 +2,12 @@
 
 ## Scope
 
-LCDForge is a per-user, local-first Windows application. It opens the selected
+LCDSirPlus is a per-user, local-first Windows application. It opens the selected
 G13 HID interface, optional local provider interfaces, Discord Desktop's local
 named pipe, and explicitly configured outbound endpoints. It does not install a
 service, driver, listener, browser extension, or elevated component.
 
-Packages are not code-signed. Verify `SHA256SUMS.txt` and the package's sorted
+Packages are not code-signed. Verify `LCDSirPlus-0.3.0-SHA256SUMS.txt` and the package's sorted
 `PACKAGE-MANIFEST.txt` before running an executable or installer. The installer
 performs the same member hash, size, name, reparse, and hard-link checks and
 refuses foreign Start Menu or HKCU Run ownership.
@@ -22,7 +22,7 @@ serials, arbitrary listings, and device paths. Review a bundle before sharing.
 Never put Discord client secrets or tokens in configuration, command arguments,
 issues, diagnostics, logs, screenshots, or package fixtures. If Discord requires
 a client secret, expose it only through the temporary
-`LCDFORGE_DISCORD_CLIENT_SECRET` environment variable for authorization and
+`LCDSIRPLUS_DISCORD_CLIENT_SECRET` environment variable for authorization and
 remove it immediately afterward. Revoke exposed credentials with Discord.
 
 ## Reporting

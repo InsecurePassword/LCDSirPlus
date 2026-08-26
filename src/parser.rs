@@ -1,7 +1,7 @@
 //! LCDSirReal-style configuration parser.
 //!
 //! Same limits, duplicate-key rules, quoting/escaping, include semantics,
-//! and file/line diagnostics as the LCDForge Go implementation.
+//! and file/line diagnostics as the original Go implementation.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -688,7 +688,7 @@ mod tests {
 
     #[test]
     fn include_rejects_traversal_and_absolute() {
-        let dir = std::env::temp_dir().join(format!("lcdforge-cfg-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lcdsirplus-cfg-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let main = dir.join("main.txt");
         std::fs::write(&main, "include ..\\escape.txt\n").unwrap();
@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn include_cycle_detected() {
-        let dir = std::env::temp_dir().join(format!("lcdforge-cfg-cycle-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lcdsirplus-cfg-cycle-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let main = dir.join("main.txt");
         let inc = dir.join("inc.txt");
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn include_overrides_primary_values() {
-        let dir = std::env::temp_dir().join(format!("lcdforge-cfg-ovr-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lcdsirplus-cfg-ovr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let main = dir.join("main.txt");
         std::fs::write(&main, "preview_scale 2\ninclude local.txt\n").unwrap();

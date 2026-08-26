@@ -1,5 +1,5 @@
-// LCDForge: LCDSirReal-style dashboard for the Logitech G13 160x43 LCD.
-// Rust port of the LCDForge Go application (0.2.0) — native-first telemetry,
+// LCDSirPlus: LCDSirReal-style dashboard for the Logitech G13 160x43 LCD.
+// Rust port of the original Go implementation — native-first telemetry,
 // direct-HID G13 backend, no Logitech runtime dependency.
 
 mod alerts;
@@ -30,10 +30,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_usage() {
     println!(
-        "LCDForge {VERSION} — LCDSirReal-style dashboard for the Logitech G13 160x43 LCD\n\
+        "LCDSirPlus {VERSION} — LCDSirReal-style dashboard for the Logitech G13 160x43 LCD\n\
          \n\
          USAGE:\n\
-         \x20 lcdforge.exe [--config PATH] [COMMAND]\n\
+         \x20 LCDSirPlus.exe [--config PATH] [COMMAND]\n\
          \n\
          COMMANDS:\n\
          \x20 (none)             Run the dashboard application\n\
@@ -182,7 +182,7 @@ fn main() {
     };
 
     if cli.version {
-        println!("LCDForge {}", VERSION);
+        println!("LCDSirPlus {}", VERSION);
         return;
     }
     if cli.help {
@@ -302,7 +302,7 @@ fn main() {
                 std::process::exit(2);
             }
         };
-        let secret = std::env::var("LCDFORGE_DISCORD_CLIENT_SECRET").unwrap_or_default();
+        let secret = std::env::var("LCDSIRPLUS_DISCORD_CLIENT_SECRET").unwrap_or_default();
         match providers::discord::authorize(&cfg, &secret) {
             Ok(()) => println!(
                 "Discord authorization complete. The token is protected with Windows DPAPI."
@@ -324,7 +324,7 @@ fn main() {
             match runtime::InstanceGuard::acquire() {
                 Ok(Some(guard)) => Some(guard),
                 Ok(None) => {
-                    eprintln!("LCDForge is already running; direct-HID test refused");
+                    eprintln!("LCDSirPlus is already running; direct-HID test refused");
                     std::process::exit(5);
                 }
                 Err(error) => {
@@ -348,7 +348,7 @@ fn main() {
     let instance = match runtime::InstanceGuard::acquire() {
         Ok(Some(guard)) => guard,
         Ok(None) => {
-            eprintln!("LCDForge is already running");
+            eprintln!("LCDSirPlus is already running");
             std::process::exit(5);
         }
         Err(error) => {
@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn diagnostics_ignore_unreachable_unc_config_without_calling_parser() {
         let directory = std::env::temp_dir().join(format!(
-            "lcdforge-cli-offline-{}-{}",
+            "lcdsirplus-cli-offline-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -381,7 +381,7 @@ mod tests {
                 .as_nanos()
         ));
         let cli = Cli {
-            config: Some(r"\\unreachable.invalid\share\lcdforge.txt".into()),
+            config: Some(r"\\unreachable.invalid\share\lcdsirplus.txt".into()),
             validate: false,
             preview: false,
             hardware_test: false,

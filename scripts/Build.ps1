@@ -100,9 +100,10 @@ try {
     $work = Join-Path $artifactsRoot ('.package-stage-' + [Guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($work) | Out-Null
 
-    $portableName = "LCDForge-$version-win-x64-portable"
-    $installerName = "LCDForge-$version-win-x64-installer"
-    $sourceName = "LCDForge-$version-source"
+    $portableName = "LCDSirPlus-$version-win-x64-portable"
+    $installerName = "LCDSirPlus-$version-win-x64-installer"
+    $sourceName = "LCDSirPlus-$version-source"
+    $checksumName = "LCDSirPlus-$version-SHA256SUMS.txt"
     $portableRoot = Join-Path $work $portableName
     $installerRoot = Join-Path $work $installerName
     $sourceRoot = Join-Path $work $sourceName
@@ -117,9 +118,9 @@ try {
         Remove-Item -LiteralPath $trackedZip -Force
 
         [IO.Directory]::CreateDirectory($portableRoot) | Out-Null
-        Copy-Item -LiteralPath (Join-Path $repo 'target\release\lcdforge.exe') -Destination (Join-Path $portableRoot 'lcdforge.exe')
+        Copy-Item -LiteralPath (Join-Path $repo 'target\release\LCDSirPlus.exe') -Destination (Join-Path $portableRoot 'LCDSirPlus.exe')
         Copy-Allowlist -SourceRoot $sourceRoot -Destination $portableRoot -Paths @(
-            'lcdforge.txt', 'LICENSE', 'README.md', 'RELEASE-NOTES.md', 'SECURITY.md',
+            'lcdsirplus.txt', 'LICENSE', 'README.md', 'RELEASE-NOTES.md', 'SECURITY.md',
             'docs/ARCHITECTURE.md', 'docs/CONFIGURATION.md', 'docs/HARDWARE-ACCEPTANCE.md',
             'docs/PRODUCT-SPEC.md', 'docs/REFERENCE-LAYOUT.md'
         )
@@ -155,7 +156,7 @@ try {
             $size = (Get-Item -LiteralPath $archive).Length
             $sums += "{0}`t{1}`t{2}" -f $hash, $size, [IO.Path]::GetFileName($archive)
         }
-        [IO.File]::WriteAllLines((Join-Path $output 'SHA256SUMS.txt'), $sums, (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllLines((Join-Path $output $checksumName), $sums, (New-Object Text.UTF8Encoding($false)))
 
         Write-Host '== clean extraction and lifecycle tests ==' -ForegroundColor Cyan
         & (Join-Path $PSScriptRoot 'Package-Test.ps1') -ArtifactDir $output -ExpectedCommit $head

@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "lcdforge"
+name = "lcdsirplus"
 version = "0.3.0"
 dependencies = [
  "windows",

@@ -1,6 +1,6 @@
 //! SteelSeries Arctis headset battery over USB HID (7P+ family).
 //!
-//! Protocol ported from the proven LCDForge Go implementation: open the
+//! Protocol ported from the proven original Go implementation: open the
 //! ranked vendor collection, send the read-only `0xB0` status request, and
 //! decode the response honestly — the device reports a coarse 0..4 level
 //! (mapped to 0/25/50/75/100%) or a direct percent; intermediate values are

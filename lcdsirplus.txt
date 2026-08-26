@@ -1,5 +1,5 @@
 ##############################################################################
-# LCDForge 0.3.0 configuration (Rust port)
+# LCDSirPlus 0.3.0 configuration (Rust port)
 #
 # Blank lines and lines beginning with # are ignored. Each setting is a key
 # followed by whitespace-separated values. The physical 160x43 layout is
@@ -56,7 +56,7 @@ logitech_reconnect_ms   auto          # 5000, doubles to reconnect_max on failur
 logitech_reconnect_max_ms auto        # 60000
 logitech_button_poll_ms auto          # 50
 logitech_button_debounce_ms auto      # 40
-logitech_friendly_name  LCDForge
+logitech_friendly_name  LCDSirPlus
 logitech_orientation    normal        # normal | flip_x | flip_y | rotate_180
 logitech_invert         0
 
@@ -121,7 +121,7 @@ audio_poll_ms           auto          # 1000
 # Discord local RPC active-speaker overlay — Phase 3.
 # Create a Discord developer application, add your account as a tester, put
 # the client ID below, register the exact redirect URI, run Discord Desktop,
-# then use: lcdforge.exe --discord-authorize
+# then use: LCDSirPlus.exe --discord-authorize
 
 discord_enabled         1
 discord_client_id       ""
@@ -142,7 +142,7 @@ hang_probe_interval_ms  2000
 hang_probe_timeout_ms   350
 hang_failures_required  3
 hang_minimum_ms         6000
-hang_ignore lcdforge.exe explorer.exe dwm.exe winlogon.exe csrss.exe services.exe lsass.exe smss.exe fontdrvhost.exe sihost.exe taskhostw.exe
+hang_ignore LCDSirPlus.exe explorer.exe dwm.exe winlogon.exe csrss.exe services.exe lsass.exe smss.exe fontdrvhost.exe sihost.exe taskhostw.exe
 
 # Alert thresholds — Phase 2/4.
 cpu_temp_warning        85
@@ -161,6 +161,6 @@ log_max_bytes           2097152
 log_backups             3
 
 # Personal overrides can be kept separately:
-# include lcdforge.local.txt
+# include lcdsirplus.local.txt
 
 # end of file

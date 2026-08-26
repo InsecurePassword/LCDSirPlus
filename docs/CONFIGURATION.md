@@ -1,4 +1,4 @@
-# LCDForge 0.3.0 configuration reference
+# LCDSirPlus 0.3.0 configuration reference
 
 Format: LCDSirReal-style. `#` comments, whitespace-separated key/value
 lines, quoted values for embedded spaces, `include` override files. The
@@ -31,7 +31,7 @@ Every selector that supports one defaults to `auto`.
 unavailable (LCDSirReal `testwindow` semantics). A tray toggle takes precedence
 over later `auto` backend changes, and `start_minimized` suppresses automatic
 preview display. `start_at_login` owns only the current user's
-`LCDForge` Run value and refuses to replace or remove a foreign value. Safe mode
+`LCDSirPlus` Run value and refuses to replace or remove a foreign value. Safe mode
 never changes startup registration.
 
 ## Slots (fixed four-button contract)
@@ -70,7 +70,7 @@ dashboard to the one-bar CPU layout automatically.
 | `logitech_reconnect_max_ms` | 60000 (`auto`) | ≥ reconnect, ≤ 600000 |
 | `logitech_button_poll_ms` | 50 (`auto`) | 10..1000 |
 | `logitech_button_debounce_ms` | 40 (`auto`) | 10..500 |
-| `logitech_friendly_name` | LCDForge | non-empty |
+| `logitech_friendly_name` | LCDSirPlus | non-empty |
 | `logitech_orientation` | `normal` | `normal` \| `flip_x` \| `flip_y` \| `rotate_180` |
 | `logitech_invert` | 0 | bool |
 
@@ -92,7 +92,7 @@ DLLs; `auto` tries NVAPI then ADLX. `presentmon_*`
 `stutter_threshold_ms` 1..1000), `headset_*` (warn ≥ critical),
 `controller_index` (-1..3), `network_probe_*` (`auto`\|`icmp`\|`tcp`),
 `audio_poll_ms`. PresentMon resolves an explicitly configured path or, for
-`auto`, a colocated `PresentMon.exe` beside LCDForge. Frame metrics become stale
+`auto`, a colocated `PresentMon.exe` beside LCDSirPlus. Frame metrics become stale
 after five seconds without output; 1% and 0.1% lows use the configured history
 window, and changing target/capture settings starts a new session. PresentMon
 is a separate runtime prerequisite and is not redistributed.
@@ -116,7 +116,7 @@ standard-library DNS resolution cannot be canceled with the required shutdown bo
 |---|---|---|
 | `discord_enabled` | 1 | disabled, and always off in safe mode, means no IPC/token/network access |
 | `discord_client_id` | empty | numeric Discord developer application client ID |
-| `discord_redirect_uri` | `http://127.0.0.1` | must exactly match the developer application; LCDForge does not listen on it |
+| `discord_redirect_uri` | `http://127.0.0.1` | must exactly match the developer application; LCDSirPlus does not listen on it |
 | `discord_linger_ms` | 700 | 0..10000 after speaking stops |
 | `discord_max_speakers` | 2 | 1..4; additional visible speakers render as `+N` |
 | `discord_show_self` | 0 | include the current user in the speaking overlay |
@@ -124,8 +124,8 @@ standard-library DNS resolution cannot be canceled with the required shutdown bo
 
 No token or client secret belongs in this file. Use `--discord-authorize`; the
 resulting access/refresh record is current-user DPAPI protected under
-`%LOCALAPPDATA%\LCDForge2`. A confidential-client secret, when required, is
-accepted only from the temporary `LCDFORGE_DISCORD_CLIENT_SECRET` environment
+`%LOCALAPPDATA%\LCDSirPlus`. A confidential-client secret, when required, is
+accepted only from the temporary `LCDSIRPLUS_DISCORD_CLIENT_SECRET` environment
 variable. Use `--discord-clear-token` to remove the local record.
 
 ## Hung-process guard
@@ -150,19 +150,19 @@ normal slot action. A cleared episode rearms if it later recurs.
 
 `log_level` (`debug`\|`info`\|`warn`\|`error`), `log_max_bytes`
 (65536..104857600), `log_backups` (1..20). Log file:
-`%LOCALAPPDATA%\LCDForge2\lcdforge.log` (or `--diagnostic-dir`).
+`%LOCALAPPDATA%\LCDSirPlus\lcdsirplus.log` (or `--diagnostic-dir`).
 Startup fails explicitly if the selected log directory or file cannot be
 opened. A later write/rotation failure leaves stdout logging active, drops the
 failed line, and disables file output rather than risking an unbounded file.
 Initialization atomically trims every retained file to the configured cap and
 removes slots above `log_backups`. Backups are atomic ring slots
-`lcdforge.log.1` through `.N`; modification time, not suffix, gives newest to
+`lcdsirplus.log.1` through `.N`; modification time, not suffix, gives newest to
 oldest order. Rotation fully prepares and flushes a bounded replacement before
 replacing the next slot, then truncates the current log.
 
 ## Diagnostics
 
-`lcdforge.exe --diagnostics [--config PATH] [--diagnostic-dir PATH]` ignores
+`LCDSirPlus.exe --diagnostics [--config PATH] [--diagnostic-dir PATH]` ignores
 `--config` without resolving, opening, or parsing it, then writes a uniquely
 named atomic ZIP without starting HID, providers, Discord, network probes, or
 hung actions. The archive is store-only, has fixed entries (`privacy.txt`,
@@ -180,7 +180,7 @@ serial, arbitrary-listing, and device-path data are excluded.
 ## Includes
 
 ```text
-include lcdforge.local.txt
+include lcdsirplus.local.txt
 ```
 
 Relative to the including file; no `..`, no absolute paths, no environment

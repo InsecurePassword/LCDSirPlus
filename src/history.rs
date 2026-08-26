@@ -1,6 +1,6 @@
 //! Bounded chronological series and frame-statistics helpers.
 //!
-//! Ported from the LCDForge Go implementation (`internal/history`). The ring
+//! Ported from the original Go implementation (`internal/history`). The ring
 //! buffer replaces the oldest sample in O(1) once full; it never shifts the
 //! complete history on every frame.
 //! Stats helpers are Phase 2 surface (PresentMon 1%/0.1% lows, jitter).

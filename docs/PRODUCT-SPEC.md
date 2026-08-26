@@ -1,8 +1,8 @@
-# LCDForge 0.3.0 product specification
+# LCDSirPlus 0.3.0 product specification
 
 ## Purpose
 
-LCDForge provides a modern fixed dashboard for the Logitech G13 160×43
+LCDSirPlus provides a modern fixed dashboard for the Logitech G13 160×43
 monochrome LCD when games occupy the user's normal displays. The 0.3.0 Rust
 port preserves the 0.2.0 product contract while removing three dependencies:
 the Logitech runtime, Process Lasso, and per-tick network polling for

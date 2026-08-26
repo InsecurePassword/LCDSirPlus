@@ -1,4 +1,4 @@
-# LCDForge 0.3.0 architecture
+# LCDSirPlus 0.3.0 architecture
 
 ## Layout
 
@@ -47,15 +47,15 @@ src\
 | Thread | Owns | Communicates via |
 |---|---|---|
 | main/app | config, slots, providers, renderer, loop timing | channels |
-| lcdforge-backend | HID handles, all device I/O | `Command` in / `Message` out |
-| lcdforge-ui | HWND, tray, GDI | frames in / `UiEvent` out |
+| lcdsirplus-backend | HID handles, all device I/O | `Command` in / `Message` out |
+| lcdsirplus-ui | HWND, tray, GDI | frames in / `UiEvent` out |
 | frame pump | latest-frame handoff to UI | `PostMessageW` wake |
 | telemetry | fast native polls, stale state, provider health | snapshot channel |
 | telemetry-gpu | read-only NVAPI/ADLX calls | event channel |
 | telemetry-presentmon | target/capture lifecycle | update channel |
 | telemetry-hang | visible-window probes and continuous-failure tracker | update channel |
 | telemetry-network-quality | optional bounded IP-literal ICMP/TCP probe | update channel |
-| lcdforge-discord | verified pipe, authentication, subscriptions, reconnect | snapshot channel |
+| lcdsirplus-discord | verified pipe, authentication, subscriptions, reconnect | snapshot channel |
 | telemetry-lhm/headset | bounded blocking HTTP/HID | event channel |
 
 The backend thread is the only toucher of the device (mirrors the Go
@@ -63,7 +63,7 @@ The backend thread is the only toucher of the device (mirrors the Go
 edges are debounced in the backend thread and delivered as events.
 
 Normal runtime and direct-HID hardware tests acquire the per-session
-`Local\\LCDForge2.Runtime` mutex before opening a backend/device. Read-only CLI
+`Local\\LCDSirPlus.Runtime` mutex before opening a backend/device. Read-only CLI
 commands and virtual tests do not acquire it. The RAII owner closes the handle
 on return. Startup registration uses a transaction and mutates only an exact
 owned current-user Run value.
@@ -73,7 +73,7 @@ owned current-user Run value.
 `scripts/Build.ps1` accepts only a clean exact Git HEAD, runs the full quality
 gate, stages explicit member allowlists, and emits deterministic portable,
 installer, and source ZIPs. Every archive has one root and a sorted hash/size
-manifest; `SHA256SUMS.txt` covers all three ZIPs. The source tree is populated
+manifest; `LCDSirPlus-0.3.0-SHA256SUMS.txt` covers all three ZIPs. The source tree is populated
 from `git archive HEAD`, not the working directory.
 
 `Install.ps1` and `Uninstall.ps1` share `Package.Common.ps1` for member, path,
@@ -151,8 +151,8 @@ Discord speaker overlay, then dashboard.
   terminate command while safe mode is active.
 - Vendor DLLs are loaded by name only from System32. GPU APIs are read-only,
   versioned, and bounded to vendor maximums. Automatically discovered
-  PresentMon is canonically contained beside LCDForge; arguments are passed
-  without a shell, and only the child started by LCDForge is terminated. Its
+  PresentMon is canonically contained beside LCDSirPlus; arguments are passed
+  without a shell, and only the child started by LCDSirPlus is terminated. Its
   owner thread is joined during shutdown.
 
 ## Security posture

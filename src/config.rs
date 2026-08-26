@@ -1,4 +1,4 @@
-//! LCDForge v2 configuration: schema, defaults, validation.
+//! LCDSirPlus v2 configuration: schema, defaults, validation.
 //!
 //! LCDSirReal-style text format: `#` comments, whitespace-separated
 //! key/value lines, ordered `slot_0`..`slot_3` module lists, `include`
@@ -19,7 +19,7 @@ pub const MAX_CONFIG_STRING_BYTES: usize = 4 * 1024;
 pub const MAX_CONFIG_LIST_ITEMS: usize = 256;
 
 /// The four button-aligned slot defaults, byte-identical to the shipped
-/// LCDForge portable configuration.
+/// LCDSirPlus portable configuration.
 pub const DEFAULT_SLOTS: [&[&str]; 4] = [
     &["HEADSET_BATTERY", "CPU_TEMP", "CONTROLLER_BATTERY"],
     &["FPS_CURRENT", "FPS_1LOW", "FRAME_TIME", "SESSION_TIME"],
@@ -199,7 +199,7 @@ impl Default for Config {
             logitech_reconnect_max: Duration::from_secs(60),
             logitech_button_poll: Duration::from_millis(50),
             logitech_button_debounce: Duration::from_millis(40),
-            logitech_friendly_name: "LCDForge".into(),
+            logitech_friendly_name: "LCDSirPlus".into(),
             logitech_orientation: "normal".into(),
             logitech_invert: false,
             lhm_mode: "auto".into(),
@@ -220,8 +220,8 @@ impl Default for Config {
                 "applicationframehost.exe",
                 "textinputhost.exe",
                 "searchhost.exe",
-                "lcdforge.exe",
-                "lcdforge.console.exe",
+                "lcdsirplus.exe",
+                "lcdsirplus.console.exe",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -260,7 +260,7 @@ impl Default for Config {
             hang_failures: 3,
             hang_minimum: Duration::from_secs(6),
             hang_ignore: [
-                "lcdforge.exe",
+                "lcdsirplus.exe",
                 "explorer.exe",
                 "dwm.exe",
                 "winlogon.exe",

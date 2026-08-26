@@ -1,15 +1,15 @@
 #Requires -Version 5.1
 [CmdletBinding()]
 param(
-    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\LCDForge2'),
+    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\LCDSirPlus'),
     [switch]$PurgeUserData,
     [string]$ConfirmPurge,
-    [string]$UserDataRoot = (Join-Path $env:LOCALAPPDATA 'LCDForge2'),
+    [string]$UserDataRoot = (Join-Path $env:LOCALAPPDATA 'LCDSirPlus'),
     [switch]$NoIntegration,
     [string]$ShortcutRoot = (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'),
-    [string]$ShortcutName = 'LCDForge 2.lnk',
+    [string]$ShortcutName = 'LCDSirPlus.lnk',
     [string]$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
-    [string]$RunName = 'LCDForge',
+    [string]$RunName = 'LCDSirPlus',
     [switch]$SimulateRunning,
     [switch]$TestMode
 )
@@ -38,12 +38,12 @@ function Get-RunValue {
 function Invoke-UserDataPurge {
     param([string]$InstallPath)
     if (-not $PurgeUserData) { return }
-    if ($ConfirmPurge -cne 'PURGE-LCDFORGE2-DATA') {
-        throw 'purge requires -ConfirmPurge PURGE-LCDFORGE2-DATA'
+    if ($ConfirmPurge -cne 'PURGE-LCDSIRPLUS-DATA') {
+        throw 'purge requires -ConfirmPurge PURGE-LCDSIRPLUS-DATA'
     }
     $userData = Get-NormalizedFullPath $UserDataRoot
-    $expected = Get-NormalizedFullPath (Join-Path $env:LOCALAPPDATA 'LCDForge2')
-    if ($TestMode -and $env:LCDFORGE_PACKAGE_TEST -cne '1') {
+    $expected = Get-NormalizedFullPath (Join-Path $env:LOCALAPPDATA 'LCDSirPlus')
+    if ($TestMode -and $env:LCDSIRPLUS_PACKAGE_TEST -cne '1') {
         throw 'test-mode purge requires the isolated package-test guard'
     }
     if (-not $TestMode -and -not $userData.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {
@@ -65,16 +65,16 @@ Assert-SafeLeafName $ShortcutName
 if (-not $RunKey.StartsWith('HKCU:\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Run key must remain beneath HKCU' }
 if (-not [IO.Directory]::Exists($install)) {
     Invoke-UserDataPurge $install
-    Write-Host 'LCDForge is not installed at the selected root.'
+    Write-Host 'LCDSirPlus is not installed at the selected root.'
     return
 }
 Assert-SafeLocalDirectory -Path $install | Out-Null
-$executable = Join-Path $install 'lcdforge.exe'
+$executable = Join-Path $install 'LCDSirPlus.exe'
 if (Test-ExactProcessRunning -ExecutablePath $executable -SimulateRunning:$SimulateRunning) {
-    throw 'LCDForge is running from the install root; uninstall refused'
+    throw 'LCDSirPlus is running from the install root; uninstall refused'
 }
 
-$entries = @(Read-VerifiedManifest -Root $install -ManifestName 'INSTALL-MANIFEST.txt' -AllowedUndeclared @('lcdforge.txt') -AllowOtherFiles)
+$entries = @(Read-VerifiedManifest -Root $install -ManifestName 'INSTALL-MANIFEST.txt' -AllowedUndeclared @('lcdsirplus.txt') -AllowOtherFiles)
 
 if (-not $NoIntegration) {
     $shortcutPath = Join-Path $ShortcutRoot $ShortcutName
@@ -126,4 +126,4 @@ if (@(Get-ChildItem -LiteralPath $install -Force).Count -eq 0) {
 
 Invoke-UserDataPurge $install
 
-Write-Host 'LCDForge uninstall complete. Configuration and user data were preserved unless explicitly purged.' -ForegroundColor Green
+Write-Host 'LCDSirPlus uninstall complete. Configuration and user data were preserved unless explicitly purged.' -ForegroundColor Green

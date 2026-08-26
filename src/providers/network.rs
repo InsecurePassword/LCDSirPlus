@@ -346,7 +346,7 @@ fn icmp_probe(address: Ipv4Addr, timeout: Duration) -> Outcome {
     let Ok(handle) = (unsafe { IcmpCreateFile() }) else {
         return Outcome::Error("ICMP provider unavailable");
     };
-    let payload = b"LCDForge";
+    let payload = b"LCDSirPlus";
     let reply_bytes = std::mem::size_of::<ICMP_ECHO_REPLY>() + payload.len() + 8;
     let mut reply = vec![0usize; reply_bytes.div_ceil(std::mem::size_of::<usize>())];
     let count = unsafe {

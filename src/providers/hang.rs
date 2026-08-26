@@ -541,7 +541,7 @@ fn enumerate_and_probe(
 ) -> Result<Vec<Observation>, &'static str> {
     let windows_dir = windows_directory()?;
     let mut ignored = ignored_names(ignore);
-    ignored.insert("lcdforge.exe".into());
+    ignored.insert("lcdsirplus.exe".into());
     let mut context = EnumerationContext {
         ignored,
         windows_dir,
@@ -913,7 +913,7 @@ impl ActionApi for NativeActionApi {
     }
 
     fn terminate(&mut self, process: &Self::Process) -> Result<(), ActionOutcome> {
-        unsafe { TerminateProcess(process.0, 0x4c43_4446) }
+        unsafe { TerminateProcess(process.0, 0x4c43_4453) }
             .map_err(|_| ActionOutcome::TerminateFailure)
     }
 
@@ -1078,8 +1078,8 @@ pub fn run_harness(duration: Duration) -> i32 {
 
 fn create_harness_window(duration: Duration) -> Result<(), &'static str> {
     let pid = unsafe { GetCurrentProcessId() };
-    let class = format!("LCDFORGE_HANG_HARNESS_{pid}\0");
-    let title = format!("LCDForge Disposable Hang Harness {pid}\0");
+    let class = format!("LCDSIRPLUS_HANG_HARNESS_{pid}\0");
+    let title = format!("LCDSirPlus Disposable Hang Harness {pid}\0");
     let class_wide: Vec<u16> = class.encode_utf16().collect();
     let title_wide: Vec<u16> = title.encode_utf16().collect();
     unsafe {
@@ -1164,7 +1164,7 @@ impl Drop for HarnessCleanup {
 fn spawn_harness(duration_secs: u64) -> Result<HarnessCleanup, String> {
     let source = smoke_source()?;
     let root = std::env::temp_dir().join(format!(
-        "lcdforge2-hang-smoke-{}-{}",
+        "lcdsirplus-hang-smoke-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1173,7 +1173,7 @@ fn spawn_harness(duration_secs: u64) -> Result<HarnessCleanup, String> {
     ));
     std::fs::create_dir(&root).map_err(|_| "temporary harness directory creation failed")?;
     let mut cleanup = HarnessCleanup { child: None, root };
-    let harness = cleanup.root.join("LCDForgeHangHarness.exe");
+    let harness = cleanup.root.join("LCDSirPlusHangHarness.exe");
     if let Err(error) = std::fs::copy(&source, &harness) {
         return Err(format!("temporary harness copy failed: {error}"));
     }
@@ -1389,7 +1389,7 @@ fn smoke_source() -> Result<std::path::PathBuf, String> {
     let is_test_binary = current
         .file_stem()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("lcdforge-"))
+        .is_some_and(|name| name.starts_with("lcdsirplus-"))
         && current
             .parent()
             .and_then(Path::file_name)
@@ -1399,7 +1399,7 @@ fn smoke_source() -> Result<std::path::PathBuf, String> {
         let release_binary = current
             .parent()
             .and_then(Path::parent)
-            .map(|parent| parent.join("lcdforge.exe"))
+            .map(|parent| parent.join("LCDSirPlus.exe"))
             .ok_or("release harness executable unavailable")?;
         if release_binary.is_file() {
             return Ok(release_binary);
@@ -2159,7 +2159,7 @@ mod tests {
     #[test]
     fn harness_cleanup_removes_only_its_owned_tree() {
         let root = std::env::temp_dir().join(format!(
-            "lcdforge2-hang-cleanup-test-{}-{:?}",
+            "lcdsirplus-hang-cleanup-test-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

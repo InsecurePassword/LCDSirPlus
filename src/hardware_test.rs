@@ -283,7 +283,7 @@ fn horizontal_rows(_tick: u64) -> Frame {
 fn identity(_tick: u64) -> Frame {
     let mut f = Frame::new();
     f.rect(0, 0, 160, 43, true);
-    f.text_centered(3, 154, 6, "LCDFORGE", 2, true);
+    f.text_centered(3, 154, 6, "LCDSIRPLUS", 2, true);
     f.text_centered(
         3,
         154,

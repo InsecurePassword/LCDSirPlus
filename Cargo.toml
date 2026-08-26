@@ -1,9 +1,13 @@
 [package]
-name = "lcdforge"
+name = "lcdsirplus"
 version = "0.3.0"
 edition = "2021"
-description = "LCDForge: LCDSirReal-style dashboard for the Logitech G13 160x43 monochrome LCD"
+description = "LCDSirPlus: LCDSirReal-style dashboard for the Logitech G13 160x43 monochrome LCD"
 license = "MIT"
+
+[[bin]]
+name = "LCDSirPlus"
+path = "src/main.rs"
 
 [dependencies]
 windows = { version = "0.58", features = [

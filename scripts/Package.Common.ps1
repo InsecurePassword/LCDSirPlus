@@ -1,12 +1,12 @@
 Set-StrictMode -Version 2.0
 
-if (-not ('LCDForge.PackageNative' -as [type])) {
+if (-not ('LCDSirPlus.PackageNative' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
-namespace LCDForge {
+namespace LCDSirPlus {
     [StructLayout(LayoutKind.Sequential)]
     public struct ByHandleFileInformation {
         public uint FileAttributes;
@@ -88,8 +88,8 @@ function Assert-RegularSingleLinkFile {
     try {
         $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
         $stream = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
-        $information = New-Object LCDForge.ByHandleFileInformation
-        if (-not [LCDForge.PackageNative]::GetFileInformationByHandle($stream.SafeFileHandle, [ref]$information)) {
+        $information = New-Object LCDSirPlus.ByHandleFileInformation
+        if (-not [LCDSirPlus.PackageNative]::GetFileInformationByHandle($stream.SafeFileHandle, [ref]$information)) {
             throw "file identity unavailable"
         }
         $directory = 0x10

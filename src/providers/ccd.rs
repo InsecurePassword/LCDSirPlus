@@ -1,6 +1,6 @@
 //! Native Cache/Frequency CCD topology detection — no Process Lasso.
 //!
-//! Strategy (locked in the LCDForge2 port plan):
+//! Strategy (locked in the Rust port plan):
 //! 1. Group logical processors by L3 cache domain via
 //!    `GetLogicalProcessorInformationEx(RelationCache)` — a dual-CCD Ryzen
 //!    enumerates as two distinct L3 domains.

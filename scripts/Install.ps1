@@ -2,13 +2,13 @@
 [CmdletBinding()]
 param(
     [string]$PackageRoot = $PSScriptRoot,
-    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\LCDForge2'),
+    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\LCDSirPlus'),
     [switch]$EnableLogin,
     [switch]$NoIntegration,
     [string]$ShortcutRoot = (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'),
-    [string]$ShortcutName = 'LCDForge 2.lnk',
+    [string]$ShortcutName = 'LCDSirPlus.lnk',
     [string]$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
-    [string]$RunName = 'LCDForge',
+    [string]$RunName = 'LCDSirPlus',
     [ValidateSet('None', 'AfterStage', 'AfterPublish', 'AfterIntegration')]
     [string]$InjectFailure = 'None',
     [switch]$SimulateRunning
@@ -19,8 +19,8 @@ Set-StrictMode -Version 2.0
 . (Join-Path $PSScriptRoot 'Package.Common.ps1')
 
 $payload = @(
-    'lcdforge.exe',
-    'lcdforge.txt',
+    'LCDSirPlus.exe',
+    'lcdsirplus.txt',
     'LICENSE',
     'README.md',
     'RELEASE-NOTES.md',
@@ -47,7 +47,7 @@ function Assert-ExpectedPackage {
 function Write-OwnershipManifest {
     param([string]$Root)
     $owned = @('Package.Common.ps1', 'Uninstall.ps1')
-    $owned += @($payload | Where-Object { $_ -ne 'lcdforge.txt' })
+    $owned += @($payload | Where-Object { $_ -ne 'lcdsirplus.txt' })
     $owned = @(Get-OrdinalSorted $owned)
     $lines = @()
     foreach ($relative in $owned) {
@@ -109,7 +109,7 @@ function Set-OwnedShortcut {
     $shortcut = $shell.CreateShortcut($Path)
     $shortcut.TargetPath = $Executable
     $shortcut.WorkingDirectory = Split-Path $Executable -Parent
-    $shortcut.Description = 'LCDForge 2'
+    $shortcut.Description = 'LCDSirPlus Logitech LCD dashboard'
     $shortcut.Save()
     Assert-RegularSingleLinkFile $Path | Out-Null
 }
@@ -147,17 +147,17 @@ $install = Get-NormalizedFullPath $InstallRoot
 Assert-NotDangerousInstallRoot $install
 $parent = Assert-SafeLocalDirectory -Path (Split-Path $install -Parent) -Create
 if ([IO.Directory]::Exists($install)) { Assert-SafeLocalDirectory -Path $install | Out-Null }
-$executable = Join-Path $install 'lcdforge.exe'
+$executable = Join-Path $install 'LCDSirPlus.exe'
 if (Test-ExactProcessRunning -ExecutablePath $executable -SimulateRunning:$SimulateRunning) {
-    throw 'LCDForge is running from the install root; install/update refused'
+    throw 'LCDSirPlus is running from the install root; install/update refused'
 }
 
 $updating = [IO.Directory]::Exists($install) -and [IO.File]::Exists((Join-Path $install 'INSTALL-MANIFEST.txt'))
 if ([IO.Directory]::Exists($install) -and -not $updating -and @(Get-ChildItem -LiteralPath $install -Force).Count -ne 0) {
-    throw 'existing install root is not owned by LCDForge'
+    throw 'existing install root is not owned by LCDSirPlus'
 }
 if ($updating) {
-    [void]@(Read-VerifiedManifest -Root $install -ManifestName 'INSTALL-MANIFEST.txt' -AllowedUndeclared @('lcdforge.txt'))
+    [void]@(Read-VerifiedManifest -Root $install -ManifestName 'INSTALL-MANIFEST.txt' -AllowedUndeclared @('lcdsirplus.txt'))
 }
 
 $shortcutPath = Join-Path $ShortcutRoot $ShortcutName
@@ -177,9 +177,9 @@ if (-not $NoIntegration) {
 }
 
 $nonce = [Guid]::NewGuid().ToString('N')
-$stage = Join-Path $parent ('.LCDForge2.stage.' + $nonce)
-$backup = Join-Path $parent ('.LCDForge2.backup.' + $nonce)
-$failed = Join-Path $parent ('.LCDForge2.failed.' + $nonce)
+$stage = Join-Path $parent ('.LCDSirPlus.stage.' + $nonce)
+$backup = Join-Path $parent ('.LCDSirPlus.backup.' + $nonce)
+$failed = Join-Path $parent ('.LCDSirPlus.failed.' + $nonce)
 $published = $false
 $backedUp = $false
 $shortcutWriteStarted = $false
@@ -205,12 +205,12 @@ try {
         $hash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
         if ($identity.Size -ne $entry.Size -or $hash -ne $entry.Hash) { throw 'staged package member mismatch' }
     }
-    if ($updating -and [IO.File]::Exists((Join-Path $install 'lcdforge.txt'))) {
-        Assert-RegularSingleLinkFile (Join-Path $install 'lcdforge.txt') | Out-Null
-        Copy-Item -LiteralPath (Join-Path $install 'lcdforge.txt') -Destination (Join-Path $stage 'lcdforge.txt') -Force
+    if ($updating -and [IO.File]::Exists((Join-Path $install 'lcdsirplus.txt'))) {
+        Assert-RegularSingleLinkFile (Join-Path $install 'lcdsirplus.txt') | Out-Null
+        Copy-Item -LiteralPath (Join-Path $install 'lcdsirplus.txt') -Destination (Join-Path $stage 'lcdsirplus.txt') -Force
     }
     Write-OwnershipManifest $stage
-    [void]@(Read-VerifiedManifest -Root $stage -ManifestName 'INSTALL-MANIFEST.txt' -AllowedUndeclared @('lcdforge.txt'))
+    [void]@(Read-VerifiedManifest -Root $stage -ManifestName 'INSTALL-MANIFEST.txt' -AllowedUndeclared @('lcdsirplus.txt'))
     if ($InjectFailure -eq 'AfterStage') { throw 'injected failure after stage' }
 
     if ([IO.Directory]::Exists($install)) {
@@ -225,7 +225,7 @@ try {
     [IO.Directory]::Move($stage, $install)
     $published = $true
     if ($InjectFailure -eq 'AfterPublish') { throw 'injected failure after publish' }
-    [void]@(Read-VerifiedManifest -Root $install -ManifestName 'INSTALL-MANIFEST.txt' -AllowedUndeclared @('lcdforge.txt'))
+    [void]@(Read-VerifiedManifest -Root $install -ManifestName 'INSTALL-MANIFEST.txt' -AllowedUndeclared @('lcdsirplus.txt'))
 
     if (-not $NoIntegration) {
         $shortcutWriteStarted = $true
@@ -242,7 +242,7 @@ try {
         Assert-SafeTree $backup
         Remove-Item -LiteralPath $backup -Recurse -Force
     }
-    Write-Host ('LCDForge 0.3.0 installed at {0}' -f $install) -ForegroundColor Green
+    Write-Host ('LCDSirPlus 0.3.0 installed at {0}' -f $install) -ForegroundColor Green
 }
 catch {
     $failure = $_

@@ -7,20 +7,20 @@ requires a complete rerun.
 
 ## Preconditions
 
-- Verify the installer/portable ZIP against `SHA256SUMS.txt` and its internal
+- Verify the installer/portable ZIP against `LCDSirPlus-0.3.0-SHA256SUMS.txt` and its internal
   `PACKAGE-MANIFEST.txt`; record both hashes.
 - Use a standard unelevated Windows 11 x64 account.
-- Back up `lcdforge.txt`; ensure no unsaved work is used for hang-action tests.
+- Back up `lcdsirplus.txt`; ensure no unsaved work is used for hang-action tests.
 - Record optional NVAPI/ADLX, PresentMon, LHM, headset, controller, and Discord
   prerequisites actually present. Absence is acceptable only when the UI shows
   explicit unavailable state.
 
 ## Logitech G13
 
-- Run `lcdforge.exe --hardware-discover`; record the accepted VID/PID, usage,
+- Run `LCDSirPlus.exe --hardware-discover`; record the accepted VID/PID, usage,
   input/output report lengths, and rejection summary. Device paths are private
   and must not be published.
-- Run `lcdforge.exe --hardware-test --backend hid --duration-secs 60` and
+- Run `LCDSirPlus.exe --hardware-test --backend hid --duration-secs 60` and
   visually confirm STEP 01-10, correct geometry, no tearing, and blank-on-close.
 - Press each physical LCD button during the test and record down/release events.
 - Start normal mode and verify all four slot buttons, alert acknowledgement,
@@ -38,13 +38,13 @@ requires a complete rerun.
   and clear the temporary secret environment variable.
 - Join a voice channel with another participant. Confirm channel label,
   self/other speaking order, mute/deafen transitions, linger, leave/rejoin,
-  Discord restart, LCDForge restart, and token refresh.
+  Discord restart, LCDSirPlus restart, and token refresh.
 - Revoke authorization and run `--discord-clear-token`; confirm the overlay
   becomes unavailable without leaking remote error content.
 
 ## Guarded Hung Action
 
-- Use only `lcdforge.exe --hang-test-harness`; never use an application with
+- Use only `LCDSirPlus.exe --hang-test-harness`; never use an application with
   unsaved data.
 - Confirm short press only cycles, early release does not terminate, target/
   identity/recovery/config/safe-mode/device changes cancel, and only a completed

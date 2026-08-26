@@ -1,5 +1,5 @@
 //! Compact deterministic 3x5 bitmap font, ported glyph-for-glyph from the
-//! LCDForge Go renderer (`internal/render/font.go`). Unsupported runes render
+//! Original Go implementation renderer (`internal/render/font.go`). Unsupported runes render
 //! as '?'.
 
 type Glyph = [u8; 5];

@@ -1,6 +1,6 @@
-# LCDForge 0.3.0 Release Notes
+# LCDSirPlus 0.3.0 Release Notes
 
-LCDForge 0.3.0 is the completed Rust port for Windows 11 x64. P1-P4 software
+LCDSirPlus 0.3.0 is the completed Rust port for Windows 11 x64. P1-P4 software
 scope is implemented: fixed rendering, direct G13 HID, native telemetry,
 Discord active-speaker integration, alerts, guarded hung-window action,
 single-instance/startup ownership, offline diagnostics, and transactional
@@ -16,7 +16,7 @@ per-user packaging.
 - Offline diagnostics ZIP with fixed entries, a 1 MiB cap, manifest hashes,
   no configuration read, and identity-checked no-overwrite publication.
 - Per-user install/update/uninstall with package verification, preserved
-  `lcdforge.txt`, rollback, exact shortcut/Run ownership, and optional explicit
+  `lcdsirplus.txt`, rollback, exact shortcut/Run ownership, and optional explicit
   user-data purge.
 
 ## Requirements and Gaps
@@ -34,5 +34,5 @@ per-user packaging.
 
 Run `Install.ps1` from the extracted installer ZIP. Updates preserve the live
 configuration byte-for-byte. `Uninstall.ps1` preserves configuration and
-`%LOCALAPPDATA%\LCDForge2`; explicit purge requires the documented confirmation
+`%LOCALAPPDATA%\LCDSirPlus`; explicit purge requires the documented confirmation
 token. Both operations refuse a running installed executable.

@@ -378,7 +378,7 @@ impl Capture {
                 "--no_console_stats",
                 "--terminate_on_proc_exit",
                 "--session_name",
-                &format!("LCDForge-{}", target.pid),
+                &format!("LCDSirPlus-{}", target.pid),
                 "--stop_existing_session",
                 "--v2_metrics",
                 "--exclude_dropped",
@@ -588,7 +588,7 @@ fn resolve_executable(setting: &str) -> Result<PathBuf, String> {
             return Ok(path);
         }
     }
-    Err("PresentMon console executable not found beside LCDForge".into())
+    Err("PresentMon console executable not found beside LCDSirPlus".into())
 }
 
 fn colocated_location(current: &Path) -> Option<(PathBuf, PathBuf)> {
@@ -805,7 +805,7 @@ mod tests {
 
     #[test]
     fn target_exclusions_are_case_insensitive_and_exact() {
-        let exclusions = vec!["DWM.EXE".to_string(), "lcdforge.exe".to_string()];
+        let exclusions = vec!["DWM.EXE".to_string(), "lcdsirplus.exe".to_string()];
         assert!(excluded("dwm.exe", &exclusions));
         assert!(!excluded("mydwm.exe", &exclusions));
     }
@@ -859,15 +859,16 @@ mod tests {
 
     #[test]
     fn auto_location_is_colocated_only() {
-        let app = Path::new(r"C:\LCDForge\LCDForge.exe");
+        let app = Path::new(r"C:\LCDSirPlus\LCDSirPlus.exe");
         let (candidate, root) = colocated_location(app).unwrap();
-        assert_eq!(candidate, Path::new(r"C:\LCDForge\PresentMon.exe"));
-        assert_eq!(root, Path::new(r"C:\LCDForge"));
+        assert_eq!(candidate, Path::new(r"C:\LCDSirPlus\PresentMon.exe"));
+        assert_eq!(root, Path::new(r"C:\LCDSirPlus"));
     }
 
     #[test]
     fn auto_validation_rejects_candidates_outside_trusted_root() {
-        let temp = std::env::temp_dir().join(format!("lcdforge-presentmon-{}", std::process::id()));
+        let temp =
+            std::env::temp_dir().join(format!("lcdsirplus-presentmon-{}", std::process::id()));
         let root = temp.join("trusted");
         let outside = temp.join("outside");
         std::fs::create_dir_all(&root).unwrap();

@@ -1,6 +1,6 @@
 //! Canonical metric model shared by providers and the renderer.
 //!
-//! Ported from the LCDForge Go implementation (`internal/model`) with the
+//! Ported from the original Go implementation (`internal/model`) with the
 //! same display semantics: explicit availability/freshness states, canonical
 //! byte values that never round-trip through float64, and legacy percentage
 //! projections for the fixed bars.

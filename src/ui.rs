@@ -82,7 +82,7 @@ impl Ui {
         UI.manual_visibility.store(false, Ordering::Relaxed);
         let _ = UI.event_tx.set(event_tx);
         let thread = std::thread::Builder::new()
-            .name("lcdforge-ui".into())
+            .name("lcdsirplus-ui".into())
             .spawn(move || ui_main(frame_rx))
             .expect("spawn ui thread");
         Ui {
@@ -133,7 +133,7 @@ fn ui_main(frame_rx: std::sync::mpsc::Receiver<Vec<u8>>) {
         let Ok(hinstance) = GetModuleHandleW(None) else {
             return;
         };
-        let class_name: Vec<u16> = "LCDFORGE_PREVIEW\0".encode_utf16().collect();
+        let class_name: Vec<u16> = "LCDSIRPLUS_PREVIEW\0".encode_utf16().collect();
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: hinstance.into(),
@@ -166,7 +166,7 @@ fn ui_main(frame_rx: std::sync::mpsc::Receiver<Vec<u8>>) {
         let _ = AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false);
         let width = (FRAME_W as i32 * scale) + (rect.right - rect.left);
         let height = (FRAME_H as i32 * scale) + (rect.bottom - rect.top);
-        let window_name: Vec<u16> = "LCDForge Preview\0".encode_utf16().collect();
+        let window_name: Vec<u16> = "LCDSirPlus Preview\0".encode_utf16().collect();
         let Ok(hwnd) = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             PCWSTR::from_raw(class_name.as_ptr()),
@@ -345,7 +345,7 @@ unsafe fn add_tray_icon(hwnd: HWND) {
         hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
         ..Default::default()
     };
-    for (i, c) in "LCDForge\0".encode_utf16().enumerate() {
+    for (i, c) in "LCDSirPlus\0".encode_utf16().enumerate() {
         if i < nid.szTip.len() {
             nid.szTip[i] = c;
         }

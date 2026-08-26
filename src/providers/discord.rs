@@ -696,7 +696,7 @@ fn credential_root() -> Result<PathBuf, String> {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .map(|path| path.join("LCDForge2"))
+        .map(|path| path.join("LCDSirPlus"))
         .ok_or_else(|| "LOCALAPPDATA does not identify an absolute credential directory".into())
 }
 
@@ -865,7 +865,7 @@ fn exchange_token_native(form: &str, deadline: Instant) -> Result<TokenResponse,
     use windows::Win32::Networking::WinHttp::*;
     unsafe {
         let session = WinHttpHandle(WinHttpOpen(
-            w!("LCDForge/0.3"),
+            w!("LCDSirPlus/0.3"),
             WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
             PCWSTR::null(),
             PCWSTR::null(),
@@ -1269,7 +1269,7 @@ fn verify_pipe(file: &File) -> Result<(), String> {
             ProcessIdToSessionId(pid, &mut server_session)
                 .map_err(|_| "Discord IPC server session identity is unavailable".to_string())?;
             ProcessIdToSessionId(GetCurrentProcessId(), &mut current_session)
-                .map_err(|_| "LCDForge session identity is unavailable".to_string())?;
+                .map_err(|_| "LCDSirPlus session identity is unavailable".to_string())?;
         }
         let same_user = same_process_user(process)?;
         let image = canonical_process_image(process)?;
@@ -1789,7 +1789,7 @@ fn connect_and_serve(
         .map(|user| field(user, "id"))
         .unwrap_or_default();
     let credential = load_token(&credential_path()?)?
-        .ok_or("Discord is not authorized; run lcdforge.exe --discord-authorize")?;
+        .ok_or("Discord is not authorized; run LCDSirPlus.exe --discord-authorize")?;
     if !credential.client_id.is_empty() && credential.client_id != config.discord_client_id {
         return Err(
             "stored Discord credential belongs to another client ID; clear and authorize again"
@@ -1889,7 +1889,7 @@ pub fn spawn(config: &Config) -> Runtime {
     let worker_config = shared.clone();
     let worker_shutdown = shutdown.clone();
     let thread = std::thread::Builder::new()
-        .name("lcdforge-discord".into())
+        .name("lcdsirplus-discord".into())
         .spawn(move || {
             let mut state = DiscordState::default();
             let latest = Mutex::new(DiscordState::default());
@@ -2058,8 +2058,8 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
-            let path =
-                std::env::temp_dir().join(format!("lcdforge-discord-{}", random_nonce().unwrap()));
+            let path = std::env::temp_dir()
+                .join(format!("lcdsirplus-discord-{}", random_nonce().unwrap()));
             std::fs::create_dir(&path).unwrap();
             Self(path)
         }
@@ -2453,7 +2453,7 @@ mod tests {
 
     #[test]
     fn dpapi_round_trip_is_current_user_and_bounded() {
-        let plain = b"lcdforge-discord-dpapi-test";
+        let plain = b"lcdsirplus-discord-dpapi-test";
         let protected = dpapi(plain, true).unwrap();
         assert_ne!(protected, plain);
         assert_eq!(dpapi(&protected, false).unwrap(), plain);

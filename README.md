@@ -1,8 +1,13 @@
-# LCDForge 0.3.0 (Rust)
+# LCDSirPlus 0.3.0 (Rust)
 
-LCDForge is a native Windows 11 x64 dashboard for the **Logitech G13 160×43
-monochrome LCD** — a faithful port of the LCDForge 0.2.0 Go application with
+LCDSirPlus is an independent, open-source modern replacement for LCDSirReal for
+**Logitech LCD devices**. It preserves the familiar LCDSirReal-style display
+layout and button-driven workflow while replacing legacy dependencies and
+integrations with modern Windows-compatible implementations. This native
+Windows 11 x64 Logitech G13 160×43 monochrome LCD implementation has
 a smaller footprint and fewer dependencies:
+
+LCDSirPlus is not affiliated with or endorsed by the original LCDSirReal developer.
 
 - **Single native executable** with no bundled runtime or installer framework.
 - **No Logitech runtime**: direct-HID G13 backend (the proven path from the
@@ -32,7 +37,7 @@ The normal framebuffer is always 160×43 pixels:
 
 Dual-CCD CPUs render stacked Cache (`C`) and Frequency (`F`) micro-bars;
 single-CCD CPUs render one full-height CPU bar. The deterministic renderer is
-hash-verified against the Go 0.2.0 goldens:
+hash-verified against the original Go implementation's goldens:
 
 | Golden dashboard | SHA-256 |
 |---|---|
@@ -54,7 +59,7 @@ Enumerated strictly via SetupAPI; exactly one candidate accepted:
 ## Command line
 
 ```text
-lcdforge.exe [--config PATH] [COMMAND]
+LCDSirPlus.exe [--config PATH] [COMMAND]
   (none)             Run the dashboard application (tray + preview)
   --validate-config  Validate the configuration and exit
   --preview          Run with the virtual preview forced on
@@ -73,17 +78,17 @@ lcdforge.exe [--config PATH] [COMMAND]
 ## Build
 
 ```powershell
-cargo build --release          # target\release\lcdforge.exe
+cargo build --release          # target\release\LCDSirPlus.exe
 cargo test                     # full suite incl. golden frames
 cargo clippy                   # zero-warning policy
 pwsh scripts/Build.ps1         # quality gates + provisional release packages
 ```
 
 Toolchain: stable Rust (MSVC), only dependency is the official `windows`
-crate. Copy `lcdforge.txt` next to the executable; live configuration and
-logs live under `%LOCALAPPDATA%\LCDForge2\`.
+crate. Copy `lcdsirplus.txt` next to the executable; live configuration and
+logs live under `%LOCALAPPDATA%\LCDSirPlus\`.
 
-`lcdforge.exe --diagnostics` writes a local, store-only ZIP to that directory.
+`LCDSirPlus.exe --diagnostics` writes a local, store-only ZIP to that directory.
 Use `--diagnostic-dir PATH` to select both the runtime log directory and the
 diagnostics output directory. The bundle is capped at 1 MiB and contains only a
 typed report, privacy notice, and SHA-256 manifest. It never includes raw logs,
@@ -94,33 +99,33 @@ is deliberately ignored in diagnostics mode, including UNC paths and includes.
 
 ## Install, update, and uninstall
 
-Verify the downloaded ZIP against `SHA256SUMS.txt`, extract the installer ZIP,
+Verify the downloaded ZIP against `LCDSirPlus-0.3.0-SHA256SUMS.txt`, extract the installer ZIP,
 then run from its extracted root:
 
 ```powershell
-Get-Content .\SHA256SUMS.txt
-Get-FileHash .\LCDForge-0.3.0-*.zip -Algorithm SHA256
+Get-Content .\LCDSirPlus-0.3.0-SHA256SUMS.txt
+Get-FileHash .\LCDSirPlus-0.3.0-*.zip -Algorithm SHA256
 pwsh -NoProfile -File .\Install.ps1
 pwsh -NoProfile -File .\Install.ps1 -EnableLogin  # optional HKCU Run ownership
-& "$env:LOCALAPPDATA\Programs\LCDForge2\Uninstall.ps1"
-& "$env:LOCALAPPDATA\Programs\LCDForge2\Uninstall.ps1" `
-  -PurgeUserData -ConfirmPurge PURGE-LCDFORGE2-DATA
+& "$env:LOCALAPPDATA\Programs\LCDSirPlus\Uninstall.ps1"
+& "$env:LOCALAPPDATA\Programs\LCDSirPlus\Uninstall.ps1" `
+  -PurgeUserData -ConfirmPurge PURGE-LCDSIRPLUS-DATA
 ```
 
 Running `Install.ps1` again performs an update. It verifies every declared
 member, stages on the same fixed local volume, preserves the installed
-`lcdforge.txt` byte-for-byte, and rolls back a failed publication/post-check.
+`lcdsirplus.txt` byte-for-byte, and rolls back a failed publication/post-check.
 Install/update/uninstall refuse while the exact installed executable is
 running. Uninstall removes only manifest-owned files and exact owned shortcut/
 Run entries; it preserves configuration, unknown install files, and
-`%LOCALAPPDATA%\LCDForge2` unless purge is explicitly confirmed. No operation
+`%LOCALAPPDATA%\LCDSirPlus` unless purge is explicitly confirmed. No operation
 requests elevation, kills a process, or replaces foreign integration state.
 
-Release output contains three deterministic archives plus `SHA256SUMS.txt`:
+Release output contains three deterministic archives plus `LCDSirPlus-0.3.0-SHA256SUMS.txt`:
 
-- `LCDForge-0.3.0-win-x64-portable.zip`
-- `LCDForge-0.3.0-win-x64-installer.zip`
-- `LCDForge-0.3.0-source.zip`
+- `LCDSirPlus-0.3.0-win-x64-portable.zip`
+- `LCDSirPlus-0.3.0-win-x64-installer.zip`
+- `LCDSirPlus-0.3.0-source.zip`
 
 Each archive has one root directory and a sorted `PACKAGE-MANIFEST.txt` with
 SHA-256 and byte size for every other member. Packages are **not code-signed**;
@@ -167,24 +172,24 @@ external prerequisites and are not redistributed.
 
 Discord access requires a developer application client ID and may require the
 account to be added as an application tester. Register the redirect URI used in
-`lcdforge.txt` (default `http://127.0.0.1`), set `discord_client_id`, run Discord
+`lcdsirplus.txt` (default `http://127.0.0.1`), set `discord_client_id`, run Discord
 Desktop, then authorize:
 
 ```powershell
-$env:LCDFORGE_DISCORD_CLIENT_SECRET = '<temporary secret only if required>'
-.\lcdforge.exe --discord-authorize
-Remove-Item Env:\LCDFORGE_DISCORD_CLIENT_SECRET -ErrorAction SilentlyContinue
+$env:LCDSIRPLUS_DISCORD_CLIENT_SECRET = '<temporary secret only if required>'
+.\LCDSirPlus.exe --discord-authorize
+Remove-Item Env:\LCDSIRPLUS_DISCORD_CLIENT_SECRET -ErrorAction SilentlyContinue
 ```
 
 The secret is never accepted in configuration or process arguments. The
 access/refresh credential is stored at
-`%LOCALAPPDATA%\LCDForge2\discord.token`, encrypted for the current Windows
+`%LOCALAPPDATA%\LCDSirPlus\discord.token`, encrypted for the current Windows
 user with DPAPI. `--discord-clear-token` removes only that local copy; revoke
 the application in Discord separately when needed. Credential access rejects
 reparse points and hard links and verifies the pinned local path boundary.
 
 Authorization uses Discord's verified local named-pipe `AUTHORIZE` flow with
-scopes `identify`, `rpc`, and `rpc.voice.read`. LCDForge opens no callback
+scopes `identify`, `rpc`, and `rpc.voice.read`. LCDSirPlus opens no callback
 listener and launches no browser. The only Discord network request is the
 HTTPS token exchange/refresh, which has a finite 20-second deadline. Discord
 pipe operations are cancelable during shutdown and configuration reload.

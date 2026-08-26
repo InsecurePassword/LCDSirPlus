@@ -1,6 +1,6 @@
 //! G13 direct-HID protocol: pure report packing/parsing.
 //!
-//! Proven contract from the LCDForge Go repair run (physical display
+//! Proven contract from the original Go implementation repair run (physical display
 //! confirmed by the user on the target machine):
 //!
 //! - Vendor collection: VID 0x046D, PID 0xC21C, usage page 0xFF00, usage 0x0000

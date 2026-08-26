@@ -71,7 +71,7 @@ impl Backend {
         let orientation = cfg.logitech_orientation.clone();
         let invert = cfg.logitech_invert;
         let thread = std::thread::Builder::new()
-            .name("lcdforge-backend".into())
+            .name("lcdsirplus-backend".into())
             .spawn(move || {
                 worker(
                     kind,

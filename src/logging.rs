@@ -349,7 +349,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "lcdforge-logging-{name}-{}-{}",
+            "lcdsirplus-logging-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn rotation_is_bounded_and_preserves_complete_lines() {
         let dir = temp_dir("rotation");
-        let path = dir.join("lcdforge.log");
+        let path = dir.join("lcdsirplus.log");
         let mut file = RotatingFile::open(path.clone(), 12, 2).unwrap();
         for line in [b"one\n".as_slice(), b"two\n", b"three\n", b"four\n"] {
             file.write(line).unwrap();
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn concurrent_writes_remain_serialized_and_bounded() {
         let dir = temp_dir("concurrent");
-        let path = dir.join("lcdforge.log");
+        let path = dir.join("lcdsirplus.log");
         let file = Arc::new(Mutex::new(
             RotatingFile::open(path.clone(), 128, 2).unwrap(),
         ));
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn initialization_caps_existing_files_and_removes_excess_backups() {
         let dir = temp_dir("initial-cap");
-        let path = dir.join("lcdforge.log");
+        let path = dir.join("lcdsirplus.log");
         std::fs::write(&path, b"0123456789ABCDEFGHIJ").unwrap();
         std::fs::write(path.with_extension("log.1"), b"abcdefghijklmnop").unwrap();
         std::fs::write(path.with_extension("log.2"), b"ABCDEFGHIJKLMNOP").unwrap();
@@ -471,7 +471,7 @@ mod tests {
             } else {
                 "publish-failure"
             });
-            let path = dir.join("lcdforge.log");
+            let path = dir.join("lcdsirplus.log");
             std::fs::write(&path, b"current\n").unwrap();
             std::fs::write(path.with_extension("log.1"), b"backup\n").unwrap();
             let mut file = RotatingFile::open(path.clone(), 8, 1).unwrap();
@@ -491,9 +491,9 @@ mod tests {
         let dir = temp_dir("failure");
         let parent_file = dir.join("not-a-directory");
         std::fs::write(&parent_file, b"sentinel").unwrap();
-        assert!(RotatingFile::open(parent_file.join("lcdforge.log"), 8, 1).is_err());
+        assert!(RotatingFile::open(parent_file.join("lcdsirplus.log"), 8, 1).is_err());
 
-        let path = dir.join("lcdforge.log");
+        let path = dir.join("lcdsirplus.log");
         std::fs::write(&path, b"12345678").unwrap();
         std::fs::create_dir(path.with_extension("log.1")).unwrap();
         assert!(RotatingFile::open(path.clone(), 4, 1).is_err());

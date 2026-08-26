@@ -50,7 +50,7 @@ pub fn validate_config(path: &std::path::Path) -> ValidateOutcome {
 fn default_config_path() -> std::path::PathBuf {
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let dir = exe.parent().unwrap_or(std::path::Path::new("."));
-    dir.join("lcdforge.txt")
+    dir.join("lcdsirplus.txt")
 }
 
 /// Public accessor for the CLI (`--validate-config` default resolution).
@@ -60,7 +60,7 @@ pub fn default_config_path_pub() -> std::path::PathBuf {
 
 pub fn log_dir() -> std::path::PathBuf {
     std::env::var("LOCALAPPDATA")
-        .map(|base| std::path::PathBuf::from(base).join("LCDForge2"))
+        .map(|base| std::path::PathBuf::from(base).join("LCDSirPlus"))
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
@@ -69,7 +69,7 @@ fn init_logging(cfg: &Config, diagnostic_dir: Option<&std::path::Path>) -> Resul
         .map(|p| p.to_path_buf())
         .unwrap_or_else(log_dir);
     std::fs::create_dir_all(&dir).map_err(|_| "log directory could not be created".to_string())?;
-    let path = dir.join("lcdforge.log");
+    let path = dir.join("lcdsirplus.log");
     crate::logging::init(
         Level::parse(&cfg.log_level).unwrap_or(Level::Info),
         Some((path, cfg.log_max_bytes, cfg.log_backups)),
@@ -119,7 +119,7 @@ pub fn run(opts: RunOptions) -> i32 {
         eprintln!("logging initialization failed: {error}");
         return 1;
     }
-    crate::log_info!("LCDForge {} starting", env!("CARGO_PKG_VERSION"));
+    crate::log_info!("LCDSirPlus {} starting", env!("CARGO_PKG_VERSION"));
     crate::log_info!("configuration: {}", cfg.path);
     let startup_executable = crate::runtime::canonical_executable().ok();
     let mut startup_synced = None;

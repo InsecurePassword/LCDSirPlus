@@ -16,9 +16,9 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::System::Threading::CreateMutexW;
 
-const INSTANCE_NAME: &str = "Local\\LCDForge2.Runtime";
+const INSTANCE_NAME: &str = "Local\\LCDSirPlus.Runtime";
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-const RUN_VALUE: &str = "LCDForge";
+const RUN_VALUE: &str = "LCDSirPlus";
 const MAX_RUN_VALUE_BYTES: u32 = 8192;
 
 pub struct InstanceGuard(HANDLE);
@@ -138,7 +138,9 @@ pub fn sync_startup(enabled: bool, executable: &Path) -> Result<(), String> {
                     .as_deref()
                     .is_some_and(|value| !startup_value_owned(value, executable))
                 {
-                    return Err("refusing to replace foreign HKCU Run value named LCDForge".into());
+                    return Err(
+                        "refusing to replace foreign HKCU Run value named LCDSirPlus".into(),
+                    );
                 }
                 let encoded: Vec<u16> = command.encode_utf16().chain(Some(0)).collect();
                 let bytes = std::slice::from_raw_parts(
@@ -224,18 +226,18 @@ mod tests {
 
     #[test]
     fn startup_command_quotes_canonical_path_and_ownership_is_exact() {
-        let path = Path::new(r"C:\Program Files\LCDForge\lcdforge.exe");
+        let path = Path::new(r"C:\Program Files\LCDSirPlus\LCDSirPlus.exe");
         assert_eq!(
             startup_command(path).unwrap(),
-            r#""C:\Program Files\LCDForge\lcdforge.exe""#
+            r#""C:\Program Files\LCDSirPlus\LCDSirPlus.exe""#
         );
         assert!(startup_value_owned(
-            r#""c:\program files\lcdforge\LCDFORGE.EXE""#,
+            r#""c:\program files\lcdsirplus\LCDSIRPLUS.EXE""#,
             path
         ));
-        assert!(!startup_value_owned(r#""C:\Other\lcdforge.exe""#, path));
+        assert!(!startup_value_owned(r#""C:\Other\LCDSirPlus.exe""#, path));
         assert!(!startup_value_owned(
-            r#"C:\Program Files\LCDForge\lcdforge.exe"#,
+            r#"C:\Program Files\LCDSirPlus\LCDSirPlus.exe"#,
             path
         ));
     }

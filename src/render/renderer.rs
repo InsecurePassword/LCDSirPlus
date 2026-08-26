@@ -1,5 +1,5 @@
-//! Fixed 160x43 dashboard renderer, ported pixel-for-pixel from the LCDForge
-//! Go renderer. The golden framebuffer hashes below are release invariants;
+//! Fixed 160x43 dashboard renderer, ported pixel-for-pixel from the original
+//! Go implementation. The golden framebuffer hashes below are release invariants;
 //! any change to them is a fixed-layout change requiring explicit review.
 #![allow(clippy::too_many_arguments)] // drawing signatures mirror the Go renderer 1:1
 

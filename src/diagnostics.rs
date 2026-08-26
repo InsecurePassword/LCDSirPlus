@@ -88,9 +88,9 @@ impl DirectoryBoundary {
 pub fn write_bundle(directory: &Path, safe_mode: bool) -> Result<PathBuf, String> {
     let boundary = DirectoryBoundary::open(directory)?;
     let report = report(safe_mode, &boundary.root);
-    let privacy = b"LCDForge diagnostics privacy notice\n\nIncluded: application version, build architecture, CLI safe-mode state, compile-time schema/G13 contract facts, closed not-collected provider states, and sizes/counts for known rotated log files.\nExcluded: configuration reads, raw logs, configuration files, credentials, Discord identifiers or content, window titles, process or filesystem paths, network targets and addresses, environment variables, command lines, registry values, serial numbers, arbitrary directory listings, and device paths.\nCollection is local and offline. The --config argument is ignored. No HID, provider, Discord, network, or hung-action work is started. Stable identifier hashes are not used. Review the bundle before sharing it.\n".to_vec();
+    let privacy = b"LCDSirPlus diagnostics privacy notice\n\nIncluded: application version, build architecture, CLI safe-mode state, compile-time schema/G13 contract facts, closed not-collected provider states, and sizes/counts for known rotated log files.\nExcluded: configuration reads, raw logs, configuration files, credentials, Discord identifiers or content, window titles, process or filesystem paths, network targets and addresses, environment variables, command lines, registry values, serial numbers, arbitrary directory listings, and device paths.\nCollection is local and offline. The --config argument is ignored. No HID, provider, Discord, network, or hung-action work is started. Stable identifier hashes are not used. Review the bundle before sharing it.\n".to_vec();
     let manifest = format!(
-        "LCDForge diagnostics manifest v1\nprivacy.txt {} {}\nreport.txt {} {}\nmanifest.txt self-excluded\n",
+        "LCDSirPlus diagnostics manifest v1\nprivacy.txt {} {}\nreport.txt {} {}\nmanifest.txt self-excluded\n",
         privacy.len(),
         crate::sha256::sha256_hex(&privacy),
         report.len(),
@@ -123,7 +123,7 @@ fn report(safe_mode: bool, log_dir: &Path) -> String {
         }
     }
     let mut output = format!(
-        "LCDForge diagnostics report v1\napp_version={}\nbuild_arch={}\nos_family={}\ncollection_mode=offline\nconfig_not_read=privacy_offline\nsafe_mode_cli={}\nconfig_schema=2\ng13_geometry=160x43\ng13_vid=046d\ng13_pid=c21c\ng13_usage=ff00:0000\nprovider_cpu=not-collected\nprovider_memory=not-collected\nprovider_gpu=not-collected\nprovider_lhm=not-collected\nprovider_presentmon=not-collected\nprovider_headset=not-collected\nprovider_controller=not-collected\nprovider_network=not-collected\nprovider_audio=not-collected\nprovider_discord=not-collected\nprovider_hang=not-collected\n",
+        "LCDSirPlus diagnostics report v1\napp_version={}\nbuild_arch={}\nos_family={}\ncollection_mode=offline\nconfig_not_read=privacy_offline\nsafe_mode_cli={}\nconfig_schema=2\ng13_geometry=160x43\ng13_vid=046d\ng13_pid=c21c\ng13_usage=ff00:0000\nprovider_cpu=not-collected\nprovider_memory=not-collected\nprovider_gpu=not-collected\nprovider_lhm=not-collected\nprovider_presentmon=not-collected\nprovider_headset=not-collected\nprovider_controller=not-collected\nprovider_network=not-collected\nprovider_audio=not-collected\nprovider_discord=not-collected\nprovider_hang=not-collected\n",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::ARCH,
         std::env::consts::OS,
@@ -133,9 +133,9 @@ fn report(safe_mode: bool, log_dir: &Path) -> String {
     let mut bytes = 0u64;
     for index in 0..=20 {
         let path = if index == 0 {
-            log_dir.join("lcdforge.log")
+            log_dir.join("lcdsirplus.log")
         } else {
-            log_dir.join(format!("lcdforge.log.{index}"))
+            log_dir.join(format!("lcdsirplus.log.{index}"))
         };
         if let Ok(file) = open_regular_read(&path) {
             if let Ok(metadata) = file.metadata() {
@@ -172,10 +172,10 @@ where
     let nonce = random_nonce()?;
     let temporary = boundary
         .root
-        .join(format!(".LCDForge-Diagnostics-{nonce}.tmp"));
+        .join(format!(".LCDSirPlus-Diagnostics-{nonce}.tmp"));
     let final_path = boundary
         .root
-        .join(format!("LCDForge-Diagnostics-{nonce}.zip"));
+        .join(format!("LCDSirPlus-Diagnostics-{nonce}.zip"));
     boundary.validate()?;
     let mut file = open_regular_no_reparse(
         &temporary,
@@ -470,7 +470,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "lcdforge-diagnostics-{name}-{}-{}",
+            "lcdsirplus-diagnostics-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -507,7 +507,7 @@ mod tests {
     fn bundle_is_bounded_valid_and_excludes_adversarial_private_data() {
         let secret = "PRIVATE-SENTINEL-user@example.test-C:\\Users\\Secret-203.0.113.9";
         let dir = temp_dir("privacy");
-        std::fs::write(dir.join("lcdforge.log"), format!("error: {secret}")).unwrap();
+        std::fs::write(dir.join("lcdsirplus.log"), format!("error: {secret}")).unwrap();
         let path = write_bundle(&dir, false).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         assert!(bytes.len() <= MAX_BUNDLE_BYTES);
