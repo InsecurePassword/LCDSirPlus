@@ -107,8 +107,8 @@ controller_poll_ms      auto          # 10000
 
 # Optional network-quality probe — Phase 2.
 network_probe_enabled   0
-network_probe_method    icmp          # icmp | tcp
-network_probe_target    1.1.1.1
+network_probe_method    icmp          # auto | icmp | tcp
+network_probe_target    1.1.1.1       # IP literal; optional TCP port
 network_probe_interval_ms auto        # 1000
 network_probe_timeout_ms auto         # 1500
 network_probe_window    30
@@ -132,8 +132,8 @@ discord_show_self       0
 discord_show_channel    0
 
 ##############################################################################
-# Hung-window detector. Physical button 3 is intentionally fixed. The
-# guarded termination flow lands in Phase 4; detection knobs validate now.
+# Hung-window detector and guarded Phase 4 action. Physical button 3 is fixed;
+# safe mode keeps ordinary short-press cycling but cannot bind/terminate.
 
 hang_enabled            1
 hang_button             3

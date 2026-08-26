@@ -1,7 +1,7 @@
 //! Optional bounded ICMP/TCP quality probe.
 
 use std::collections::VecDeque;
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -17,7 +17,29 @@ use crate::model::Metric;
 const TICK: Duration = Duration::from_millis(50);
 const IP_SUCCESS: u32 = 0;
 const IP_REQ_TIMED_OUT: u32 = 11010;
-static DNS_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy)]
+struct Deadline(Instant);
+
+impl Deadline {
+    fn new(timeout: Duration) -> Self {
+        Self(
+            Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(Instant::now),
+        )
+    }
+
+    fn remaining(self) -> Option<Duration> {
+        self.remaining_at(Instant::now())
+    }
+
+    fn remaining_at(self, now: Instant) -> Option<Duration> {
+        self.0
+            .checked_duration_since(now)
+            .filter(|left| !left.is_zero())
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Update {
@@ -64,6 +86,23 @@ enum Outcome {
     Success(f64),
     Loss,
     Error(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    Tcp,
+    Icmp(Ipv4Addr),
+    Auto(Ipv4Addr),
+    Invalid,
+}
+
+fn route(method: &str, ip: IpAddr) -> Route {
+    match (method, ip) {
+        ("tcp", _) | ("auto", IpAddr::V6(_)) => Route::Tcp,
+        ("auto", IpAddr::V4(ipv4)) => Route::Auto(ipv4),
+        ("icmp", IpAddr::V4(ipv4)) => Route::Icmp(ipv4),
+        _ => Route::Invalid,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -176,7 +215,10 @@ fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Send
             continue;
         }
         last_attempt = Some(now);
-        let outcome = probe(&current);
+        let outcome = probe(&current, &config, &shutdown);
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
         let latest = Policy::from(&*config.read().unwrap_or_else(|e| e.into_inner()));
         if latest != current || !latest.active() {
             state.clear();
@@ -196,24 +238,82 @@ fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Send
     }
 }
 
-fn probe(policy: &Policy) -> Outcome {
-    match policy.method.as_str() {
-        "tcp" => tcp_probe(&policy.target, policy.timeout),
-        "auto" => match icmp_probe(auto_host(&policy.target), policy.timeout) {
-            success @ Outcome::Success(_) => success,
-            _ => tcp_probe(&auto_tcp_target(&policy.target), policy.timeout),
-        },
-        _ => icmp_probe(auto_host(&policy.target), policy.timeout),
+fn probe(policy: &Policy, config: &RwLock<Config>, shutdown: &AtomicBool) -> Outcome {
+    let Ok((ip, port)) = crate::config::parse_network_target(&policy.target) else {
+        return Outcome::Error("network target is invalid");
+    };
+    let deadline = Deadline::new(policy.timeout);
+    let tcp_address = SocketAddr::new(ip, port.unwrap_or(443));
+    let mut current = || {
+        !shutdown.load(Ordering::Acquire)
+            && Policy::from(&*config.read().unwrap_or_else(|e| e.into_inner())) == *policy
+            && policy.active()
+    };
+    match route(&policy.method, ip) {
+        Route::Tcp => tcp_probe(tcp_address, deadline, &mut current),
+        Route::Auto(ipv4) => auto_probe(
+            ipv4,
+            tcp_address,
+            deadline,
+            &mut current,
+            icmp_probe,
+            tcp_probe,
+        ),
+        Route::Icmp(ipv4) => {
+            if !current() {
+                return Outcome::Error("network probe canceled");
+            }
+            deadline
+                .remaining()
+                .map(|remaining| icmp_probe(ipv4, remaining))
+                .unwrap_or(Outcome::Loss)
+        }
+        Route::Invalid => Outcome::Error("network probe method or target is invalid"),
     }
 }
 
-fn tcp_probe(target: &str, timeout: Duration) -> Outcome {
-    let Ok(addresses) = resolve_bounded(target.to_string(), timeout) else {
-        return Outcome::Error("network target resolution failed");
+fn auto_probe<C, I, T>(
+    ipv4: Ipv4Addr,
+    tcp_address: SocketAddr,
+    deadline: Deadline,
+    current: &mut C,
+    icmp: I,
+    tcp: T,
+) -> Outcome
+where
+    C: FnMut() -> bool,
+    I: FnOnce(Ipv4Addr, Duration) -> Outcome,
+    T: FnOnce(SocketAddr, Deadline, &mut C) -> Outcome,
+{
+    if !current() {
+        return Outcome::Error("network probe canceled");
+    }
+    let Some(remaining) = deadline.remaining() else {
+        return Outcome::Loss;
     };
-    let Some(address) = addresses.into_iter().next() else {
-        return Outcome::Error("network target has no address");
+    let outcome = icmp(ipv4, remaining);
+    if matches!(outcome, Outcome::Success(_)) {
+        return outcome;
+    }
+    if !current() {
+        return Outcome::Error("network probe canceled");
+    }
+    tcp(tcp_address, deadline, current)
+}
+
+fn tcp_probe<C>(address: SocketAddr, deadline: Deadline, current: &mut C) -> Outcome
+where
+    C: FnMut() -> bool,
+{
+    if !current() {
+        return Outcome::Error("network probe canceled");
+    }
+    let Some(timeout) = deadline.remaining() else {
+        return Outcome::Loss;
     };
+    if !current() {
+        return Outcome::Error("network probe canceled");
+    }
     let started = Instant::now();
     match TcpStream::connect_timeout(&address, timeout) {
         Ok(stream) => {
@@ -239,22 +339,10 @@ fn tcp_probe(target: &str, timeout: Duration) -> Outcome {
     }
 }
 
-fn icmp_probe(target: &str, timeout: Duration) -> Outcome {
-    let query = if target.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv6()) {
-        format!("[{target}]:0")
-    } else {
-        format!("{target}:0")
-    };
-    let Ok(addresses) = resolve_bounded(query, timeout) else {
-        return Outcome::Error("network target resolution failed");
-    };
-    let Some(IpAddr::V4(address)) = addresses
-        .into_iter()
-        .map(|address| address.ip())
-        .find(|address| address.is_ipv4())
-    else {
-        return Outcome::Error("ICMP requires an IPv4 target");
-    };
+fn icmp_probe(address: Ipv4Addr, timeout: Duration) -> Outcome {
+    if timeout < Duration::from_millis(1) {
+        return Outcome::Loss;
+    }
     let Ok(handle) = (unsafe { IcmpCreateFile() }) else {
         return Outcome::Error("ICMP provider unavailable");
     };
@@ -292,55 +380,6 @@ fn icmp_probe(target: &str, timeout: Duration) -> Outcome {
     }
 }
 
-fn resolve_bounded(query: String, timeout: Duration) -> Result<Vec<SocketAddr>, ()> {
-    if DNS_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-        .is_err()
-    {
-        return Err(());
-    }
-    let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let result = query.to_socket_addrs().map(|addresses| {
-            let mut addresses: Vec<_> = addresses.collect();
-            addresses.sort();
-            addresses.dedup();
-            addresses
-        });
-        DNS_IN_FLIGHT.store(false, Ordering::Release);
-        let _ = tx.send(result);
-    });
-    rx.recv_timeout(timeout).map_err(|_| ())?.map_err(|_| ())
-}
-
-fn auto_host(target: &str) -> &str {
-    if let Some(rest) = target.strip_prefix('[') {
-        return rest.split_once(']').map(|(host, _)| host).unwrap_or(target);
-    }
-    if target.matches(':').count() == 1 {
-        return target
-            .rsplit_once(':')
-            .map(|(host, _)| host)
-            .unwrap_or(target);
-    }
-    target
-}
-
-fn auto_tcp_target(target: &str) -> String {
-    if target.parse::<SocketAddr>().is_ok()
-        || (target.matches(':').count() == 1
-            && target
-                .rsplit_once(':')
-                .is_some_and(|(_, port)| port.parse::<u16>().is_ok()))
-    {
-        target.to_string()
-    } else if target.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv6()) {
-        format!("[{target}]:443")
-    } else {
-        format!("{target}:443")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,11 +401,59 @@ mod tests {
     }
 
     #[test]
-    fn auto_target_uses_one_endpoint_and_default_https_fallback() {
-        assert_eq!(auto_host("example.test:8443"), "example.test");
-        assert_eq!(auto_tcp_target("example.test"), "example.test:443");
-        assert_eq!(auto_tcp_target("example.test:8443"), "example.test:8443");
-        assert_eq!(auto_tcp_target("::1"), "[::1]:443");
+    fn one_absolute_deadline_supplies_the_remaining_budget() {
+        let start = Instant::now();
+        let deadline = Deadline(start + Duration::from_millis(100));
+        assert_eq!(
+            deadline.remaining_at(start),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            deadline.remaining_at(start + Duration::from_millis(40)),
+            Some(Duration::from_millis(60))
+        );
+        assert_eq!(
+            deadline.remaining_at(start + Duration::from_millis(100)),
+            None
+        );
+        assert_eq!(
+            deadline.remaining_at(start + Duration::from_millis(101)),
+            None
+        );
+    }
+
+    #[test]
+    fn ipv6_auto_routes_directly_to_tcp_and_icmp_is_invalid() {
+        let ipv6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        assert_eq!(route("auto", ipv6), Route::Tcp);
+        assert_eq!(route("tcp", ipv6), Route::Tcp);
+        assert_eq!(route("icmp", ipv6), Route::Invalid);
+    }
+
+    #[test]
+    fn shutdown_before_auto_fallback_starts_no_tcp_io() {
+        use std::cell::Cell;
+
+        let checks = Cell::new(0);
+        let tcp_calls = Cell::new(0);
+        let mut current = || {
+            let check = checks.get();
+            checks.set(check + 1);
+            check == 0
+        };
+        let outcome = auto_probe(
+            Ipv4Addr::LOCALHOST,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            Deadline::new(Duration::from_secs(1)),
+            &mut current,
+            |_, _| Outcome::Loss,
+            |_, _, _| {
+                tcp_calls.set(tcp_calls.get() + 1);
+                Outcome::Success(1.0)
+            },
+        );
+        assert_eq!(outcome, Outcome::Error("network probe canceled"));
+        assert_eq!(tcp_calls.get(), 0);
     }
 
     #[test]
@@ -394,10 +481,27 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let owner = std::thread::spawn(move || listener.accept().unwrap());
+        let mut current = || true;
         assert!(matches!(
-            tcp_probe(&address.to_string(), Duration::from_secs(1)),
+            tcp_probe(address, Deadline::new(Duration::from_secs(1)), &mut current),
             Outcome::Success(_)
         ));
         drop(owner.join().unwrap());
+    }
+
+    #[test]
+    fn canceled_tcp_probe_starts_no_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut current = || false;
+        assert_eq!(
+            tcp_probe(address, Deadline::new(Duration::from_secs(1)), &mut current),
+            Outcome::Error("network probe canceled")
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }

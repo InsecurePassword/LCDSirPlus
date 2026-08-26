@@ -471,7 +471,12 @@ pub fn validate(c: &Config) -> Result<(), String> {
         if c.network_probe_target.trim().is_empty() {
             return Err("network_probe_target cannot be empty".into());
         }
-        validate_network_target(&c.network_probe_target, &c.network_probe_method)?;
+        let (address, port) = parse_network_target(&c.network_probe_target)?;
+        if c.network_probe_method == "icmp" && (!address.is_ipv4() || port.is_some()) {
+            return Err(
+                "network_probe_target must be an IPv4 literal without a port for icmp".into(),
+            );
+        }
         check_range_i32("network_probe_window", c.network_probe_window, 5, 600)?;
     }
     check_range_u64(
@@ -563,59 +568,24 @@ pub fn validate(c: &Config) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_network_target(target: &str, method: &str) -> Result<(), String> {
-    if target != target.trim()
-        || target.chars().any(char::is_whitespace)
-        || target.contains(['/', '\\', '@', '?', '#'])
-    {
-        return Err("network_probe_target must be one host or IP address".into());
+pub(crate) fn parse_network_target(
+    target: &str,
+) -> Result<(std::net::IpAddr, Option<u16>), String> {
+    if target != target.trim() {
+        return Err("network_probe_target must be one IP literal with no whitespace".into());
     }
-    let tcp = method == "tcp"
-        || (method == "auto"
-            && (target.parse::<std::net::SocketAddr>().is_ok()
-                || target.matches(':').count() == 1));
-    let host = if tcp {
-        if let Ok(address) = target.parse::<std::net::SocketAddr>() {
-            if address.port() == 0 {
-                return Err("network_probe_target port must be 1..65535".into());
-            }
-            address.ip().to_string()
-        } else {
-            let Some((host, port)) = target.rsplit_once(':') else {
-                return Err("network_probe_target must be host:port for tcp".into());
-            };
-            if host.is_empty() || !port.parse::<u16>().is_ok_and(|port| port != 0) {
-                return Err("network_probe_target must be host:port for tcp".into());
-            }
-            host.to_string()
+    if let Ok(address) = target.parse::<std::net::SocketAddr>() {
+        if address.port() == 0 {
+            return Err("network_probe_target port must be 1..65535".into());
         }
-    } else {
-        target.to_string()
-    };
-    if host.starts_with('[')
-        && host.ends_with(']')
-        && host[1..host.len() - 1]
-            .parse::<std::net::Ipv6Addr>()
-            .is_err()
-    {
-        return Err("network_probe_target brackets require an IPv6 address".into());
+        return Ok((address.ip(), Some(address.port())));
     }
-    let host = host.trim_matches(['[', ']']).trim_end_matches('.');
-    if host.parse::<std::net::IpAddr>().is_ok()
-        || (!host.is_empty()
-            && host.len() <= 253
-            && host.split('.').all(|label| {
-                !label.is_empty()
-                    && label.len() <= 63
-                    && !label.starts_with('-')
-                    && !label.ends_with('-')
-                    && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-            }))
-    {
-        Ok(())
-    } else {
-        Err("network_probe_target must contain one valid host or IP address".into())
-    }
+    target
+        .parse::<std::net::IpAddr>()
+        .map(|address| (address, None))
+        .map_err(|_| {
+            "network_probe_target must be an IP literal, optionally with a TCP port".into()
+        })
 }
 
 fn ccd_frequency(c: &Config) -> &Option<Vec<u32>> {
@@ -723,24 +693,27 @@ mod tests {
         let mut cfg = Config {
             network_probe_enabled: true,
             network_probe_method: "auto".into(),
-            network_probe_target: "example.test".into(),
+            network_probe_target: "127.0.0.1".into(),
             ..Config::default()
         };
         assert!(validate(&cfg).is_ok());
-        cfg.network_probe_target = "example.test:443".into();
+        cfg.network_probe_target = "127.0.0.1:443".into();
         assert!(validate(&cfg).is_ok());
         cfg.network_probe_method = "tcp".into();
-        cfg.network_probe_target = "example.test".into();
-        assert!(validate(&cfg).is_err());
-        cfg.network_probe_target = "example.test:443/path".into();
-        assert!(validate(&cfg).is_err());
+        cfg.network_probe_target = "::1".into();
+        assert!(validate(&cfg).is_ok(), "TCP permits IPv6 with default port");
         cfg.network_probe_target = "127.0.0.1:0".into();
         assert!(validate(&cfg).is_err());
-        cfg.network_probe_target = "[example.test]:443".into();
-        assert!(validate(&cfg).is_err());
-        cfg.network_probe_method = "icmp".into();
         cfg.network_probe_target = "example.test:443".into();
         assert!(validate(&cfg).is_err());
+        cfg.network_probe_method = "icmp".into();
+        cfg.network_probe_target = "::1".into();
+        assert!(validate(&cfg).is_err());
+        cfg.network_probe_target = "127.0.0.1:443".into();
+        assert!(validate(&cfg).is_err());
+        cfg.network_probe_method = "auto".into();
+        cfg.network_probe_target = "::1".into();
+        assert!(validate(&cfg).is_ok(), "auto IPv6 uses TCP only");
     }
 
     #[test]

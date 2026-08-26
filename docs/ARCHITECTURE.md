@@ -53,7 +53,7 @@ src\
 | telemetry-gpu | read-only NVAPI/ADLX calls | event channel |
 | telemetry-presentmon | target/capture lifecycle | update channel |
 | telemetry-hang | visible-window probes and continuous-failure tracker | update channel |
-| telemetry-network-quality | optional bounded DNS + ICMP/TCP probe | update channel |
+| telemetry-network-quality | optional bounded IP-literal ICMP/TCP probe | update channel |
 | lcdforge-discord | verified pipe, authentication, subscriptions, reconnect | snapshot channel |
 | telemetry-lhm/headset | bounded blocking HTTP/HID | event channel |
 
@@ -104,9 +104,11 @@ Discord speaker overlay, then dashboard.
 - Providers: absent data renders explicit `N/A`/`STALE` states — the fixed
   bars read only canonical readings, never legacy projections.
 - Network quality: disabled and safe-mode policies clear metrics and perform no
-  I/O. One configured endpoint is resolved/probed per bounded interval; timeout
-  and loss remain distinct from provider/API failure, and reload discards old
-  policy history before publication.
+  I/O. One configured IP endpoint is probed per bounded interval; one absolute
+  deadline covers ICMP, fallback, and TCP connect. Shutdown or policy changes
+  prevent fallback/new I/O, and the worker joins within one configured timeout
+  plus its 50 ms scheduling tick. Timeout and loss remain distinct from
+  provider/API failure, and reload discards old policy history before publish.
 - Hung detector: query-only visible top-level-window enumeration captures
   HWND/PID/creation-time/image identity, applies configured and Windows-directory
   exclusions, and counts only documented `WM_NULL` timeouts after revalidating
@@ -129,6 +131,9 @@ Discord speaker overlay, then dashboard.
   `PROCESS_QUERY_LIMITED_INFORMATION`, rechecks identity through that handle,
   terminates once, and waits at most five seconds. Audits contain only PID,
   sanitized basename, and a fixed outcome label.
+  Safe mode creates only unbound button presses, so releases retain normal slot
+  behavior; the app and native action boundaries independently refuse any
+  terminate command while safe mode is active.
 - Vendor DLLs are loaded by name only from System32. GPU APIs are read-only,
   versioned, and bounded to vendor maximums. Automatically discovered
   PresentMon is canonically contained beside LCDForge; arguments are passed

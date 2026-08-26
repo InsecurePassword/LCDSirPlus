@@ -31,6 +31,8 @@ user-customizable surface.
   preserved when a list changes).
 - Unavailable modules display an explicit unavailable/stale state; they are
   never silently replaced by unrelated data.
+- Safe mode disables destructive hung-target binding/action, not harmless slot
+  cycling or alert acknowledgement.
 
 ## CCD bars (Process Lasso removed)
 
@@ -82,7 +84,8 @@ README.md and enforced in `src/backends/g13.rs` + `src/backends/hid.rs`.
 - One normal/direct-HID runtime per Windows session; read-only and virtual test
   commands remain available alongside it.
 - Optional network-quality probes are disabled by default, bounded to one
-  configured endpoint, and always disabled in safe mode.
+  configured IP-literal endpoint and one overall timeout, and always disabled
+  in safe mode.
 - Optional current-user startup registration never replaces or removes a
   foreign Run value and is never mutated in safe mode.
 

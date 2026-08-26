@@ -99,13 +99,16 @@ is a separate runtime prerequisite and is not redistributed.
 `headset_query_timeout_ms` bounds the complete HID write/read sequence after
 bounded device enumeration.
 
-Network quality probing is off by default and performs no DNS or network I/O
-while disabled or in safe mode. A target is one host/IP for ICMP, one
-`host:port` for TCP, or either form for `auto`; `auto` tries ICMP before one
-TCP fallback (port 443 when omitted). Interval, timeout, and history-window
-settings are hot-reloaded. Probe timeout/loss contributes to packet loss,
-while DNS/native provider failures retain prior values as stale and mark the
-provider unavailable.
+Network quality probing is off by default and performs no network I/O while
+disabled or in safe mode. The target must be one IP literal, optionally with a
+TCP port (`127.0.0.1:443` or `[::1]:443`); omitted TCP ports default to 443.
+Explicit `icmp` accepts IPv4 without a port only. `auto` tries IPv4 ICMP before
+TCP, while an IPv6 target skips unsupported ICMP and uses TCP only. One
+absolute deadline bounds the complete probe including fallback. Interval,
+timeout, and history-window settings are hot-reloaded. Probe timeout/loss
+contributes to packet loss, while native provider failures retain prior values
+as stale and mark the provider unavailable. Hostnames are rejected because
+standard-library DNS resolution cannot be canceled with the required shutdown bound.
 
 ## Discord (Phase 3)
 
@@ -130,7 +133,9 @@ variable. Use `--discord-clear-token` to remove the local record.
 `hang_enabled`, `hang_button` (fixed 3), `hang_hold_ms` (1000..10000),
 `hang_probe_interval_ms` (250..60000), `hang_probe_timeout_ms` (10..5000,
 < interval), `hang_failures_required` (2..10), `hang_minimum_ms`
-(1000..60000), `hang_ignore` (process list).
+(1000..60000), `hang_ignore` (process list). Safe mode prevents target binding
+and termination but preserves ordinary short-press slot cycling and button 4
+alert acknowledgement.
 
 ## Alerts (Phase 2/4)
 

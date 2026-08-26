@@ -188,15 +188,16 @@ impl HoldState {
             }
         }
         if event.down {
-            if cfg.safe_mode {
-                return HoldCommand::None;
-            }
             if let Some(existing) = &self.presses[event.index] {
                 if existing.source != event.source || existing.canceled {
                     return HoldCommand::None;
                 }
             }
-            let bound = if event.index == button && cfg.hang_enabled && provider_available {
+            let bound = if event.index == button
+                && cfg.hang_enabled
+                && !cfg.safe_mode
+                && provider_available
+            {
                 (!targets.is_empty()).then(|| {
                     let index = self.hung_index % targets.len();
                     (index, targets[index].clone(), Policy::from(cfg))
@@ -222,10 +223,10 @@ impl HoldState {
             return HoldCommand::None;
         }
         let Some((index, target, policy)) = press.bound else {
-            if event.canceled || cfg.safe_mode || event.at < press.started {
+            if event.canceled || event.at < press.started {
                 return HoldCommand::None;
             }
-            if event.index == button && !targets.is_empty() {
+            if event.index == button && !cfg.safe_mode && !targets.is_empty() {
                 return HoldCommand::None;
             }
             return HoldCommand::Cycle {
@@ -1775,6 +1776,41 @@ mod tests {
                 true
             ),
             HoldCommand::Terminate(bound) if bound == item
+        ));
+    }
+
+    #[test]
+    fn safe_mode_short_press_cycles_without_binding_a_target() {
+        let cfg = Config {
+            safe_mode: true,
+            ..Config::default()
+        };
+        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let started = Instant::now();
+        let mut hold = HoldState::default();
+        assert!(matches!(
+            hold.event(
+                button(2, true, started, "hid"),
+                &cfg,
+                std::slice::from_ref(&item),
+                true
+            ),
+            HoldCommand::None
+        ));
+        assert!(hold.presses[2]
+            .as_ref()
+            .is_some_and(|press| press.bound.is_none()));
+        assert!(matches!(
+            hold.event(
+                button(2, false, started + cfg.hang_hold, "hid"),
+                &cfg,
+                std::slice::from_ref(&item),
+                true
+            ),
+            HoldCommand::Cycle {
+                index: 2,
+                backward: false
+            }
         ));
     }
 

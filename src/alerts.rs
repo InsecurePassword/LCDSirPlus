@@ -1,7 +1,7 @@
 //! Deterministic configured alert episodes and acknowledgement.
 
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
+use std::time::Instant;
 
 use crate::config::Config;
 use crate::model::{Alert, Metric, MetricKey, Snapshot};
@@ -14,12 +14,12 @@ pub struct Manager {
 #[derive(Clone)]
 struct Episode {
     alert: Alert,
-    first_seen: SystemTime,
-    last_seen: SystemTime,
+    first_seen: Instant,
+    last_seen: Instant,
 }
 
 impl Manager {
-    pub fn evaluate(&mut self, snapshot: &mut Snapshot, cfg: &Config, now: SystemTime) {
+    pub fn evaluate(&mut self, snapshot: &mut Snapshot, cfg: &Config, now: Instant) {
         let mut active = Vec::new();
         metric_alert(
             &mut active,
@@ -110,7 +110,7 @@ impl Manager {
         self.seen.retain(|id, episode| {
             active_ids.contains(id)
                 || (episode.alert.severity >= 2
-                    && elapsed(now, episode.last_seen) < cfg.critical_alert_linger)
+                    && now.saturating_duration_since(episode.last_seen) < cfg.critical_alert_linger)
         });
         let mut episodes: Vec<&Episode> = self.seen.values().collect();
         episodes.sort_by(|a, b| {
@@ -176,19 +176,16 @@ fn metric_alert(
     });
 }
 
-fn elapsed(now: SystemTime, then: SystemTime) -> Duration {
-    now.duration_since(then).unwrap_or(Duration::ZERO)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, SystemTime};
 
     #[test]
     fn unavailable_stale_linger_ack_and_rearm_are_episode_scoped() {
         let mut manager = Manager::default();
         let cfg = Config::default();
-        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let start = Instant::now();
         let mut snapshot = Snapshot::default();
         manager.evaluate(&mut snapshot, &cfg, start);
         assert!(snapshot.alerts.is_empty());
@@ -230,7 +227,7 @@ mod tests {
             gpu_temp: Metric::valid(91.0, SystemTime::UNIX_EPOCH),
             ..Default::default()
         };
-        manager.evaluate(&mut snapshot, &cfg, SystemTime::UNIX_EPOCH);
+        manager.evaluate(&mut snapshot, &cfg, Instant::now());
         assert_eq!(snapshot.alerts[0].id, "gpu-temp");
         assert_eq!(snapshot.alerts[1].id, "cpu-temp");
     }
@@ -250,10 +247,29 @@ mod tests {
             gpu_temp: Metric::valid(81.0, SystemTime::UNIX_EPOCH),
             ..Default::default()
         };
-        manager.evaluate(&mut snapshot, &cfg, SystemTime::UNIX_EPOCH);
+        manager.evaluate(&mut snapshot, &cfg, Instant::now());
         assert_eq!(snapshot.alerts[0].id, "cpu-temp");
         assert!(manager.acknowledge_highest(&mut snapshot));
         assert!(snapshot.alerts[0].acknowledged);
         assert!(!snapshot.alerts[1].acknowledged);
+    }
+
+    #[test]
+    fn wall_clock_rollback_does_not_extend_linger() {
+        let mut manager = Manager::default();
+        let cfg = Config::default();
+        let start = Instant::now();
+        let mut snapshot = Snapshot {
+            now: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(100)),
+            gpu_temp: Metric::valid(91.0, SystemTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        manager.evaluate(&mut snapshot, &cfg, start);
+        snapshot.gpu_temp.value = 40.0;
+        snapshot.now = Some(SystemTime::UNIX_EPOCH);
+        manager.evaluate(&mut snapshot, &cfg, start + Duration::from_secs(2));
+        assert_eq!(snapshot.alerts.len(), 1);
+        manager.evaluate(&mut snapshot, &cfg, start + Duration::from_secs(4));
+        assert!(snapshot.alerts.is_empty());
     }
 }

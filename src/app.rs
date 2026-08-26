@@ -231,7 +231,7 @@ pub fn run(opts: RunOptions) -> i32 {
         {
             log_hang_audit(&audit);
         }
-        alerts.evaluate(&mut snapshot, &cfg, SystemTime::now());
+        alerts.evaluate(&mut snapshot, &cfg, now);
 
         if now.duration_since(last_render) >= cfg.render_interval {
             last_render = now;
@@ -653,6 +653,28 @@ fn apply_hold_command(
     alerts: &mut crate::alerts::Manager,
     snapshot: &mut Snapshot,
 ) {
+    apply_hold_command_with(
+        command,
+        slots,
+        indexes,
+        cfg,
+        alerts,
+        snapshot,
+        hang::terminate_bound_target,
+    );
+}
+
+fn apply_hold_command_with<F>(
+    command: hang::HoldCommand,
+    slots: &Manager,
+    indexes: &mut [usize; 4],
+    cfg: &Config,
+    alerts: &mut crate::alerts::Manager,
+    snapshot: &mut Snapshot,
+    terminate: F,
+) where
+    F: FnOnce(&crate::model::HungTarget, &Config) -> hang::ActionOutcome,
+{
     match command {
         hang::HoldCommand::None => {}
         hang::HoldCommand::Cycle { index, backward } => {
@@ -666,11 +688,18 @@ fn apply_hold_command(
         }
         hang::HoldCommand::Audit(audit) => log_hang_audit(&audit),
         hang::HoldCommand::Terminate(target) => {
+            if cfg.safe_mode {
+                log_hang_audit(&hang::Audit {
+                    target,
+                    outcome: "refused-safe-mode",
+                });
+                return;
+            }
             log_hang_audit(&hang::Audit {
                 target: target.clone(),
                 outcome: "attempted",
             });
-            let outcome = hang::terminate_bound_target(&target, cfg);
+            let outcome = terminate(&target, cfg);
             log_hang_audit(&hang::Audit {
                 target,
                 outcome: outcome.label(),
@@ -783,5 +812,79 @@ mod tests {
         let mut synced = None;
         sync_startup_if_needed(&cfg, None, &mut synced);
         assert_eq!(synced, None);
+    }
+
+    #[test]
+    fn safe_mode_cycles_acknowledges_and_never_calls_terminate() {
+        use std::cell::Cell;
+
+        let cfg = Config {
+            safe_mode: true,
+            ..Config::default()
+        };
+        let slots = Manager::new(&cfg, [0; 4]);
+        let mut indexes = [0; 4];
+        let mut alerts = crate::alerts::Manager::default();
+        let mut snapshot = Snapshot {
+            gpu_temp: Metric::valid(91.0, SystemTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        alerts.evaluate(&mut snapshot, &cfg, Instant::now());
+        let kills = Cell::new(0);
+
+        apply_hold_command_with(
+            hang::HoldCommand::Cycle {
+                index: 0,
+                backward: false,
+            },
+            &slots,
+            &mut indexes,
+            &cfg,
+            &mut alerts,
+            &mut snapshot,
+            |_, _| {
+                kills.set(kills.get() + 1);
+                hang::ActionOutcome::Success
+            },
+        );
+        assert_eq!(slots.current(0), "CPU_TEMP");
+
+        apply_hold_command_with(
+            hang::HoldCommand::Cycle {
+                index: 3,
+                backward: false,
+            },
+            &slots,
+            &mut indexes,
+            &cfg,
+            &mut alerts,
+            &mut snapshot,
+            |_, _| {
+                kills.set(kills.get() + 1);
+                hang::ActionOutcome::Success
+            },
+        );
+        assert!(snapshot.alerts[0].acknowledged);
+
+        apply_hold_command_with(
+            hang::HoldCommand::Terminate(crate::model::HungTarget {
+                hwnd: 1,
+                pid: 2,
+                creation_time: 3,
+                image_path: r"C:\Games\game.exe".into(),
+                process_name: "game.exe".into(),
+                title: "Game".into(),
+            }),
+            &slots,
+            &mut indexes,
+            &cfg,
+            &mut alerts,
+            &mut snapshot,
+            |_, _| {
+                kills.set(kills.get() + 1);
+                hang::ActionOutcome::Success
+            },
+        );
+        assert_eq!(kills.get(), 0);
     }
 }
