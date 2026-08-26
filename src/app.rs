@@ -18,6 +18,7 @@ pub struct RunOptions {
     pub config_path: Option<std::path::PathBuf>,
     pub preview_always: bool,
     pub safe_mode: bool,
+    pub diagnostic_dir: Option<std::path::PathBuf>,
 }
 
 pub struct ValidateOutcome {
@@ -57,22 +58,22 @@ pub fn default_config_path_pub() -> std::path::PathBuf {
     default_config_path()
 }
 
-fn log_dir() -> std::path::PathBuf {
+pub fn log_dir() -> std::path::PathBuf {
     std::env::var("LOCALAPPDATA")
         .map(|base| std::path::PathBuf::from(base).join("LCDForge2"))
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
-fn init_logging(cfg: &Config, diagnostic_dir: Option<&std::path::Path>) {
+fn init_logging(cfg: &Config, diagnostic_dir: Option<&std::path::Path>) -> Result<(), String> {
     let dir = diagnostic_dir
         .map(|p| p.to_path_buf())
         .unwrap_or_else(log_dir);
-    let _ = std::fs::create_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|_| "log directory could not be created".to_string())?;
     let path = dir.join("lcdforge.log");
     crate::logging::init(
         Level::parse(&cfg.log_level).unwrap_or(Level::Info),
         Some((path, cfg.log_max_bytes, cfg.log_backups)),
-    );
+    )
 }
 
 /// Passive, read-only HID discovery: enumerates interfaces and reports the
@@ -114,7 +115,10 @@ pub fn run(opts: RunOptions) -> i32 {
     if opts.safe_mode {
         cfg.safe_mode = true;
     }
-    init_logging(&cfg, None);
+    if let Err(error) = init_logging(&cfg, opts.diagnostic_dir.as_deref()) {
+        eprintln!("logging initialization failed: {error}");
+        return 1;
+    }
     crate::log_info!("LCDForge {} starting", env!("CARGO_PKG_VERSION"));
     crate::log_info!("configuration: {}", cfg.path);
     let startup_executable = crate::runtime::canonical_executable().ok();
@@ -392,6 +396,7 @@ pub fn run_hardware_test(
     config_path: Option<std::path::PathBuf>,
     backend: BackendKind,
     duration: Duration,
+    diagnostic_dir: Option<std::path::PathBuf>,
 ) -> i32 {
     let config_path = config_path.unwrap_or_else(default_config_path);
     let outcome = validate_config(&config_path);
@@ -400,7 +405,10 @@ pub fn run_hardware_test(
         return 2;
     }
     let cfg = crate::parser::load(&config_path).expect("checked").config;
-    init_logging(&cfg, None);
+    if let Err(error) = init_logging(&cfg, diagnostic_dir.as_deref()) {
+        eprintln!("logging initialization failed: {error}");
+        return 1;
+    }
     crate::log_info!(
         "hardware test: backend={} duration={:?}",
         backend.name(),

@@ -80,6 +80,9 @@ README.md and enforced in `src/backends/g13.rs` + `src/backends/hid.rs`.
 - Reconnect after device loss with bounded, capped backoff.
 - No unchanged-frame submission.
 - Bounded histories/logs/protocol inputs.
+- A local-only diagnostics command produces an atomic, redacted ZIP capped at
+  1 MiB from typed offline facts; it excludes raw logs/configuration and private
+  identifiers/content and starts no hardware, provider, network, or action path.
 - Single static native binary; no runtime installation.
 - One normal/direct-HID runtime per Windows session; read-only and virtual test
   commands remain available alongside it.

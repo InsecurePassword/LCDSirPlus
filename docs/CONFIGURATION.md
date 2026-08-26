@@ -151,6 +151,24 @@ normal slot action. A cleared episode rearms if it later recurs.
 `log_level` (`debug`\|`info`\|`warn`\|`error`), `log_max_bytes`
 (65536..104857600), `log_backups` (1..20). Log file:
 `%LOCALAPPDATA%\LCDForge2\lcdforge.log` (or `--diagnostic-dir`).
+Startup fails explicitly if the selected log directory or file cannot be
+opened. A later write/rotation failure leaves stdout logging active, drops the
+failed line, and disables file output rather than risking an unbounded file.
+
+## Diagnostics
+
+`lcdforge.exe --diagnostics [--config PATH] [--diagnostic-dir PATH]` validates
+configuration and writes a uniquely named, atomic ZIP without starting HID,
+providers, Discord, network probes, or hung actions. The archive is store-only,
+has fixed entries (`privacy.txt`, `report.txt`, `manifest.txt`), per-entry caps,
+and a 1 MiB total cap. The selected directory must be a regular non-reparse
+directory on a fixed local volume; existing destination files are not replaced.
+
+The report uses a closed allowlist of version/build, validated modes, booleans,
+bounded cadences, fixed G13 contract values, closed provider states, and size
+totals for known rotated log names. Raw logs/configuration and user, credential,
+Discord, title, path, address/target, environment, command-line, registry,
+serial, arbitrary-listing, and device-path data are excluded.
 
 ## Includes
 

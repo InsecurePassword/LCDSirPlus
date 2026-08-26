@@ -60,6 +60,7 @@ lcdforge.exe [--config PATH] [COMMAND]
   --preview          Run with the virtual preview forced on
   --hardware-test    Run the deterministic 10-step G13 test sequence
   --hardware-discover  Passive read-only G13 HID enumeration
+  --diagnostics      Write a bounded offline diagnostics ZIP and exit
   --discord-authorize  Authorize Discord local RPC for the current user
   --discord-clear-token  Remove the current-user Discord credential
   --backend hid|virtual  Backend for --hardware-test (default hid)
@@ -80,6 +81,14 @@ cargo clippy                   # zero-warning policy
 Toolchain: stable Rust (MSVC), only dependency is the official `windows`
 crate. Copy `lcdforge.txt` next to the executable; live configuration and
 logs live under `%LOCALAPPDATA%\LCDForge2\`.
+
+`lcdforge.exe --diagnostics` writes a local, store-only ZIP to that directory.
+Use `--diagnostic-dir PATH` to select both the runtime log directory and the
+diagnostics output directory. The bundle is capped at 1 MiB and contains only a
+typed report, privacy notice, and SHA-256 manifest. It never includes raw logs,
+configuration files, credentials, Discord data, window/process details, paths,
+network targets, environment values, registry values, serials, or device paths;
+collection does not start hardware, providers, probes, or actions.
 
 ## Verification status
 

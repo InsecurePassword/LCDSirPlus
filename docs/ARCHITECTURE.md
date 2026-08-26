@@ -7,6 +7,7 @@ src\
 ├── main.rs             CLI parsing, command dispatch
 ├── app.rs              orchestration loop, hot reload, wiring
 ├── config.rs           v2 schema, defaults, validation
+├── diagnostics.rs      offline typed report + bounded store-only ZIP
 ├── parser.rs           tokenizer + include graph + line diagnostics
 ├── model.rs            canonical metric/reading/snapshot model
 ├── history.rs          ring buffer + frame statistics (Phase 2 consumers)
@@ -158,5 +159,9 @@ Discord speaker overlay, then dashboard.
   Optional client secrets cross only the temporary environment boundary.
 - Authorization is local RPC plus outbound WinHTTP token exchange. There is no
   callback listener, browser launch, bot/Gateway connection, or user token.
-- Diagnostics redaction expands in Phase 4; current logs contain no user
-  data beyond window/metric values.
+- Diagnostics are a separate offline privacy boundary: a closed typed allowlist
+  is written atomically as a store-only ZIP capped at 1 MiB. Raw logs/config,
+  credentials, Discord content/identifiers, titles, paths, addresses/targets,
+  environment/command-line/registry values, serials, listings, and device paths
+  are never archive inputs. Collection starts no HID, providers, probes, RPC,
+  or actions, and output rejects reparse directories and linked files.

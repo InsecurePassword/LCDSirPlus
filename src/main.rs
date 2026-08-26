@@ -6,6 +6,7 @@ mod alerts;
 mod app;
 mod backends;
 mod config;
+mod diagnostics;
 mod hardware_test;
 mod history;
 mod http;
@@ -39,6 +40,7 @@ fn print_usage() {
          \x20 --validate-config  Validate the configuration and exit\n\
          \x20 --preview          Run with the virtual preview forced on\n\
          \x20 --hardware-test    Run the deterministic 10-step G13 test sequence\n\
+         \x20 --diagnostics      Write a bounded offline diagnostics ZIP and exit\n\
          \x20 --discord-authorize  Authorize Discord RPC for the current user\n\
          \x20 --discord-clear-token  Remove the current-user Discord credential\n\
          \x20 --backend hid|virtual  Backend for --hardware-test (default hid)\n\
@@ -55,6 +57,7 @@ struct Cli {
     preview: bool,
     hardware_test: bool,
     hardware_discover: bool,
+    diagnostics: bool,
     discord_authorize: bool,
     discord_clear_token: bool,
     hang_test_harness: bool,
@@ -78,6 +81,7 @@ fn parse_args() -> Result<Cli, String> {
         preview: false,
         hardware_test: false,
         hardware_discover: false,
+        diagnostics: false,
         discord_authorize: false,
         discord_clear_token: false,
         hang_test_harness: false,
@@ -107,6 +111,7 @@ fn parse_args() -> Result<Cli, String> {
             "--preview" => cli.preview = true,
             "--hardware-test" => cli.hardware_test = true,
             "--hardware-discover" => cli.hardware_discover = true,
+            "--diagnostics" => cli.diagnostics = true,
             "--discord-authorize" => cli.discord_authorize = true,
             "--discord-clear-token" => cli.discord_clear_token = true,
             "--hang-test-harness" => cli.hang_test_harness = true,
@@ -175,6 +180,7 @@ fn main() {
         cli.validate,
         cli.hardware_test,
         cli.hardware_discover,
+        cli.diagnostics,
         cli.discord_authorize,
         cli.discord_clear_token,
         cli.hang_test_harness,
@@ -247,6 +253,34 @@ fn main() {
         }
     }
 
+    if cli.diagnostics {
+        let path = cli
+            .config
+            .clone()
+            .unwrap_or_else(app::default_config_path_pub);
+        let mut config = match parser::load(&path) {
+            Ok(loaded) => loaded.config,
+            Err(_) => {
+                eprintln!("diagnostics failed: configuration is invalid or unavailable");
+                std::process::exit(2);
+            }
+        };
+        if cli.safe_mode {
+            config.safe_mode = true;
+        }
+        let directory = cli.diagnostic_dir.clone().unwrap_or_else(app::log_dir);
+        match diagnostics::write_bundle(&directory, &config, None) {
+            Ok(path) => {
+                println!("Diagnostics written to {}", path.display());
+                return;
+            }
+            Err(error) => {
+                eprintln!("diagnostics failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     if cli.discord_clear_token {
         let path = cli
             .config
@@ -311,7 +345,12 @@ fn main() {
         } else {
             None
         };
-        let code = app::run_hardware_test(cli.config.clone(), cli.backend, cli.duration);
+        let code = app::run_hardware_test(
+            cli.config.clone(),
+            cli.backend,
+            cli.duration,
+            cli.diagnostic_dir.clone(),
+        );
         drop(instance);
         std::process::exit(code);
     }
@@ -331,6 +370,7 @@ fn main() {
         config_path: cli.config,
         preview_always: cli.preview,
         safe_mode: cli.safe_mode,
+        diagnostic_dir: cli.diagnostic_dir,
     });
     drop(instance);
     std::process::exit(code);
