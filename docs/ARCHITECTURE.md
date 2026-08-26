@@ -60,7 +60,9 @@ src\
 
 The backend thread is the only toucher of the device (mirrors the Go
 `LockOSThread` discipline). Frames are submitted only when changed; button
-edges are debounced in the backend thread and delivered as events.
+edges are debounced in the backend thread and delivered as events. The UI
+producer atomically replaces one pending frame slot, so slow I/O and reconnect
+retain only the newest frame while shutdown uses a separate reliable signal.
 Before any direct-HID device open, a read-only ToolHelp snapshot rejects exact
 case-insensitive `LCore.exe` ownership with an actionable unavailable state.
 No device handle exists and no blank is sent on this refusal path; normal

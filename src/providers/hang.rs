@@ -1386,16 +1386,7 @@ fn action_smoke(negative: bool) -> Result<u32, String> {
 
 fn smoke_source() -> Result<std::path::PathBuf, String> {
     let current = std::env::current_exe().map_err(|_| "current executable unavailable")?;
-    let is_test_binary = current
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("lcdsirplus-"))
-        && current
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            == Some("deps");
-    if is_test_binary {
+    if is_cargo_test_binary(&current) {
         let release_binary = current
             .parent()
             .and_then(Path::parent)
@@ -1407,6 +1398,18 @@ fn smoke_source() -> Result<std::path::PathBuf, String> {
         return Err("build the release executable before running the ignored harness smoke".into());
     }
     Ok(current)
+}
+
+fn is_cargo_test_binary(current: &Path) -> bool {
+    current
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().starts_with("lcdsirplus-"))
+        && current
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some("deps")
 }
 
 #[cfg(test)]
@@ -2172,6 +2175,16 @@ mod tests {
             };
         }
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn renamed_cargo_test_binary_is_recognized_case_insensitively() {
+        assert!(is_cargo_test_binary(Path::new(
+            r"C:\repo\target\release\deps\LCDSirPlus-0ffc5aa055826aa0.exe"
+        )));
+        assert!(!is_cargo_test_binary(Path::new(
+            r"C:\repo\target\release\LCDSirPlus.exe"
+        )));
     }
 
     #[test]

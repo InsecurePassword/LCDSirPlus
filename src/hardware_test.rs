@@ -253,6 +253,7 @@ fn run_with_clock(
         }
     }
 
+    buttons.extend(button_transitions.disconnect(clock.now()));
     (results, buttons)
 }
 
@@ -293,7 +294,6 @@ fn run_step(
             submit_interval,
             clock.now(),
         ) {
-            buttons.extend(button_transitions.disconnect(clock.now()));
             error = Some(e);
             break;
         }
@@ -475,15 +475,26 @@ mod tests {
     struct FakeIo {
         writes: RefCell<Vec<[u8; G13_OUTPUT_REPORT_LENGTH]>>,
         reads: RefCell<VecDeque<[u8; 8]>>,
+        fail_write_at: Cell<Option<usize>>,
+        read_count: Cell<usize>,
+        fail_read_at: Cell<Option<usize>>,
     }
 
     impl FakeTransport for FakeIo {
         fn write(&self, report: &[u8; G13_OUTPUT_REPORT_LENGTH]) -> Result<(), String> {
+            if self.fail_write_at.get() == Some(self.writes.borrow().len()) {
+                return Err("injected write failure".into());
+            }
             self.writes.borrow_mut().push(*report);
             Ok(())
         }
 
         fn read(&self, buffer: &mut [u8; 8], _timeout: Duration) -> Result<bool, String> {
+            let count = self.read_count.get();
+            self.read_count.set(count + 1);
+            if self.fail_read_at.get() == Some(count) {
+                return Err("injected read failure".into());
+            }
             let Some(report) = self.reads.borrow_mut().pop_front() else {
                 return Ok(false);
             };
@@ -554,6 +565,58 @@ mod tests {
         assert_eq!(events.len(), 8);
         assert_eq!(events.iter().filter(|event| event.down).count(), 4);
         assert!(events.iter().all(|event| !event.canceled));
+    }
+
+    fn short_test() -> TestConfig {
+        TestConfig {
+            duration: Duration::from_millis(20),
+            backend_name: "fake",
+            dashboard: None,
+            step_duration: Duration::from_millis(2),
+            submit_interval: Duration::from_millis(1),
+        }
+    }
+
+    #[test]
+    fn held_button_is_canceled_on_normal_completion_without_duplicate_release() {
+        let io = FakeIo::default();
+        io.reads
+            .borrow_mut()
+            .extend([[1, 0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 2, 0]]);
+        let (_, buttons) = run_with_clock(&Transport::Fake(&io), &short_test(), &FakeClock::new());
+        assert_eq!(buttons.len(), 2);
+        assert!(buttons[0].down && !buttons[0].canceled);
+        assert!(!buttons[1].down && buttons[1].canceled);
+
+        let io = FakeIo::default();
+        io.reads.borrow_mut().extend([
+            [1, 0, 0, 0, 0, 0, 0, 0],
+            [1, 0, 0, 0, 0, 0, 2, 0],
+            [1, 0, 0, 0, 0, 0, 0, 0],
+        ]);
+        let (_, buttons) = run_with_clock(&Transport::Fake(&io), &short_test(), &FakeClock::new());
+        assert_eq!(buttons.len(), 2);
+        assert!(buttons[0].down && !buttons[0].canceled);
+        assert!(!buttons[1].down && !buttons[1].canceled);
+    }
+
+    #[test]
+    fn held_button_is_canceled_on_write_and_read_failures() {
+        let io = FakeIo::default();
+        io.fail_write_at.set(Some(1));
+        io.reads
+            .borrow_mut()
+            .extend([[1, 0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 2, 0]]);
+        let (_, buttons) = run_with_clock(&Transport::Fake(&io), &short_test(), &FakeClock::new());
+        assert!(buttons.last().is_some_and(|event| event.canceled));
+
+        let io = FakeIo::default();
+        io.fail_read_at.set(Some(2));
+        io.reads
+            .borrow_mut()
+            .extend([[1, 0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 2, 0]]);
+        let (_, buttons) = run_with_clock(&Transport::Fake(&io), &short_test(), &FakeClock::new());
+        assert!(buttons.last().is_some_and(|event| event.canceled));
     }
 
     #[test]

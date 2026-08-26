@@ -42,9 +42,9 @@ hash-verified against the original Go implementation's goldens:
 
 | Golden dashboard | SHA-256 |
 |---|---|
-| Normal | `3cee8a2dae57386c1d33b6039d28c79046e569f4c87f41692493dfae345e7525` |
-| All-bars-unavailable | `79a153e1a0fba0904b8b9b75cf9daf6a2eaff15eb838fc178e5e68220928373a` |
-| All-bars-stale | `c1a643090e938bd807a8e9b5c43791c6ae0efe20093e7c27762e1ee6d378ab6d` |
+| Normal | `16eaeeb02f8ed4b89f721cad9557b749ad5ca2c24a7a9ff41b9682d678cec9a4` |
+| All-bars-unavailable | `0ba19f9f03f908986009a86c3766755b5570e699fb97409dbabaa55a941a6940` |
+| All-bars-stale | `2905e74cd8844a8b168a7575b663b889232c04aa8b0dedac7b57f58d42208854` |
 
 ## G13 backend (proven contract)
 

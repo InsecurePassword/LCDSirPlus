@@ -9,7 +9,9 @@
 pub mod g13;
 pub mod hid;
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -40,21 +42,43 @@ pub enum BackendState {
     ShutDown,
 }
 
-pub enum Command {
-    /// Submit a transformed 160x43 frame (logical pixels).
-    Frame(Box<[u8; crate::model::WIDTH * crate::model::HEIGHT]>),
-    Shutdown,
-}
-
 pub enum Message {
     State(BackendState),
     Buttons(Vec<Event>),
 }
 
 pub struct Backend {
-    pub cmd_tx: Sender<Command>,
+    commands: Arc<CommandQueue>,
     pub msg_rx: Receiver<Message>,
     thread: Option<JoinHandle<()>>,
+}
+
+type Pixels = Box<[u8; crate::model::WIDTH * crate::model::HEIGHT]>;
+
+struct CommandQueue {
+    latest: Mutex<Option<Pixels>>,
+    shutdown: AtomicBool,
+    wake: SyncSender<()>,
+}
+
+impl CommandQueue {
+    fn submit(&self, pixels: Pixels) {
+        *self.latest.lock().unwrap() = Some(pixels);
+        let _ = self.wake.try_send(());
+    }
+
+    fn take_latest(&self) -> Option<Pixels> {
+        self.latest.lock().unwrap().take()
+    }
+
+    fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        let _ = self.wake.try_send(());
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
 }
 
 impl Backend {
@@ -62,7 +86,12 @@ impl Backend {
     /// (`auto` resolves to Hid here; the worker falls back to Virtual when
     /// HID discovery cannot find a device).
     pub fn spawn(kind: BackendKind, cfg: &Config) -> Backend {
-        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
+        let commands = Arc::new(CommandQueue {
+            latest: Mutex::new(None),
+            shutdown: AtomicBool::new(false),
+            wake: wake_tx,
+        });
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         let reconnect = cfg.logitech_reconnect;
         let reconnect_max = cfg.logitech_reconnect_max;
@@ -70,12 +99,14 @@ impl Backend {
         let debounce = cfg.logitech_button_debounce;
         let orientation = cfg.logitech_orientation.clone();
         let invert = cfg.logitech_invert;
+        let worker_commands = Arc::clone(&commands);
         let thread = std::thread::Builder::new()
             .name("lcdsirplus-backend".into())
             .spawn(move || {
                 worker(
                     kind,
-                    cmd_rx,
+                    worker_commands,
+                    wake_rx,
                     msg_tx,
                     reconnect,
                     reconnect_max,
@@ -87,7 +118,7 @@ impl Backend {
             })
             .expect("spawn backend thread");
         Backend {
-            cmd_tx,
+            commands,
             msg_rx,
             thread: Some(thread),
         }
@@ -96,11 +127,11 @@ impl Backend {
     pub fn submit(&self, frame: &crate::render::Frame) {
         let mut boxed = Box::new([0u8; crate::model::WIDTH * crate::model::HEIGHT]);
         boxed.copy_from_slice(&frame.pixels);
-        let _ = self.cmd_tx.send(Command::Frame(boxed));
+        self.commands.submit(boxed);
     }
 
     pub fn shutdown(mut self) {
-        let _ = self.cmd_tx.send(Command::Shutdown);
+        self.commands.shutdown();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -110,7 +141,7 @@ impl Backend {
 impl Drop for Backend {
     fn drop(&mut self) {
         if self.thread.is_some() {
-            let _ = self.cmd_tx.send(Command::Shutdown);
+            self.commands.shutdown();
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
@@ -121,8 +152,9 @@ impl Drop for Backend {
 #[allow(clippy::too_many_arguments)]
 fn worker(
     kind: BackendKind,
-    cmd_rx: Receiver<Command>,
-    msg_tx: Sender<Message>,
+    commands: Arc<CommandQueue>,
+    wake_rx: Receiver<()>,
+    msg_tx: std::sync::mpsc::Sender<Message>,
     reconnect: Duration,
     reconnect_max: Duration,
     button_poll: Duration,
@@ -132,10 +164,11 @@ fn worker(
 ) {
     let _ = msg_tx.send(Message::State(BackendState::Discovering));
     match kind {
-        BackendKind::Virtual => virtual_worker(cmd_rx, msg_tx),
+        BackendKind::Virtual => virtual_worker(commands, wake_rx, msg_tx),
         BackendKind::Hid => {
             hid_worker(
-                &cmd_rx,
+                &commands,
+                &wake_rx,
                 &msg_tx,
                 reconnect,
                 reconnect_max,
@@ -176,8 +209,9 @@ fn transform_frame(
 
 #[allow(clippy::too_many_arguments, unused_assignments)]
 fn hid_worker(
-    cmd_rx: &Receiver<Command>,
-    msg_tx: &Sender<Message>,
+    commands: &CommandQueue,
+    wake_rx: &Receiver<()>,
+    msg_tx: &std::sync::mpsc::Sender<Message>,
     reconnect: Duration,
     reconnect_max: Duration,
     button_poll: Duration,
@@ -186,7 +220,6 @@ fn hid_worker(
     invert: bool,
 ) {
     let mut backoff = reconnect;
-    let mut pending: Option<[u8; G13_OUTPUT_REPORT_LENGTH]> = None;
     let mut last_sent: Option<[u8; G13_OUTPUT_REPORT_LENGTH]> = None;
     let mut tracker = ButtonTracker::default();
 
@@ -195,7 +228,7 @@ fn hid_worker(
         match hid::HidDevice::open() {
             Err(reason) => {
                 let _ = msg_tx.send(Message::State(BackendState::Disconnected { reason }));
-                if sleep_interruptible(cmd_rx, &mut pending, backoff, &orientation, invert) {
+                if sleep_interruptible(commands, wake_rx, backoff) {
                     break 'outer;
                 }
                 backoff = (backoff * 2).min(reconnect_max);
@@ -211,21 +244,27 @@ fn hid_worker(
 
                 // --- connected loop ---
                 loop {
-                    match cmd_rx.recv_timeout(button_poll) {
-                        Ok(Command::Frame(pixels)) => {
-                            pending = Some(transform_frame(&pixels, &orientation, invert));
+                    if commands.is_shutdown() {
+                        if let Err(reason) = device.close() {
+                            let _ =
+                                msg_tx.send(Message::State(BackendState::Disconnected { reason }));
                         }
-                        Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
-                            if let Err(reason) = device.close() {
-                                let _ = msg_tx
-                                    .send(Message::State(BackendState::Disconnected { reason }));
-                            }
-                            break 'outer;
+                        break 'outer;
+                    }
+                    let mut pixels = commands.take_latest();
+                    if pixels.is_none() {
+                        match wake_rx.recv_timeout(button_poll) {
+                            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+                            Err(RecvTimeoutError::Disconnected) => break 'outer,
                         }
-                        Err(RecvTimeoutError::Timeout) => {}
+                        if commands.is_shutdown() {
+                            continue;
+                        }
+                        pixels = commands.take_latest();
                     }
 
-                    if let Some(report) = pending.take() {
+                    if let Some(pixels) = pixels {
+                        let report = transform_frame(&pixels, &orientation, invert);
                         if last_sent.as_ref() != Some(&report) {
                             match device.write_report(&report) {
                                 Ok(()) => last_sent = Some(report),
@@ -241,13 +280,7 @@ fn hid_worker(
                                     let _ = msg_tx.send(Message::Buttons(
                                         tracker.disconnect(Instant::now(), "hid"),
                                     ));
-                                    if sleep_interruptible(
-                                        cmd_rx,
-                                        &mut pending,
-                                        backoff,
-                                        &orientation,
-                                        invert,
-                                    ) {
+                                    if sleep_interruptible(commands, wake_rx, backoff) {
                                         break 'outer;
                                     }
                                     backoff = (backoff * 2).min(reconnect_max);
@@ -280,13 +313,7 @@ fn hid_worker(
                                 let _ = msg_tx.send(Message::Buttons(
                                     tracker.disconnect(Instant::now(), "hid"),
                                 ));
-                                if sleep_interruptible(
-                                    cmd_rx,
-                                    &mut pending,
-                                    backoff,
-                                    &orientation,
-                                    invert,
-                                ) {
+                                if sleep_interruptible(commands, wake_rx, backoff) {
                                     break 'outer;
                                 }
                                 backoff = (backoff * 2).min(reconnect_max);
@@ -304,13 +331,7 @@ fn hid_worker(
                                 msg_tx.send(Message::State(BackendState::Disconnected { reason }));
                             let _ = msg_tx
                                 .send(Message::Buttons(tracker.disconnect(Instant::now(), "hid")));
-                            if sleep_interruptible(
-                                cmd_rx,
-                                &mut pending,
-                                backoff,
-                                &orientation,
-                                invert,
-                            ) {
+                            if sleep_interruptible(commands, wake_rx, backoff) {
                                 break 'outer;
                             }
                             backoff = (backoff * 2).min(reconnect_max);
@@ -323,14 +344,10 @@ fn hid_worker(
     }
 }
 
-/// Sleep for `duration` while still draining commands. Returns true when the
-/// worker must shut down; frames arriving during the wait update `pending`.
 fn sleep_interruptible(
-    cmd_rx: &Receiver<Command>,
-    pending: &mut Option<[u8; G13_OUTPUT_REPORT_LENGTH]>,
+    commands: &CommandQueue,
+    wake_rx: &Receiver<()>,
     duration: Duration,
-    orientation: &str,
-    invert: bool,
 ) -> bool {
     let deadline = Instant::now() + duration;
     loop {
@@ -338,33 +355,41 @@ fn sleep_interruptible(
         if remaining.is_zero() {
             return false;
         }
-        match cmd_rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
-            Ok(Command::Frame(pixels)) => {
-                *pending = Some(transform_frame(&pixels, orientation, invert));
-            }
-            Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => return true,
-            Err(RecvTimeoutError::Timeout) => {}
+        if commands.is_shutdown() {
+            return true;
+        }
+        match wake_rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return true,
         }
     }
 }
 
-fn virtual_fallback_loop(cmd_rx: &Receiver<Command>, msg_tx: &Sender<Message>) {
+fn virtual_fallback_loop(
+    commands: &CommandQueue,
+    wake_rx: &Receiver<()>,
+    msg_tx: &std::sync::mpsc::Sender<Message>,
+) {
     let _ = msg_tx.send(Message::State(BackendState::Connected {
         kind: BackendKind::Virtual,
     }));
-    loop {
-        match cmd_rx.recv() {
-            Ok(Command::Frame(_)) => {}
-            Ok(Command::Shutdown) | Err(_) => return,
+    while !commands.is_shutdown() {
+        let _ = commands.take_latest();
+        if wake_rx.recv_timeout(Duration::from_millis(100)).is_err() && commands.is_shutdown() {
+            return;
         }
     }
 }
 
-fn virtual_worker(cmd_rx: Receiver<Command>, msg_tx: Sender<Message>) {
+fn virtual_worker(
+    commands: Arc<CommandQueue>,
+    wake_rx: Receiver<()>,
+    msg_tx: std::sync::mpsc::Sender<Message>,
+) {
     let _ = msg_tx.send(Message::State(BackendState::Connected {
         kind: BackendKind::Virtual,
     }));
-    virtual_fallback_loop(&cmd_rx, &msg_tx);
+    virtual_fallback_loop(&commands, &wake_rx, &msg_tx);
     let _ = msg_tx.send(Message::State(BackendState::ShutDown));
 }
 
@@ -380,6 +405,59 @@ pub fn resolve_kind(config_backend: &str) -> BackendKind {
 mod tests {
     use super::*;
     use crate::render::Frame;
+
+    fn command_queue() -> (Arc<CommandQueue>, Receiver<()>) {
+        let (wake, receiver) = std::sync::mpsc::sync_channel(1);
+        (
+            Arc::new(CommandQueue {
+                latest: Mutex::new(None),
+                shutdown: AtomicBool::new(false),
+                wake,
+            }),
+            receiver,
+        )
+    }
+
+    fn pixels(value: u8) -> Pixels {
+        Box::new([value; crate::model::WIDTH * crate::model::HEIGHT])
+    }
+
+    #[test]
+    fn command_queue_retains_only_latest_frame_and_shutdown_is_reliable() {
+        let (queue, wake) = command_queue();
+        queue.submit(pixels(1));
+        queue.submit(pixels(2));
+        queue.submit(pixels(3));
+        assert_eq!(wake.try_recv(), Ok(()));
+        assert!(wake.try_recv().is_err(), "wake channel is bounded to one");
+        assert_eq!(queue.take_latest().unwrap()[0], 3);
+        assert!(queue.take_latest().is_none());
+
+        queue.submit(pixels(4));
+        queue.shutdown();
+        assert!(
+            queue.is_shutdown(),
+            "shutdown does not depend on wake capacity"
+        );
+    }
+
+    #[test]
+    fn backoff_retains_one_newest_frame_for_one_reconnect_replay() {
+        let (queue, wake) = command_queue();
+        queue.submit(pixels(1));
+        queue.submit(pixels(2));
+        queue.submit(pixels(3));
+        assert!(!sleep_interruptible(
+            &queue,
+            &wake,
+            Duration::from_millis(1)
+        ));
+        let newest = queue.take_latest().unwrap();
+        assert_eq!(newest[0], 3);
+        let replay = transform_frame(&newest, "normal", false);
+        assert!(queue.take_latest().is_none());
+        assert_eq!(replay[32], 0xFF, "newest nonzero frame is replayed once");
+    }
 
     #[test]
     fn transform_identity_matches_direct_pack() {

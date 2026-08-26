@@ -327,18 +327,13 @@ impl HidDevice {
             });
         };
         let handle = unsafe { open_path(&candidate.device_path)? };
-        let read_event = unsafe { CreateEventW(None, true, false, None) }
-            .map_err(|e| format!("CreateEventW failed: {}", e))?;
-        let write_event = match unsafe { CreateEventW(None, true, false, None) } {
-            Ok(event) => event,
-            Err(error) => {
-                unsafe {
-                    let _ = CloseHandle(read_event);
-                    let _ = CloseHandle(handle);
-                }
-                return Err(format!("CreateEventW failed: {error}"));
-            }
-        };
+        let (read_event, write_event) = create_io_events(
+            handle,
+            || unsafe { CreateEventW(None, true, false, None) }.map_err(|e| e.to_string()),
+            |owned| unsafe {
+                let _ = CloseHandle(owned);
+            },
+        )?;
         Ok((
             HidDevice {
                 handle,
@@ -354,19 +349,22 @@ impl HidDevice {
         unsafe { ResetEvent(self.write_event) }
             .map_err(|e| format!("HID reset write event: {e}"))?;
         let mut overlapped = self.new_overlapped(self.write_event);
-        let mut transferred = 0u32;
         let result = unsafe {
             windows::Win32::Storage::FileSystem::WriteFile(
                 self.handle,
                 Some(report.as_slice()),
-                Some(&mut transferred),
+                None,
                 Some(&mut overlapped),
             )
         };
         match result {
-            Ok(()) => validate_transfer("HID write", transferred, G13_OUTPUT_REPORT_LENGTH),
+            Ok(()) => validate_transfer(
+                "HID write",
+                self.overlapped_result(&overlapped, "HID write")?,
+                G13_OUTPUT_REPORT_LENGTH,
+            ),
             Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => {
-                transferred =
+                let transferred =
                     self.wait_pending(self.write_event, &overlapped, IO_TIMEOUT, "HID write")?;
                 validate_transfer("HID write", transferred, G13_OUTPUT_REPORT_LENGTH)
             }
@@ -382,17 +380,17 @@ impl HidDevice {
     ) -> Result<bool, String> {
         unsafe { ResetEvent(self.read_event) }.map_err(|e| format!("HID reset read event: {e}"))?;
         let mut overlapped = self.new_overlapped(self.read_event);
-        let mut transferred = 0u32;
         let result = unsafe {
             windows::Win32::Storage::FileSystem::ReadFile(
                 self.handle,
                 Some(buffer.as_mut_slice()),
-                Some(&mut transferred),
+                None,
                 Some(&mut overlapped),
             )
         };
         match result {
             Ok(()) => {
+                let transferred = self.overlapped_result(&overlapped, "HID read")?;
                 validate_transfer("HID read", transferred, G13_INPUT_REPORT_LENGTH)?;
                 validate_input_id(buffer[0])?;
                 Ok(true)
@@ -400,7 +398,7 @@ impl HidDevice {
             Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => {
                 match unsafe { WaitForSingleObject(self.read_event, timeout.as_millis() as u32) } {
                     WAIT_OBJECT_0 => {
-                        transferred = self.overlapped_result(&overlapped, "HID read")?;
+                        let transferred = self.overlapped_result(&overlapped, "HID read")?;
                         validate_transfer("HID read", transferred, G13_INPUT_REPORT_LENGTH)?;
                         validate_input_id(buffer[0])?;
                         Ok(true)
@@ -478,6 +476,29 @@ impl HidDevice {
     }
 }
 
+fn create_io_events(
+    device: HANDLE,
+    mut create: impl FnMut() -> Result<HANDLE, String>,
+    mut close: impl FnMut(HANDLE),
+) -> Result<(HANDLE, HANDLE), String> {
+    let read = match create() {
+        Ok(event) => event,
+        Err(error) => {
+            close(device);
+            return Err(format!("create HID read event: {error}"));
+        }
+    };
+    let write = match create() {
+        Ok(event) => event,
+        Err(error) => {
+            close(read);
+            close(device);
+            return Err(format!("create HID write event: {error}"));
+        }
+    };
+    Ok((read, write))
+}
+
 fn validate_transfer(label: &str, transferred: u32, expected: usize) -> Result<(), String> {
     if transferred as usize != expected {
         return Err(format!(
@@ -515,5 +536,38 @@ mod tests {
     fn partial_transfers_are_rejected() {
         assert!(validate_transfer("HID write", 991, 992).is_err());
         assert!(validate_transfer("HID write", 992, 992).is_ok());
+    }
+
+    #[test]
+    fn event_creation_failures_close_every_owned_handle() {
+        let device = HANDLE(11usize as _);
+        let read = HANDLE(12usize as _);
+        let mut closed = Vec::new();
+        let mut calls = 0;
+        let error = create_io_events(
+            device,
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Ok(read)
+                } else {
+                    Err("injected".into())
+                }
+            },
+            |handle| closed.push(handle.0 as usize),
+        )
+        .unwrap_err();
+        assert!(error.contains("write event"));
+        assert_eq!(closed, vec![12, 11]);
+
+        let mut closed = Vec::new();
+        let error = create_io_events(
+            device,
+            || Err("injected".into()),
+            |handle| closed.push(handle.0 as usize),
+        )
+        .unwrap_err();
+        assert!(error.contains("read event"));
+        assert_eq!(closed, vec![11]);
     }
 }
