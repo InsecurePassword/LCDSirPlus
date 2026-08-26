@@ -145,6 +145,8 @@ pub fn run(opts: RunOptions) -> i32 {
 
     // Providers.
     let mut cpu_provider = cpu::CpuLoadProvider::new();
+    let telemetry_rx = crate::telemetry::spawn(&cfg);
+    let mut telemetry = crate::telemetry::Update::default();
     let mut renderer = Renderer::new();
     let slots = Manager::new(&cfg, [0; 4]);
     let mut slot_indexes: [usize; 4] = [0; 4];
@@ -162,7 +164,10 @@ pub fn run(opts: RunOptions) -> i32 {
 
         if now.duration_since(last_telemetry) >= cfg.telemetry_interval {
             last_telemetry = now;
-            snapshot = build_snapshot(&cfg, &topology, &mut cpu_provider, &slots, slot_indexes);
+            while let Ok(update) = telemetry_rx.try_recv() {
+                telemetry = update;
+            }
+            snapshot = build_snapshot(&cfg, &topology, &mut cpu_provider, &telemetry, slot_indexes);
         }
 
         if now.duration_since(last_render) >= cfg.render_interval {
@@ -281,8 +286,13 @@ pub fn run_hardware_test(
     // Build the live dashboard frame for STEP 10.
     let mut cpu_provider = cpu::CpuLoadProvider::new();
     let topology = ccd::detect();
-    let slots = Manager::new(&cfg, [0; 4]);
-    let snapshot = build_snapshot(&cfg, &topology, &mut cpu_provider, &slots, [0; 4]);
+    let snapshot = build_snapshot(
+        &cfg,
+        &topology,
+        &mut cpu_provider,
+        &crate::telemetry::Update::default(),
+        [0; 4],
+    );
     let dashboard = crate::render::renderer::Renderer::new().render(
         &snapshot,
         OverlayOptions::default(),
@@ -387,7 +397,7 @@ fn build_snapshot(
     cfg: &Config,
     topology: &ccd::CcdTopology,
     cpu_provider: &mut cpu::CpuLoadProvider,
-    _slots: &Manager,
+    telemetry: &crate::telemetry::Update,
     _slot_indexes: [usize; 4],
 ) -> Snapshot {
     let now = SystemTime::now();
@@ -418,11 +428,12 @@ fn build_snapshot(
         time_text: clock.time,
         cpu_cache_load: Metric::valid(cache_load, now),
         cpu_freq_load: Metric::valid(freq_load, now),
+        headset: telemetry.headset.clone(),
+        controller: telemetry.controller.clone(),
         ..Default::default()
     };
 
-    // Canonical readings for the fixed bars (GPU/VRAM arrive with Phase 2;
-    // until then they render the explicit unavailable state).
+    // Canonical readings for the fixed bars.
     let mut readings = ReadingsSnapshot::default();
     if total_load.is_finite() {
         readings.metrics.push(Reading::current_percent(
@@ -440,10 +451,29 @@ fn build_snapshot(
             now,
         ));
     }
+    readings
+        .metrics
+        .extend(telemetry.lhm_readings.iter().cloned());
     snapshot.readings = readings;
+
+    // Network throughput (bytes/second).
+    if telemetry.net.in_bps > 0.0 || telemetry.net.out_bps > 0.0 {
+        snapshot.network_in = Metric::valid(telemetry.net.in_bps, now);
+        snapshot.network_out = Metric::valid(telemetry.net.out_bps, now);
+    }
+
+    // Audio endpoint state.
+    if let Some(audio) = &telemetry.audio {
+        snapshot.audio_volume = Metric::valid(audio.volume_percent, now);
+        snapshot.microphone_known = audio.mic_known;
+        snapshot.microphone_muted = audio.mic_muted;
+    }
 
     if cfg.safe_mode {
         snapshot.providers.insert("safe-mode".into(), true);
+    }
+    for (name, ok) in &telemetry.providers {
+        snapshot.providers.insert(name.clone(), *ok);
     }
     snapshot
 }

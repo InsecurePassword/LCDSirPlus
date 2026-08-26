@@ -7,7 +7,9 @@ mod backends;
 mod config;
 mod hardware_test;
 mod history;
+mod http;
 mod input;
+mod json;
 mod logging;
 mod model;
 mod parser;
@@ -16,6 +18,7 @@ mod providers;
 mod render;
 mod sha256;
 mod slots;
+mod telemetry;
 mod ui;
 
 use std::time::Duration;
