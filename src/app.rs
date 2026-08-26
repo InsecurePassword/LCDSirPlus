@@ -7,10 +7,9 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::backends::{Backend, BackendKind, BackendState, Message};
 use crate::config::Config;
 use crate::hardware_test::{self, TestConfig, Transport};
-use crate::input::Event;
 use crate::logging::Level;
 use crate::model::{DiscordState, Metric, MetricKey, Reading, ReadingsSnapshot, Snapshot};
-use crate::providers::{ccd, clock, cpu, memory};
+use crate::providers::{ccd, clock, cpu, hang, memory};
 use crate::render::renderer::{OverlayOptions, Renderer, View};
 use crate::slots::Manager;
 use crate::ui::{Ui, UiEvent};
@@ -152,6 +151,7 @@ pub fn run(opts: RunOptions) -> i32 {
     let mut renderer = Renderer::new();
     let slots = Manager::new(&cfg, [0; 4]);
     let mut slot_indexes: [usize; 4] = [0; 4];
+    let mut hang_hold = hang::HoldState::default();
 
     // Config watcher state: (mtime, len) of primary.
     let mut watcher = ConfigWatcher::new(&config_path);
@@ -164,14 +164,44 @@ pub fn run(opts: RunOptions) -> i32 {
     while running {
         let now = Instant::now();
 
+        while let Ok(update) = telemetry_runtime.updates.try_recv() {
+            telemetry = update;
+        }
+        while let Ok(update) = discord_runtime.updates.try_recv() {
+            discord = update;
+        }
+
+        // Reload before input so a same-loop release cannot use stale action policy.
+        if now.duration_since(watcher.last_check) >= cfg.config_refresh {
+            watcher.last_check = now;
+            if watcher.changed() {
+                crate::log_info!("configuration changed on disk; reloading");
+                match crate::parser::load(&config_path) {
+                    Ok(loaded) => {
+                        if let Some(audit) = hang_hold.cancel_reload() {
+                            log_hang_audit(&audit);
+                        }
+                        cfg = loaded.config;
+                        if opts.safe_mode {
+                            cfg.safe_mode = true;
+                        }
+                        telemetry_runtime.update_config(&cfg);
+                        discord_runtime.update_config(&cfg);
+                        slots.apply(&cfg);
+                        crate::log_info!("configuration reloaded");
+                    }
+                    Err(e) => {
+                        crate::log_error!(
+                            "configuration reload rejected: {} (last valid config stays active)",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
         if now.duration_since(last_telemetry) >= cfg.telemetry_interval {
             last_telemetry = now;
-            while let Ok(update) = telemetry_runtime.updates.try_recv() {
-                telemetry = update;
-            }
-            while let Ok(update) = discord_runtime.updates.try_recv() {
-                discord = update;
-            }
             snapshot = build_snapshot(
                 &cfg,
                 &topology,
@@ -180,6 +210,16 @@ pub fn run(opts: RunOptions) -> i32 {
                 &discord,
                 slot_indexes,
             );
+        }
+        snapshot.hung = if cfg.safe_mode || !cfg.hang_enabled || !hang_available(&telemetry) {
+            Vec::new()
+        } else {
+            telemetry.hung.clone()
+        };
+
+        if let Some(audit) = hang_hold.reconcile(&cfg, &telemetry.hung, hang_available(&telemetry))
+        {
+            log_hang_audit(&audit);
         }
 
         if now.duration_since(last_render) >= cfg.render_interval {
@@ -191,6 +231,9 @@ pub fn run(opts: RunOptions) -> i32 {
                     slots.current(2),
                     slots.current(3),
                 ],
+                hung_index: hang_hold.hung_index,
+                hung_detail: hang_hold.hung_detail,
+                hung_hold: hang_hold.progress(now, &cfg),
                 ..Default::default()
             };
             let frame = renderer.render(
@@ -222,7 +265,13 @@ pub fn run(opts: RunOptions) -> i32 {
                 },
                 Message::Buttons(events) => {
                     for event in events {
-                        handle_button(event, &slots, &mut slot_indexes, &cfg);
+                        let command = hang_hold.event(
+                            event,
+                            &cfg,
+                            &telemetry.hung,
+                            hang_available(&telemetry),
+                        );
+                        apply_hold_command(command, &slots, &mut slot_indexes, &cfg);
                     }
                 }
             }
@@ -240,32 +289,6 @@ pub fn run(opts: RunOptions) -> i32 {
                 UiEvent::Exit => {
                     crate::log_info!("exit requested from tray");
                     running = false;
-                }
-            }
-        }
-
-        // Hot reload.
-        if now.duration_since(watcher.last_check) >= cfg.config_refresh {
-            watcher.last_check = now;
-            if watcher.changed() {
-                crate::log_info!("configuration changed on disk; reloading");
-                match crate::parser::load(&config_path) {
-                    Ok(loaded) => {
-                        cfg = loaded.config;
-                        if opts.safe_mode {
-                            cfg.safe_mode = true;
-                        }
-                        telemetry_runtime.update_config(&cfg);
-                        discord_runtime.update_config(&cfg);
-                        slots.apply(&cfg);
-                        crate::log_info!("configuration reloaded");
-                    }
-                    Err(e) => {
-                        crate::log_error!(
-                            "configuration reload rejected: {} (last valid config stays active)",
-                            e
-                        );
-                    }
                 }
             }
         }
@@ -489,6 +512,9 @@ fn build_snapshot(
         "Discord".into(),
         snapshot.discord.connected && snapshot.discord.authenticated,
     );
+    if cfg.safe_mode || !cfg.hang_enabled || !hang_available(telemetry) {
+        snapshot.hung.clear();
+    }
     snapshot
 }
 
@@ -516,24 +542,48 @@ fn apply_telemetry(snapshot: &mut Snapshot, telemetry: &crate::telemetry::Update
     }
 }
 
-fn handle_button(event: Event, slots: &Manager, indexes: &mut [usize; 4], cfg: &Config) {
-    if event.canceled {
-        crate::log_debug!("button {} canceled (device loss)", event.index + 1);
-        return;
+fn hang_available(telemetry: &crate::telemetry::Update) -> bool {
+    telemetry
+        .providers
+        .iter()
+        .any(|(name, available)| name == "Hung window detector" && *available)
+}
+
+fn log_hang_audit(audit: &hang::Audit) {
+    crate::log_warn!(
+        "hung action pid={} process={} outcome={}",
+        audit.target.pid,
+        audit.target.process_name,
+        audit.outcome
+    );
+}
+
+fn apply_hold_command(
+    command: hang::HoldCommand,
+    slots: &Manager,
+    indexes: &mut [usize; 4],
+    cfg: &Config,
+) {
+    match command {
+        hang::HoldCommand::None => {}
+        hang::HoldCommand::Cycle { index, backward } => {
+            let module = slots.cycle(index, if backward { -1 } else { 1 });
+            *indexes = slots.indexes();
+            crate::log_debug!("button {} -> slot module {}", index + 1, module);
+        }
+        hang::HoldCommand::Audit(audit) => log_hang_audit(&audit),
+        hang::HoldCommand::Terminate(target) => {
+            log_hang_audit(&hang::Audit {
+                target: target.clone(),
+                outcome: "attempted",
+            });
+            let outcome = hang::terminate_bound_target(&target, cfg);
+            log_hang_audit(&hang::Audit {
+                target,
+                outcome: outcome.label(),
+            });
+        }
     }
-    if !event.down {
-        return; // release edges: long-press logic arrives with Phase 4
-    }
-    if cfg.safe_mode {
-        crate::log_info!(
-            "safe-mode: button {} press observed, no slot cycling",
-            event.index + 1
-        );
-        return;
-    }
-    let module = slots.cycle(event.index, 1);
-    *indexes = slots.indexes();
-    crate::log_debug!("button {} -> slot module {}", event.index + 1, module);
 }
 
 struct ConfigWatcher {

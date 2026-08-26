@@ -1432,4 +1432,50 @@ mod tests {
         assert!(!alert_frame.equal(&base));
         assert!(alert_frame.get(0, 0) && alert_frame.get(159, 42));
     }
+
+    #[test]
+    fn hung_hold_overrides_alert_and_discord_then_restores_exact_dashboard() {
+        let mut normal = sample_snapshot();
+        let view = golden_view();
+        let mut renderer = Renderer::new();
+        let dashboard = renderer.render(&normal, OverlayOptions::default(), &view);
+
+        normal.hung.push(HungTarget {
+            hwnd: 1,
+            pid: 2,
+            creation_time: 3,
+            image_path: r"c:\games\game.exe".into(),
+            process_name: "game.exe".into(),
+            title: "Game".into(),
+        });
+        normal.alerts.push(Alert {
+            severity: 2,
+            title: "CRITICAL".into(),
+            ..Default::default()
+        });
+        normal.discord.connected = true;
+        normal.discord.authenticated = true;
+        normal.discord.speakers.push(Speaker {
+            user_id: "1".into(),
+            name: "speaker".into(),
+            speaking: true,
+            ..Default::default()
+        });
+        let mut hold_view = view.clone();
+        hold_view.hung_hold = 0.5;
+        let with_priority = renderer.render(&normal, OverlayOptions::default(), &hold_view);
+
+        let mut only_hung = normal.clone();
+        only_hung.alerts.clear();
+        only_hung.discord = Default::default();
+        let expected = Renderer::new().render(&only_hung, OverlayOptions::default(), &hold_view);
+        assert!(with_priority.equal(&expected));
+        assert!((81..100).all(|x| with_priority.get(x, 42)));
+
+        normal.hung.clear();
+        normal.alerts.clear();
+        normal.discord = Default::default();
+        let restored = renderer.render(&normal, OverlayOptions::default(), &view);
+        assert!(restored.equal(&dashboard));
+    }
 }

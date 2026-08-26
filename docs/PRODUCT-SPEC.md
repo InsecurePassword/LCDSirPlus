@@ -87,8 +87,17 @@ Windows directory and configured ignore list. A target appears only after its
 exact HWND, PID, creation time, and normalized image path fail consecutive
 bounded `WM_NULL` probes for the configured minimum duration. Responsiveness,
 absence, identity replacement, safe mode, or disabling the detector removes it
-immediately. Guarded process termination is a later Phase 4 action and is not
-present in the detector.
+immediately. A detector publication is display input only and is never sufficient
+authorization for the guarded action.
+
+The guarded action binds the exact selected target only at physical button-down.
+The same input source must remain continuously held and release after the
+configured duration; full progress alone does nothing. Recovery, disappearance,
+identity or selection change, device loss, provider failure, safe mode, disable,
+or any hang-policy reload irreversibly cancels that press. The release boundary
+independently repeats native eligibility, timeout, exclusion, and process
+identity checks before using narrowly scoped terminate/query/synchronize rights.
+It never elevates or retries with broader access.
 
 ## Non-goals
 

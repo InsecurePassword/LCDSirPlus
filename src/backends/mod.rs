@@ -205,9 +205,7 @@ fn hid_worker(
                 let _ = msg_tx.send(Message::State(BackendState::Connected {
                     kind: BackendKind::Hid,
                 }));
-                let _ = msg_tx.send(Message::Buttons(
-                    tracker.disconnect(Instant::now(), "hid-reconnect"),
-                ));
+                let _ = msg_tx.send(Message::Buttons(tracker.disconnect(Instant::now(), "hid")));
                 last_sent = None;
                 backoff = reconnect;
 
@@ -235,7 +233,7 @@ fn hid_worker(
                                             reason,
                                         }));
                                     let _ = msg_tx.send(Message::Buttons(
-                                        tracker.disconnect(Instant::now(), "hid-loss"),
+                                        tracker.disconnect(Instant::now(), "hid"),
                                     ));
                                     if sleep_interruptible(
                                         cmd_rx,
@@ -270,7 +268,7 @@ fn hid_worker(
                                 let _ = msg_tx
                                     .send(Message::State(BackendState::Disconnected { reason }));
                                 let _ = msg_tx.send(Message::Buttons(
-                                    tracker.disconnect(Instant::now(), "hid-loss"),
+                                    tracker.disconnect(Instant::now(), "hid"),
                                 ));
                                 if sleep_interruptible(
                                     cmd_rx,
@@ -290,9 +288,8 @@ fn hid_worker(
                             device.close();
                             let _ =
                                 msg_tx.send(Message::State(BackendState::Disconnected { reason }));
-                            let _ = msg_tx.send(Message::Buttons(
-                                tracker.disconnect(Instant::now(), "hid-loss"),
-                            ));
+                            let _ = msg_tx
+                                .send(Message::Buttons(tracker.disconnect(Instant::now(), "hid")));
                             if sleep_interruptible(
                                 cmd_rx,
                                 &mut pending,

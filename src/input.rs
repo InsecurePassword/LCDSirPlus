@@ -175,5 +175,6 @@ mod tests {
         let events = b.disconnect(t(3, 0), "test");
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|e| !e.down && e.canceled));
+        assert!(events.iter().all(|e| e.source == "test"));
     }
 }

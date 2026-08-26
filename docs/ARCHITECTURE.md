@@ -102,6 +102,16 @@ Backend button reports flow back: `parse_input` → `ButtonTracker.observe`
   pumping messages, and detects only that child PID. An isolated cleanup owner
   waits for normal exit or terminates only that disposable child on exceptional
   return, then removes only its temporary tree.
+- Hung action: physical button 3 binds the exact currently selected confirmed
+  target at button-down. A single-source monotonic state machine cancels on
+  release loss, recovery, selection/identity/provider/policy change, safe mode,
+  disable, or reload. Reaching full progress never acts; only the matching
+  release can enter the native boundary. That boundary repeats visible titled
+  top-level HWND/PID/creation/path/exclusion and `ERROR_TIMEOUT` checks, opens
+  only `PROCESS_TERMINATE`, `PROCESS_SYNCHRONIZE`, and
+  `PROCESS_QUERY_LIMITED_INFORMATION`, rechecks identity through that handle,
+  terminates once, and waits at most five seconds. Audits contain only PID,
+  sanitized basename, and a fixed outcome label.
 - Vendor DLLs are loaded by name only from System32. GPU APIs are read-only,
   versioned, and bounded to vendor maximums. Automatically discovered
   PresentMon is canonically contained beside LCDForge; arguments are passed

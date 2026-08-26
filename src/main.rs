@@ -57,6 +57,8 @@ struct Cli {
     discord_clear_token: bool,
     hang_test_harness: bool,
     hang_detector_smoke: bool,
+    hang_action_smoke: bool,
+    hang_action_negative_smoke: bool,
     backend: backends::BackendKind,
     duration: Duration,
     safe_mode: bool,
@@ -76,6 +78,8 @@ fn parse_args() -> Result<Cli, String> {
         discord_clear_token: false,
         hang_test_harness: false,
         hang_detector_smoke: false,
+        hang_action_smoke: false,
+        hang_action_negative_smoke: false,
         backend: backends::BackendKind::Hid,
         duration: Duration::from_secs(30),
         safe_mode: false,
@@ -101,6 +105,8 @@ fn parse_args() -> Result<Cli, String> {
             "--discord-clear-token" => cli.discord_clear_token = true,
             "--hang-test-harness" => cli.hang_test_harness = true,
             "--hang-detector-smoke" => cli.hang_detector_smoke = true,
+            "--hang-action-smoke" => cli.hang_action_smoke = true,
+            "--hang-action-negative-smoke" => cli.hang_action_negative_smoke = true,
             "--backend" => {
                 i += 1;
                 match args.get(i).map(|s| s.as_str()) {
@@ -165,6 +171,8 @@ fn main() {
         cli.discord_clear_token,
         cli.hang_test_harness,
         cli.hang_detector_smoke,
+        cli.hang_action_smoke,
+        cli.hang_action_negative_smoke,
     ]
     .into_iter()
     .filter(|selected| *selected)
@@ -179,6 +187,12 @@ fn main() {
     }
     if cli.hang_detector_smoke {
         std::process::exit(providers::hang::run_smoke());
+    }
+    if cli.hang_action_smoke {
+        std::process::exit(providers::hang::run_action_smoke(false));
+    }
+    if cli.hang_action_negative_smoke {
+        std::process::exit(providers::hang::run_action_smoke(true));
     }
 
     if cli.validate {
