@@ -10,8 +10,9 @@ a smaller footprint and fewer dependencies:
 LCDSirPlus is not affiliated with or endorsed by the original LCDSirReal developer.
 
 - **Single native executable** with no bundled runtime or installer framework.
-- **No Logitech runtime**: direct-HID G13 backend (the proven path from the
-  0.2.0 repair — no LCore, no G HUB conflict, no administrator rights).
+- **No Logitech runtime dependency**: direct-HID G13 backend (the proven path
+  from the 0.2.0 repair, with no administrator rights). Logitech Gaming
+  Software must be exited because its `LCore.exe` process also owns the LCD.
 - **No Process Lasso**: Cache/Frequency CCD bars come from native topology
   detection (L3/NUMA domains + CPUID L3-size labeling of the 3D V-Cache die).
 - **Native-first telemetry**: CPU load from scheduler accounting deltas,
@@ -55,6 +56,10 @@ Enumerated strictly via SetupAPI; exactly one candidate accepted:
   `report[32 + x + (y/8)*160] |= 1 << (y & 7)`
 - Input: report ID `0x01`; LCD buttons in byte 6, bits `0x02 << 0..3`
 - Overlapped I/O, 1 s op timeout, bounded reconnect backoff, blank-on-close
+- Direct HID refuses to open while exact process name `LCore.exe` is running,
+  preventing competing LCD writers. It does not blanket-block G HUB services.
+- Static frames are submitted once; animated hardware-test frames are capped at
+  10 updates per second while button polling continues independently.
 
 ## Command line
 

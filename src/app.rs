@@ -462,8 +462,13 @@ pub fn run_hardware_test(
                 ..Default::default()
             };
             let (results, buttons) = hardware_test::run(&Transport::DirectHid(&device), &test);
-            device.close();
-            report_test_results(&results, &buttons)
+            let code = report_test_results(&results, &buttons);
+            if let Err(error) = device.close() {
+                crate::log_error!("hardware test close failed: {}", error);
+                eprintln!("hardware test close failed: {error}");
+                return 1;
+            }
+            code
         }
         BackendKind::Virtual => {
             let test = TestConfig {
@@ -510,7 +515,13 @@ fn report_test_results(
             crate::log_info!(
                 "button {} {}",
                 b.index + 1,
-                if b.down { "down" } else { "up" }
+                if b.canceled {
+                    "canceled"
+                } else if b.down {
+                    "down"
+                } else {
+                    "up"
+                }
             );
         }
         println!("buttons: {} transitions observed", buttons.len());

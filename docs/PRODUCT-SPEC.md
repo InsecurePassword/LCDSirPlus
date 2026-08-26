@@ -55,6 +55,10 @@ the G HUB conflict on the reference machine; the direct-HID path was
 physically confirmed during the 0.2.0 repair). Modes: `auto` (= hid),
 `hid`, `virtual`. Exact device contract and I/O discipline are documented in
 README.md and enforced in `src/backends/g13.rs` + `src/backends/hid.rs`.
+Direct HID refuses to open while Logitech Gaming Software's exact `LCore.exe`
+process is running, because simultaneous LGS and direct-HID LCD ownership was
+physically proven to flicker. Unrelated G HUB background processes are not
+blocked without equivalent evidence.
 
 ## Required telemetry sources
 

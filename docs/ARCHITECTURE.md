@@ -61,6 +61,10 @@ src\
 The backend thread is the only toucher of the device (mirrors the Go
 `LockOSThread` discipline). Frames are submitted only when changed; button
 edges are debounced in the backend thread and delivered as events.
+Before any direct-HID device open, a read-only ToolHelp snapshot rejects exact
+case-insensitive `LCore.exe` ownership with an actionable unavailable state.
+No device handle exists and no blank is sent on this refusal path; normal
+bounded reconnect continues so exiting LGS allows recovery.
 
 Normal runtime and direct-HID hardware tests acquire the per-session
 `Local\\LCDSirPlus.Runtime` mutex before opening a backend/device. Read-only CLI

@@ -17,11 +17,14 @@ requires a complete rerun.
 
 ## Logitech G13
 
+- Exit Logitech Gaming Software normally and verify `LCore.exe` is no longer
+  running before direct-HID testing. Do not stop unrelated G HUB services.
 - Run `LCDSirPlus.exe --hardware-discover`; record the accepted VID/PID, usage,
   input/output report lengths, and rejection summary. Device paths are private
   and must not be published.
 - Run `LCDSirPlus.exe --hardware-test --backend hid --duration-secs 60` and
-  visually confirm STEP 01-10, correct geometry, no tearing, and blank-on-close.
+  visually confirm STEP 01-10, correct geometry, no tearing or full-screen
+  disappear/return flicker, and blank-on-close.
 - Press each physical LCD button during the test and record down/release events.
 - Start normal mode and verify all four slot buttons, alert acknowledgement,
   preview fallback, tray controls, orientation, and inversion.

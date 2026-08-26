@@ -216,7 +216,10 @@ fn hid_worker(
                             pending = Some(transform_frame(&pixels, &orientation, invert));
                         }
                         Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
-                            device.close();
+                            if let Err(reason) = device.close() {
+                                let _ = msg_tx
+                                    .send(Message::State(BackendState::Disconnected { reason }));
+                            }
                             break 'outer;
                         }
                         Err(RecvTimeoutError::Timeout) => {}
@@ -226,8 +229,11 @@ fn hid_worker(
                         if last_sent.as_ref() != Some(&report) {
                             match device.write_report(&report) {
                                 Ok(()) => last_sent = Some(report),
-                                Err(reason) => {
-                                    device.close();
+                                Err(mut reason) => {
+                                    if let Err(close_error) = device.close() {
+                                        reason.push_str("; ");
+                                        reason.push_str(&close_error);
+                                    }
                                     let _ =
                                         msg_tx.send(Message::State(BackendState::Disconnected {
                                             reason,
@@ -264,7 +270,11 @@ fn hid_worker(
                                 }
                             }
                             Err(reason) => {
-                                device.close();
+                                let mut reason = reason;
+                                if let Err(close_error) = device.close() {
+                                    reason.push_str("; ");
+                                    reason.push_str(&close_error);
+                                }
                                 let _ = msg_tx
                                     .send(Message::State(BackendState::Disconnected { reason }));
                                 let _ = msg_tx.send(Message::Buttons(
@@ -285,7 +295,11 @@ fn hid_worker(
                         },
                         Ok(false) => {}
                         Err(reason) => {
-                            device.close();
+                            let mut reason = reason;
+                            if let Err(close_error) = device.close() {
+                                reason.push_str("; ");
+                                reason.push_str(&close_error);
+                            }
                             let _ =
                                 msg_tx.send(Message::State(BackendState::Disconnected { reason }));
                             let _ = msg_tx

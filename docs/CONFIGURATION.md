@@ -74,6 +74,12 @@ dashboard to the one-bar CPU layout automatically.
 | `logitech_orientation` | `normal` | `normal` \| `flip_x` \| `flip_y` \| `rotate_180` |
 | `logitech_invert` | 0 | bool |
 
+`auto` and `hid` require Logitech Gaming Software to be exited. If exact
+process name `LCore.exe` is present, LCDSirPlus keeps the backend unavailable,
+shows the automatic preview, and retries with the configured bounded backoff.
+It never terminates Logitech software and does not reject unrelated G HUB
+background components.
+
 ## LibreHardwareMonitor (optional temperature fallback)
 
 | Key | Default | Notes |

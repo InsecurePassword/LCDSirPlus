@@ -20,13 +20,17 @@ use windows::Win32::Devices::HumanInterfaceDevice::{
     GUID_DEVINTERFACE_HID, HIDD_ATTRIBUTES, HIDP_CAPS, PHIDP_PREPARSED_DATA,
 };
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_IO_PENDING, ERROR_NO_MORE_FILES, ERROR_OPERATION_ABORTED, GENERIC_READ,
+    GENERIC_WRITE, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     OPEN_EXISTING,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
+use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 use super::g13::{
@@ -36,6 +40,55 @@ use super::g13::{
 
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_INTERFACES_VISITED: usize = 256;
+const COMPETING_OWNER: &str = "LCore.exe";
+const OWNER_MESSAGE: &str =
+    "Logitech Gaming Software (LCore.exe) owns the G13 LCD; exit Logitech Gaming Software to release the G13 LCD";
+
+fn owner_gate(processes: Result<Vec<String>, String>) -> Result<(), String> {
+    let processes = processes
+        .map_err(|e| format!("cannot verify G13 LCD ownership ({e}); refusing direct HID"))?;
+    if processes
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(COMPETING_OWNER))
+    {
+        return Err(OWNER_MESSAGE.into());
+    }
+    Ok(())
+}
+
+fn running_process_names() -> Result<Vec<String>, String> {
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            .map_err(|e| format!("process enumeration failed: {e}"))?;
+        let mut names = Vec::new();
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let first = Process32FirstW(snapshot, &mut entry);
+        if let Err(error) = first {
+            let _ = CloseHandle(snapshot);
+            return Err(format!("process enumeration failed: {error}"));
+        }
+        loop {
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|value| *value == 0)
+                .unwrap_or(entry.szExeFile.len());
+            names.push(String::from_utf16_lossy(&entry.szExeFile[..end]));
+            if let Err(error) = Process32NextW(snapshot, &mut entry) {
+                if error.code() != ERROR_NO_MORE_FILES.to_hresult() {
+                    let _ = CloseHandle(snapshot);
+                    return Err(format!("process enumeration failed: {error}"));
+                }
+                break;
+            }
+        }
+        let _ = CloseHandle(snapshot);
+        Ok(names)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CandidateInfo {
@@ -243,7 +296,8 @@ fn validate_input_id(id: u8) -> Result<(), String> {
 /// An opened, validated G13 vendor collection.
 pub struct HidDevice {
     handle: HANDLE,
-    event: HANDLE,
+    read_event: HANDLE,
+    write_event: HANDLE,
 }
 
 // HANDLE is a raw wrapper; the device thread owns it exclusively.
@@ -253,6 +307,7 @@ impl HidDevice {
     /// Open the first matching G13 collection. Returns discovery evidence
     /// alongside the device so callers can log exact selection reasons.
     pub fn open() -> Result<(HidDevice, Discovery), String> {
+        owner_gate(running_process_names())?;
         let discovery = discover();
         let Some(candidate) = discovery.candidates.first() else {
             let detail = discovery
@@ -272,46 +327,48 @@ impl HidDevice {
             });
         };
         let handle = unsafe { open_path(&candidate.device_path)? };
-        let event = unsafe { CreateEventW(None, true, false, None) }
+        let read_event = unsafe { CreateEventW(None, true, false, None) }
             .map_err(|e| format!("CreateEventW failed: {}", e))?;
-        Ok((HidDevice { handle, event }, discovery))
+        let write_event = match unsafe { CreateEventW(None, true, false, None) } {
+            Ok(event) => event,
+            Err(error) => {
+                unsafe {
+                    let _ = CloseHandle(read_event);
+                    let _ = CloseHandle(handle);
+                }
+                return Err(format!("CreateEventW failed: {error}"));
+            }
+        };
+        Ok((
+            HidDevice {
+                handle,
+                read_event,
+                write_event,
+            },
+            discovery,
+        ))
     }
 
     /// Write one 992-byte output report with a bounded timeout.
     pub fn write_report(&self, report: &[u8; G13_OUTPUT_REPORT_LENGTH]) -> Result<(), String> {
-        let mut overlapped = self.new_overlapped();
+        unsafe { ResetEvent(self.write_event) }
+            .map_err(|e| format!("HID reset write event: {e}"))?;
+        let mut overlapped = self.new_overlapped(self.write_event);
+        let mut transferred = 0u32;
         let result = unsafe {
             windows::Win32::Storage::FileSystem::WriteFile(
                 self.handle,
                 Some(report.as_slice()),
-                None,
+                Some(&mut transferred),
                 Some(&mut overlapped),
             )
         };
         match result {
-            Ok(()) => Ok(()),
+            Ok(()) => validate_transfer("HID write", transferred, G13_OUTPUT_REPORT_LENGTH),
             Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => {
-                match unsafe { WaitForSingleObject(self.event, IO_TIMEOUT.as_millis() as u32) } {
-                    WAIT_OBJECT_0 => {
-                        let mut transferred = 0u32;
-                        unsafe {
-                            GetOverlappedResult(self.handle, &overlapped, &mut transferred, false)
-                        }
-                        .map_err(|e| format!("HID write result: {}", e))?;
-                        if transferred as usize != G13_OUTPUT_REPORT_LENGTH {
-                            return Err(format!(
-                                "HID write completed {} of {} bytes",
-                                transferred, G13_OUTPUT_REPORT_LENGTH
-                            ));
-                        }
-                        Ok(())
-                    }
-                    WAIT_TIMEOUT => {
-                        self.cancel_and_drain(&overlapped);
-                        Err("HID write timed out".into())
-                    }
-                    event => Err(format!("HID write wait failed: {:?}", event)),
-                }
+                transferred =
+                    self.wait_pending(self.write_event, &overlapped, IO_TIMEOUT, "HID write")?;
+                validate_transfer("HID write", transferred, G13_OUTPUT_REPORT_LENGTH)
             }
             Err(e) => Err(format!("HID write: {}", e)),
         }
@@ -323,42 +380,39 @@ impl HidDevice {
         buffer: &mut [u8; G13_INPUT_REPORT_LENGTH],
         timeout: Duration,
     ) -> Result<bool, String> {
-        let mut overlapped = self.new_overlapped();
+        unsafe { ResetEvent(self.read_event) }.map_err(|e| format!("HID reset read event: {e}"))?;
+        let mut overlapped = self.new_overlapped(self.read_event);
+        let mut transferred = 0u32;
         let result = unsafe {
             windows::Win32::Storage::FileSystem::ReadFile(
                 self.handle,
                 Some(buffer.as_mut_slice()),
-                None,
+                Some(&mut transferred),
                 Some(&mut overlapped),
             )
         };
         match result {
             Ok(()) => {
+                validate_transfer("HID read", transferred, G13_INPUT_REPORT_LENGTH)?;
                 validate_input_id(buffer[0])?;
                 Ok(true)
             }
             Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => {
-                match unsafe { WaitForSingleObject(self.event, timeout.as_millis() as u32) } {
+                match unsafe { WaitForSingleObject(self.read_event, timeout.as_millis() as u32) } {
                     WAIT_OBJECT_0 => {
-                        let mut transferred = 0u32;
-                        unsafe {
-                            GetOverlappedResult(self.handle, &overlapped, &mut transferred, false)
-                        }
-                        .map_err(|e| format!("HID read result: {}", e))?;
-                        if transferred as usize != G13_INPUT_REPORT_LENGTH {
-                            return Err(format!(
-                                "HID read completed {} of {} bytes",
-                                transferred, G13_INPUT_REPORT_LENGTH
-                            ));
-                        }
+                        transferred = self.overlapped_result(&overlapped, "HID read")?;
+                        validate_transfer("HID read", transferred, G13_INPUT_REPORT_LENGTH)?;
                         validate_input_id(buffer[0])?;
                         Ok(true)
                     }
                     WAIT_TIMEOUT => {
-                        self.cancel_and_drain(&overlapped);
+                        self.cancel_and_drain(&overlapped, "HID read")?;
                         Ok(false)
                     }
-                    event => Err(format!("HID read wait failed: {:?}", event)),
+                    result => {
+                        self.cancel_and_drain(&overlapped, "HID read")?;
+                        Err(format!("HID read wait failed: {result:?}"))
+                    }
                 }
             }
             Err(e) => Err(format!("HID read: {}", e)),
@@ -366,39 +420,100 @@ impl HidDevice {
     }
 
     #[allow(clippy::field_reassign_with_default)]
-    fn new_overlapped(&self) -> OVERLAPPED {
+    fn new_overlapped(&self, event: HANDLE) -> OVERLAPPED {
         let mut overlapped = OVERLAPPED::default();
-        overlapped.hEvent = self.event;
+        overlapped.hEvent = event;
         overlapped
     }
 
-    fn cancel_and_drain(&self, overlapped: &OVERLAPPED) {
+    fn overlapped_result(&self, overlapped: &OVERLAPPED, label: &str) -> Result<u32, String> {
+        let mut transferred = 0u32;
+        unsafe { GetOverlappedResult(self.handle, overlapped, &mut transferred, false) }
+            .map_err(|e| format!("{label} completion: {e}"))?;
+        Ok(transferred)
+    }
+
+    fn wait_pending(
+        &self,
+        event: HANDLE,
+        overlapped: &OVERLAPPED,
+        timeout: Duration,
+        label: &str,
+    ) -> Result<u32, String> {
+        match unsafe { WaitForSingleObject(event, timeout.as_millis() as u32) } {
+            WAIT_OBJECT_0 => self.overlapped_result(overlapped, label),
+            WAIT_TIMEOUT => {
+                self.cancel_and_drain(overlapped, label)?;
+                Err(format!("{label} timed out"))
+            }
+            result => {
+                self.cancel_and_drain(overlapped, label)?;
+                Err(format!("{label} wait failed: {result:?}"))
+            }
+        }
+    }
+
+    fn cancel_and_drain(&self, overlapped: &OVERLAPPED, label: &str) -> Result<(), String> {
         unsafe {
             let _ = CancelIoEx(self.handle, Some(overlapped));
-            let mut drained = 0u32;
-            let _ = GetOverlappedResult(self.handle, overlapped, &mut drained, true);
+            let mut transferred = 0u32;
+            match GetOverlappedResult(self.handle, overlapped, &mut transferred, true) {
+                Ok(()) => Ok(()),
+                Err(error) if error.code() == ERROR_OPERATION_ABORTED.to_hresult() => Ok(()),
+                Err(error) => Err(format!("{label} cancellation completion: {error}")),
+            }
         }
     }
 
     /// Blank the panel, cancel any pending I/O, and close handles.
-    pub fn close(&mut self) {
+    pub fn close(&mut self) -> Result<(), String> {
+        let blank_result = self.write_report(&super::g13::blank_report());
         unsafe {
-            let blank = super::g13::blank_report();
-            #[allow(clippy::field_reassign_with_default)]
-            let mut overlapped = self.new_overlapped();
-            if windows::Win32::Storage::FileSystem::WriteFile(
-                self.handle,
-                Some(blank.as_slice()),
-                None,
-                Some(&mut overlapped),
-            )
-            .is_ok()
-            {
-                let _ = WaitForSingleObject(self.event, 500);
-            }
             let _ = CancelIoEx(self.handle, None);
             let _ = CloseHandle(self.handle);
-            let _ = CloseHandle(self.event);
+            let _ = CloseHandle(self.read_event);
+            let _ = CloseHandle(self.write_event);
         }
+        blank_result.map_err(|e| format!("HID blank on close: {e}"))
+    }
+}
+
+fn validate_transfer(label: &str, transferred: u32, expected: usize) -> Result<(), String> {
+    if transferred as usize != expected {
+        return Err(format!(
+            "{label} completed {transferred} of {expected} bytes"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_name_matching_is_exact_and_case_insensitive() {
+        assert!(owner_gate(Ok(vec!["lcore.EXE".into()])).is_err());
+        assert!(owner_gate(Ok(vec!["lcore-helper.exe".into(), "lghub.exe".into()])).is_ok());
+    }
+
+    #[test]
+    fn owner_detection_errors_fail_closed_without_private_data() {
+        let error = owner_gate(Err("snapshot unavailable".into())).unwrap_err();
+        assert!(error.contains("refusing direct HID"));
+        assert!(!error.contains('\\'));
+    }
+
+    #[test]
+    fn owner_refusal_is_actionable_and_retry_can_recover() {
+        let refused = owner_gate(Ok(vec!["LCore.exe".into()])).unwrap_err();
+        assert!(refused.contains("exit Logitech Gaming Software"));
+        assert!(owner_gate(Ok(Vec::new())).is_ok());
+    }
+
+    #[test]
+    fn partial_transfers_are_rejected() {
+        assert!(validate_transfer("HID write", 991, 992).is_err());
+        assert!(validate_transfer("HID write", 992, 992).is_ok());
     }
 }
