@@ -88,7 +88,7 @@ DLLs; `auto` tries NVAPI then ADLX. `presentmon_*`
 `stutter_threshold_ms` 1..1000), `headset_*` (warn ≥ critical),
 `controller_index` (-1..3), `network_probe_*` (`icmp`\|`tcp`),
 `audio_poll_ms`. PresentMon resolves an explicitly configured path, a colocated
-console, `PATH`, or its Program Files locations. Frame metrics become stale
+console, or its known Program Files locations. Frame metrics become stale
 after five seconds without output; 1% and 0.1% lows use the configured history
 window, and changing target/capture settings starts a new session. PresentMon
 is a separate runtime prerequisite and is not redistributed.

@@ -214,13 +214,16 @@ impl Stats {
     }
 }
 
-pub fn spawn(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>) -> mpsc::Receiver<Update> {
+pub fn spawn(
+    config: Arc<RwLock<Config>>,
+    shutdown: Arc<AtomicBool>,
+) -> (mpsc::Receiver<Update>, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("telemetry-presentmon".into())
         .spawn(move || run(config, shutdown, tx))
         .expect("PresentMon telemetry thread");
-    rx
+    (rx, thread)
 }
 
 fn run(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Sender<Update>) {
@@ -267,7 +270,7 @@ impl Capture {
                 Ok(target) if target.pid != 0 => {
                     let key = capture_key(cfg, &target);
                     if self.child.is_none() || key != self.key {
-                        if self.retry_after.map(|retry| now < retry).unwrap_or(false) {
+                        if retry_pending(self.retry_after, now) {
                             self.unavailable(tx, "PresentMon restart cooldown".into());
                             return;
                         }
@@ -294,6 +297,7 @@ impl Capture {
                                 });
                             }
                             Err(e) => {
+                                self.schedule_retry(now);
                                 self.unavailable(tx, e);
                                 return;
                             }
@@ -312,11 +316,13 @@ impl Capture {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     self.stop();
+                    self.schedule_retry(now);
                     self.unavailable(tx, format!("PresentMon exited ({status})"));
                     return;
                 }
                 Err(e) => {
                     self.stop();
+                    self.schedule_retry(now);
                     self.unavailable(tx, format!("PresentMon process status failed: {e}"));
                     return;
                 }
@@ -331,29 +337,21 @@ impl Capture {
                 .unwrap_or(false)
         {
             self.stop();
-            self.retry_after = Some(now + RETRY_DELAY);
+            self.schedule_retry(now);
             self.unavailable(tx, "PresentMon produced no frames for 45 seconds".into());
             return;
         }
-        if self
-            .last_frame
-            .map(|last| now.duration_since(last) > STALE_AFTER)
-            .unwrap_or(false)
-        {
-            let mut game = self
-                .stats
-                .as_ref()
-                .map(|s| s.model(SystemTime::now(), cfg.presentmon_window, &self.target.name))
-                .unwrap_or_default();
-            for metric in [
-                &mut game.fps,
-                &mut game.one_percent,
-                &mut game.point_one_low,
-                &mut game.frame_time_ms,
-            ] {
-                metric.stale = metric.valid;
-            }
-            let detail = "capture stale: no frames for 5 seconds".to_string();
+        if let (Some(last), Some(stats)) = (self.last_frame, self.stats.as_ref()) {
+            let idle = now.duration_since(last);
+            let Some((game, detail)) = stale_projection(
+                stats,
+                SystemTime::now(),
+                cfg.presentmon_window,
+                &self.target.name,
+                idle,
+            ) else {
+                return;
+            };
             if self.last_unavailable != detail {
                 self.last_unavailable = detail.clone();
                 let _ = tx.send(Update {
@@ -477,6 +475,42 @@ impl Capture {
             });
         }
     }
+
+    fn schedule_retry(&mut self, now: Instant) {
+        self.retry_after = Some(now + RETRY_DELAY);
+    }
+}
+
+fn retry_pending(retry_after: Option<Instant>, now: Instant) -> bool {
+    retry_after.map(|retry| now < retry).unwrap_or(false)
+}
+
+fn stale_projection(
+    stats: &Stats,
+    now: SystemTime,
+    window: Duration,
+    process: &str,
+    idle: Duration,
+) -> Option<(GameStats, String)> {
+    if idle <= STALE_AFTER {
+        return None;
+    }
+    if idle > STALE_AFTER + STALE_AFTER {
+        return Some((
+            GameStats::default(),
+            "capture unavailable: stale data expired".into(),
+        ));
+    }
+    let mut game = stats.model(now, window + STALE_AFTER, process);
+    for metric in [
+        &mut game.fps,
+        &mut game.one_percent,
+        &mut game.point_one_low,
+        &mut game.frame_time_ms,
+    ] {
+        metric.stale = metric.valid;
+    }
+    Some((game, "capture stale: no frames for 5 seconds".into()))
 }
 
 fn read_output(mut reader: impl BufRead, tx: mpsc::Sender<String>) {
@@ -541,46 +575,55 @@ fn capture_key(cfg: &Config, target: &ProcessInfo) -> String {
 }
 
 fn resolve_executable(setting: &str) -> Result<PathBuf, String> {
-    let mut candidates = Vec::new();
     if !setting.trim().is_empty() && !setting.eq_ignore_ascii_case("auto") {
-        candidates.push(PathBuf::from(setting));
-    } else {
-        if let Ok(current) = std::env::current_exe() {
-            if let Some(dir) = current.parent() {
-                candidates.push(dir.join("PresentMon.exe"));
-            }
+        return validate_executable(Path::new(setting));
+    }
+
+    let current = std::env::current_exe().ok();
+    let program_roots = ["ProgramFiles", "ProgramFiles(x86)"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    for (candidate, root) in auto_locations(current.as_deref(), &program_roots) {
+        if let Ok(path) = validate_auto_executable(&candidate, &root) {
+            return Ok(path);
         }
-        if let Some(path) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&path).take(256) {
-                candidates.push(dir.join("PresentMon.exe"));
-            }
-        }
-        for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
-            if let Some(root) = std::env::var_os(variable) {
-                for base in [
-                    PathBuf::from(&root).join(r"Intel\PresentMon"),
-                    PathBuf::from(&root).join("PresentMon"),
-                ] {
-                    candidates.push(base.join("PresentMon.exe"));
-                    if let Ok(entries) = std::fs::read_dir(base) {
-                        for entry in entries.flatten().take(128) {
-                            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                                candidates.push(entry.path().join("PresentMon.exe"));
-                            } else {
-                                candidates.push(entry.path());
-                            }
-                        }
+    }
+    Err("PresentMon console executable not found in colocated or Program Files locations".into())
+}
+
+fn auto_locations(current: Option<&Path>, program_roots: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
+    let mut locations = Vec::new();
+    if let Some(dir) = current.and_then(Path::parent) {
+        locations.push((dir.join("PresentMon.exe"), dir.to_path_buf()));
+    }
+    for root in program_roots {
+        for base in [root.join(r"Intel\PresentMon"), root.join("PresentMon")] {
+            locations.push((base.join("PresentMon.exe"), root.clone()));
+            if let Ok(entries) = std::fs::read_dir(&base) {
+                for entry in entries.flatten().take(128) {
+                    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        locations.push((entry.path().join("PresentMon.exe"), root.clone()));
+                    } else {
+                        locations.push((entry.path(), root.clone()));
                     }
                 }
             }
         }
     }
-    for candidate in candidates {
-        if let Ok(path) = validate_executable(&candidate) {
-            return Ok(path);
-        }
+    locations
+}
+
+fn validate_auto_executable(path: &Path, root: &Path) -> Result<PathBuf, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("PresentMon trusted root {}: {e}", root.display()))?;
+    let executable = validate_executable(path)?;
+    if !executable.starts_with(&root) {
+        return Err("PresentMon candidate escapes its trusted root".into());
     }
-    Err("PresentMon console executable not found in configured, colocated, PATH, or Program Files locations".into())
+    Ok(executable)
 }
 
 fn validate_executable(path: &Path) -> Result<PathBuf, String> {
@@ -795,23 +838,78 @@ mod tests {
     }
 
     #[test]
-    fn stale_projection_marks_every_valid_metric() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
-        let mut game = GameStats {
-            fps: Metric::valid(60.0, now),
-            one_percent: Metric::valid(50.0, now),
-            point_one_low: Metric::valid(40.0, now),
-            frame_time_ms: Metric::valid(16.0, now),
+    fn stale_projection_retains_then_expires_metrics() {
+        let frame_at = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+        let mut stats = Stats::new(30.0);
+        stats.add(&Frame {
+            at: frame_at,
+            frame_ms: 16.0,
             ..Default::default()
-        };
-        for metric in [
-            &mut game.fps,
-            &mut game.one_percent,
-            &mut game.point_one_low,
-            &mut game.frame_time_ms,
-        ] {
-            metric.stale = metric.valid;
-        }
-        assert!(game.fps.stale && game.one_percent.stale && game.point_one_low.stale);
+        });
+
+        let (stale, _) = stale_projection(
+            &stats,
+            frame_at + Duration::from_secs(6),
+            Duration::from_secs(5),
+            "game.exe",
+            Duration::from_secs(6),
+        )
+        .unwrap();
+        assert!(stale.active && stale.fps.valid && stale.fps.stale);
+
+        let (expired, _) = stale_projection(
+            &stats,
+            frame_at + Duration::from_secs(11),
+            Duration::from_secs(5),
+            "game.exe",
+            Duration::from_secs(11),
+        )
+        .unwrap();
+        assert!(!expired.active && !expired.fps.valid);
+    }
+
+    #[test]
+    fn retry_cooldown_blocks_until_deadline() {
+        let now = Instant::now();
+        assert!(retry_pending(Some(now + RETRY_DELAY), now));
+        assert!(!retry_pending(Some(now), now));
+    }
+
+    #[test]
+    fn auto_locations_do_not_include_path_candidates() {
+        let app = Path::new(r"C:\LCDForge\LCDForge.exe");
+        let roots = vec![PathBuf::from(r"C:\Program Files")];
+        let locations = auto_locations(Some(app), &roots);
+        assert!(locations
+            .iter()
+            .any(|(path, _)| path == Path::new(r"C:\LCDForge\PresentMon.exe")));
+        assert!(!locations
+            .iter()
+            .any(|(path, _)| path == Path::new(r"C:\UntrustedPath\PresentMon.exe")));
+    }
+
+    #[test]
+    fn auto_validation_rejects_candidates_outside_trusted_root() {
+        let temp = std::env::temp_dir().join(format!("lcdforge-presentmon-{}", std::process::id()));
+        let root = temp.join("trusted");
+        let outside = temp.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let candidate = outside.join("PresentMon.exe");
+        std::fs::write(&candidate, b"test").unwrap();
+        assert!(validate_auto_executable(&candidate, &root).is_err());
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn owner_thread_stops_and_joins_after_shutdown() {
+        let config = Arc::new(RwLock::new(Config {
+            safe_mode: true,
+            ..Config::default()
+        }));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (_updates, thread) = spawn(config, Arc::clone(&shutdown));
+        shutdown.store(true, Ordering::Relaxed);
+        assert!(thread.join().is_ok());
     }
 }

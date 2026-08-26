@@ -610,7 +610,7 @@ unsafe fn release<T>(value: *mut T) {
 }
 
 fn adlx_status(code: AdlxResult, operation: &str) -> Result<(), String> {
-    if matches!(code, 0 | 2 | 3) {
+    if matches!(code, 0..=2) {
         Ok(())
     } else {
         Err(format!("{operation} failed ({code})"))
@@ -627,6 +627,15 @@ mod tests {
         assert_eq!(candidates("nvapi"), &["nvapi"]);
         assert_eq!(candidates("adlx"), &["adlx"]);
         assert!(candidates("off").is_empty());
+    }
+
+    #[test]
+    fn adlx_accepts_only_success_equivalent_results() {
+        for code in [0, 1, 2] {
+            assert!(adlx_status(code, "test").is_ok());
+        }
+        assert!(adlx_status(3, "test").is_err());
+        assert!(adlx_status(-1, "test").is_err());
     }
 
     #[test]

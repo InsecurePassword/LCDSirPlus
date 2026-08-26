@@ -32,11 +32,15 @@ pub struct Telemetry {
     pub updates: mpsc::Receiver<Update>,
     config: Arc<RwLock<Config>>,
     shutdown: Arc<AtomicBool>,
+    presentmon_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Telemetry {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.presentmon_thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -498,7 +502,8 @@ pub fn spawn(cfg: &Config) -> Telemetry {
         slow_tx.clone(),
     );
     spawn_gpu(Arc::clone(&config), Arc::clone(&shutdown), slow_tx);
-    let presentmon_rx = presentmon::spawn(Arc::clone(&config), Arc::clone(&shutdown));
+    let (presentmon_rx, presentmon_thread) =
+        presentmon::spawn(Arc::clone(&config), Arc::clone(&shutdown));
 
     let worker = Worker {
         config: Arc::clone(&config),
@@ -539,6 +544,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
         updates: rx,
         config,
         shutdown,
+        presentmon_thread: Some(presentmon_thread),
     }
 }
 
@@ -649,6 +655,7 @@ mod tests {
             updates,
             config: Arc::clone(&shared),
             shutdown: Arc::new(AtomicBool::new(false)),
+            presentmon_thread: None,
         };
         let changed = Config {
             audio_enabled: false,
