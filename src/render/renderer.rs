@@ -150,7 +150,7 @@ impl Renderer {
             f,
             81,
             18,
-            "VMEM",
+            "VRAM",
             &canonical_percent_metric(&s.readings, MetricKey::VRAMUtilization, ""),
             77,
             7,
@@ -927,10 +927,10 @@ mod tests {
     use crate::model::{Alert, ControllerBattery, GameStats, Reading};
     use std::time::{Duration, SystemTime};
 
-    const GOLDEN_NORMAL: &str = "3cee8a2dae57386c1d33b6039d28c79046e569f4c87f41692493dfae345e7525";
+    const GOLDEN_NORMAL: &str = "16eaeeb02f8ed4b89f721cad9557b749ad5ca2c24a7a9ff41b9682d678cec9a4";
     const GOLDEN_UNAVAILABLE: &str =
-        "79a153e1a0fba0904b8b9b75cf9daf6a2eaff15eb838fc178e5e68220928373a";
-    const GOLDEN_STALE: &str = "c1a643090e938bd807a8e9b5c43791c6ae0efe20093e7c27762e1ee6d378ab6d";
+        "0ba19f9f03f908986009a86c3766755b5570e699fb97409dbabaa55a941a6940";
+    const GOLDEN_STALE: &str = "2905e74cd8844a8b168a7575b663b889232c04aa8b0dedac7b57f58d42208854";
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
@@ -1050,6 +1050,33 @@ mod tests {
     }
 
     #[test]
+    fn attached_target_snapshot_matches() {
+        let snapshot = Snapshot {
+            cpu_dual: true,
+            date_text: "2026-08-26 WEDNESDAY".into(),
+            date_short_text: "2026-08-26 WED".into(),
+            time_text: "16:42:13".into(),
+            ..Default::default()
+        };
+        let view = View {
+            slot_modules: [
+                "HEADSET_BATTERY".into(),
+                "FPS_CURRENT".into(),
+                "GPU_TEMP".into(),
+                "PACKET_LOSS".into(),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            Renderer::new()
+                .render(&snapshot, OverlayOptions::default(), &view)
+                .hash_hex(),
+            "c93f879db203dbe8a974f797bec8f8f222c61191006b074207cf80f8a19f3cb2"
+        );
+    }
+
+    #[test]
     fn utilization_bars_use_solid_and_explicit_state_patterns() {
         let now = at(42);
         let cases = vec![
@@ -1148,17 +1175,32 @@ mod tests {
     }
 
     #[test]
-    fn fixed_dashboard_uses_full_vmem_label() {
-        let f = render_dashboard(&sample_snapshot());
+    fn fixed_dashboard_uses_vram_label_only() {
+        let current = render_dashboard(&sample_snapshot());
+        let mut previous = current.clone();
+        previous.fill_rect(81, 19, text_width("VRAM", 1), 5, false);
+        previous.text(81, 19, "VMEM", true);
+
+        let changed: Vec<_> = current
+            .pixels
+            .iter()
+            .zip(&previous.pixels)
+            .enumerate()
+            .filter(|(_, (current, previous))| current != previous)
+            .map(|(i, _)| ((i % WIDTH) as i32, (i / WIDTH) as i32))
+            .collect();
+        assert_eq!(changed.len(), 10);
         assert!(
-            f.get(93, 19) || f.get(94, 19) || f.get(95, 19),
-            "VMEM label missing final M"
+            changed
+                .iter()
+                .all(|&(x, y)| (86..=91).contains(&x) && (19..=23).contains(&y)),
+            "label diff escaped audited bounds: {changed:?}"
         );
     }
 
     #[test]
     fn fixed_bars_ignore_noncanonical_sources() {
-        // The fixed MEM/GPU/VMEM bars read only the canonical readings; a
+        // The fixed MEM/GPU/VRAM bars read only the canonical readings; a
         // change to unrelated snapshot fields (temps feed slots, not bars)
         // must leave the bar regions pixel-identical.
         let s = sample_snapshot();

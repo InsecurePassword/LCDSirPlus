@@ -9,7 +9,7 @@ x: 0                                                        159
    ├─────────────────────────────┬────────────────────────────┤ y=7
    │ CPU: Cache CCD micro-bar     │ GPU load bar               │
    │      Frequency CCD micro-bar │                            │
-   │ MEM load bar                 │ VMEM load bar              │
+   │ MEM load bar                 │ VRAM load bar              │
    ├──────────────┬──────────────┬──────────────┬──────────────┤ y=25
    │ slot/button 1│ slot/button 2│ slot/button 3│ slot/button 4│
    └──────────────┴──────────────┴──────────────┴──────────────┘ y=42
@@ -34,15 +34,15 @@ On CPUs with one CCD the left column renders one full-height CPU bar
 ## Golden frames
 
 Rendered with: date `2026-08-08 Saturday`, time `10:44:14`, Cache CCD 22%,
-Frequency CCD 47%, MEM 63%, GPU 91%, VMEM 72%, headset 75% (raw level 3),
+Frequency CCD 47%, MEM 63%, GPU 91%, VRAM 72%, headset 75% (raw level 3),
 FPS 144, 1% low 118, GPU temp 74 °C; slots
 `HEADSET_BATTERY FPS_CURRENT GPU_TEMP FPS_1LOW`.
 
 | Variant | Logical pixel-buffer SHA-256 |
 |---|---|
-| Normal (dual-CCD) | `3cee8a2dae57386c1d33b6039d28c79046e569f4c87f41692493dfae345e7525` |
-| Bars unavailable | `79a153e1a0fba0904b8b9b75cf9daf6a2eaff15eb838fc178e5e68220928373a` |
-| Bars stale | `c1a643090e938bd807a8e9b5c43791c6ae0efe20093e7c27762e1ee6d378ab6d` |
+| Normal (dual-CCD) | `16eaeeb02f8ed4b89f721cad9557b749ad5ca2c24a7a9ff41b9682d678cec9a4` |
+| Bars unavailable | `0ba19f9f03f908986009a86c3766755b5570e699fb97409dbabaa55a941a6940` |
+| Bars stale | `2905e74cd8844a8b168a7575b663b889232c04aa8b0dedac7b57f58d42208854` |
 
 These hashes are release invariants inherited from the Go 0.2.0 renderer. A
 change to any of them is a fixed-layout change and requires explicit visual
