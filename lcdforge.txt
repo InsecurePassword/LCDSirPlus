@@ -1,0 +1,163 @@
+##############################################################################
+# LCDForge 0.3.0 configuration (Rust port)
+#
+# Blank lines and lines beginning with # are ignored. Each setting is a key
+# followed by whitespace-separated values. The physical 160x43 layout is
+# fixed; these settings select data sources, thresholds, and the ordered
+# module list for each LCD button. Saving a valid file hot-reloads it;
+# invalid changes are rejected with file/line diagnostics and the prior
+# valid configuration stays active.
+#
+# Every selector that supports one defaults to "auto".
+
+config_refresh_ms       1000
+telemetry_interval_ms   auto          # 300
+render_interval_ms      auto          # 100
+preview_mode            auto          # auto | always | never
+preview_scale           4
+start_minimized         0
+start_at_login          0
+safe_mode               0
+
+# Date/time render from the Windows local clock and locale.
+date_format             yyyy-MM-dd dddd
+time_format             HH:mm:ss
+
+##############################################################################
+# Four physical button slots. A short press cycles the matching list.
+
+slot_0  HEADSET_BATTERY CPU_TEMP CONTROLLER_BATTERY
+slot_1  FPS_CURRENT FPS_1LOW FRAME_TIME SESSION_TIME
+slot_2  GPU_TEMP PING JITTER AUDIO
+slot_3  PACKET_LOSS MIC_STATUS SESSION_SUMMARY PROVIDER_STATUS
+
+##############################################################################
+# Cache/Frequency CCD bars (dual-CCD Ryzen). Detection is fully native:
+# L3/NUMA topology groups the dies; CPUID L3 size labels the 3D V-Cache die
+# (e.g. 96 MB vs 32 MB on the 9950X3D). Process Lasso is not required.
+#
+# ccd_source             auto | manual
+# ccd_cache_processors   auto or logical-processor list (0,1,2 / 0-15)
+# ccd_frequency_processors
+
+ccd_source              auto
+ccd_cache_processors    auto
+ccd_frequency_processors auto
+
+##############################################################################
+# Logitech G13 backend. The SDK mode is retired: the Logitech runtime
+# triggers the G HUB compatibility conflict. Direct HID needs no driver,
+# service, or administrator rights.
+#
+# logitech_backend       auto | hid | virtual   (auto = hid with reconnect)
+
+logitech_backend        auto
+logitech_reconnect_ms   auto          # 5000, doubles to reconnect_max on failure
+logitech_reconnect_max_ms auto        # 60000
+logitech_button_poll_ms auto          # 50
+logitech_button_debounce_ms auto      # 40
+logitech_friendly_name  LCDForge
+logitech_orientation    normal        # normal | flip_x | flip_y | rotate_180
+logitech_invert         0
+
+##############################################################################
+# LibreHardwareMonitor: demoted to an optional temps-only fallback (Phase 2).
+# In auto mode it is contacted only when the GPU vendor DLL cannot provide a
+# value. Its loopback web server must then be enabled on port 8085.
+
+lhm_mode                auto          # auto | on | off
+lhm_url                 auto          # http://127.0.0.1:8085/data.json
+lhm_interval_ms         auto          # 300
+lhm_stale_ms            auto          # 3000
+# Optional stable SensorId overrides from a diagnostic bundle:
+# lhm_cpu_temp_sensor    /amdcpu/0/temperature/2
+# lhm_gpu_temp_sensor    /lpc/it8720f/temperature/2
+
+# GPU provider chain (Phase 2): nvapi -> adlx -> lhm.
+gpu_provider            auto
+
+##############################################################################
+# PresentMon game performance provider (Phase 2).
+
+presentmon_enabled      1
+presentmon_path         auto
+presentmon_interval_ms  auto          # 1000
+presentmon_window_ms    auto          # 60000
+presentmon_target_mode  foreground    # foreground | process_name | disabled
+presentmon_process_name ""
+stutter_threshold_ms    33.34
+
+##############################################################################
+# SteelSeries Arctis 7P+ (VID 1038 / PID 2212) — Phase 2.
+
+headset_enabled         1
+headset_poll_ms         auto          # 15000
+headset_query_timeout_ms auto         # 1200
+headset_stale_ms        auto          # 45000
+headset_warn_percent    25
+headset_critical_percent 0
+headset_estimate_hours  1
+
+# XInput controller battery — Phase 2.
+controller_enabled      1
+controller_index        -1            # -1 = first connected
+controller_poll_ms      auto          # 10000
+
+# Optional network-quality probe — Phase 2.
+network_probe_enabled   0
+network_probe_method    icmp          # icmp | tcp
+network_probe_target    1.1.1.1
+network_probe_interval_ms auto        # 1000
+network_probe_timeout_ms auto         # 1500
+network_probe_window    30
+
+# Windows default audio endpoints — Phase 2.
+audio_enabled           1
+audio_poll_ms           auto          # 1000
+
+##############################################################################
+# Discord local RPC active-speaker overlay — Phase 3.
+# Create a Discord developer application, add your account as a tester, put
+# the client ID below, then authorize (Phase 3 CLI).
+
+discord_enabled         1
+discord_client_id       ""
+discord_redirect_uri    http://127.0.0.1
+discord_linger_ms       700
+discord_max_speakers    2
+discord_show_self       0
+discord_show_channel    0
+
+##############################################################################
+# Hung-window detector. Physical button 3 is intentionally fixed. The
+# guarded termination flow lands in Phase 4; detection knobs validate now.
+
+hang_enabled            1
+hang_button             3
+hang_hold_ms            2000
+hang_probe_interval_ms  2000
+hang_probe_timeout_ms   350
+hang_failures_required  3
+hang_minimum_ms         6000
+hang_ignore lcdforge.exe explorer.exe dwm.exe winlogon.exe csrss.exe services.exe lsass.exe smss.exe fontdrvhost.exe sihost.exe taskhostw.exe
+
+# Alert thresholds — Phase 2/4.
+cpu_temp_warning        85
+cpu_temp_critical       95
+gpu_temp_warning        83
+gpu_temp_critical       90
+memory_warning          90
+vmem_warning            95
+critical_alert_linger_ms 3000
+
+##############################################################################
+# Logging.
+
+log_level               info          # debug | info | warn | error
+log_max_bytes           2097152
+log_backups             3
+
+# Personal overrides can be kept separately:
+# include lcdforge.local.txt
+
+# end of file

@@ -1,0 +1,5 @@
+/target
+Cargo.lock.orig
+*.log
+artifacts/
+lcdforge.local.txt

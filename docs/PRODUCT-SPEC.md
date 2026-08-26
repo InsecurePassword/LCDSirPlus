@@ -1,0 +1,86 @@
+# LCDForge 0.3.0 product specification
+
+## Purpose
+
+LCDForge provides a modern fixed dashboard for the Logitech G13 160×43
+monochrome LCD when games occupy the user's normal displays. The 0.3.0 Rust
+port preserves the 0.2.0 product contract while removing three dependencies:
+the Logitech runtime, Process Lasso, and per-tick network polling for
+core telemetry.
+
+## Normal screen
+
+The normal screen always shows:
+
+- Windows-local date/day/time;
+- independent Cache-CCD and Frequency-CCD CPU load (dual-CCD CPUs), or one
+  full-height CPU load bar (single-CCD CPUs);
+- system memory load;
+- GPU load and VRAM load (Phase 2 providers; explicit unavailable state until
+  then);
+- four button-aligned configurable telemetry modules.
+
+The fixed layout is intentionally static. The lower slot contents are the
+user-customizable surface.
+
+## Button behavior
+
+- Physical button 1–4 short press: cycle matching slot forward.
+- Preview left click: equivalent short press. Preview right click: backward.
+- Selection wraps and persists across config reloads (module identity is
+  preserved when a list changes).
+- Unavailable modules display an explicit unavailable/stale state; they are
+  never silently replaced by unrelated data.
+
+## CCD bars (Process Lasso removed)
+
+Detection is native and automatic:
+
+1. `GetLogicalProcessorInformationEx(RelationCache)` groups logical
+   processors by L3 cache domain; NUMA nodes are the fallback grouping.
+2. Pinned-thread CPUID `Fn8000_001D` compares L3 sizes to label the 3D
+   V-Cache die (larger L3 = cache CCD; e.g. 96 MB vs 32 MB on the 9950X3D).
+3. Per-logical-processor busy time from
+   `NtQuerySystemInformation(SystemProcessorPerformanceInformation)` deltas
+   is aggregated over each die's mask. No sensors, no drivers, no services.
+4. Manual override: `ccd_cache_processors` / `ccd_frequency_processors`.
+5. One detected domain renders the single-bar layout.
+
+## G13 backend
+
+Direct HID only. The Logitech SDK backend is retired (its runtime triggers
+the G HUB conflict on the reference machine; the direct-HID path was
+physically confirmed during the 0.2.0 repair). Modes: `auto` (= hid),
+`hid`, `virtual`. Exact device contract and I/O discipline are documented in
+README.md and enforced in `src/backends/g13.rs` + `src/backends/hid.rs`.
+
+## Required telemetry sources
+
+- Windows local clock: date/day/time.
+- Windows scheduler: per-logical-processor CPU load (CCD aggregation).
+- GlobalMemoryStatusEx: memory load.
+- AMD/Intel vendor GPU DLLs → LibreHardwareMonitor loopback JSON (temps
+  only, optional): GPU load/VRAM/temps (Phase 2).
+- PresentMon: FPS/frame timing (Phase 2).
+- Arctis 7P+ USB HID: headset battery (Phase 2).
+- Discord local RPC: active speaker overlay (Phase 3).
+
+## Operational requirements
+
+- Standard user; medium integrity; no elevation.
+- Local-first and offline (Discord token exchange in Phase 3 is the only
+  network dependency; operator probes optional).
+- No arbitrary scripts/plugins; no kernel drivers; no services; no listeners.
+- Provider failures isolated; explicit stale/unavailable states.
+- Config hot reload preserves last valid state.
+- Reconnect after device loss with bounded, capped backoff.
+- No unchanged-frame submission.
+- Bounded histories/logs/protocol inputs.
+- Single static native binary; no runtime installation.
+
+## Non-goals
+
+- G19 color LCD; direct Logitech SDK/LCore support.
+- Steam/NVIDIA overlay hooking; kernel-driver sensor access.
+- Email integration; remote telemetry/control; arbitrary third-party
+  modules; layout editor; Process Lasso integration.

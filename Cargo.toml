@@ -1,0 +1,33 @@
+[package]
+name = "lcdforge"
+version = "0.3.0"
+edition = "2021"
+description = "LCDForge: LCDSirReal-style dashboard for the Logitech G13 160x43 monochrome LCD"
+license = "MIT"
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_Console",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Globalization",
+    "Win32_Graphics",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = "z"
