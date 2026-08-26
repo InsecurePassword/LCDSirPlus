@@ -52,6 +52,7 @@ struct UiShared {
     pixels: Mutex<Vec<u8>>,
     scale: AtomicU32,
     preview_visible: AtomicBool,
+    manual_visibility: AtomicBool,
     event_tx: OnceLock<Sender<UiEvent>>,
     hwnd: AtomicIsize,
 }
@@ -60,6 +61,7 @@ static UI: UiShared = UiShared {
     pixels: Mutex::new(Vec::new()),
     scale: AtomicU32::new(4),
     preview_visible: AtomicBool::new(false),
+    manual_visibility: AtomicBool::new(false),
     event_tx: OnceLock::new(),
     hwnd: AtomicIsize::new(0),
 };
@@ -77,6 +79,7 @@ impl Ui {
         let (frame_tx, frame_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         UI.scale.store(scale.max(1), Ordering::Relaxed);
         UI.preview_visible.store(show_preview, Ordering::Relaxed);
+        UI.manual_visibility.store(false, Ordering::Relaxed);
         let _ = UI.event_tx.set(event_tx);
         let thread = std::thread::Builder::new()
             .name("lcdforge-ui".into())
@@ -100,12 +103,20 @@ impl Ui {
 
     #[allow(dead_code)] // tray toggle drives visibility directly; API kept for config changes
     pub fn set_preview_visible(&self, visible: bool) {
-        UI.preview_visible.store(visible, Ordering::Relaxed);
+        if UI.preview_visible.swap(visible, Ordering::Relaxed) == visible {
+            return;
+        }
         unsafe {
             let hwnd = UI.hwnd.load(Ordering::Relaxed);
             if hwnd != 0 {
                 let _ = ShowWindow(HWND(hwnd as _), if visible { SW_SHOW } else { SW_HIDE });
             }
+        }
+    }
+
+    pub fn set_preview_auto_visible(&self, visible: bool) {
+        if !UI.manual_visibility.load(Ordering::Relaxed) {
+            self.set_preview_visible(visible);
         }
     }
 
@@ -285,6 +296,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
 unsafe fn toggle_preview(hwnd: HWND) {
     let visible = !UI.preview_visible.load(Ordering::Relaxed);
+    UI.manual_visibility.store(true, Ordering::Relaxed);
     UI.preview_visible.store(visible, Ordering::Relaxed);
     let _ = ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
 }

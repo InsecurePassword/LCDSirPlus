@@ -12,5 +12,6 @@ pub mod headset;
 pub mod lhm;
 pub mod memory;
 pub mod netif;
+pub mod network;
 pub mod presentmon;
 pub mod xinput;

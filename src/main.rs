@@ -2,6 +2,7 @@
 // Rust port of the LCDForge Go application (0.2.0) — native-first telemetry,
 // direct-HID G13 backend, no Logitech runtime dependency.
 
+mod alerts;
 mod app;
 mod backends;
 mod config;
@@ -16,6 +17,7 @@ mod parser;
 mod png;
 mod providers;
 mod render;
+mod runtime;
 mod sha256;
 mod slots;
 mod telemetry;
@@ -59,6 +61,8 @@ struct Cli {
     hang_detector_smoke: bool,
     hang_action_smoke: bool,
     hang_action_negative_smoke: bool,
+    instance_smoke: bool,
+    instance_smoke_child: bool,
     backend: backends::BackendKind,
     duration: Duration,
     safe_mode: bool,
@@ -80,6 +84,8 @@ fn parse_args() -> Result<Cli, String> {
         hang_detector_smoke: false,
         hang_action_smoke: false,
         hang_action_negative_smoke: false,
+        instance_smoke: false,
+        instance_smoke_child: false,
         backend: backends::BackendKind::Hid,
         duration: Duration::from_secs(30),
         safe_mode: false,
@@ -107,6 +113,8 @@ fn parse_args() -> Result<Cli, String> {
             "--hang-detector-smoke" => cli.hang_detector_smoke = true,
             "--hang-action-smoke" => cli.hang_action_smoke = true,
             "--hang-action-negative-smoke" => cli.hang_action_negative_smoke = true,
+            "--instance-smoke" => cli.instance_smoke = true,
+            "--instance-smoke-child" => cli.instance_smoke_child = true,
             "--backend" => {
                 i += 1;
                 match args.get(i).map(|s| s.as_str()) {
@@ -173,6 +181,8 @@ fn main() {
         cli.hang_detector_smoke,
         cli.hang_action_smoke,
         cli.hang_action_negative_smoke,
+        cli.instance_smoke,
+        cli.instance_smoke_child,
     ]
     .into_iter()
     .filter(|selected| *selected)
@@ -193,6 +203,28 @@ fn main() {
     }
     if cli.hang_action_negative_smoke {
         std::process::exit(providers::hang::run_action_smoke(true));
+    }
+    if cli.instance_smoke_child {
+        let blocked = runtime::InstanceGuard::acquire().is_ok_and(|guard| guard.is_none());
+        std::process::exit(if blocked { 0 } else { 1 });
+    }
+    if cli.instance_smoke {
+        let first = runtime::InstanceGuard::acquire().ok().flatten();
+        let blocked = first.is_some()
+            && std::env::current_exe()
+                .ok()
+                .and_then(|exe| {
+                    std::process::Command::new(exe)
+                        .arg("--instance-smoke-child")
+                        .status()
+                        .ok()
+                })
+                .is_some_and(|status| status.success());
+        drop(first);
+        let released = runtime::InstanceGuard::acquire().is_ok_and(|guard| guard.is_some());
+        let passed = blocked && released;
+        println!("INSTANCE SMOKE {}", if passed { "OK" } else { "FAILED" });
+        std::process::exit(if passed { 0 } else { 1 });
     }
 
     if cli.validate {
@@ -264,16 +296,42 @@ fn main() {
     }
 
     if cli.hardware_test {
-        std::process::exit(app::run_hardware_test(
-            cli.config.clone(),
-            cli.backend,
-            cli.duration,
-        ));
+        let instance = if cli.backend == backends::BackendKind::Hid {
+            match runtime::InstanceGuard::acquire() {
+                Ok(Some(guard)) => Some(guard),
+                Ok(None) => {
+                    eprintln!("LCDForge is already running; direct-HID test refused");
+                    std::process::exit(5);
+                }
+                Err(error) => {
+                    eprintln!("single-instance ownership failed: {error}");
+                    std::process::exit(5);
+                }
+            }
+        } else {
+            None
+        };
+        let code = app::run_hardware_test(cli.config.clone(), cli.backend, cli.duration);
+        drop(instance);
+        std::process::exit(code);
     }
 
-    std::process::exit(app::run(app::RunOptions {
+    let instance = match runtime::InstanceGuard::acquire() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            eprintln!("LCDForge is already running");
+            std::process::exit(5);
+        }
+        Err(error) => {
+            eprintln!("single-instance ownership failed: {error}");
+            std::process::exit(5);
+        }
+    };
+    let code = app::run(app::RunOptions {
         config_path: cli.config,
         preview_always: cli.preview,
         safe_mode: cli.safe_mode,
-    }));
+    });
+    drop(instance);
+    std::process::exit(code);
 }

@@ -117,6 +117,9 @@ pub fn run(opts: RunOptions) -> i32 {
     init_logging(&cfg, None);
     crate::log_info!("LCDForge {} starting", env!("CARGO_PKG_VERSION"));
     crate::log_info!("configuration: {}", cfg.path);
+    let startup_executable = crate::runtime::canonical_executable().ok();
+    let mut startup_synced = None;
+    sync_startup_if_needed(&cfg, startup_executable.as_deref(), &mut startup_synced);
 
     // CCD topology (native detection; Process Lasso retired).
     let topology = match (&cfg.ccd_source, &cfg.ccd_cache_processors) {
@@ -135,11 +138,8 @@ pub fn run(opts: RunOptions) -> i32 {
 
     // UI (tray + preview per mode).
     let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
-    let show_preview = match cfg.preview_mode.as_str() {
-        "always" => true,
-        "never" => false,
-        _ => opts.preview_always, // auto: preview only when forced/CLI
-    };
+    let show_preview =
+        opts.preview_always || (!cfg.start_minimized && cfg.preview_mode.as_str() == "always");
     let ui = Ui::spawn(cfg.preview_scale.max(1) as u32, show_preview, ui_tx);
 
     // Providers.
@@ -152,6 +152,7 @@ pub fn run(opts: RunOptions) -> i32 {
     let slots = Manager::new(&cfg, [0; 4]);
     let mut slot_indexes: [usize; 4] = [0; 4];
     let mut hang_hold = hang::HoldState::default();
+    let mut alerts = crate::alerts::Manager::default();
 
     // Config watcher state: (mtime, len) of primary.
     let mut watcher = ConfigWatcher::new(&config_path);
@@ -160,6 +161,7 @@ pub fn run(opts: RunOptions) -> i32 {
     let mut last_render = Instant::now() - cfg.render_interval;
     let mut snapshot = Snapshot::default();
     let mut running = true;
+    let mut backend_state = BackendState::Discovering;
 
     while running {
         let now = Instant::now();
@@ -188,6 +190,14 @@ pub fn run(opts: RunOptions) -> i32 {
                         telemetry_runtime.update_config(&cfg);
                         discord_runtime.update_config(&cfg);
                         slots.apply(&cfg);
+                        sync_startup_if_needed(
+                            &cfg,
+                            startup_executable.as_deref(),
+                            &mut startup_synced,
+                        );
+                        if !opts.preview_always {
+                            apply_preview_policy(&ui, &cfg, &backend_state);
+                        }
                         crate::log_info!("configuration reloaded");
                     }
                     Err(e) => {
@@ -221,6 +231,7 @@ pub fn run(opts: RunOptions) -> i32 {
         {
             log_hang_audit(&audit);
         }
+        alerts.evaluate(&mut snapshot, &cfg, SystemTime::now());
 
         if now.duration_since(last_render) >= cfg.render_interval {
             last_render = now;
@@ -255,13 +266,27 @@ pub fn run(opts: RunOptions) -> i32 {
             match message {
                 Message::State(state) => match state {
                     BackendState::Connected { kind } => {
-                        crate::log_info!("backend connected: {}", kind.name())
+                        crate::log_info!("backend connected: {}", kind.name());
+                        backend_state = BackendState::Connected { kind };
+                        if !opts.preview_always
+                            && cfg.preview_mode == "auto"
+                            && !cfg.start_minimized
+                        {
+                            ui.set_preview_auto_visible(kind != BackendKind::Hid);
+                        }
                     }
                     BackendState::Disconnected { reason } => {
-                        crate::log_warn!("backend disconnected: {}", reason)
+                        crate::log_warn!("backend disconnected: {}", reason);
+                        backend_state = BackendState::Disconnected { reason };
+                        if !opts.preview_always
+                            && cfg.preview_mode == "auto"
+                            && !cfg.start_minimized
+                        {
+                            ui.set_preview_auto_visible(true);
+                        }
                     }
-                    BackendState::Discovering => {}
-                    BackendState::ShutDown => {}
+                    BackendState::Discovering => backend_state = BackendState::Discovering,
+                    BackendState::ShutDown => backend_state = BackendState::ShutDown,
                 },
                 Message::Buttons(events) => {
                     for event in events {
@@ -271,7 +296,14 @@ pub fn run(opts: RunOptions) -> i32 {
                             &telemetry.hung,
                             hang_available(&telemetry),
                         );
-                        apply_hold_command(command, &slots, &mut slot_indexes, &cfg);
+                        apply_hold_command(
+                            command,
+                            &slots,
+                            &mut slot_indexes,
+                            &cfg,
+                            &mut alerts,
+                            &mut snapshot,
+                        );
                     }
                 }
             }
@@ -281,6 +313,10 @@ pub fn run(opts: RunOptions) -> i32 {
         while let Ok(event) = ui_rx.try_recv() {
             match event {
                 UiEvent::SlotCycle { slot, backward } => {
+                    if slot == 3 && alerts.acknowledge_highest(&mut snapshot) {
+                        crate::log_info!("acknowledged highest critical alert");
+                        continue;
+                    }
                     let delta: i64 = if backward { -1 } else { 1 };
                     slots.cycle(slot, delta);
                     slot_indexes = slots.indexes();
@@ -300,6 +336,54 @@ pub fn run(opts: RunOptions) -> i32 {
     backend.shutdown();
     ui.shutdown();
     0
+}
+
+fn preview_for_backend(cfg: &Config, state: &BackendState) -> bool {
+    match cfg.preview_mode.as_str() {
+        "always" => true,
+        "never" => false,
+        _ => !matches!(
+            state,
+            BackendState::Connected {
+                kind: BackendKind::Hid
+            }
+        ),
+    }
+}
+
+fn apply_preview_policy(ui: &Ui, cfg: &Config, state: &BackendState) {
+    match cfg.preview_mode.as_str() {
+        "always" if !cfg.start_minimized => ui.set_preview_visible(true),
+        "never" => ui.set_preview_visible(false),
+        "auto" if !cfg.start_minimized => {
+            ui.set_preview_auto_visible(preview_for_backend(cfg, state))
+        }
+        _ => {}
+    }
+}
+
+fn sync_startup_if_needed(
+    cfg: &Config,
+    executable: Option<&std::path::Path>,
+    synced: &mut Option<bool>,
+) {
+    if cfg.safe_mode || *synced == Some(cfg.start_at_login) {
+        return;
+    }
+    let Some(executable) = executable else {
+        crate::log_warn!(
+            "start-at-login synchronization skipped: canonical executable unavailable"
+        );
+        return;
+    };
+    match crate::runtime::sync_startup(cfg.start_at_login, executable) {
+        Ok(()) => *synced = Some(cfg.start_at_login),
+        Err(error) => crate::log_warn!(
+            "start-at-login synchronization failed enabled={}: {}",
+            cfg.start_at_login,
+            error
+        ),
+    }
 }
 
 /// Isolated hardware test: owns the device directly for honest transport
@@ -522,6 +606,9 @@ fn apply_telemetry(snapshot: &mut Snapshot, telemetry: &crate::telemetry::Update
     snapshot.cpu_temp = telemetry.cpu_temp;
     snapshot.gpu_temp = telemetry.gpu_temp;
     snapshot.game = telemetry.game.clone();
+    snapshot.ping_ms = telemetry.ping_ms;
+    snapshot.jitter_ms = telemetry.jitter_ms;
+    snapshot.packet_loss = telemetry.packet_loss;
 
     // A sampled idle interval is valid telemetry, not unavailable data.
     snapshot.network_in = Metric::default();
@@ -563,10 +650,16 @@ fn apply_hold_command(
     slots: &Manager,
     indexes: &mut [usize; 4],
     cfg: &Config,
+    alerts: &mut crate::alerts::Manager,
+    snapshot: &mut Snapshot,
 ) {
     match command {
         hang::HoldCommand::None => {}
         hang::HoldCommand::Cycle { index, backward } => {
+            if index == 3 && alerts.acknowledge_highest(snapshot) {
+                crate::log_info!("acknowledged highest critical alert");
+                return;
+            }
             let module = slots.cycle(index, if backward { -1 } else { 1 });
             *indexes = slots.indexes();
             crate::log_debug!("button {} -> slot module {}", index + 1, module);
@@ -632,6 +725,8 @@ mod tests {
         let mut update = crate::telemetry::Update {
             cpu_temp: Metric::valid(67.0, now),
             gpu_temp: Metric::valid(74.0, now),
+            ping_ms: Metric::valid(12.0, now),
+            packet_loss: Metric::valid(0.0, now),
             net: Some(crate::providers::netif::NetThroughput::default()),
             ..Default::default()
         };
@@ -640,6 +735,8 @@ mod tests {
         apply_telemetry(&mut snapshot, &update, now);
         assert!(snapshot.cpu_temp.valid && !snapshot.cpu_temp.stale);
         assert!(snapshot.gpu_temp.valid && snapshot.gpu_temp.stale);
+        assert_eq!(snapshot.ping_ms.value, 12.0);
+        assert!(snapshot.packet_loss.valid);
         assert!(snapshot.network_in.valid && snapshot.network_out.valid);
 
         apply_telemetry(&mut snapshot, &crate::telemetry::Update::default(), now);
@@ -647,5 +744,44 @@ mod tests {
         assert!(!snapshot.gpu_temp.valid);
         assert!(!snapshot.network_in.valid);
         assert!(!snapshot.audio_volume.valid);
+    }
+
+    #[test]
+    fn preview_policy_tracks_only_physical_hid_availability() {
+        let mut cfg = Config::default();
+        assert!(!preview_for_backend(
+            &cfg,
+            &BackendState::Connected {
+                kind: BackendKind::Hid
+            }
+        ));
+        assert!(preview_for_backend(
+            &cfg,
+            &BackendState::Connected {
+                kind: BackendKind::Virtual
+            }
+        ));
+        assert!(preview_for_backend(
+            &cfg,
+            &BackendState::Disconnected {
+                reason: "test".into()
+            }
+        ));
+        cfg.preview_mode = "never".into();
+        assert!(!preview_for_backend(&cfg, &BackendState::Discovering));
+        cfg.preview_mode = "always".into();
+        assert!(preview_for_backend(&cfg, &BackendState::Discovering));
+    }
+
+    #[test]
+    fn safe_mode_never_attempts_startup_synchronization() {
+        let cfg = Config {
+            safe_mode: true,
+            start_at_login: true,
+            ..Config::default()
+        };
+        let mut synced = None;
+        sync_startup_if_needed(&cfg, None, &mut synced);
+        assert_eq!(synced, None);
     }
 }

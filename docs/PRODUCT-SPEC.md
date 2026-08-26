@@ -79,6 +79,25 @@ README.md and enforced in `src/backends/g13.rs` + `src/backends/hid.rs`.
 - No unchanged-frame submission.
 - Bounded histories/logs/protocol inputs.
 - Single static native binary; no runtime installation.
+- One normal/direct-HID runtime per Windows session; read-only and virtual test
+  commands remain available alongside it.
+- Optional network-quality probes are disabled by default, bounded to one
+  configured endpoint, and always disabled in safe mode.
+- Optional current-user startup registration never replaces or removes a
+  foreign Run value and is never mutated in safe mode.
+
+## Alerts and preview
+
+Current CPU/GPU temperature, memory/VRAM load, and headset battery readings
+produce deterministic configured alert episodes. Hung-target interaction has
+highest display priority, followed by unacknowledged alerts, Discord speakers,
+and the dashboard. Physical button 4 acknowledges the highest episode; an
+episode rearms only after clearing and recurring.
+
+Preview mode `auto` follows physical HID availability, `always` starts visible
+unless minimized, and `never` starts hidden. Backend reconnect state changes
+reuse the existing preview window rather than creating another UI owner and do
+not override a manual tray toggle.
 
 ## Hung-window detector
 

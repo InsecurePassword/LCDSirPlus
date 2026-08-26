@@ -28,7 +28,11 @@ Every selector that supports one defaults to `auto`.
 | `time_format` | `HH:mm:ss` | Windows GetTimeFormat tokens |
 
 `preview_mode auto` shows the preview only when the physical backend is
-unavailable (LCDSirReal `testwindow` semantics).
+unavailable (LCDSirReal `testwindow` semantics). A tray toggle takes precedence
+over later `auto` backend changes, and `start_minimized` suppresses automatic
+preview display. `start_at_login` owns only the current user's
+`LCDForge` Run value and refuses to replace or remove a foreign value. Safe mode
+never changes startup registration.
 
 ## Slots (fixed four-button contract)
 
@@ -86,7 +90,7 @@ dashboard to the one-bar CPU layout automatically.
 DLLs; `auto` tries NVAPI then ADLX. `presentmon_*`
 (`presentmon_target_mode`: `foreground`\|`process_name`\|`disabled`;
 `stutter_threshold_ms` 1..1000), `headset_*` (warn ≥ critical),
-`controller_index` (-1..3), `network_probe_*` (`icmp`\|`tcp`),
+`controller_index` (-1..3), `network_probe_*` (`auto`\|`icmp`\|`tcp`),
 `audio_poll_ms`. PresentMon resolves an explicitly configured path or, for
 `auto`, a colocated `PresentMon.exe` beside LCDForge. Frame metrics become stale
 after five seconds without output; 1% and 0.1% lows use the configured history
@@ -94,6 +98,14 @@ window, and changing target/capture settings starts a new session. PresentMon
 is a separate runtime prerequisite and is not redistributed.
 `headset_query_timeout_ms` bounds the complete HID write/read sequence after
 bounded device enumeration.
+
+Network quality probing is off by default and performs no DNS or network I/O
+while disabled or in safe mode. A target is one host/IP for ICMP, one
+`host:port` for TCP, or either form for `auto`; `auto` tries ICMP before one
+TCP fallback (port 443 when omitted). Interval, timeout, and history-window
+settings are hot-reloaded. Probe timeout/loss contributes to packet loss,
+while DNS/native provider failures retain prior values as stale and mark the
+provider unavailable.
 
 ## Discord (Phase 3)
 
@@ -124,7 +136,10 @@ variable. Use `--discord-clear-token` to remove the local record.
 
 `cpu_temp_warning/critical` (0..150, critical ≥ warning), `gpu_temp_*`,
 `memory_warning`/`vmem_warning` (0..100), `critical_alert_linger_ms`
-(0..60000).
+(0..60000). Only current, valid readings create episodes. Alerts are ordered by
+severity, first observation, then stable identity; physical button 4
+acknowledges the highest unacknowledged warning/critical episode before its
+normal slot action. A cleared episode rearms if it later recurs.
 
 ## Logging
 

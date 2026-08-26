@@ -27,7 +27,10 @@ src\
 │   ├── gpu.rs          trusted NVAPI/ADLX loading + canonical GPU metrics
 │   ├── hang.rs         bounded WM_NULL probes + exact process identity tracker
 │   ├── lhm.rs          optional loopback temperatures-only fallback
-│   └── presentmon.rs   owned console capture + CSV frame statistics
+│   ├── presentmon.rs   owned console capture + CSV frame statistics
+│   └── network.rs      bounded optional ICMP/TCP quality probe
+├── runtime.rs          named-mutex ownership + owned HKCU startup value
+├── alerts.rs           configured alert episodes + acknowledgement
 ├── telemetry.rs        provider workers, cadence, stale state, health
 ├── hardware_test.rs    STEP 01..10 sequence, transports, button capture
 ├── logging.rs          leveled log + size-capped rotation
@@ -50,12 +53,19 @@ src\
 | telemetry-gpu | read-only NVAPI/ADLX calls | event channel |
 | telemetry-presentmon | target/capture lifecycle | update channel |
 | telemetry-hang | visible-window probes and continuous-failure tracker | update channel |
+| telemetry-network-quality | optional bounded DNS + ICMP/TCP probe | update channel |
 | lcdforge-discord | verified pipe, authentication, subscriptions, reconnect | snapshot channel |
 | telemetry-lhm/headset | bounded blocking HTTP/HID | event channel |
 
 The backend thread is the only toucher of the device (mirrors the Go
 `LockOSThread` discipline). Frames are submitted only when changed; button
 edges are debounced in the backend thread and delivered as events.
+
+Normal runtime and direct-HID hardware tests acquire the per-session
+`Local\\LCDForge2.Runtime` mutex before opening a backend/device. Read-only CLI
+commands and virtual tests do not acquire it. The RAII owner closes the handle
+on return. Startup registration uses a transaction and mutates only an exact
+owned current-user Run value.
 
 ## Data flow (one tick)
 
@@ -70,7 +80,10 @@ clock + CPU/memory + NVAPI/ADLX + optional LHM + PresentMon
 ```
 
 Backend button reports flow back: `parse_input` → `ButtonTracker.observe`
-(debounce) → app cycles the matching slot.
+(debounce) → app handles the matching action. Button 3 remains exclusive to a
+bound hung-target hold; button 4 acknowledges the highest active alert before
+cycling its slot. Render priority is hung hold, unacknowledged critical alert,
+Discord speaker overlay, then dashboard.
 
 ## Determinism
 
@@ -90,6 +103,10 @@ Backend button reports flow back: `parse_input` → `ButtonTracker.observe`
   canceled button releases so no press is ever stuck.
 - Providers: absent data renders explicit `N/A`/`STALE` states — the fixed
   bars read only canonical readings, never legacy projections.
+- Network quality: disabled and safe-mode policies clear metrics and perform no
+  I/O. One configured endpoint is resolved/probed per bounded interval; timeout
+  and loss remain distinct from provider/API failure, and reload discards old
+  policy history before publication.
 - Hung detector: query-only visible top-level-window enumeration captures
   HWND/PID/creation-time/image identity, applies configured and Windows-directory
   exclusions, and counts only documented `WM_NULL` timeouts after revalidating

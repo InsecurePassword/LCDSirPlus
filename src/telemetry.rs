@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::model::{
     ControllerBattery, Freshness, GameStats, HeadsetBattery, HungTarget, Metric, Reading,
 };
-use crate::providers::{audio, gpu, hang, headset, lhm, netif, presentmon, xinput};
+use crate::providers::{audio, gpu, hang, headset, lhm, netif, network, presentmon, xinput};
 
 const DEFAULT_LHM_URL: &str = "http://127.0.0.1:8085/data.json";
 const TICK: Duration = Duration::from_millis(50);
@@ -27,6 +27,9 @@ pub struct Update {
     pub gpu_readings: Vec<Reading>,
     pub game: GameStats,
     pub hung: Vec<HungTarget>,
+    pub ping_ms: Metric,
+    pub jitter_ms: Metric,
+    pub packet_loss: Metric,
     /// Per-provider health: (name, last poll succeeded).
     pub providers: Vec<(String, bool)>,
 }
@@ -37,6 +40,7 @@ pub struct Telemetry {
     shutdown: Arc<AtomicBool>,
     presentmon_thread: Option<std::thread::JoinHandle<()>>,
     hang_thread: Option<std::thread::JoinHandle<()>>,
+    network_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Telemetry {
@@ -46,6 +50,9 @@ impl Drop for Telemetry {
             let _ = thread.join();
         }
         if let Some(thread) = self.hang_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.network_thread.take() {
             let _ = thread.join();
         }
     }
@@ -77,6 +84,7 @@ struct Worker {
     net_attempt: Option<Instant>,
     presentmon_rx: mpsc::Receiver<presentmon::Update>,
     hang_rx: mpsc::Receiver<hang::Update>,
+    network_rx: mpsc::Receiver<network::Update>,
     temps_need_refresh: Arc<AtomicBool>,
     native_gpu_temp: Metric,
     lhm_gpu_temp: Metric,
@@ -109,6 +117,7 @@ fn enabled(cfg: &Config, provider: &str) -> bool {
         "controller" => cfg.controller_enabled,
         "audio" => cfg.audio_enabled,
         "net" => true,
+        "network_probe" => cfg.network_probe_enabled,
         "gpu" => cfg.gpu_provider != "off",
         "presentmon" => cfg.presentmon_enabled && cfg.presentmon_target_mode != "disabled",
         _ => false,
@@ -177,6 +186,19 @@ impl Worker {
             self.set_provider("Hung window detector", update.available);
             if let Some(error) = update.error {
                 crate::log_debug!("hung-window detector unavailable: {}", error);
+            }
+        }
+        while let Ok(update) = self.network_rx.try_recv() {
+            self.update.ping_ms = update.ping;
+            self.update.jitter_ms = update.jitter;
+            self.update.packet_loss = update.loss;
+            if cfg.network_probe_enabled && !cfg.safe_mode {
+                self.set_provider("network probe", update.available);
+                if let Some(error) = update.error {
+                    crate::log_debug!("network probe unavailable: {}", error);
+                }
+            } else {
+                self.remove_provider("network probe");
             }
         }
 
@@ -380,6 +402,29 @@ impl Worker {
             self.update.game = GameStats::default();
             self.remove_provider("presentmon");
         }
+        if enabled(cfg, "network_probe") {
+            let stale_after = cfg
+                .network_probe_interval
+                .saturating_mul(3)
+                .max(Duration::from_secs(3));
+            let wall_now = SystemTime::now();
+            for metric in [
+                &mut self.update.ping_ms,
+                &mut self.update.jitter_ms,
+                &mut self.update.packet_loss,
+            ] {
+                metric.stale = metric.valid
+                    && (metric.stale
+                        || metric.updated.is_some_and(|updated| {
+                            wall_now.duration_since(updated).unwrap_or(Duration::ZERO) > stale_after
+                        }));
+            }
+        } else {
+            self.update.ping_ms = Metric::default();
+            self.update.jitter_ms = Metric::default();
+            self.update.packet_loss = Metric::default();
+            self.remove_provider("network probe");
+        }
         self.temps_need_refresh.store(
             !self.update.cpu_temp.valid
                 || self.update.cpu_temp.stale
@@ -520,6 +565,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
     let (presentmon_rx, presentmon_thread) =
         presentmon::spawn(Arc::clone(&config), Arc::clone(&shutdown));
     let (hang_rx, hang_thread) = hang::spawn(Arc::clone(&config), Arc::clone(&shutdown));
+    let (network_rx, network_thread) = network::spawn(Arc::clone(&config), Arc::clone(&shutdown));
 
     let worker = Worker {
         config: Arc::clone(&config),
@@ -535,6 +581,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
         net_attempt: None,
         presentmon_rx,
         hang_rx,
+        network_rx,
         temps_need_refresh,
         native_gpu_temp: Metric::default(),
         lhm_gpu_temp: Metric::default(),
@@ -563,6 +610,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
         shutdown,
         presentmon_thread: Some(presentmon_thread),
         hang_thread: Some(hang_thread),
+        network_thread: Some(network_thread),
     }
 }
 
@@ -675,6 +723,7 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             presentmon_thread: None,
             hang_thread: None,
+            network_thread: None,
         };
         let changed = Config {
             audio_enabled: false,

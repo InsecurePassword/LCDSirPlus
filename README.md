@@ -111,8 +111,10 @@ logs live under `%LOCALAPPDATA%\LCDForge2\`.
   console remain optional runtime prerequisites; absence renders unavailable.
 - **P3 (implemented)**: verified Discord desktop IPC active-speaker overlay,
   RPC OAuth authorization, refresh, and current-user DPAPI credential storage.
-- **P4**: guarded hung-process termination, alerts, diagnostics bundle,
-  installer/packaging.
+- **P4 (runtime implemented)**: guarded hung-process termination, alerts,
+  single-instance ownership, startup registration, preview fallback, and
+  optional network-quality probes. Diagnostics bundle and installer/packaging
+  remain pending.
 
 ## Discord authorization
 
