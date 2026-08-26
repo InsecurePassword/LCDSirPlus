@@ -131,12 +131,14 @@ The secret is never accepted in configuration or process arguments. The
 access/refresh credential is stored at
 `%LOCALAPPDATA%\LCDForge2\discord.token`, encrypted for the current Windows
 user with DPAPI. `--discord-clear-token` removes only that local copy; revoke
-the application in Discord separately when needed.
+the application in Discord separately when needed. Credential access rejects
+reparse points and hard links and verifies the pinned local path boundary.
 
 Authorization uses Discord's verified local named-pipe `AUTHORIZE` flow with
 scopes `identify`, `rpc`, and `rpc.voice.read`. LCDForge opens no callback
 listener and launches no browser. The only Discord network request is the
-HTTPS token exchange/refresh.
+HTTPS token exchange/refresh, which has a finite 20-second deadline. Discord
+pipe operations are cancelable during shutdown and configuration reload.
 
 ## License
 
