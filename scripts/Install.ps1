@@ -67,6 +67,37 @@ function Get-ShortcutTarget {
     return $shell.CreateShortcut($Path).TargetPath
 }
 
+function Get-ShortcutState {
+    param([string]$Path)
+    if (-not [IO.File]::Exists($Path)) { return $null }
+    Assert-RegularSingleLinkFile $Path | Out-Null
+    $file = Get-Item -LiteralPath $Path -Force
+    return [pscustomobject]@{
+        Bytes = [IO.File]::ReadAllBytes($Path)
+        Attributes = $file.Attributes
+        CreationTimeUtc = $file.CreationTimeUtc
+        LastAccessTimeUtc = $file.LastAccessTimeUtc
+        LastWriteTimeUtc = $file.LastWriteTimeUtc
+        Target = Get-ShortcutTarget $Path
+    }
+}
+
+function Restore-ShortcutState {
+    param([string]$Path, [object]$Before, [string]$Executable)
+    if ($null -eq $Before) {
+        if ([IO.File]::Exists($Path) -and (Get-NormalizedFullPath (Get-ShortcutTarget $Path)).Equals((Get-NormalizedFullPath $Executable), [StringComparison]::OrdinalIgnoreCase)) {
+            Remove-Item -LiteralPath $Path -Force
+        }
+        return
+    }
+    if ([IO.File]::Exists($Path)) { [IO.File]::SetAttributes($Path, [IO.FileAttributes]::Normal) }
+    [IO.File]::WriteAllBytes($Path, $Before.Bytes)
+    [IO.File]::SetCreationTimeUtc($Path, $Before.CreationTimeUtc)
+    [IO.File]::SetLastWriteTimeUtc($Path, $Before.LastWriteTimeUtc)
+    [IO.File]::SetLastAccessTimeUtc($Path, $Before.LastAccessTimeUtc)
+    [IO.File]::SetAttributes($Path, $Before.Attributes)
+}
+
 function Set-OwnedShortcut {
     param([string]$Path, [string]$Executable)
     $parent = Assert-SafeLocalDirectory -Path (Split-Path $Path -Parent) -Create
@@ -83,13 +114,27 @@ function Set-OwnedShortcut {
     Assert-RegularSingleLinkFile $Path | Out-Null
 }
 
-function Get-RunValue {
+function Get-RunState {
     if (-not (Test-Path -LiteralPath $RunKey)) { return $null }
-    $item = Get-ItemProperty -LiteralPath $RunKey -Name $RunName -ErrorAction SilentlyContinue
-    if ($null -eq $item) { return $null }
-    $property = $item.PSObject.Properties[$RunName]
-    if ($null -eq $property) { return $null }
-    return [string]$property.Value
+    $key = Get-Item -LiteralPath $RunKey
+    if (-not $key.GetValueNames().Contains($RunName)) { return $null }
+    return [pscustomobject]@{
+        Value = [string]$key.GetValue($RunName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        Kind = $key.GetValueKind($RunName)
+    }
+}
+
+function Restore-RunState {
+    param([object]$Before, [string]$Executable)
+    if ($null -ne $Before) {
+        if (-not (Test-Path -LiteralPath $RunKey)) { New-Item -Path $RunKey -Force | Out-Null }
+        New-ItemProperty -LiteralPath $RunKey -Name $RunName -Value $Before.Value -PropertyType $Before.Kind.ToString() -Force | Out-Null
+        return
+    }
+    $current = Get-RunState
+    if ($null -ne $current -and (Test-CommandTargets -Command $current.Value -ExecutablePath $Executable)) {
+        Remove-ItemProperty -LiteralPath $RunKey -Name $RunName -ErrorAction SilentlyContinue
+    }
 }
 
 $package = Assert-SafeLocalDirectory -Path $PackageRoot
@@ -120,13 +165,13 @@ $runBefore = $null
 $shortcutBefore = $null
 if (-not $NoIntegration) {
     if ([IO.File]::Exists($shortcutPath)) {
-        $shortcutBefore = Get-ShortcutTarget $shortcutPath
-        if (-not (Get-NormalizedFullPath $shortcutBefore).Equals((Get-NormalizedFullPath $executable), [StringComparison]::OrdinalIgnoreCase)) {
+        $shortcutBefore = Get-ShortcutState $shortcutPath
+        if (-not (Get-NormalizedFullPath $shortcutBefore.Target).Equals((Get-NormalizedFullPath $executable), [StringComparison]::OrdinalIgnoreCase)) {
             throw 'foreign Start Menu shortcut uses the owned name'
         }
     }
-    $runBefore = Get-RunValue
-    if ($EnableLogin -and $null -ne $runBefore -and -not (Test-CommandTargets -Command $runBefore -ExecutablePath $executable)) {
+    $runBefore = Get-RunState
+    if ($EnableLogin -and $null -ne $runBefore -and -not (Test-CommandTargets -Command $runBefore.Value -ExecutablePath $executable)) {
         throw 'foreign HKCU Run value uses the owned name'
     }
 }
@@ -137,8 +182,8 @@ $backup = Join-Path $parent ('.LCDForge2.backup.' + $nonce)
 $failed = Join-Path $parent ('.LCDForge2.failed.' + $nonce)
 $published = $false
 $backedUp = $false
-$createdShortcut = $false
-$createdRun = $false
+$shortcutWriteStarted = $false
+$runWriteStarted = $false
 
 try {
     [IO.Directory]::CreateDirectory($stage) | Out-Null
@@ -183,11 +228,11 @@ try {
     [void]@(Read-VerifiedManifest -Root $install -ManifestName 'INSTALL-MANIFEST.txt' -AllowedUndeclared @('lcdforge.txt'))
 
     if (-not $NoIntegration) {
-        $createdShortcut = $null -eq $shortcutBefore
+        $shortcutWriteStarted = $true
         Set-OwnedShortcut -Path $shortcutPath -Executable $executable
         if ($EnableLogin) {
             if (-not (Test-Path -LiteralPath $RunKey)) { New-Item -Path $RunKey -Force | Out-Null }
-            $createdRun = $null -eq $runBefore
+            $runWriteStarted = $true
             New-ItemProperty -LiteralPath $RunKey -Name $RunName -Value ('"{0}"' -f $executable) -PropertyType String -Force | Out-Null
         }
     }
@@ -201,6 +246,12 @@ try {
 }
 catch {
     $failure = $_
+    $integrationRollbackFailure = $null
+    try {
+        if ($runWriteStarted) { Restore-RunState -Before $runBefore -Executable $executable }
+        if ($shortcutWriteStarted) { Restore-ShortcutState -Path $shortcutPath -Before $shortcutBefore -Executable $executable }
+    }
+    catch { $integrationRollbackFailure = $_ }
     if ($published -and [IO.Directory]::Exists($install)) {
         [IO.Directory]::Move($install, $failed)
     }
@@ -213,20 +264,6 @@ catch {
             Remove-Item -LiteralPath $temporary -Recurse -Force
         }
     }
-    try {
-        if ($createdRun -and (Test-Path -LiteralPath $RunKey)) {
-            $value = Get-RunValue
-            if (Test-CommandTargets -Command $value -ExecutablePath $executable) {
-                Remove-ItemProperty -LiteralPath $RunKey -Name $RunName -ErrorAction SilentlyContinue
-            }
-        }
-        if ($createdShortcut -and [IO.File]::Exists($shortcutPath)) {
-            $target = Get-ShortcutTarget $shortcutPath
-            if ((Get-NormalizedFullPath $target).Equals((Get-NormalizedFullPath $executable), [StringComparison]::OrdinalIgnoreCase)) {
-                Remove-Item -LiteralPath $shortcutPath -Force
-            }
-        }
-    }
-    catch { }
+    if ($null -ne $integrationRollbackFailure) { throw "installation failed and integration rollback failed: $integrationRollbackFailure" }
     throw $failure
 }

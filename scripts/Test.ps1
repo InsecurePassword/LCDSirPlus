@@ -8,6 +8,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
+$config = Join-Path $repo 'lcdforge.txt'
 Set-Location -LiteralPath $repo
 
 Write-Host '== PowerShell syntax ==' -ForegroundColor Cyan
@@ -50,7 +51,7 @@ Write-Host '== smoke: --version ==' -ForegroundColor Cyan
 if ($LASTEXITCODE -ne 0) { throw '--version failed' }
 
 Write-Host '== smoke: --validate-config ==' -ForegroundColor Cyan
-& (Join-Path $repo 'target\release\lcdforge.exe') --validate-config --config (Join-Path $repo 'lcdforge.txt')
+& (Join-Path $repo 'target\release\lcdforge.exe') --validate-config --config $config
 if ($LASTEXITCODE -ne 0) { throw 'shipped configuration is invalid' }
 
 Write-Host '== smoke: --hardware-discover (read-only) ==' -ForegroundColor Cyan
@@ -58,7 +59,7 @@ Write-Host '== smoke: --hardware-discover (read-only) ==' -ForegroundColor Cyan
 Write-Host '   (exit code 3 = no G13 present; acceptable on machines without the device)'
 
 Write-Host '== smoke: --hardware-test --backend virtual ==' -ForegroundColor Cyan
-& (Join-Path $repo 'target\release\lcdforge.exe') --hardware-test --backend virtual --duration-secs 1
+& (Join-Path $repo 'target\release\lcdforge.exe') --hardware-test --backend virtual --duration-secs 1 --config $config
 if ($LASTEXITCODE -ne 0) { throw 'virtual hardware test failed' }
 
 Write-Host ''

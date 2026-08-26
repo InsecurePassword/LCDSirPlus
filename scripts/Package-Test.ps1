@@ -50,6 +50,50 @@ function Test-ArchiveInventory {
     finally { $zip.Dispose() }
 }
 
+function Assert-PrivateBytesAbsent {
+    param([byte[]]$Bytes, [string[]]$Needles, [switch]$SensitivePackage)
+    $views = New-Object 'Collections.Generic.List[string]'
+    [void]$views.Add([Text.Encoding]::Latin1.GetString($Bytes))
+    foreach ($encoding in @([Text.Encoding]::Unicode, [Text.Encoding]::BigEndianUnicode)) {
+        foreach ($offset in @(0, 1)) {
+            $count = $Bytes.Length - $offset
+            if (($count -band 1) -ne 0) { $count-- }
+            if ($count -gt 0) { [void]$views.Add($encoding.GetString($Bytes, $offset, $count)) }
+        }
+    }
+    foreach ($text in $views) {
+        foreach ($needle in $Needles) {
+            if (-not [string]::IsNullOrWhiteSpace($needle) -and $text.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                throw 'package member contains a machine-specific value'
+            }
+        }
+        if ($text -match '(?i)(?:[A-Z]:[\\/]|/)(?:Users|home)[\\/]') {
+            throw 'package member contains a user-profile path'
+        }
+        if ($SensitivePackage -and $text -match '(?i)(PACKAGE-PRIVATE-SENTINEL|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|sk-[A-Za-z0-9]{20,})') {
+            throw 'binary package contains a private-key or token sentinel'
+        }
+    }
+}
+
+function Assert-ArchivePrivacy {
+    param([string]$Archive, [string[]]$Needles, [switch]$SensitivePackage)
+    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        foreach ($entry in $zip.Entries) {
+            if ($entry.Length -gt 128MB) { throw 'archive member exceeds privacy scan bound' }
+            $input = $entry.Open()
+            $memory = New-Object IO.MemoryStream
+            try {
+                $input.CopyTo($memory)
+                Assert-PrivateBytesAbsent -Bytes $memory.ToArray() -Needles $Needles -SensitivePackage:$SensitivePackage
+            }
+            finally { $memory.Dispose(); $input.Dispose() }
+        }
+    }
+    finally { $zip.Dispose() }
+}
+
 Write-Host '== verify outer checksums and archive names ==' -ForegroundColor Cyan
 $sumLines = @([IO.File]::ReadAllLines((Join-Path $artifactRoot 'SHA256SUMS.txt'), [Text.Encoding]::UTF8) | Where-Object { $_.Length -gt 0 })
 if ($sumLines.Count -ne 3) { throw 'outer checksum inventory mismatch' }
@@ -83,6 +127,21 @@ $runKey = 'HKCU:\Software\LCDForge2-PackageTest-' + [Guid]::NewGuid().ToString('
 $env:LCDFORGE_PACKAGE_TEST = '1'
 
 try {
+    $privacyFixture = Join-Path $testRoot 'privacy-fixture.zip'
+    $privacyStream = [IO.File]::Open($privacyFixture, [IO.FileMode]::CreateNew)
+    try {
+        $privacyZip = New-Object IO.Compression.ZipArchive($privacyStream, [IO.Compression.ZipArchiveMode]::Create, $true)
+        try {
+            $privacyEntry = $privacyZip.CreateEntry('fixture/data.bin', [IO.Compression.CompressionLevel]::Optimal)
+            $writer = New-Object IO.StreamWriter($privacyEntry.Open(), [Text.Encoding]::UTF8)
+            try { $writer.Write('C:' + '\Users\LeakUser\private.txt') }
+            finally { $writer.Dispose() }
+        }
+        finally { $privacyZip.Dispose() }
+    }
+    finally { $privacyStream.Dispose() }
+    Expect-Failure { Assert-ArchivePrivacy -Archive $privacyFixture -Needles @() } 'compressed private path fixture was accepted'
+
     $portableExtract = Join-Path $testRoot 'portable'
     $installerExtract = Join-Path $testRoot 'installer'
     $sourceExtract = Join-Path $testRoot 'source'
@@ -155,10 +214,48 @@ try {
     $shortcutRoot = Join-Path $testRoot 'shortcuts'
     $shortcutName = 'LCDForge-PackageTest.lnk'
     $runName = 'LCDForge-PackageTest'
+    & (Join-Path $installer 'Install.ps1') -PackageRoot $installer -InstallRoot $integrationInstall -NoIntegration
+    Expect-Failure {
+        & (Join-Path $installer 'Install.ps1') -PackageRoot $installer -InstallRoot $integrationInstall -EnableLogin -ShortcutRoot $shortcutRoot -ShortcutName $shortcutName -RunKey $runKey -RunName $runName -InjectFailure AfterIntegration
+    } 'new integration rollback injection unexpectedly succeeded'
+    if ([IO.File]::Exists((Join-Path $shortcutRoot $shortcutName))) { throw 'failed install left a new shortcut' }
+    $absentRun = Get-ItemProperty -LiteralPath $runKey -Name $runName -ErrorAction SilentlyContinue
+    if ($null -ne $absentRun -and $null -ne $absentRun.PSObject.Properties[$runName]) { throw 'failed install left a new Run value' }
+
     & (Join-Path $installer 'Install.ps1') -PackageRoot $installer -InstallRoot $integrationInstall -EnableLogin -ShortcutRoot $shortcutRoot -ShortcutName $shortcutName -RunKey $runKey -RunName $runName
-    if (-not [IO.File]::Exists((Join-Path $shortcutRoot $shortcutName))) { throw 'owned shortcut not created' }
+    $shortcutPath = Join-Path $shortcutRoot $shortcutName
+    if (-not [IO.File]::Exists($shortcutPath)) { throw 'owned shortcut not created' }
     $runValue = (Get-ItemProperty -LiteralPath $runKey -Name $runName).$runName
     if (-not (Test-CommandTargets -Command $runValue -ExecutablePath (Join-Path $integrationInstall 'lcdforge.exe'))) { throw 'owned Run value not created' }
+
+    $ownedExe = Join-Path $integrationInstall 'lcdforge.exe'
+    $customRun = '"' + $ownedExe + '" --config "%TEMP%\lcdforge-owned.txt"'
+    New-ItemProperty -LiteralPath $runKey -Name $runName -Value $customRun -PropertyType ExpandString -Force | Out-Null
+    $customShortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
+    $customShortcut.TargetPath = $ownedExe
+    $customShortcut.Arguments = '--safe --config "owned custom.txt"'
+    $customShortcut.IconLocation = $ownedExe + ',0'
+    $customShortcut.WorkingDirectory = $integrationInstall
+    $customShortcut.Description = 'Owned custom LCDForge shortcut'
+    $customShortcut.WindowStyle = 7
+    $customShortcut.Save()
+    $shortcutBeforeHash = (Get-FileHash -LiteralPath $shortcutPath -Algorithm SHA256).Hash
+    $shortcutBeforeFile = Get-Item -LiteralPath $shortcutPath -Force
+    $shortcutBeforeAttributes = $shortcutBeforeFile.Attributes
+    $shortcutBeforeCreation = $shortcutBeforeFile.CreationTimeUtc
+    $shortcutBeforeWrite = $shortcutBeforeFile.LastWriteTimeUtc
+    Expect-Failure {
+        & (Join-Path $installer 'Install.ps1') -PackageRoot $installer -InstallRoot $integrationInstall -EnableLogin -ShortcutRoot $shortcutRoot -ShortcutName $shortcutName -RunKey $runKey -RunName $runName -InjectFailure AfterIntegration
+    } 'owned integration rollback injection unexpectedly succeeded'
+    $restoredKey = Get-Item -LiteralPath $runKey
+    $restoredRun = [string]$restoredKey.GetValue($runName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    if ($restoredRun -cne $customRun -or $restoredKey.GetValueKind($runName) -ne [Microsoft.Win32.RegistryValueKind]::ExpandString) { throw 'owned Run value was not restored exactly' }
+    if ((Get-FileHash -LiteralPath $shortcutPath -Algorithm SHA256).Hash -ne $shortcutBeforeHash) { throw 'owned shortcut bytes were not restored exactly' }
+    $shortcutAfterFile = Get-Item -LiteralPath $shortcutPath -Force
+    if ($shortcutAfterFile.Attributes -ne $shortcutBeforeAttributes -or $shortcutAfterFile.CreationTimeUtc -ne $shortcutBeforeCreation -or $shortcutAfterFile.LastWriteTimeUtc -ne $shortcutBeforeWrite) { throw 'owned shortcut metadata was not restored exactly' }
+    $restoredShortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
+    if ($restoredShortcut.TargetPath -cne $ownedExe -or $restoredShortcut.Arguments -cne '--safe --config "owned custom.txt"' -or $restoredShortcut.IconLocation -cne ($ownedExe + ',0') -or $restoredShortcut.WorkingDirectory -cne $integrationInstall -or $restoredShortcut.Description -cne 'Owned custom LCDForge shortcut' -or $restoredShortcut.WindowStyle -ne 7) { throw 'owned shortcut behavior was not restored exactly' }
+
     & (Join-Path $integrationInstall 'Uninstall.ps1') -InstallRoot $integrationInstall -ShortcutRoot $shortcutRoot -ShortcutName $shortcutName -RunKey $runKey -RunName $runName
     if ([IO.File]::Exists((Join-Path $shortcutRoot $shortcutName))) { throw 'owned shortcut not removed' }
     $remainingRun = Get-ItemProperty -LiteralPath $runKey -Name $runName -ErrorAction SilentlyContinue
@@ -196,21 +293,12 @@ try {
     }
 
     Write-Host '== artifact privacy scan ==' -ForegroundColor Cyan
-    $needles = @((Get-NormalizedFullPath $repo), (Get-NormalizedFullPath $testRoot))
+    $needles = @((Get-NormalizedFullPath $repo), (Get-NormalizedFullPath $testRoot), (Get-NormalizedFullPath ([IO.Path]::GetTempPath())))
+    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) { $needles += Get-NormalizedFullPath $env:USERPROFILE }
+    if (-not [string]::IsNullOrWhiteSpace($env:CARGO_HOME)) { $needles += Get-NormalizedFullPath $env:CARGO_HOME }
     if (-not [string]::IsNullOrWhiteSpace($env:USERNAME)) { $needles += $env:USERNAME }
     foreach ($archive in $archives) {
-        $text = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($archive))
-        foreach ($needle in $needles) {
-            if (-not [string]::IsNullOrEmpty($needle) -and $text.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                throw 'artifact contains a machine-specific or sentinel value'
-            }
-        }
-    }
-    foreach ($archive in @($portableZip, $installerZip)) {
-        $text = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($archive))
-        if ($text.IndexOf('PACKAGE-PRIVATE-SENTINEL', [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-            throw 'binary package contains the diagnostics sentinel'
-        }
+        Assert-ArchivePrivacy -Archive $archive -Needles $needles -SensitivePackage:($archive -ne $sourceZip)
     }
 }
 finally {

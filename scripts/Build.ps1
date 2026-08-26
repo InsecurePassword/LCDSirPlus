@@ -71,80 +71,103 @@ function Write-DeterministicZip {
     finally { $stream.Dispose() }
 }
 
-Write-Host '== quality gate ==' -ForegroundColor Cyan
-& (Join-Path $PSScriptRoot 'Test.ps1')
-if ($LASTEXITCODE -ne 0) { throw 'quality gate failed' }
-if (@(git status --porcelain).Count -ne 0 -or (git rev-parse HEAD).Trim() -ne $head) { throw 'source changed during quality gate' }
-
-if ([IO.Directory]::Exists($output)) { Remove-Item -LiteralPath $output -Recurse -Force }
-[IO.Directory]::CreateDirectory($output) | Out-Null
-$work = Join-Path $artifactsRoot ('.package-stage-' + [Guid]::NewGuid().ToString('N'))
-[IO.Directory]::CreateDirectory($work) | Out-Null
-
-$portableName = "LCDForge-$version-win-x64-portable"
-$installerName = "LCDForge-$version-win-x64-installer"
-$sourceName = "LCDForge-$version-source"
-$portableRoot = Join-Path $work $portableName
-$installerRoot = Join-Path $work $installerName
-$sourceRoot = Join-Path $work $sourceName
+$encodedRustFlagsBefore = [Environment]::GetEnvironmentVariable('CARGO_ENCODED_RUSTFLAGS', 'Process')
+$remapRoots = @(
+    [pscustomobject]@{ Path = $repo; Destination = '/workspace' },
+    [pscustomobject]@{ Path = $(if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }); Destination = '/cargo' },
+    [pscustomobject]@{ Path = $env:USERPROFILE; Destination = '/user' },
+    [pscustomobject]@{ Path = $env:HOME; Destination = '/home' },
+    [pscustomobject]@{ Path = [IO.Path]::GetTempPath(); Destination = '/tmp' }
+)
+$seenRemaps = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$remapFlags = @()
+foreach ($remap in $remapRoots) {
+    if ([string]::IsNullOrWhiteSpace($remap.Path)) { continue }
+    $source = Get-NormalizedFullPath $remap.Path
+    if ($seenRemaps.Add($source)) { $remapFlags += "--remap-path-prefix=$source=$($remap.Destination)" }
+}
 
 try {
-    Write-Host '== assemble explicit package trees ==' -ForegroundColor Cyan
-    $trackedZip = Join-Path $work 'tracked.zip'
-    git archive --format=zip --output=$trackedZip HEAD
-    if ($LASTEXITCODE -ne 0) { throw 'git archive failed' }
-    [IO.Directory]::CreateDirectory($sourceRoot) | Out-Null
-    Expand-Archive -LiteralPath $trackedZip -DestinationPath $sourceRoot
-    Remove-Item -LiteralPath $trackedZip -Force
+    $env:CARGO_ENCODED_RUSTFLAGS = $remapFlags -join [char]0x1f
+    Write-Host '== quality gate ==' -ForegroundColor Cyan
+    & (Join-Path $PSScriptRoot 'Test.ps1')
+    if ($LASTEXITCODE -ne 0) { throw 'quality gate failed' }
+    if (@(git status --porcelain).Count -ne 0 -or (git rev-parse HEAD).Trim() -ne $head) { throw 'source changed during quality gate' }
 
-    [IO.Directory]::CreateDirectory($portableRoot) | Out-Null
-    Copy-Item -LiteralPath (Join-Path $repo 'target\release\lcdforge.exe') -Destination (Join-Path $portableRoot 'lcdforge.exe')
-    Copy-Allowlist -SourceRoot $sourceRoot -Destination $portableRoot -Paths @(
-        'lcdforge.txt', 'LICENSE', 'README.md', 'RELEASE-NOTES.md', 'SECURITY.md',
-        'docs/ARCHITECTURE.md', 'docs/CONFIGURATION.md', 'docs/HARDWARE-ACCEPTANCE.md',
-        'docs/PRODUCT-SPEC.md', 'docs/REFERENCE-LAYOUT.md'
-    )
-    Write-PackageManifest $portableRoot
+    if ([IO.Directory]::Exists($output)) { Remove-Item -LiteralPath $output -Recurse -Force }
+    [IO.Directory]::CreateDirectory($output) | Out-Null
+    $work = Join-Path $artifactsRoot ('.package-stage-' + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($work) | Out-Null
 
-    [IO.Directory]::CreateDirectory((Join-Path $installerRoot 'payload')) | Out-Null
-    foreach ($file in Get-ChildItem -LiteralPath $portableRoot -File -Force -Recurse | Where-Object { $_.Name -ne 'PACKAGE-MANIFEST.txt' }) {
-        $relative = Get-RelativePackagePath -Root $portableRoot -Path $file.FullName
-        $target = Join-Path $installerRoot ('payload\' + $relative.Replace('/', '\'))
-        [IO.Directory]::CreateDirectory((Split-Path $target -Parent)) | Out-Null
-        Copy-Item -LiteralPath $file.FullName -Destination $target
+    $portableName = "LCDForge-$version-win-x64-portable"
+    $installerName = "LCDForge-$version-win-x64-installer"
+    $sourceName = "LCDForge-$version-source"
+    $portableRoot = Join-Path $work $portableName
+    $installerRoot = Join-Path $work $installerName
+    $sourceRoot = Join-Path $work $sourceName
+
+    try {
+        Write-Host '== assemble explicit package trees ==' -ForegroundColor Cyan
+        $trackedZip = Join-Path $work 'tracked.zip'
+        git archive --format=zip --output=$trackedZip HEAD
+        if ($LASTEXITCODE -ne 0) { throw 'git archive failed' }
+        [IO.Directory]::CreateDirectory($sourceRoot) | Out-Null
+        Expand-Archive -LiteralPath $trackedZip -DestinationPath $sourceRoot
+        Remove-Item -LiteralPath $trackedZip -Force
+
+        [IO.Directory]::CreateDirectory($portableRoot) | Out-Null
+        Copy-Item -LiteralPath (Join-Path $repo 'target\release\lcdforge.exe') -Destination (Join-Path $portableRoot 'lcdforge.exe')
+        Copy-Allowlist -SourceRoot $sourceRoot -Destination $portableRoot -Paths @(
+            'lcdforge.txt', 'LICENSE', 'README.md', 'RELEASE-NOTES.md', 'SECURITY.md',
+            'docs/ARCHITECTURE.md', 'docs/CONFIGURATION.md', 'docs/HARDWARE-ACCEPTANCE.md',
+            'docs/PRODUCT-SPEC.md', 'docs/REFERENCE-LAYOUT.md'
+        )
+        Write-PackageManifest $portableRoot
+
+        [IO.Directory]::CreateDirectory((Join-Path $installerRoot 'payload')) | Out-Null
+        foreach ($file in Get-ChildItem -LiteralPath $portableRoot -File -Force -Recurse | Where-Object { $_.Name -ne 'PACKAGE-MANIFEST.txt' }) {
+            $relative = Get-RelativePackagePath -Root $portableRoot -Path $file.FullName
+            $target = Join-Path $installerRoot ('payload\' + $relative.Replace('/', '\'))
+            [IO.Directory]::CreateDirectory((Split-Path $target -Parent)) | Out-Null
+            Copy-Item -LiteralPath $file.FullName -Destination $target
+        }
+        foreach ($script in @('Install.ps1', 'Uninstall.ps1', 'Package.Common.ps1')) {
+            Copy-Item -LiteralPath (Join-Path $sourceRoot ('scripts\' + $script)) -Destination (Join-Path $installerRoot $script)
+        }
+        Write-PackageManifest $installerRoot
+
+        [IO.File]::WriteAllText((Join-Path $sourceRoot 'SOURCE-COMMIT.txt'), $head + "`n", (New-Object Text.UTF8Encoding($false)))
+        Write-PackageManifest $sourceRoot
+
+        $portableZip = Join-Path $output ($portableName + '.zip')
+        $installerZip = Join-Path $output ($installerName + '.zip')
+        $sourceZip = Join-Path $output ($sourceName + '.zip')
+        Write-DeterministicZip -Root $portableRoot -Archive $portableZip -Prefix $portableName
+        Write-DeterministicZip -Root $installerRoot -Archive $installerZip -Prefix $installerName
+        Write-DeterministicZip -Root $sourceRoot -Archive $sourceZip -Prefix $sourceName
+
+        $archives = @($installerZip, $portableZip, $sourceZip)
+        $archives = @($archives | Sort-Object { [IO.Path]::GetFileName($_) })
+        $sums = @()
+        foreach ($archive in $archives) {
+            $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            $size = (Get-Item -LiteralPath $archive).Length
+            $sums += "{0}`t{1}`t{2}" -f $hash, $size, [IO.Path]::GetFileName($archive)
+        }
+        [IO.File]::WriteAllLines((Join-Path $output 'SHA256SUMS.txt'), $sums, (New-Object Text.UTF8Encoding($false)))
+
+        Write-Host '== clean extraction and lifecycle tests ==' -ForegroundColor Cyan
+        & (Join-Path $PSScriptRoot 'Package-Test.ps1') -ArtifactDir $output -ExpectedCommit $head
+        if ($LASTEXITCODE -ne 0) { throw 'package tests failed' }
     }
-    foreach ($script in @('Install.ps1', 'Uninstall.ps1', 'Package.Common.ps1')) {
-        Copy-Item -LiteralPath (Join-Path $sourceRoot ('scripts\' + $script)) -Destination (Join-Path $installerRoot $script)
+    finally {
+        if ([IO.Directory]::Exists($work)) { Remove-Item -LiteralPath $work -Recurse -Force }
     }
-    Write-PackageManifest $installerRoot
 
-    [IO.File]::WriteAllText((Join-Path $sourceRoot 'SOURCE-COMMIT.txt'), $head + "`n", (New-Object Text.UTF8Encoding($false)))
-    Write-PackageManifest $sourceRoot
-
-    $portableZip = Join-Path $output ($portableName + '.zip')
-    $installerZip = Join-Path $output ($installerName + '.zip')
-    $sourceZip = Join-Path $output ($sourceName + '.zip')
-    Write-DeterministicZip -Root $portableRoot -Archive $portableZip -Prefix $portableName
-    Write-DeterministicZip -Root $installerRoot -Archive $installerZip -Prefix $installerName
-    Write-DeterministicZip -Root $sourceRoot -Archive $sourceZip -Prefix $sourceName
-
-    $archives = @($installerZip, $portableZip, $sourceZip)
-    $archives = @($archives | Sort-Object { [IO.Path]::GetFileName($_) })
-    $sums = @()
-    foreach ($archive in $archives) {
-        $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-        $size = (Get-Item -LiteralPath $archive).Length
-        $sums += "{0}`t{1}`t{2}" -f $hash, $size, [IO.Path]::GetFileName($archive)
-    }
-    [IO.File]::WriteAllLines((Join-Path $output 'SHA256SUMS.txt'), $sums, (New-Object Text.UTF8Encoding($false)))
-
-    Write-Host '== clean extraction and lifecycle tests ==' -ForegroundColor Cyan
-    & (Join-Path $PSScriptRoot 'Package-Test.ps1') -ArtifactDir $output -ExpectedCommit $head
-    if ($LASTEXITCODE -ne 0) { throw 'package tests failed' }
+    if (@(git status --porcelain).Count -ne 0 -or (git rev-parse HEAD).Trim() -ne $head) { throw 'source changed during package build' }
+    Write-Host "Provisional release artifacts: $output" -ForegroundColor Green
 }
 finally {
-    if ([IO.Directory]::Exists($work)) { Remove-Item -LiteralPath $work -Recurse -Force }
+    if ($null -eq $encodedRustFlagsBefore) { Remove-Item Env:\CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue }
+    else { $env:CARGO_ENCODED_RUSTFLAGS = $encodedRustFlagsBefore }
 }
-
-if (@(git status --porcelain).Count -ne 0 -or (git rev-parse HEAD).Trim() -ne $head) { throw 'source changed during package build' }
-Write-Host "Provisional release artifacts: $output" -ForegroundColor Green
