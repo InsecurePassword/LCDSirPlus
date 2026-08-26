@@ -87,8 +87,8 @@ DLLs; `auto` tries NVAPI then ADLX. `presentmon_*`
 (`presentmon_target_mode`: `foreground`\|`process_name`\|`disabled`;
 `stutter_threshold_ms` 1..1000), `headset_*` (warn ≥ critical),
 `controller_index` (-1..3), `network_probe_*` (`icmp`\|`tcp`),
-`audio_poll_ms`. PresentMon resolves an explicitly configured path, a colocated
-console, or its known Program Files locations. Frame metrics become stale
+`audio_poll_ms`. PresentMon resolves an explicitly configured path or, for
+`auto`, a colocated `PresentMon.exe` beside LCDForge. Frame metrics become stale
 after five seconds without output; 1% and 0.1% lows use the configured history
 window, and changing target/capture settings starts a new session. PresentMon
 is a separate runtime prerequisite and is not redistributed.

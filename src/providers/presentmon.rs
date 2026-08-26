@@ -579,40 +579,22 @@ fn resolve_executable(setting: &str) -> Result<PathBuf, String> {
         return validate_executable(Path::new(setting));
     }
 
-    let current = std::env::current_exe().ok();
-    let program_roots = ["ProgramFiles", "ProgramFiles(x86)"]
-        .into_iter()
-        .filter_map(std::env::var_os)
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    for (candidate, root) in auto_locations(current.as_deref(), &program_roots) {
+    if let Some((candidate, root)) = std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(colocated_location)
+    {
         if let Ok(path) = validate_auto_executable(&candidate, &root) {
             return Ok(path);
         }
     }
-    Err("PresentMon console executable not found in colocated or Program Files locations".into())
+    Err("PresentMon console executable not found beside LCDForge".into())
 }
 
-fn auto_locations(current: Option<&Path>, program_roots: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
-    let mut locations = Vec::new();
-    if let Some(dir) = current.and_then(Path::parent) {
-        locations.push((dir.join("PresentMon.exe"), dir.to_path_buf()));
-    }
-    for root in program_roots {
-        for base in [root.join(r"Intel\PresentMon"), root.join("PresentMon")] {
-            locations.push((base.join("PresentMon.exe"), root.clone()));
-            if let Ok(entries) = std::fs::read_dir(&base) {
-                for entry in entries.flatten().take(128) {
-                    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        locations.push((entry.path().join("PresentMon.exe"), root.clone()));
-                    } else {
-                        locations.push((entry.path(), root.clone()));
-                    }
-                }
-            }
-        }
-    }
-    locations
+fn colocated_location(current: &Path) -> Option<(PathBuf, PathBuf)> {
+    current
+        .parent()
+        .map(|dir| (dir.join("PresentMon.exe"), dir.to_path_buf()))
 }
 
 fn validate_auto_executable(path: &Path, root: &Path) -> Result<PathBuf, String> {
@@ -876,16 +858,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_locations_do_not_include_path_candidates() {
+    fn auto_location_is_colocated_only() {
         let app = Path::new(r"C:\LCDForge\LCDForge.exe");
-        let roots = vec![PathBuf::from(r"C:\Program Files")];
-        let locations = auto_locations(Some(app), &roots);
-        assert!(locations
-            .iter()
-            .any(|(path, _)| path == Path::new(r"C:\LCDForge\PresentMon.exe")));
-        assert!(!locations
-            .iter()
-            .any(|(path, _)| path == Path::new(r"C:\UntrustedPath\PresentMon.exe")));
+        let (candidate, root) = colocated_location(app).unwrap();
+        assert_eq!(candidate, Path::new(r"C:\LCDForge\PresentMon.exe"));
+        assert_eq!(root, Path::new(r"C:\LCDForge"));
     }
 
     #[test]

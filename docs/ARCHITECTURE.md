@@ -88,9 +88,9 @@ Backend button reports flow back: `parse_input` → `ButtonTracker.observe`
   bars read only canonical readings, never legacy projections.
 - Vendor DLLs are loaded by name only from System32. GPU APIs are read-only,
   versioned, and bounded to vendor maximums. Automatically discovered
-  PresentMon paths are canonically contained in colocated or Program Files
-  roots and arguments are passed without a shell; only the child started by
-  LCDForge is terminated and its owner thread is joined during shutdown.
+  PresentMon is canonically contained beside LCDForge; arguments are passed
+  without a shell, and only the child started by LCDForge is terminated. Its
+  owner thread is joined during shutdown.
 
 ## Security posture
 
