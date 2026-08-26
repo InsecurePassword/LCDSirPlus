@@ -62,8 +62,9 @@ logitech_invert         0
 
 ##############################################################################
 # LibreHardwareMonitor: demoted to an optional temps-only fallback (Phase 2).
-# In auto mode it is contacted only when the GPU vendor DLL cannot provide a
-# value. Its loopback web server must then be enabled on port 8085.
+# In auto mode it supplies CPU temperature and only supplies GPU temperature
+# when the native vendor DLL cannot. Healthy temperatures reduce its cadence.
+# Its loopback web server must be enabled on port 8085.
 
 lhm_mode                auto          # auto | on | off
 lhm_url                 auto          # http://127.0.0.1:8085/data.json
@@ -73,11 +74,12 @@ lhm_stale_ms            auto          # 3000
 # lhm_cpu_temp_sensor    /amdcpu/0/temperature/2
 # lhm_gpu_temp_sensor    /lpc/it8720f/temperature/2
 
-# GPU provider chain (Phase 2): nvapi -> adlx -> lhm.
-gpu_provider            auto
+# Native GPU provider (Phase 2): auto tries nvapi then adlx; off disables it.
+gpu_provider            auto          # auto | nvapi | adlx | off
 
 ##############################################################################
 # PresentMon game performance provider (Phase 2).
+# The external PresentMon console is optional and is not redistributed.
 
 presentmon_enabled      1
 presentmon_path         auto

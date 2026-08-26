@@ -395,13 +395,7 @@ impl ParseContext {
             "lhm_url" => cfg.lhm_url = one(v)?,
             "lhm_interval_ms" => cfg.lhm_interval = ms_auto(v, Duration::from_millis(300))?,
             "lhm_stale_ms" => cfg.lhm_stale_after = ms_auto(v, Duration::from_secs(3))?,
-            "lhm_cpu_temp_sensor"
-            | "lhm_gpu_temp_sensor"
-            | "lhm_gpu_load_sensor"
-            | "lhm_vram_load_sensor"
-            | "lhm_memory_sensor"
-            | "lhm_network_in_sensor"
-            | "lhm_network_out_sensor" => {
+            "lhm_cpu_temp_sensor" | "lhm_gpu_temp_sensor" => {
                 cfg.lhm_sensors
                     .insert(key.trim_start_matches("lhm_").to_string(), one(v)?);
             }

@@ -59,8 +59,9 @@ README.md and enforced in `src/backends/g13.rs` + `src/backends/hid.rs`.
 - Windows local clock: date/day/time.
 - Windows scheduler: per-logical-processor CPU load (CCD aggregation).
 - GlobalMemoryStatusEx: memory load.
-- AMD/Intel vendor GPU DLLs → LibreHardwareMonitor loopback JSON (temps
-  only, optional): GPU load/VRAM/temps (Phase 2).
+- NVIDIA NVAPI / AMD ADLX vendor DLLs provide GPU load, VRAM, and temperature;
+  LibreHardwareMonitor loopback JSON is an optional temperatures-only fallback
+  (Phase 2).
 - PresentMon: FPS/frame timing (Phase 2).
 - Arctis 7P+ USB HID: headset battery (Phase 2).
 - Discord local RPC: active speaker overlay (Phase 3).

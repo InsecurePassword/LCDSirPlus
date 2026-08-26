@@ -74,19 +74,24 @@ dashboard to the one-bar CPU layout automatically.
 
 | Key | Default | Notes |
 |---|---|---|
-| `lhm_mode` | `auto` | `auto` (only when vendor DLLs can't) \| `on` \| `off` |
+| `lhm_mode` | `auto` | `auto` (CPU temp and missing native GPU temp only) \| `on` \| `off` |
 | `lhm_url` | `auto` → `http://127.0.0.1:8085/data.json` | loopback HTTP only, no query/fragment/credentials |
 | `lhm_interval_ms` | 300 (`auto`) | 100..60000 |
 | `lhm_stale_ms` | 3000 (`auto`) | ≥ interval, ≤ 300000 |
-| `lhm_cpu_temp_sensor` etc. | — | stable SensorId overrides |
+| `lhm_cpu_temp_sensor`, `lhm_gpu_temp_sensor` | — | stable SensorId overrides; no LHM load/VRAM/RAM/network publication |
 
 ## GPU / PresentMon / Headset / Controller / Network / Audio (Phase 2)
 
-`gpu_provider` (`auto`\|`nvapi`\|`adlx`\|`lhm`), `presentmon_*`
+`gpu_provider` (`auto`\|`nvapi`\|`adlx`\|`off`) uses trusted System32 vendor
+DLLs; `auto` tries NVAPI then ADLX. `presentmon_*`
 (`presentmon_target_mode`: `foreground`\|`process_name`\|`disabled`;
 `stutter_threshold_ms` 1..1000), `headset_*` (warn ≥ critical),
 `controller_index` (-1..3), `network_probe_*` (`icmp`\|`tcp`),
-`audio_poll_ms`. All validate now; providers activate in Phase 2.
+`audio_poll_ms`. PresentMon resolves an explicitly configured path, a colocated
+console, `PATH`, or its Program Files locations. Frame metrics become stale
+after five seconds without output; 1% and 0.1% lows use the configured history
+window, and changing target/capture settings starts a new session. PresentMon
+is a separate runtime prerequisite and is not redistributed.
 `headset_query_timeout_ms` bounds the complete HID write/read sequence after
 bounded device enumeration.
 

@@ -22,7 +22,11 @@ src\
 │   ├── clock.rs        Win32 NLS date/time formatting
 │   ├── cpu.rs          NtQuerySystemInformation per-LP deltas
 │   ├── memory.rs       GlobalMemoryStatusEx
-│   └── ccd.rs          L3/NUMA topology + CPUID cache-size labeling
+│   ├── ccd.rs          L3/NUMA topology + CPUID cache-size labeling
+│   ├── gpu.rs          trusted NVAPI/ADLX loading + canonical GPU metrics
+│   ├── lhm.rs          optional loopback temperatures-only fallback
+│   └── presentmon.rs   owned console capture + CSV frame statistics
+├── telemetry.rs        provider workers, cadence, stale state, health
 ├── hardware_test.rs    STEP 01..10 sequence, transports, button capture
 ├── logging.rs          leveled log + size-capped rotation
 ├── ui.rs               preview window (GDI) + tray icon
@@ -40,6 +44,10 @@ src\
 | lcdforge-backend | HID handles, all device I/O | `Command` in / `Message` out |
 | lcdforge-ui | HWND, tray, GDI | frames in / `UiEvent` out |
 | frame pump | latest-frame handoff to UI | `PostMessageW` wake |
+| telemetry | fast native polls, stale state, provider health | snapshot channel |
+| telemetry-gpu | read-only NVAPI/ADLX calls | event channel |
+| telemetry-presentmon | target/capture lifecycle | update channel |
+| telemetry-lhm/headset | bounded blocking HTTP/HID | event channel |
 
 The backend thread is the only toucher of the device (mirrors the Go
 `LockOSThread` discipline). Frames are submitted only when changed; button
@@ -48,7 +56,7 @@ edges are debounced in the backend thread and delivered as events.
 ## Data flow (one tick)
 
 ```text
-clock + NtQuerySystemInformation + GlobalMemoryStatusEx
+clock + CPU/memory + NVAPI/ADLX + optional LHM + PresentMon
   → Snapshot { date/time, cpu_dual, cache/freq/total load, mem, readings }
   → Renderer::render(snapshot, overlay opts, view{slot modules})
   → Frame (160x43 bytes)
@@ -78,6 +86,10 @@ Backend button reports flow back: `parse_input` → `ButtonTracker.observe`
   canceled button releases so no press is ever stuck.
 - Providers: absent data renders explicit `N/A`/`STALE` states — the fixed
   bars read only canonical readings, never legacy projections.
+- Vendor DLLs are loaded by name only from System32. GPU APIs are read-only,
+  versioned, and bounded to vendor maximums. PresentMon paths are canonical
+  local console executables and arguments are passed without a shell; only the
+  child started by LCDForge is terminated.
 
 ## Security posture
 

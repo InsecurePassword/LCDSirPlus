@@ -457,7 +457,7 @@ fn build_snapshot(
     }
     readings
         .metrics
-        .extend(telemetry.lhm_readings.iter().cloned());
+        .extend(telemetry.gpu_readings.iter().cloned());
     snapshot.readings = readings;
 
     apply_telemetry(&mut snapshot, telemetry, now);
@@ -474,6 +474,7 @@ fn build_snapshot(
 fn apply_telemetry(snapshot: &mut Snapshot, telemetry: &crate::telemetry::Update, now: SystemTime) {
     snapshot.cpu_temp = telemetry.cpu_temp;
     snapshot.gpu_temp = telemetry.gpu_temp;
+    snapshot.game = telemetry.game.clone();
 
     // A sampled idle interval is valid telemetry, not unavailable data.
     snapshot.network_in = Metric::default();

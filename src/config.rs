@@ -107,7 +107,7 @@ pub struct Config {
     pub lhm_stale_after: Duration,
     pub lhm_sensors: std::collections::BTreeMap<String, String>,
 
-    // GPU provider selection: nvapi -> adlx -> lhm fallback chain in auto.
+    // GPU provider selection: native NVAPI -> ADLX in auto.
     pub gpu_provider: String,
 
     pub presentmon_enabled: bool,
@@ -406,8 +406,8 @@ pub fn validate(c: &Config) -> Result<(), String> {
     if c.lhm_stale_after < c.lhm_interval || c.lhm_stale_after > Duration::from_secs(300) {
         return Err("lhm_stale_ms must be >= lhm_interval_ms and <= 300000".into());
     }
-    if !matches!(c.gpu_provider.as_str(), "auto" | "nvapi" | "adlx" | "lhm") {
-        return Err("gpu_provider must be auto, nvapi, adlx, or lhm".into());
+    if !matches!(c.gpu_provider.as_str(), "auto" | "nvapi" | "adlx" | "off") {
+        return Err("gpu_provider must be auto, nvapi, adlx, or off".into());
     }
     if !matches!(
         c.presentmon_target_mode.as_str(),

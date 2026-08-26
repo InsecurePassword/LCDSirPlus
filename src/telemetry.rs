@@ -2,12 +2,13 @@
 //! dedicated persistent workers; the coordinator handles fast native polls,
 //! retention, staleness, and publication to the render loop.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::Config;
-use crate::model::{ControllerBattery, Freshness, HeadsetBattery, Metric, Reading};
-use crate::providers::{audio, headset, lhm, netif, xinput};
+use crate::model::{ControllerBattery, Freshness, GameStats, HeadsetBattery, Metric, Reading};
+use crate::providers::{audio, gpu, headset, lhm, netif, presentmon, xinput};
 
 const DEFAULT_LHM_URL: &str = "http://127.0.0.1:8085/data.json";
 const TICK: Duration = Duration::from_millis(50);
@@ -21,7 +22,8 @@ pub struct Update {
     pub net: Option<netif::NetThroughput>,
     pub cpu_temp: Metric,
     pub gpu_temp: Metric,
-    pub lhm_readings: Vec<Reading>,
+    pub gpu_readings: Vec<Reading>,
+    pub game: GameStats,
     /// Per-provider health: (name, last poll succeeded).
     pub providers: Vec<(String, bool)>,
 }
@@ -29,6 +31,13 @@ pub struct Update {
 pub struct Telemetry {
     pub updates: mpsc::Receiver<Update>,
     config: Arc<RwLock<Config>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl Drop for Telemetry {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Telemetry {
@@ -40,6 +49,7 @@ impl Telemetry {
 enum SlowEvent {
     Headset(Result<headset::Status, String>),
     Lhm(Box<Result<(lhm::Selection, SystemTime), String>>),
+    Gpu(Result<gpu::Sample, String>),
 }
 
 struct Worker {
@@ -50,9 +60,15 @@ struct Worker {
     net: netif::NetProvider,
     headset_success: Option<Instant>,
     lhm_success: Option<Instant>,
+    gpu_success: Option<Instant>,
     controller_attempt: Option<Instant>,
     audio_attempt: Option<Instant>,
     net_attempt: Option<Instant>,
+    presentmon_rx: mpsc::Receiver<presentmon::Update>,
+    temps_need_refresh: Arc<AtomicBool>,
+    native_gpu_temp: Metric,
+    lhm_gpu_temp: Metric,
+    gpu_backend: String,
 }
 
 fn current_config(config: &RwLock<Config>) -> Config {
@@ -81,6 +97,8 @@ fn enabled(cfg: &Config, provider: &str) -> bool {
         "controller" => cfg.controller_enabled,
         "audio" => cfg.audio_enabled,
         "net" => true,
+        "gpu" => cfg.gpu_provider != "off",
+        "presentmon" => cfg.presentmon_enabled && cfg.presentmon_target_mode != "disabled",
         _ => false,
     }
 }
@@ -103,22 +121,24 @@ fn temperature(sensor: &Option<lhm::Sensor>, at: SystemTime) -> Metric {
         .unwrap_or_default()
 }
 
+fn prefer_native_temperature(native: Metric, fallback: Metric) -> Metric {
+    if native.valid && !native.stale {
+        native
+    } else {
+        fallback
+    }
+}
+
 fn apply_lhm_freshness(
     update: &mut Update,
+    lhm_gpu_temp: &mut Metric,
     last_success: Option<Instant>,
     stale_after: Duration,
     now: Instant,
 ) {
     let is_stale = stale(last_success, stale_after, now);
     update.cpu_temp.stale = update.cpu_temp.valid && is_stale;
-    update.gpu_temp.stale = update.gpu_temp.valid && is_stale;
-    for reading in &mut update.lhm_readings {
-        reading.freshness = if is_stale {
-            Freshness::Stale
-        } else {
-            Freshness::Current
-        };
-    }
+    lhm_gpu_temp.stale = lhm_gpu_temp.valid && is_stale;
 }
 
 impl Worker {
@@ -130,6 +150,14 @@ impl Worker {
             match event {
                 SlowEvent::Headset(result) => self.apply_headset(result, now),
                 SlowEvent::Lhm(result) => self.apply_lhm(*result, now),
+                SlowEvent::Gpu(result) => self.apply_gpu(result, now),
+            }
+        }
+        while let Ok(update) = self.presentmon_rx.try_recv() {
+            self.update.game = update.game;
+            self.set_provider("presentmon", update.available);
+            if !update.available && !update.detail.is_empty() {
+                crate::log_debug!("PresentMon unavailable: {}", update.detail);
             }
         }
 
@@ -165,14 +193,32 @@ impl Worker {
         match result {
             Ok((selection, sampled_at)) => {
                 self.update.cpu_temp = temperature(&selection.cpu_temp, sampled_at);
-                self.update.gpu_temp = temperature(&selection.gpu_temp, sampled_at);
-                self.update.lhm_readings = lhm::readings(&selection, sampled_at);
+                self.lhm_gpu_temp = temperature(&selection.gpu_temp, sampled_at);
                 self.lhm_success = Some(now);
                 self.set_provider("lhm", true);
             }
             Err(e) => {
                 crate::log_debug!("LHM sample failed: {}", e);
                 self.set_provider("lhm", false);
+            }
+        }
+    }
+
+    fn apply_gpu(&mut self, result: Result<gpu::Sample, String>, now: Instant) {
+        match result {
+            Ok(sample) => {
+                if self.gpu_backend != sample.backend {
+                    crate::log_info!("native GPU provider selected: {}", sample.backend);
+                    self.gpu_backend = sample.backend;
+                }
+                self.update.gpu_readings = sample.readings;
+                self.native_gpu_temp = sample.temperature;
+                self.gpu_success = Some(now);
+                self.set_provider("gpu", true);
+            }
+            Err(e) => {
+                crate::log_debug!("native GPU sample failed: {}", e);
+                self.set_provider("gpu", false);
             }
         }
     }
@@ -275,14 +321,53 @@ impl Worker {
         }
 
         if enabled(cfg, "lhm") {
-            apply_lhm_freshness(&mut self.update, self.lhm_success, cfg.lhm_stale_after, now);
+            apply_lhm_freshness(
+                &mut self.update,
+                &mut self.lhm_gpu_temp,
+                self.lhm_success,
+                cfg.lhm_stale_after,
+                now,
+            );
         } else {
             self.update.cpu_temp = Metric::default();
-            self.update.gpu_temp = Metric::default();
-            self.update.lhm_readings.clear();
+            self.lhm_gpu_temp = Metric::default();
             self.lhm_success = None;
             self.remove_provider("lhm");
         }
+
+        if enabled(cfg, "gpu") {
+            let stale_after = cfg
+                .telemetry_interval
+                .saturating_mul(3)
+                .max(Duration::from_secs(3));
+            let gpu_stale = stale(self.gpu_success, stale_after, now);
+            for reading in &mut self.update.gpu_readings {
+                if gpu_stale {
+                    reading.freshness = Freshness::Stale;
+                }
+            }
+            if self.native_gpu_temp.valid && gpu_stale {
+                self.native_gpu_temp.stale = true;
+            }
+        } else {
+            self.update.gpu_readings.clear();
+            self.native_gpu_temp = Metric::default();
+            self.gpu_success = None;
+            self.gpu_backend.clear();
+            self.remove_provider("gpu");
+        }
+        self.update.gpu_temp = prefer_native_temperature(self.native_gpu_temp, self.lhm_gpu_temp);
+        if !enabled(cfg, "presentmon") {
+            self.update.game = GameStats::default();
+            self.remove_provider("presentmon");
+        }
+        self.temps_need_refresh.store(
+            !self.update.cpu_temp.valid
+                || self.update.cpu_temp.stale
+                || !self.update.gpu_temp.valid
+                || self.update.gpu_temp.stale,
+            Ordering::Relaxed,
+        );
     }
 
     fn set_provider(&mut self, name: &str, ok: bool) {
@@ -298,12 +383,16 @@ impl Worker {
     }
 }
 
-fn spawn_headset(config: Arc<RwLock<Config>>, tx: mpsc::Sender<SlowEvent>) {
+fn spawn_headset(
+    config: Arc<RwLock<Config>>,
+    shutdown: Arc<AtomicBool>,
+    tx: mpsc::Sender<SlowEvent>,
+) {
     std::thread::Builder::new()
         .name("telemetry-headset".into())
         .spawn(move || {
             let mut last_attempt = None;
-            loop {
+            while !shutdown.load(Ordering::Relaxed) {
                 let cfg = current_config(&config);
                 if !enabled(&cfg, "headset") {
                     last_attempt = None;
@@ -327,16 +416,28 @@ fn spawn_headset(config: Arc<RwLock<Config>>, tx: mpsc::Sender<SlowEvent>) {
         .expect("headset telemetry thread");
 }
 
-fn spawn_lhm(config: Arc<RwLock<Config>>, tx: mpsc::Sender<SlowEvent>) {
+fn spawn_lhm(
+    config: Arc<RwLock<Config>>,
+    shutdown: Arc<AtomicBool>,
+    temps_need_refresh: Arc<AtomicBool>,
+    tx: mpsc::Sender<SlowEvent>,
+) {
     std::thread::Builder::new()
         .name("telemetry-lhm".into())
         .spawn(move || {
             let mut last_attempt = None;
-            loop {
+            while !shutdown.load(Ordering::Relaxed) {
                 let cfg = current_config(&config);
                 if let Some(url) = lhm_url(&cfg) {
                     let now = Instant::now();
-                    if due(last_attempt, cfg.lhm_interval, now) {
+                    let settled_interval = (cfg.lhm_stale_after / 2).max(cfg.lhm_interval);
+                    let interval =
+                        if cfg.lhm_mode == "on" || temps_need_refresh.load(Ordering::Relaxed) {
+                            cfg.lhm_interval
+                        } else {
+                            settled_interval
+                        };
+                    if due(last_attempt, interval, now) {
                         last_attempt = Some(now);
                         let result = lhm::sample(url, &cfg.lhm_sensors, Duration::from_secs(2))
                             .map(|selection| (selection, SystemTime::now()));
@@ -353,13 +454,51 @@ fn spawn_lhm(config: Arc<RwLock<Config>>, tx: mpsc::Sender<SlowEvent>) {
         .expect("LHM telemetry thread");
 }
 
+fn spawn_gpu(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Sender<SlowEvent>) {
+    std::thread::Builder::new()
+        .name("telemetry-gpu".into())
+        .spawn(move || {
+            let mut provider = gpu::Provider::new("off");
+            let mut last_attempt = None;
+            while !shutdown.load(Ordering::Relaxed) {
+                let cfg = current_config(&config);
+                if enabled(&cfg, "gpu") {
+                    let now = Instant::now();
+                    if due(last_attempt, cfg.telemetry_interval, now) {
+                        last_attempt = Some(now);
+                        if tx
+                            .send(SlowEvent::Gpu(provider.sample(&cfg.gpu_provider)))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                } else {
+                    last_attempt = None;
+                    provider = gpu::Provider::new("off");
+                }
+                std::thread::sleep(TICK);
+            }
+        })
+        .expect("GPU telemetry thread");
+}
+
 /// Start one coordinator and two persistent blocking-I/O workers.
 pub fn spawn(cfg: &Config) -> Telemetry {
     let config = Arc::new(RwLock::new(cfg.clone()));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let temps_need_refresh = Arc::new(AtomicBool::new(true));
     let (tx, rx) = mpsc::channel();
     let (slow_tx, slow_rx) = mpsc::channel();
-    spawn_headset(Arc::clone(&config), slow_tx.clone());
-    spawn_lhm(Arc::clone(&config), slow_tx);
+    spawn_headset(Arc::clone(&config), Arc::clone(&shutdown), slow_tx.clone());
+    spawn_lhm(
+        Arc::clone(&config),
+        Arc::clone(&shutdown),
+        Arc::clone(&temps_need_refresh),
+        slow_tx.clone(),
+    );
+    spawn_gpu(Arc::clone(&config), Arc::clone(&shutdown), slow_tx);
+    let presentmon_rx = presentmon::spawn(Arc::clone(&config), Arc::clone(&shutdown));
 
     let worker = Worker {
         config: Arc::clone(&config),
@@ -369,10 +508,17 @@ pub fn spawn(cfg: &Config) -> Telemetry {
         net: netif::NetProvider::new(),
         headset_success: None,
         lhm_success: None,
+        gpu_success: None,
         controller_attempt: None,
         audio_attempt: None,
         net_attempt: None,
+        presentmon_rx,
+        temps_need_refresh,
+        native_gpu_temp: Metric::default(),
+        lhm_gpu_temp: Metric::default(),
+        gpu_backend: String::new(),
     };
+    let coordinator_shutdown = Arc::clone(&shutdown);
     std::thread::Builder::new()
         .name("telemetry".into())
         .spawn(move || {
@@ -384,7 +530,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
                 }
             };
             let mut worker = worker;
-            while worker.tick() {
+            while !coordinator_shutdown.load(Ordering::Relaxed) && worker.tick() {
                 std::thread::sleep(TICK);
             }
         })
@@ -392,6 +538,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
     Telemetry {
         updates: rx,
         config,
+        shutdown,
     }
 }
 
@@ -456,32 +603,42 @@ mod tests {
     fn lhm_values_transition_from_current_to_stale() {
         let now = Instant::now();
         let sampled_at = SystemTime::now();
+        let mut lhm_gpu_temp = Metric::valid(74.0, sampled_at);
         let mut update = Update {
             cpu_temp: Metric::valid(67.0, sampled_at),
-            gpu_temp: Metric::valid(74.0, sampled_at),
-            lhm_readings: vec![Reading {
-                freshness: Freshness::Current,
-                ..Default::default()
-            }],
             ..Default::default()
         };
         apply_lhm_freshness(
             &mut update,
+            &mut lhm_gpu_temp,
             Some(now),
             Duration::from_secs(3),
             now + Duration::from_secs(2),
         );
         assert!(!update.cpu_temp.stale);
-        assert_eq!(update.lhm_readings[0].freshness, Freshness::Current);
         apply_lhm_freshness(
             &mut update,
+            &mut lhm_gpu_temp,
             Some(now),
             Duration::from_secs(3),
             now + Duration::from_secs(4),
         );
-        assert!(update.cpu_temp.stale && update.gpu_temp.stale);
-        assert_eq!(update.lhm_readings[0].freshness, Freshness::Stale);
+        assert!(update.cpu_temp.stale && lhm_gpu_temp.stale);
         assert!(!Update::default().cpu_temp.valid);
+    }
+
+    #[test]
+    fn native_gpu_temperature_wins_until_stale() {
+        let at = SystemTime::UNIX_EPOCH;
+        let fallback = Metric::valid(60.0, at);
+        let mut native = Metric::valid(70.0, at);
+        assert_eq!(prefer_native_temperature(native, fallback).value, 70.0);
+        native.stale = true;
+        assert_eq!(prefer_native_temperature(native, fallback).value, 60.0);
+        assert_eq!(
+            prefer_native_temperature(Metric::default(), fallback).value,
+            60.0
+        );
     }
 
     #[test]
@@ -491,6 +648,7 @@ mod tests {
         let telemetry = Telemetry {
             updates,
             config: Arc::clone(&shared),
+            shutdown: Arc::new(AtomicBool::new(false)),
         };
         let changed = Config {
             audio_enabled: false,

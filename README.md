@@ -10,7 +10,9 @@ a smaller footprint and fewer dependencies:
 - **No Process Lasso**: Cache/Frequency CCD bars come from native topology
   detection (L3/NUMA domains + CPUID L3-size labeling of the 3D V-Cache die).
 - **Native-first telemetry**: CPU load from scheduler accounting deltas,
-  memory from `GlobalMemoryStatusEx` — memory reads, not network polling.
+  memory from `GlobalMemoryStatusEx`, GPU load/VRAM/temperature from the
+  vendor-installed NVAPI or ADLX DLL, and PresentMon frame telemetry when its
+  external console is installed. LHM is optional and temperatures-only.
 
 ## Fixed dashboard
 
@@ -79,9 +81,9 @@ logs live under `%LOCALAPPDATA%\LCDForge2\`.
 
 ## Verification status
 
-- Automated: 68 tests green (golden frames, parser, tokenizer, include
-  graph, slots, debounce, G13 report packing/parsing, IEC formatting,
-  hardware-test sequencing, SHA-256/PNG codecs, CCD list handling).
+- Automated: the full Rust suite covers golden rendering, config, device
+  protocols, native GPU arbitration/projection, LHM restriction, and
+  PresentMon parsing/statistics/session/stale behavior.
 - Live machine: G13 vendor collection enumerated (`046d:c21c`, 8/992) at
   medium integrity; configuration validated; virtual hardware-test sequence
   passes end to end.
@@ -95,8 +97,10 @@ logs live under `%LOCALAPPDATA%\LCDForge2\`.
 - **P1 (this release)**: renderer + golden frames, direct-HID G13 backend,
   virtual preview + tray, clock/CPU/CCD/memory providers, config v2 hot
   reload, hardware test.
-- **P2**: GPU vendor DLLs (nvapi/ADLX) → LHM temps fallback, network,
-  Arctis 7P+ battery, XInput, Core Audio, PresentMon.
+- **P2 (implemented)**: native NVAPI/ADLX GPU telemetry, optional LHM
+  temperatures fallback, interface network throughput, Arctis 7P+ battery,
+  XInput, Core Audio, and PresentMon. Vendor hardware, LHM, and the PresentMon
+  console remain optional runtime prerequisites; absence renders unavailable.
 - **P3**: Discord active-speaker overlay (IPC + OAuth + DPAPI).
 - **P4**: guarded hung-process termination, alerts, diagnostics bundle,
   installer/packaging.
