@@ -15,7 +15,7 @@ $output = [IO.Path]::GetFullPath((Join-Path $repo $OutputDir))
 if (-not ($output + '\').StartsWith($artifactsRoot.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
     throw 'release output must remain beneath artifacts/'
 }
-if ((git status --porcelain).Count -ne 0) { throw 'release build requires a clean worktree' }
+if (@(git status --porcelain).Count -ne 0) { throw 'release build requires a clean worktree' }
 $head = (git rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-f]{40}$') { throw 'cannot resolve release commit' }
 
@@ -74,7 +74,7 @@ function Write-DeterministicZip {
 Write-Host '== quality gate ==' -ForegroundColor Cyan
 & (Join-Path $PSScriptRoot 'Test.ps1')
 if ($LASTEXITCODE -ne 0) { throw 'quality gate failed' }
-if ((git status --porcelain).Count -ne 0 -or (git rev-parse HEAD).Trim() -ne $head) { throw 'source changed during quality gate' }
+if (@(git status --porcelain).Count -ne 0 -or (git rev-parse HEAD).Trim() -ne $head) { throw 'source changed during quality gate' }
 
 if ([IO.Directory]::Exists($output)) { Remove-Item -LiteralPath $output -Recurse -Force }
 [IO.Directory]::CreateDirectory($output) | Out-Null
@@ -146,5 +146,5 @@ finally {
     if ([IO.Directory]::Exists($work)) { Remove-Item -LiteralPath $work -Recurse -Force }
 }
 
-if ((git status --porcelain).Count -ne 0 -or (git rev-parse HEAD).Trim() -ne $head) { throw 'source changed during package build' }
+if (@(git status --porcelain).Count -ne 0 -or (git rev-parse HEAD).Trim() -ne $head) { throw 'source changed during package build' }
 Write-Host "Provisional release artifacts: $output" -ForegroundColor Green
