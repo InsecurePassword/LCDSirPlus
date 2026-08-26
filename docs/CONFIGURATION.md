@@ -74,7 +74,7 @@ dashboard to the one-bar CPU layout automatically.
 | `logitech_orientation` | `normal` | `normal` \| `flip_x` \| `flip_y` \| `rotate_180` |
 | `logitech_invert` | 0 | bool |
 
-## LibreHardwareMonitor (optional temps fallback, Phase 2)
+## LibreHardwareMonitor (optional temperature fallback)
 
 | Key | Default | Notes |
 |---|---|---|
@@ -84,7 +84,7 @@ dashboard to the one-bar CPU layout automatically.
 | `lhm_stale_ms` | 3000 (`auto`) | ≥ interval, ≤ 300000 |
 | `lhm_cpu_temp_sensor`, `lhm_gpu_temp_sensor` | — | stable SensorId overrides; no LHM load/VRAM/RAM/network publication |
 
-## GPU / PresentMon / Headset / Controller / Network / Audio (Phase 2)
+## GPU / PresentMon / Headset / Controller / Network / Audio
 
 `gpu_provider` (`auto`\|`nvapi`\|`adlx`\|`off`) uses trusted System32 vendor
 DLLs; `auto` tries NVAPI then ADLX. `presentmon_*`
@@ -110,7 +110,7 @@ contributes to packet loss, while native provider failures retain prior values
 as stale and mark the provider unavailable. Hostnames are rejected because
 standard-library DNS resolution cannot be canceled with the required shutdown bound.
 
-## Discord (Phase 3)
+## Discord
 
 | Key | Default | Notes |
 |---|---|---|
@@ -128,7 +128,7 @@ resulting access/refresh record is current-user DPAPI protected under
 accepted only from the temporary `LCDFORGE_DISCORD_CLIENT_SECRET` environment
 variable. Use `--discord-clear-token` to remove the local record.
 
-## Hung-process guard (Phase 4)
+## Hung-process guard
 
 `hang_enabled`, `hang_button` (fixed 3), `hang_hold_ms` (1000..10000),
 `hang_probe_interval_ms` (250..60000), `hang_probe_timeout_ms` (10..5000,
@@ -137,7 +137,7 @@ variable. Use `--discord-clear-token` to remove the local record.
 and termination but preserves ordinary short-press slot cycling and button 4
 alert acknowledgement.
 
-## Alerts (Phase 2/4)
+## Alerts
 
 `cpu_temp_warning/critical` (0..150, critical ≥ warning), `gpu_temp_*`,
 `memory_warning`/`vmem_warning` (0..100), `critical_alert_linger_ms`

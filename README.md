@@ -4,7 +4,7 @@ LCDForge is a native Windows 11 x64 dashboard for the **Logitech G13 160×43
 monochrome LCD** — a faithful port of the LCDForge 0.2.0 Go application with
 a smaller footprint and fewer dependencies:
 
-- **~370 KB single static executable** (Go build: multi-MB with runtime).
+- **Single native executable** with no bundled runtime or installer framework.
 - **No Logitech runtime**: direct-HID G13 backend (the proven path from the
   0.2.0 repair — no LCore, no G HUB conflict, no administrator rights).
 - **No Process Lasso**: Cache/Frequency CCD bars come from native topology
@@ -76,6 +76,7 @@ lcdforge.exe [--config PATH] [COMMAND]
 cargo build --release          # target\release\lcdforge.exe
 cargo test                     # full suite incl. golden frames
 cargo clippy                   # zero-warning policy
+pwsh scripts/Build.ps1         # quality gates + provisional release packages
 ```
 
 Toolchain: stable Rust (MSVC), only dependency is the official `windows`
@@ -90,6 +91,42 @@ configuration files, credentials, Discord data, window/process details, paths,
 network targets, environment values, registry values, serials, or device paths;
 collection does not start hardware, providers, probes, or actions. `--config`
 is deliberately ignored in diagnostics mode, including UNC paths and includes.
+
+## Install, update, and uninstall
+
+Verify the downloaded ZIP against `SHA256SUMS.txt`, extract the installer ZIP,
+then run from its extracted root:
+
+```powershell
+Get-Content .\SHA256SUMS.txt
+Get-FileHash .\LCDForge-0.3.0-*.zip -Algorithm SHA256
+pwsh -NoProfile -File .\Install.ps1
+pwsh -NoProfile -File .\Install.ps1 -EnableLogin  # optional HKCU Run ownership
+& "$env:LOCALAPPDATA\Programs\LCDForge2\Uninstall.ps1"
+& "$env:LOCALAPPDATA\Programs\LCDForge2\Uninstall.ps1" `
+  -PurgeUserData -ConfirmPurge PURGE-LCDFORGE2-DATA
+```
+
+Running `Install.ps1` again performs an update. It verifies every declared
+member, stages on the same fixed local volume, preserves the installed
+`lcdforge.txt` byte-for-byte, and rolls back a failed publication/post-check.
+Install/update/uninstall refuse while the exact installed executable is
+running. Uninstall removes only manifest-owned files and exact owned shortcut/
+Run entries; it preserves configuration, unknown install files, and
+`%LOCALAPPDATA%\LCDForge2` unless purge is explicitly confirmed. No operation
+requests elevation, kills a process, or replaces foreign integration state.
+
+Release output contains three deterministic archives plus `SHA256SUMS.txt`:
+
+- `LCDForge-0.3.0-win-x64-portable.zip`
+- `LCDForge-0.3.0-win-x64-installer.zip`
+- `LCDForge-0.3.0-source.zip`
+
+Each archive has one root directory and a sorted `PACKAGE-MANIFEST.txt` with
+SHA-256 and byte size for every other member. Packages are **not code-signed**;
+checksum verification is mandatory. PresentMon, LibreHardwareMonitor, vendor
+drivers, Discord Desktop, and Discord developer/tester setup are optional
+external prerequisites and are not redistributed.
 
 ## Verification status
 
@@ -110,21 +147,21 @@ is deliberately ignored in diagnostics mode, including UNC paths and includes.
   voice-channel speaker/channel/reconnect/refresh behavior require the user's
   Discord application, tester account, consent, and another voice participant.
 
-## Phase roadmap
+## Completion status
 
-- **P1 (this release)**: renderer + golden frames, direct-HID G13 backend,
+- **P1 complete**: renderer + golden frames, direct-HID G13 backend,
   virtual preview + tray, clock/CPU/CCD/memory providers, config v2 hot
   reload, hardware test.
-- **P2 (implemented)**: native NVAPI/ADLX GPU telemetry, optional LHM
+- **P2 complete**: native NVAPI/ADLX GPU telemetry, optional LHM
   temperatures fallback, interface network throughput, Arctis 7P+ battery,
   XInput, Core Audio, and PresentMon. Vendor hardware, LHM, and the PresentMon
   console remain optional runtime prerequisites; absence renders unavailable.
-- **P3 (implemented)**: verified Discord desktop IPC active-speaker overlay,
+- **P3 complete**: verified Discord desktop IPC active-speaker overlay,
   RPC OAuth authorization, refresh, and current-user DPAPI credential storage.
-- **P4 (runtime implemented)**: guarded hung-process termination, alerts,
+- **P4 complete**: guarded hung-process termination, alerts,
   single-instance ownership, startup registration, preview fallback, and
-  optional network-quality probes. Diagnostics bundle and installer/packaging
-  remain pending.
+  optional network-quality probes, offline diagnostics, and transactional
+  install/update/uninstall packaging.
 
 ## Discord authorization
 
@@ -151,6 +188,17 @@ scopes `identify`, `rpc`, and `rpc.voice.read`. LCDForge opens no callback
 listener and launches no browser. The only Discord network request is the
 HTTPS token exchange/refresh, which has a finite 20-second deadline. Discord
 pipe operations are cancelable during shutdown and configuration reload.
+
+The application otherwise remains local-first. Optional network quality uses
+only the configured IP literal with a bounded ICMP/TCP deadline and is disabled
+in safe mode. Discord authorization/refresh uses bounded outbound HTTPS; LHM is
+restricted to loopback. No feature opens an inbound listener.
+
+The hung-window action can terminate a process. It requires repeated bounded
+failure evidence, exact identity revalidation, a continuous physical hold, and
+release; safe mode disables it. Test only with `--hang-test-harness` and never
+with unsaved work. Final physical and Discord acceptance is tracked in
+`docs/HARDWARE-ACCEPTANCE.md`.
 
 ## License
 

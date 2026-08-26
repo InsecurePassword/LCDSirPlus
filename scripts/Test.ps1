@@ -10,6 +10,21 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 Set-Location -LiteralPath $repo
 
+Write-Host '== PowerShell syntax ==' -ForegroundColor Cyan
+$parse = '$tokens=$null; $errors=$null; [Management.Automation.Language.Parser]::ParseFile($env:LCDFORGE_PARSE_FILE,[ref]$tokens,[ref]$errors) | Out-Null; if ($errors.Count -ne 0) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }'
+$allScripts = @('Build.ps1', 'Install.ps1', 'Package.Common.ps1', 'Package-Test.ps1', 'Test.ps1', 'Uninstall.ps1')
+foreach ($script in $allScripts) {
+    $env:LCDFORGE_PARSE_FILE = Join-Path $PSScriptRoot $script
+    & (Get-Command pwsh).Source -NoProfile -Command $parse
+    if ($LASTEXITCODE -ne 0) { throw "pwsh syntax failed: $script" }
+}
+foreach ($script in @('Install.ps1', 'Package.Common.ps1', 'Uninstall.ps1')) {
+    $env:LCDFORGE_PARSE_FILE = Join-Path $PSScriptRoot $script
+    & (Get-Command powershell.exe).Source -NoProfile -Command $parse
+    if ($LASTEXITCODE -ne 0) { throw "Windows PowerShell 5.1 syntax failed: $script" }
+}
+Remove-Item Env:\LCDFORGE_PARSE_FILE -ErrorAction SilentlyContinue
+
 Write-Host '== cargo fmt check ==' -ForegroundColor Cyan
 cargo fmt --check
 if ($LASTEXITCODE -ne 0) { throw 'cargo fmt check failed' }

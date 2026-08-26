@@ -16,8 +16,8 @@ The normal screen always shows:
 - independent Cache-CCD and Frequency-CCD CPU load (dual-CCD CPUs), or one
   full-height CPU load bar (single-CCD CPUs);
 - system memory load;
-- GPU load and VRAM load (Phase 2 providers; explicit unavailable state until
-  then);
+- GPU load and VRAM load from available native vendor providers, with explicit
+  unavailable state when prerequisites are absent;
 - four button-aligned configurable telemetry modules.
 
 The fixed layout is intentionally static. The lower slot contents are the
@@ -63,17 +63,17 @@ README.md and enforced in `src/backends/g13.rs` + `src/backends/hid.rs`.
 - GlobalMemoryStatusEx: memory load.
 - NVIDIA NVAPI / AMD ADLX vendor DLLs provide GPU load, VRAM, and temperature;
   LibreHardwareMonitor loopback JSON is an optional temperatures-only fallback
-  (Phase 2).
-- PresentMon: FPS/frame timing (Phase 2).
-- Arctis 7P+ USB HID: headset battery (Phase 2).
+  when available.
+- PresentMon: optional FPS/frame timing.
+- Arctis 7P+ USB HID: optional headset battery.
 - Discord local RPC: verified active-speaker overlay with RPC OAuth and
-  current-user DPAPI credential storage (Phase 3).
+  current-user DPAPI credential storage.
 
 ## Operational requirements
 
 - Standard user; medium integrity; no elevation.
-- Local-first and offline (Discord token exchange in Phase 3 is the only
-  network dependency; operator probes optional).
+- Local-first and offline except bounded Discord token exchange/refresh and
+  explicitly enabled operator probes.
 - No arbitrary scripts/plugins; no kernel drivers; no services; no listeners.
 - Provider failures isolated; explicit stale/unavailable states.
 - Config hot reload preserves last valid state.
@@ -83,7 +83,7 @@ README.md and enforced in `src/backends/g13.rs` + `src/backends/hid.rs`.
 - A local-only diagnostics command produces an atomic, redacted ZIP capped at
   1 MiB from typed offline facts; it excludes raw logs/configuration and private
   identifiers/content and starts no hardware, provider, network, or action path.
-- Single static native binary; no runtime installation.
+- Single native binary; no framework/runtime installation.
 - One normal/direct-HID runtime per Windows session; read-only and virtual test
   commands remain available alongside it.
 - Optional network-quality probes are disabled by default, bounded to one
@@ -91,6 +91,9 @@ README.md and enforced in `src/backends/g13.rs` + `src/backends/hid.rs`.
   in safe mode.
 - Optional current-user startup registration never replaces or removes a
   foreign Run value and is never mutated in safe mode.
+- Per-user install/update uses a verified manifest, same-volume staging,
+  rollback, exact shortcut/Run ownership, and byte-preserved configuration.
+  Uninstall preserves configuration, unknown files, and user data by default.
 
 ## Alerts and preview
 

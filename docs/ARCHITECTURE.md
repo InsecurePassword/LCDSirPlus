@@ -10,7 +10,7 @@ src\
 ├── diagnostics.rs      offline typed report + bounded store-only ZIP
 ├── parser.rs           tokenizer + include graph + line diagnostics
 ├── model.rs            canonical metric/reading/snapshot model
-├── history.rs          ring buffer + frame statistics (Phase 2 consumers)
+├── history.rs          ring buffer + frame statistics
 ├── render\
 │   ├── mod.rs          160x43 Frame (set/get/rect/hash/png)
 │   ├── font.rs         3x5 bitmap font (glyph-exact Go port)
@@ -67,6 +67,20 @@ Normal runtime and direct-HID hardware tests acquire the per-session
 commands and virtual tests do not acquire it. The RAII owner closes the handle
 on return. Startup registration uses a transaction and mutates only an exact
 owned current-user Run value.
+
+## Packaging boundary
+
+`scripts/Build.ps1` accepts only a clean exact Git HEAD, runs the full quality
+gate, stages explicit member allowlists, and emits deterministic portable,
+installer, and source ZIPs. Every archive has one root and a sorted hash/size
+manifest; `SHA256SUMS.txt` covers all three ZIPs. The source tree is populated
+from `git archive HEAD`, not the working directory.
+
+`Install.ps1` and `Uninstall.ps1` share `Package.Common.ps1` for member, path,
+fixed-volume, reparse, hard-link, hash, and process checks. Install uses a
+same-parent stage/backup swap and preserves the live config on update. Uninstall
+uses the installed ownership manifest, preserves undeclared files/config/data,
+and removes shortcut/Run state only when it still targets the exact install.
 
 ## Data flow (one tick)
 
