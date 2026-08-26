@@ -35,8 +35,17 @@ pub const KNOWN_PIDS: [u16; 5] = [0x220C, 0x220E, 0x2212, 0x2216, 0x2236];
 
 const MAX_VISITED: usize = 256;
 const MAX_CANDIDATES: usize = 64;
-const IO_TIMEOUT_MS: u32 = 2000;
 const READ_ATTEMPTS: usize = 5;
+
+struct EventHandle(HANDLE);
+
+impl Drop for EventHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Status {
@@ -310,14 +319,15 @@ pub fn parse_interface_number(path: &str) -> i32 {
 }
 
 /// One bounded status query: rank, open best candidate, 0xB0 request, read.
-pub fn query() -> Result<Status, String> {
+pub fn query(timeout: std::time::Duration) -> Result<Status, String> {
     let candidates = rank_candidates(enumerate());
     let Some(_best) = candidates.first() else {
         return Err("compatible SteelSeries Arctis receiver not found".into());
     };
+    let deadline = std::time::Instant::now() + timeout;
     let mut last_error = String::new();
     for candidate in &candidates {
-        match probe(candidate) {
+        match probe(candidate, deadline) {
             Ok(status) => return Ok(status),
             Err(e) => last_error = e,
         }
@@ -328,7 +338,7 @@ pub fn query() -> Result<Status, String> {
     Err(last_error)
 }
 
-fn probe(info: &HidInterface) -> Result<Status, String> {
+fn probe(info: &HidInterface, deadline: std::time::Instant) -> Result<Status, String> {
     unsafe {
         let wide: Vec<u16> = info.path.encode_utf16().chain(std::iter::once(0)).collect();
         let handle = CreateFileW(
@@ -341,22 +351,28 @@ fn probe(info: &HidInterface) -> Result<Status, String> {
             None,
         )
         .map_err(|e| format!("open shared SteelSeries HID interface: {}", e))?;
-        let result = probe_handle(handle, info);
+        let result = probe_handle(handle, info, deadline);
         let _ = CloseHandle(handle);
         result
     }
 }
 
-unsafe fn probe_handle(handle: HANDLE, info: &HidInterface) -> Result<Status, String> {
-    let event =
-        CreateEventW(None, true, false, None).map_err(|e| format!("CreateEventW: {}", e))?;
+unsafe fn probe_handle(
+    handle: HANDLE,
+    info: &HidInterface,
+    deadline: std::time::Instant,
+) -> Result<Status, String> {
+    let event = EventHandle(
+        CreateEventW(None, false, false, None).map_err(|e| format!("CreateEventW: {}", e))?,
+    );
     let out_len = info.output_len.max(2) as usize;
     let mut out = vec![0u8; out_len];
     out[1] = 0xB0;
 
     let write = || -> Result<usize, String> {
+        let wait_ms = remaining_ms(deadline)?;
         let mut overlapped = OVERLAPPED {
-            hEvent: event,
+            hEvent: event.0,
             ..Default::default()
         };
         match windows::Win32::Storage::FileSystem::WriteFile(
@@ -367,7 +383,7 @@ unsafe fn probe_handle(handle: HANDLE, info: &HidInterface) -> Result<Status, St
         ) {
             Ok(()) => Ok(out_len),
             Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => {
-                match WaitForSingleObject(event, IO_TIMEOUT_MS) {
+                match WaitForSingleObject(event.0, wait_ms) {
                     WAIT_OBJECT_0 => {
                         let mut transferred = 0u32;
                         GetOverlappedResult(handle, &overlapped, &mut transferred, false)
@@ -380,7 +396,12 @@ unsafe fn probe_handle(handle: HANDLE, info: &HidInterface) -> Result<Status, St
                         let _ = GetOverlappedResult(handle, &overlapped, &mut drained, true);
                         Err("status request timed out".into())
                     }
-                    _ => Err("status request wait failed".into()),
+                    _ => {
+                        let _ = CancelIoEx(handle, Some(&overlapped));
+                        let mut drained = 0u32;
+                        let _ = GetOverlappedResult(handle, &overlapped, &mut drained, true);
+                        Err("status request wait failed".into())
+                    }
                 }
             }
             Err(e) => Err(format!("status request: {}", e)),
@@ -395,24 +416,36 @@ unsafe fn probe_handle(handle: HANDLE, info: &HidInterface) -> Result<Status, St
     let mut last_error = String::new();
     for _ in 0..READ_ATTEMPTS {
         let mut buffer = vec![0u8; in_len];
-        let transferred = read_once(handle, event, &mut buffer)?;
+        let transferred = read_once(handle, event.0, &mut buffer, deadline)?;
         buffer.truncate(transferred);
         match parse_status(&buffer) {
             Ok(status) => {
-                let _ = CloseHandle(event);
                 return Ok(status);
             }
             Err(e) => last_error = e,
         }
     }
-    let _ = CloseHandle(event);
     if last_error.is_empty() {
         last_error = "no compatible SteelSeries battery status report received".into();
     }
     Err(last_error)
 }
 
-unsafe fn read_once(handle: HANDLE, event: HANDLE, buffer: &mut [u8]) -> Result<usize, String> {
+fn remaining_ms(deadline: std::time::Instant) -> Result<u32, String> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err("status query timed out".into());
+    }
+    Ok(remaining.as_millis().clamp(1, u32::MAX as u128) as u32)
+}
+
+unsafe fn read_once(
+    handle: HANDLE,
+    event: HANDLE,
+    buffer: &mut [u8],
+    deadline: std::time::Instant,
+) -> Result<usize, String> {
+    let wait_ms = remaining_ms(deadline)?;
     let mut overlapped = OVERLAPPED {
         hEvent: event,
         ..Default::default()
@@ -425,7 +458,7 @@ unsafe fn read_once(handle: HANDLE, event: HANDLE, buffer: &mut [u8]) -> Result<
     ) {
         Ok(()) => Ok(buffer.len()),
         Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => {
-            match WaitForSingleObject(event, IO_TIMEOUT_MS) {
+            match WaitForSingleObject(event, wait_ms) {
                 WAIT_OBJECT_0 => {
                     let mut transferred = 0u32;
                     GetOverlappedResult(handle, &overlapped, &mut transferred, false)
@@ -438,7 +471,12 @@ unsafe fn read_once(handle: HANDLE, event: HANDLE, buffer: &mut [u8]) -> Result<
                     let _ = GetOverlappedResult(handle, &overlapped, &mut drained, true);
                     Err("status response timed out".into())
                 }
-                _ => Err("status response wait failed".into()),
+                _ => {
+                    let _ = CancelIoEx(handle, Some(&overlapped));
+                    let mut drained = 0u32;
+                    let _ = GetOverlappedResult(handle, &overlapped, &mut drained, true);
+                    Err("status response wait failed".into())
+                }
             }
         }
         Err(e) => Err(format!("read status response: {}", e)),

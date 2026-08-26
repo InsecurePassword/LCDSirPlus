@@ -3,10 +3,11 @@
 
 #![cfg(windows)]
 
+use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{EDataFlow, ERole, IMMDeviceEnumerator, MMDeviceEnumerator};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -14,6 +15,36 @@ pub struct AudioState {
     pub volume_percent: f64,
     pub mic_known: bool,
     pub mic_muted: bool,
+}
+
+pub struct ComThread {
+    uninitialize: bool,
+}
+
+impl Drop for ComThread {
+    fn drop(&mut self) {
+        if self.uninitialize {
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
+/// Initialize COM once for the provider thread. S_OK and S_FALSE both require
+/// a matching CoUninitialize; RPC_E_CHANGED_MODE means COM is already usable.
+pub fn initialize_thread() -> Result<ComThread, String> {
+    let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    if result.is_ok() {
+        Ok(ComThread { uninitialize: true })
+    } else if result == RPC_E_CHANGED_MODE {
+        Ok(ComThread {
+            uninitialize: false,
+        })
+    } else {
+        Err(format!(
+            "initialize COM: {}",
+            windows::core::Error::from(result)
+        ))
+    }
 }
 
 fn endpoint_volume(dataflow: EDataFlow) -> windows::core::Result<IAudioEndpointVolume> {
@@ -27,9 +58,6 @@ fn endpoint_volume(dataflow: EDataFlow) -> windows::core::Result<IAudioEndpointV
 
 pub fn read() -> Result<AudioState, String> {
     unsafe {
-        // Already-initialized COM on this thread is fine; a different model
-        // (RPC_E_CHANGED_MODE) also works for our purposes.
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let output =
             endpoint_volume(EDataFlow(0)).map_err(|e| format!("output endpoint: {}", e))?;
         let volume = output

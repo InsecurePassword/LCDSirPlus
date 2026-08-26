@@ -575,26 +575,21 @@ fn check_range_i32(name: &str, v: i32, lo: i32, hi: i32) -> Result<(), String> {
 }
 
 fn validate_lhm_url(url: &str) -> Result<(), String> {
-    // Loopback-only http(s), no credentials, no query, no fragment.
-    let lower = url.to_lowercase();
-    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-        return Err("lhm_url must be http or https".into());
-    }
-    let rest = &url[url.find("://").unwrap() + 3..];
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
+    // The runtime client supports loopback HTTP only.
+    let rest = url.strip_prefix("http://").ok_or("lhm_url must use http")?;
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
     if authority.contains('@') {
         return Err("lhm_url must not contain credentials".into());
-    }
-    let host = authority.split(':').next().unwrap_or("").to_lowercase();
-    if !matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]") {
-        return Err("lhm_url must be loopback".into());
     }
     if url.contains('?') {
         return Err("lhm_url must not contain a query".into());
     }
     if url.contains('#') {
         return Err("lhm_url must not contain a fragment".into());
+    }
+    let parsed = crate::http::parse_url(url)?;
+    if !crate::http::is_loopback_host(&parsed.host) {
+        return Err("lhm_url must be loopback".into());
     }
     Ok(())
 }
@@ -716,6 +711,21 @@ mod tests {
             ..Config::default()
         };
         assert!(validate(&c).is_ok());
+        let c = Config {
+            lhm_url: "http://[::1]:8085/data.json".into(),
+            ..Config::default()
+        };
+        assert!(validate(&c).is_ok());
+        for url in [
+            "https://127.0.0.1:8085/data.json",
+            "http://example.com@127.0.0.1:8085/data.json",
+        ] {
+            let c = Config {
+                lhm_url: url.into(),
+                ..Config::default()
+            };
+            assert!(validate(&c).is_err());
+        }
     }
 
     #[test]

@@ -4,7 +4,10 @@
 #![cfg(windows)]
 
 use windows::core::{s, w};
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::Foundation::ERROR_DEVICE_NOT_CONNECTED;
+use windows::Win32::System::LibraryLoader::{
+    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+};
 
 use std::sync::OnceLock;
 
@@ -41,7 +44,7 @@ fn xinput_battery_fn() -> Option<XInputGetBatteryInformationFn> {
             w!("xinput1_3.dll"),
             w!("xinput9_1_0.dll"),
         ] {
-            let Ok(module) = LoadLibraryW(dll) else {
+            let Ok(module) = LoadLibraryExW(dll, None, LOAD_LIBRARY_SEARCH_SYSTEM32) else {
                 continue;
             };
             if let Some(p) = GetProcAddress(module, s!("XInputGetBatteryInformation")) {
@@ -62,10 +65,14 @@ pub fn query_index(index: u32) -> Result<Option<XInputControllerBattery>, String
     };
     let mut battery = XInputBatteryInformation::default();
     let status = unsafe { f(index, BATTERY_DEVICE_TYPE_GAMEPAD, &mut battery) };
-    if status != 0 {
-        // ERROR_NOT_CONNECTED (1163) and ERROR_DEVICE_NOT_CONNECTED are the
-        // documented "no controller" outcomes.
+    if status == ERROR_DEVICE_NOT_CONNECTED.0 {
         return Ok(None);
+    }
+    if status != 0 {
+        return Err(format!(
+            "XInputGetBatteryInformation failed with status {}",
+            status
+        ));
     }
     if battery.battery_type == BATTERY_TYPE_DISCONNECTED {
         return Ok(None);

@@ -31,11 +31,12 @@ struct SystemCounters {
     entries: Vec<(usize, u64, u64)>, // (interface index, inOctets, outOctets)
 }
 
-fn snapshot() -> Option<SystemCounters> {
+fn snapshot() -> Result<SystemCounters, String> {
     unsafe {
         let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
-        if GetIfTable2(&mut table) != NO_ERROR || table.is_null() {
-            return None;
+        let status = GetIfTable2(&mut table);
+        if status != NO_ERROR || table.is_null() {
+            return Err(format!("GetIfTable2 failed with status {}", status.0));
         }
         let mut out = SystemCounters::default();
         let rows = std::ptr::addr_of!((*table).Table) as *const MIB_IF_ROW2;
@@ -52,7 +53,7 @@ fn snapshot() -> Option<SystemCounters> {
                 .push((row.InterfaceIndex as usize, row.InOctets, row.OutOctets));
         }
         FreeMibTable(table.cast());
-        Some(out)
+        Ok(out)
     }
 }
 
@@ -61,16 +62,22 @@ impl NetProvider {
         NetProvider::default()
     }
 
-    /// Sample throughput. The first call returns zeros (no delta yet).
-    pub fn update(&mut self) -> NetThroughput {
-        let Some(current) = snapshot() else {
-            return NetThroughput::default();
-        };
-        let now = std::time::Instant::now();
+    /// Sample throughput. `Ok(None)` means a baseline was captured but no
+    /// rate exists yet; a real idle delta is `Ok(Some(0, 0))`.
+    pub fn update(&mut self) -> Result<Option<NetThroughput>, String> {
+        self.update_from(snapshot(), std::time::Instant::now())
+    }
+
+    fn update_from(
+        &mut self,
+        current: Result<SystemCounters, String>,
+        now: std::time::Instant,
+    ) -> Result<Option<NetThroughput>, String> {
+        let current = current?;
         let Some(prev) = self.prev.take() else {
             self.prev = Some(current);
             self.prev_at = Some(now);
-            return NetThroughput::default();
+            return Ok(None);
         };
         let elapsed = now
             .duration_since(self.prev_at.unwrap_or(now))
@@ -79,7 +86,7 @@ impl NetProvider {
         let mut result = NetThroughput::default();
         if elapsed <= 0.0 {
             self.prev = Some(current);
-            return result;
+            return Ok(Some(result));
         }
         for (luid, in_octets, out_octets) in &current.entries {
             if let Some((_, p_in, p_out)) =
@@ -93,7 +100,7 @@ impl NetProvider {
             }
         }
         self.prev = Some(current);
-        result
+        Ok(Some(result))
     }
 }
 
@@ -102,10 +109,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_sample_is_zero() {
+    fn baseline_idle_and_failure_are_distinct() {
         let mut p = NetProvider::new();
-        let n = p.update();
+        let now = std::time::Instant::now();
+        let counters = || SystemCounters {
+            entries: vec![(1, 100, 200)],
+        };
+        assert!(p.update_from(Ok(counters()), now).unwrap().is_none());
+        let n = p
+            .update_from(Ok(counters()), now + std::time::Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
         assert_eq!(n.in_bps, 0.0);
         assert_eq!(n.out_bps, 0.0);
+        assert!(p
+            .update_from(
+                Err("failed".into()),
+                now + std::time::Duration::from_secs(2)
+            )
+            .is_err());
     }
 }

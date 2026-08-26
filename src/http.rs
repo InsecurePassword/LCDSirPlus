@@ -26,12 +26,26 @@ pub fn parse_url(url: &str) -> Result<Url, String> {
     let authority = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (
-            h.to_string(),
-            p.parse::<u16>().map_err(|_| "invalid port".to_string())?,
-        ),
-        None => (authority.to_string(), 80),
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let end = bracketed.find(']').ok_or("invalid IPv6 authority")?;
+        let host = &bracketed[..end];
+        let suffix = &bracketed[end + 1..];
+        let port = match suffix.strip_prefix(':') {
+            Some(p) => p.parse::<u16>().map_err(|_| "invalid port".to_string())?,
+            None if suffix.is_empty() => 80,
+            None => return Err("invalid IPv6 authority".into()),
+        };
+        (host.to_string(), port)
+    } else if authority.matches(':').count() > 1 {
+        (authority.to_string(), 80)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (
+                h.to_string(),
+                p.parse::<u16>().map_err(|_| "invalid port".to_string())?,
+            ),
+            None => (authority.to_string(), 80),
+        }
     };
     if host.is_empty() {
         return Err("empty host".into());
@@ -46,7 +60,7 @@ pub fn parse_url(url: &str) -> Result<Url, String> {
 pub fn is_loopback_host(host: &str) -> bool {
     matches!(
         host.to_lowercase().as_str(),
-        "127.0.0.1" | "localhost" | "::1" | "[::1]"
+        "127.0.0.1" | "localhost" | "::1"
     )
 }
 
@@ -56,7 +70,11 @@ pub fn get(url: &str, timeout: Duration) -> Result<Vec<u8>, String> {
     if !is_loopback_host(&parsed.host) {
         return Err("refusing non-loopback HTTP request".into());
     }
-    let addr = format!("{}:{}", parsed.host, parsed.port);
+    let addr = if parsed.host.contains(':') {
+        format!("[{}]:{}", parsed.host, parsed.port)
+    } else {
+        format!("{}:{}", parsed.host, parsed.port)
+    };
     let mut stream = TcpStream::connect(&addr).map_err(|e| format!("connect {}: {}", addr, e))?;
     stream
         .set_read_timeout(Some(timeout))
@@ -171,6 +189,8 @@ mod tests {
         assert!(parse_url("https://127.0.0.1/x").is_err());
         let u = parse_url("http://user:pass@host:8080/x").unwrap();
         assert_eq!((u.host.as_str(), u.port), ("host", 8080)); // caller validates loopback
+        let u = parse_url("http://[::1]:8085/data.json").unwrap();
+        assert_eq!((u.host.as_str(), u.port), ("::1", 8085));
     }
 
     #[test]

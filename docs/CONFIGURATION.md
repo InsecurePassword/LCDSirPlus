@@ -75,7 +75,7 @@ dashboard to the one-bar CPU layout automatically.
 | Key | Default | Notes |
 |---|---|---|
 | `lhm_mode` | `auto` | `auto` (only when vendor DLLs can't) \| `on` \| `off` |
-| `lhm_url` | `auto` → `http://127.0.0.1:8085/data.json` | loopback http(s) only, no query/fragment/credentials |
+| `lhm_url` | `auto` → `http://127.0.0.1:8085/data.json` | loopback HTTP only, no query/fragment/credentials |
 | `lhm_interval_ms` | 300 (`auto`) | 100..60000 |
 | `lhm_stale_ms` | 3000 (`auto`) | ≥ interval, ≤ 300000 |
 | `lhm_cpu_temp_sensor` etc. | — | stable SensorId overrides |
@@ -87,6 +87,8 @@ dashboard to the one-bar CPU layout automatically.
 `stutter_threshold_ms` 1..1000), `headset_*` (warn ≥ critical),
 `controller_index` (-1..3), `network_probe_*` (`icmp`\|`tcp`),
 `audio_poll_ms`. All validate now; providers activate in Phase 2.
+`headset_query_timeout_ms` bounds the complete HID write/read sequence after
+bounded device enumeration.
 
 ## Discord (Phase 3)
 

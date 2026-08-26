@@ -145,7 +145,7 @@ pub fn run(opts: RunOptions) -> i32 {
 
     // Providers.
     let mut cpu_provider = cpu::CpuLoadProvider::new();
-    let telemetry_rx = crate::telemetry::spawn(&cfg);
+    let telemetry_runtime = crate::telemetry::spawn(&cfg);
     let mut telemetry = crate::telemetry::Update::default();
     let mut renderer = Renderer::new();
     let slots = Manager::new(&cfg, [0; 4]);
@@ -164,7 +164,7 @@ pub fn run(opts: RunOptions) -> i32 {
 
         if now.duration_since(last_telemetry) >= cfg.telemetry_interval {
             last_telemetry = now;
-            while let Ok(update) = telemetry_rx.try_recv() {
+            while let Ok(update) = telemetry_runtime.updates.try_recv() {
                 telemetry = update;
             }
             snapshot = build_snapshot(&cfg, &topology, &mut cpu_provider, &telemetry, slot_indexes);
@@ -240,6 +240,10 @@ pub fn run(opts: RunOptions) -> i32 {
                 match crate::parser::load(&config_path) {
                     Ok(loaded) => {
                         cfg = loaded.config;
+                        if opts.safe_mode {
+                            cfg.safe_mode = true;
+                        }
+                        telemetry_runtime.update_config(&cfg);
                         slots.apply(&cfg);
                         crate::log_info!("configuration reloaded");
                     }
@@ -456,18 +460,7 @@ fn build_snapshot(
         .extend(telemetry.lhm_readings.iter().cloned());
     snapshot.readings = readings;
 
-    // Network throughput (bytes/second).
-    if telemetry.net.in_bps > 0.0 || telemetry.net.out_bps > 0.0 {
-        snapshot.network_in = Metric::valid(telemetry.net.in_bps, now);
-        snapshot.network_out = Metric::valid(telemetry.net.out_bps, now);
-    }
-
-    // Audio endpoint state.
-    if let Some(audio) = &telemetry.audio {
-        snapshot.audio_volume = Metric::valid(audio.volume_percent, now);
-        snapshot.microphone_known = audio.mic_known;
-        snapshot.microphone_muted = audio.mic_muted;
-    }
+    apply_telemetry(&mut snapshot, telemetry, now);
 
     if cfg.safe_mode {
         snapshot.providers.insert("safe-mode".into(), true);
@@ -476,6 +469,29 @@ fn build_snapshot(
         snapshot.providers.insert(name.clone(), *ok);
     }
     snapshot
+}
+
+fn apply_telemetry(snapshot: &mut Snapshot, telemetry: &crate::telemetry::Update, now: SystemTime) {
+    snapshot.cpu_temp = telemetry.cpu_temp;
+    snapshot.gpu_temp = telemetry.gpu_temp;
+
+    // A sampled idle interval is valid telemetry, not unavailable data.
+    snapshot.network_in = Metric::default();
+    snapshot.network_out = Metric::default();
+    if let Some(net) = telemetry.net {
+        snapshot.network_in = Metric::valid(net.in_bps, now);
+        snapshot.network_out = Metric::valid(net.out_bps, now);
+    }
+
+    // Audio endpoint state.
+    snapshot.audio_volume = Metric::default();
+    snapshot.microphone_known = false;
+    snapshot.microphone_muted = false;
+    if let Some(audio) = &telemetry.audio {
+        snapshot.audio_volume = Metric::valid(audio.volume_percent, now);
+        snapshot.microphone_known = audio.mic_known;
+        snapshot.microphone_muted = audio.mic_muted;
+    }
 }
 
 fn handle_button(event: Event, slots: &Manager, indexes: &mut [usize; 4], cfg: &Config) {
@@ -531,5 +547,33 @@ fn stat(path: &std::path::Path) -> (Option<SystemTime>, u64) {
     match std::fs::metadata(path) {
         Ok(meta) => (meta.modified().ok(), meta.len()),
         Err(_) => (None, 0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_projects_temperature_states_and_idle_network() {
+        let now = SystemTime::now();
+        let mut update = crate::telemetry::Update {
+            cpu_temp: Metric::valid(67.0, now),
+            gpu_temp: Metric::valid(74.0, now),
+            net: Some(crate::providers::netif::NetThroughput::default()),
+            ..Default::default()
+        };
+        update.gpu_temp.stale = true;
+        let mut snapshot = Snapshot::default();
+        apply_telemetry(&mut snapshot, &update, now);
+        assert!(snapshot.cpu_temp.valid && !snapshot.cpu_temp.stale);
+        assert!(snapshot.gpu_temp.valid && snapshot.gpu_temp.stale);
+        assert!(snapshot.network_in.valid && snapshot.network_out.valid);
+
+        apply_telemetry(&mut snapshot, &crate::telemetry::Update::default(), now);
+        assert!(!snapshot.cpu_temp.valid);
+        assert!(!snapshot.gpu_temp.valid);
+        assert!(!snapshot.network_in.valid);
+        assert!(!snapshot.audio_volume.valid);
     }
 }
