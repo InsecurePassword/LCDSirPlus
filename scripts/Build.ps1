@@ -86,6 +86,7 @@ foreach ($remap in $remapRoots) {
     $source = Get-NormalizedFullPath $remap.Path
     if ($seenRemaps.Add($source)) { $remapFlags += "--remap-path-prefix=$source=$($remap.Destination)" }
 }
+$remapFlags += @('-C', 'link-arg=/Brepro')
 
 try {
     $env:CARGO_ENCODED_RUSTFLAGS = $remapFlags -join [char]0x1f
