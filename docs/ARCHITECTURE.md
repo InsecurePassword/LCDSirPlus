@@ -92,13 +92,16 @@ Backend button reports flow back: `parse_input` → `ButtonTracker.observe`
   bars read only canonical readings, never legacy projections.
 - Hung detector: query-only visible top-level-window enumeration captures
   HWND/PID/creation-time/image identity, applies configured and Windows-directory
-  exclusions, and requires consecutive bounded `WM_NULL` failures plus minimum
-  elapsed time. Recovery, absence, identity change, disable, and safe mode clear
-  targets immediately. This phase has no process-termination capability.
+  exclusions, and counts only documented `WM_NULL` timeouts after revalidating
+  the exact identity. Other message errors are indeterminate. Recovery, absence,
+  identity or probe-policy change, disable, and safe mode clear targets
+  immediately; in-flight results are compared with current policy before publish.
+  The normal detector worker has no process-termination capability.
   The hidden bounded smoke mode copies the same executable under a disposable
   non-ignored basename, creates one visible window that intentionally stops
-  pumping messages, detects only that child PID, waits for its natural exit,
-  and removes the temporary copy.
+  pumping messages, and detects only that child PID. An isolated cleanup owner
+  waits for normal exit or terminates only that disposable child on exceptional
+  return, then removes only its temporary tree.
 - Vendor DLLs are loaded by name only from System32. GPU APIs are read-only,
   versioned, and bounded to vendor maximums. Automatically discovered
   PresentMon is canonically contained beside LCDForge; arguments are passed

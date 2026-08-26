@@ -1,13 +1,17 @@
 //! Query-only hung-window detection and disposable test harness.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{BOOL, FILETIME, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, SetLastError, BOOL, ERROR_SUCCESS, ERROR_TIMEOUT, FILETIME, HWND, LPARAM,
+    WIN32_ERROR, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::UpdateWindow;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetWindowsDirectoryW;
@@ -17,8 +21,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, EnumWindows, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, RegisterClassW, SendMessageTimeoutW, ShowWindow,
-    CW_USEDEFAULT, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SW_SHOW, WM_NULL, WNDCLASSW,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, RegisterClassW, SendMessageTimeoutW,
+    ShowWindow, CW_USEDEFAULT, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SW_SHOW, WM_NULL, WNDCLASSW,
     WS_OVERLAPPEDWINDOW,
 };
 
@@ -45,6 +49,37 @@ struct Identity {
     image_path: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Policy {
+    enabled: bool,
+    safe_mode: bool,
+    interval: Duration,
+    timeout: Duration,
+    failures: i32,
+    minimum: Duration,
+    ignore: Vec<String>,
+}
+
+impl From<&Config> for Policy {
+    fn from(cfg: &Config) -> Self {
+        Self {
+            enabled: cfg.hang_enabled,
+            safe_mode: cfg.safe_mode,
+            interval: cfg.hang_probe_interval,
+            timeout: cfg.hang_probe_timeout,
+            failures: cfg.hang_failures,
+            minimum: cfg.hang_minimum,
+            ignore: cfg.hang_ignore.clone(),
+        }
+    }
+}
+
+impl Policy {
+    fn active(&self) -> bool {
+        self.enabled && !self.safe_mode
+    }
+}
+
 impl From<&HungTarget> for Identity {
     fn from(target: &HungTarget) -> Self {
         Self {
@@ -60,6 +95,13 @@ impl From<&HungTarget> for Identity {
 struct Observation {
     target: HungTarget,
     responsive: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeResult {
+    Responsive,
+    Timeout,
+    Indeterminate,
 }
 
 #[derive(Clone, Debug)]
@@ -80,20 +122,39 @@ struct Cadence {
 }
 
 impl Cadence {
-    fn poll_due(&mut self, cfg: &Config, now: Duration) -> bool {
-        if cfg.safe_mode || !cfg.hang_enabled {
+    fn poll_due(&mut self, policy: &Policy, now: Duration) -> bool {
+        if !policy.active() {
             self.last_attempt = None;
             return false;
         }
         if self
             .last_attempt
-            .is_some_and(|last| now.saturating_sub(last) < cfg.hang_probe_interval)
+            .is_some_and(|last| now.saturating_sub(last) < policy.interval)
         {
             return false;
         }
         self.last_attempt = Some(now);
         true
     }
+}
+
+fn reset_on_policy_change(
+    current: &mut Option<Policy>,
+    next: &Policy,
+    tracker: &mut Tracker,
+    cadence: &mut Cadence,
+) -> bool {
+    let changed = current.as_ref().is_some_and(|old| old != next);
+    if changed {
+        tracker.clear();
+        cadence.last_attempt = None;
+    }
+    *current = Some(next.clone());
+    changed
+}
+
+fn poll_policy_current(started: &Policy, latest: &Policy) -> bool {
+    latest.active() && latest == started
 }
 
 impl Tracker {
@@ -162,12 +223,28 @@ fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Send
     let started = Instant::now();
     let mut tracker = Tracker::default();
     let mut cadence = Cadence::default();
+    let mut current_policy = None;
     let mut disabled_published = false;
     while !shutdown.load(Ordering::Relaxed) {
         let cfg = config.read().unwrap_or_else(|e| e.into_inner()).clone();
-        if cfg.safe_mode || !cfg.hang_enabled {
+        let policy = Policy::from(&cfg);
+        if reset_on_policy_change(&mut current_policy, &policy, &mut tracker, &mut cadence) {
+            if tx
+                .send(Update {
+                    targets: Vec::new(),
+                    available: policy.active(),
+                    error: None,
+                })
+                .is_err()
+            {
+                return;
+            }
+            disabled_published = !policy.active();
+            continue;
+        }
+        if !policy.active() {
             tracker.clear();
-            cadence.poll_due(&cfg, started.elapsed());
+            cadence.poll_due(&policy, started.elapsed());
             if !disabled_published
                 && tx
                     .send(Update {
@@ -184,17 +261,40 @@ fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Send
             continue;
         }
         disabled_published = false;
-        if !cadence.poll_due(&cfg, started.elapsed()) {
+        if !cadence.poll_due(&policy, started.elapsed()) {
             std::thread::sleep(TICK);
             continue;
         }
-        let update = match enumerate_and_probe(cfg.hang_probe_timeout, &cfg.hang_ignore, None) {
+        let result = enumerate_and_probe(policy.timeout, &policy.ignore, None);
+        let latest = config.read().unwrap_or_else(|e| e.into_inner());
+        let latest_policy = Policy::from(&*latest);
+        if !poll_policy_current(&policy, &latest_policy) {
+            reset_on_policy_change(
+                &mut current_policy,
+                &latest_policy,
+                &mut tracker,
+                &mut cadence,
+            );
+            disabled_published = !latest_policy.active();
+            if tx
+                .send(Update {
+                    targets: Vec::new(),
+                    available: latest_policy.active(),
+                    error: None,
+                })
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
+        let update = match result {
             Ok(observations) => Update {
                 targets: tracker.update(
                     started.elapsed(),
                     observations,
-                    cfg.hang_failures,
-                    cfg.hang_minimum,
+                    policy.failures,
+                    policy.minimum,
                 ),
                 available: true,
                 error: None,
@@ -288,10 +388,19 @@ unsafe extern "system" fn enumerate_callback(hwnd: HWND, lparam: LPARAM) -> BOOL
     };
     let remaining = context.deadline.saturating_duration_since(Instant::now());
     let probe_timeout = context.timeout.min(remaining).max(Duration::from_millis(1));
-    context.observations.push(Observation {
-        target,
-        responsive: probe(hwnd, probe_timeout),
-    });
+    match probe(hwnd, probe_timeout) {
+        ProbeResult::Responsive => context.observations.push(Observation {
+            target,
+            responsive: true,
+        }),
+        ProbeResult::Timeout if identity_still_matches(hwnd, &target) => {
+            context.observations.push(Observation {
+                target,
+                responsive: false,
+            });
+        }
+        ProbeResult::Timeout | ProbeResult::Indeterminate => {}
+    }
     BOOL(1)
 }
 
@@ -337,9 +446,10 @@ unsafe fn describe_candidate(
     })
 }
 
-unsafe fn probe(hwnd: HWND, timeout: Duration) -> bool {
+unsafe fn probe(hwnd: HWND, timeout: Duration) -> ProbeResult {
     let timeout_ms = timeout.as_millis().clamp(1, u32::MAX as u128) as u32;
-    SendMessageTimeoutW(
+    SetLastError(ERROR_SUCCESS);
+    let result = SendMessageTimeoutW(
         hwnd,
         WM_NULL,
         WPARAM(0),
@@ -347,8 +457,43 @@ unsafe fn probe(hwnd: HWND, timeout: Duration) -> bool {
         SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
         timeout_ms,
         None,
-    )
-    .0 != 0
+    );
+    classify_probe_result(result.0 != 0, GetLastError())
+}
+
+fn classify_probe_result(succeeded: bool, error: WIN32_ERROR) -> ProbeResult {
+    if succeeded {
+        ProbeResult::Responsive
+    } else if error == ERROR_TIMEOUT {
+        ProbeResult::Timeout
+    } else {
+        ProbeResult::Indeterminate
+    }
+}
+
+unsafe fn identity_still_matches(hwnd: HWND, expected: &HungTarget) -> bool {
+    if !IsWindow(hwnd).as_bool() {
+        return false;
+    }
+    let mut pid = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    let Ok((creation_time, image_path, _)) = query_identity(pid) else {
+        return false;
+    };
+    identity_matches(expected, hwnd.0 as usize, pid, creation_time, &image_path)
+}
+
+fn identity_matches(
+    expected: &HungTarget,
+    hwnd: usize,
+    pid: u32,
+    creation_time: u64,
+    image_path: &str,
+) -> bool {
+    expected.hwnd == hwnd
+        && expected.pid == pid
+        && expected.creation_time == creation_time
+        && expected.image_path == normalize_path(image_path)
 }
 
 fn query_identity(pid: u32) -> Result<(u64, String, String), ()> {
@@ -545,6 +690,35 @@ pub fn run_smoke() -> i32 {
     }
 }
 
+struct HarnessCleanup {
+    child: Option<Child>,
+    root: PathBuf,
+}
+
+impl HarnessCleanup {
+    fn remove_tree(&mut self) -> std::io::Result<()> {
+        if self.root.as_os_str().is_empty() {
+            return Ok(());
+        }
+        std::fs::remove_dir_all(&self.root)?;
+        self.root.clear();
+        Ok(())
+    }
+}
+
+impl Drop for HarnessCleanup {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                // This handle is created only by smoke(); the detector never terminates processes.
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        let _ = self.remove_tree();
+    }
+}
+
 fn smoke() -> Result<HungTarget, String> {
     let source = smoke_source()?;
     let root = std::env::temp_dir().join(format!(
@@ -556,26 +730,21 @@ fn smoke() -> Result<HungTarget, String> {
             .as_nanos()
     ));
     std::fs::create_dir(&root).map_err(|_| "temporary harness directory creation failed")?;
-    let harness = root.join("LCDForgeHangHarness.exe");
+    let mut cleanup = HarnessCleanup { child: None, root };
+    let harness = cleanup.root.join("LCDForgeHangHarness.exe");
     if let Err(error) = std::fs::copy(&source, &harness) {
-        let _ = std::fs::remove_dir(&root);
         return Err(format!("temporary harness copy failed: {error}"));
     }
-    let mut child = match std::process::Command::new(&harness)
-        .args(["--hang-test-harness", "--duration-secs", "6"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = std::fs::remove_file(&harness);
-            let _ = std::fs::remove_dir(&root);
-            return Err(format!("temporary harness start failed: {error}"));
-        }
-    };
-    let pid = child.id();
+    cleanup.child = Some(
+        std::process::Command::new(&harness)
+            .args(["--hang-test-harness", "--duration-secs", "6"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| format!("temporary harness start failed: {error}"))?,
+    );
+    let pid = cleanup.child.as_ref().unwrap().id();
     let started = Instant::now();
     let mut tracker = Tracker::default();
     let mut detected = None;
@@ -600,20 +769,22 @@ fn smoke() -> Result<HungTarget, String> {
     }
     let exit_deadline = Instant::now() + Duration::from_secs(8);
     loop {
-        match child.try_wait() {
+        match cleanup.child.as_mut().unwrap().try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if Instant::now() < exit_deadline => std::thread::sleep(TICK),
             Ok(None) => return Err("temporary harness did not exit within its bound".into()),
             Err(_) => return Err("temporary harness status unavailable".into()),
         }
     }
-    std::fs::remove_file(&harness).map_err(|_| "temporary harness cleanup failed")?;
-    std::fs::remove_dir(&root).map_err(|_| "temporary harness directory cleanup failed")?;
-    detected.ok_or_else(|| {
+    let result = detected.ok_or_else(|| {
         last_error
             .unwrap_or("purpose-built hung window was not confirmed")
             .into()
-    })
+    });
+    cleanup
+        .remove_tree()
+        .map_err(|_| "temporary harness cleanup failed")?;
+    result
 }
 
 fn smoke_source() -> Result<std::path::PathBuf, String> {
@@ -805,6 +976,60 @@ mod tests {
     }
 
     #[test]
+    fn probe_classification_counts_only_documented_timeout() {
+        assert_eq!(
+            classify_probe_result(false, ERROR_TIMEOUT),
+            ProbeResult::Timeout
+        );
+        assert_eq!(
+            classify_probe_result(false, ERROR_SUCCESS),
+            ProbeResult::Indeterminate
+        );
+        assert_eq!(
+            classify_probe_result(false, WIN32_ERROR(5)),
+            ProbeResult::Indeterminate
+        );
+        assert_eq!(
+            classify_probe_result(true, ERROR_TIMEOUT),
+            ProbeResult::Responsive
+        );
+    }
+
+    #[test]
+    fn post_probe_identity_requires_every_captured_field() {
+        let expected = target(1, 10, 20, r"C:\Games\game.exe");
+        assert!(identity_matches(&expected, 1, 10, 20, r"C:\GAMES\GAME.EXE"));
+        assert!(!identity_matches(
+            &expected,
+            2,
+            10,
+            20,
+            &expected.image_path
+        ));
+        assert!(!identity_matches(
+            &expected,
+            1,
+            11,
+            20,
+            &expected.image_path
+        ));
+        assert!(!identity_matches(
+            &expected,
+            1,
+            10,
+            21,
+            &expected.image_path
+        ));
+        assert!(!identity_matches(
+            &expected,
+            1,
+            10,
+            20,
+            r"D:\Games\game.exe"
+        ));
+    }
+
+    #[test]
     fn disabled_policy_clears_tracker_and_cadence_reloads() {
         let mut tracker = Tracker::default();
         tracker.update(
@@ -821,16 +1046,102 @@ mod tests {
             hang_probe_interval: Duration::from_secs(10),
             ..Config::default()
         };
-        assert!(cadence.poll_due(&cfg, Duration::ZERO));
-        assert!(!cadence.poll_due(&cfg, Duration::from_secs(5)));
+        let mut policy = Policy::from(&cfg);
+        assert!(cadence.poll_due(&policy, Duration::ZERO));
+        assert!(!cadence.poll_due(&policy, Duration::from_secs(5)));
         cfg.hang_probe_interval = Duration::from_secs(2);
-        assert!(cadence.poll_due(&cfg, Duration::from_secs(5)));
+        policy = Policy::from(&cfg);
+        assert!(cadence.poll_due(&policy, Duration::from_secs(5)));
         cfg.safe_mode = true;
-        assert!(!cadence.poll_due(&cfg, Duration::from_secs(6)));
+        policy = Policy::from(&cfg);
+        assert!(!cadence.poll_due(&policy, Duration::from_secs(6)));
         cfg.safe_mode = false;
-        assert!(cadence.poll_due(&cfg, Duration::from_secs(6)));
+        policy = Policy::from(&cfg);
+        assert!(cadence.poll_due(&policy, Duration::from_secs(6)));
         cfg.hang_enabled = false;
-        assert!(!cadence.poll_due(&cfg, Duration::from_secs(7)));
+        policy = Policy::from(&cfg);
+        assert!(!cadence.poll_due(&policy, Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn changed_or_disabled_policy_discards_poll_and_resets_evidence() {
+        let cfg = Config::default();
+        let started = Policy::from(&cfg);
+        assert!(poll_policy_current(&started, &started));
+
+        let mut changed = started.clone();
+        changed.timeout += Duration::from_millis(1);
+        assert!(!poll_policy_current(&started, &changed));
+
+        let mut disabled = started.clone();
+        disabled.enabled = false;
+        assert!(!poll_policy_current(&started, &disabled));
+
+        let mut tracker = Tracker::default();
+        tracker.update(
+            Duration::ZERO,
+            vec![failed(target(1, 2, 3, r"C:\Games\game.exe"))],
+            1,
+            Duration::ZERO,
+        );
+        let mut cadence = Cadence {
+            last_attempt: Some(Duration::ZERO),
+        };
+        let mut current = Some(started);
+        assert!(reset_on_policy_change(
+            &mut current,
+            &changed,
+            &mut tracker,
+            &mut cadence
+        ));
+        assert!(tracker.records.is_empty());
+        assert_eq!(cadence.last_attempt, None);
+    }
+
+    #[test]
+    fn policy_compares_every_runtime_probe_setting() {
+        let base = Policy::from(&Config::default());
+        let mut values = Vec::new();
+        let mut value = base.clone();
+        value.enabled = !value.enabled;
+        values.push(value);
+        let mut value = base.clone();
+        value.safe_mode = !value.safe_mode;
+        values.push(value);
+        let mut value = base.clone();
+        value.interval += Duration::from_millis(1);
+        values.push(value);
+        let mut value = base.clone();
+        value.timeout += Duration::from_millis(1);
+        values.push(value);
+        let mut value = base.clone();
+        value.failures += 1;
+        values.push(value);
+        let mut value = base.clone();
+        value.minimum += Duration::from_millis(1);
+        values.push(value);
+        let mut value = base.clone();
+        value.ignore.push("another.exe".into());
+        values.push(value);
+        assert!(values.into_iter().all(|value| value != base));
+    }
+
+    #[test]
+    fn harness_cleanup_removes_only_its_owned_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "lcdforge2-hang-cleanup-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("owned"), b"test").unwrap();
+        {
+            let _cleanup = HarnessCleanup {
+                child: None,
+                root: root.clone(),
+            };
+        }
+        assert!(!root.exists());
     }
 
     #[test]
