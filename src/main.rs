@@ -37,6 +37,8 @@ fn print_usage() {
          \x20 --validate-config  Validate the configuration and exit\n\
          \x20 --preview          Run with the virtual preview forced on\n\
          \x20 --hardware-test    Run the deterministic 10-step G13 test sequence\n\
+         \x20 --discord-authorize  Authorize Discord RPC for the current user\n\
+         \x20 --discord-clear-token  Remove the current-user Discord credential\n\
          \x20 --backend hid|virtual  Backend for --hardware-test (default hid)\n\
          \x20 --duration-secs N  Visible-sequence duration for --hardware-test\n\
          \x20 --safe-mode        Run with providers/destructive actions disabled\n\
@@ -51,6 +53,8 @@ struct Cli {
     preview: bool,
     hardware_test: bool,
     hardware_discover: bool,
+    discord_authorize: bool,
+    discord_clear_token: bool,
     backend: backends::BackendKind,
     duration: Duration,
     safe_mode: bool,
@@ -66,6 +70,8 @@ fn parse_args() -> Result<Cli, String> {
         preview: false,
         hardware_test: false,
         hardware_discover: false,
+        discord_authorize: false,
+        discord_clear_token: false,
         backend: backends::BackendKind::Hid,
         duration: Duration::from_secs(30),
         safe_mode: false,
@@ -87,6 +93,8 @@ fn parse_args() -> Result<Cli, String> {
             "--preview" => cli.preview = true,
             "--hardware-test" => cli.hardware_test = true,
             "--hardware-discover" => cli.hardware_discover = true,
+            "--discord-authorize" => cli.discord_authorize = true,
+            "--discord-clear-token" => cli.discord_clear_token = true,
             "--backend" => {
                 i += 1;
                 match args.get(i).map(|s| s.as_str()) {
@@ -143,6 +151,21 @@ fn main() {
         return;
     }
 
+    let command_count = [
+        cli.validate,
+        cli.hardware_test,
+        cli.hardware_discover,
+        cli.discord_authorize,
+        cli.discord_clear_token,
+    ]
+    .into_iter()
+    .filter(|selected| *selected)
+    .count();
+    if command_count > 1 {
+        eprintln!("error: select only one command");
+        std::process::exit(2);
+    }
+
     if cli.validate {
         let path = cli
             .config
@@ -161,6 +184,50 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+
+    if cli.discord_clear_token {
+        let path = cli
+            .config
+            .clone()
+            .unwrap_or_else(app::default_config_path_pub);
+        if let Err(error) = parser::load(&path) {
+            eprintln!("configuration error: {}", error);
+            std::process::exit(2);
+        }
+        match providers::discord::clear_token() {
+            Ok(()) => println!("Discord token removed."),
+            Err(error) => {
+                eprintln!("error: {}", error);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if cli.discord_authorize {
+        let path = cli
+            .config
+            .clone()
+            .unwrap_or_else(app::default_config_path_pub);
+        let cfg = match parser::load(&path) {
+            Ok(loaded) => loaded.config,
+            Err(error) => {
+                eprintln!("configuration error: {}", error);
+                std::process::exit(2);
+            }
+        };
+        let secret = std::env::var("LCDFORGE_DISCORD_CLIENT_SECRET").unwrap_or_default();
+        match providers::discord::authorize(&cfg, &secret) {
+            Ok(()) => println!(
+                "Discord authorization complete. The token is protected with Windows DPAPI."
+            ),
+            Err(error) => {
+                eprintln!("Discord authorization failed: {}", error);
+                std::process::exit(1);
+            }
+        }
+        return;
     }
 
     if cli.hardware_discover {

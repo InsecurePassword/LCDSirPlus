@@ -64,7 +64,8 @@ README.md and enforced in `src/backends/g13.rs` + `src/backends/hid.rs`.
   (Phase 2).
 - PresentMon: FPS/frame timing (Phase 2).
 - Arctis 7P+ USB HID: headset battery (Phase 2).
-- Discord local RPC: active speaker overlay (Phase 3).
+- Discord local RPC: verified active-speaker overlay with RPC OAuth and
+  current-user DPAPI credential storage (Phase 3).
 
 ## Operational requirements
 

@@ -5,6 +5,7 @@ pub mod audio;
 pub mod ccd;
 pub mod clock;
 pub mod cpu;
+pub mod discord;
 pub mod gpu;
 pub mod headset;
 pub mod lhm;

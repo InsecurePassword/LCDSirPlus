@@ -1213,6 +1213,96 @@ mod tests {
     }
 
     #[test]
+    fn discord_visibility_order_linger_self_and_restoration() {
+        let mut s = sample_snapshot();
+        let dashboard = render_dashboard(&s);
+        let now = s.now.unwrap();
+        s.discord.connected = true;
+        s.discord.authenticated = true;
+        s.discord.channel_name = "General".into();
+        s.discord.speakers = vec![
+            Speaker {
+                user_id: "2".into(),
+                name: "Older".into(),
+                speaking: true,
+                started_at: Some(now - Duration::from_secs(2)),
+                ..Default::default()
+            },
+            Speaker {
+                user_id: "1".into(),
+                name: "Newer".into(),
+                speaking: true,
+                started_at: Some(now - Duration::from_secs(1)),
+                ..Default::default()
+            },
+            Speaker {
+                user_id: "self".into(),
+                name: "Self".into(),
+                speaking: true,
+                is_self: true,
+                started_at: Some(now),
+                ..Default::default()
+            },
+            Speaker {
+                user_id: "linger".into(),
+                name: "Linger".into(),
+                stopped_at: Some(now - Duration::from_millis(700)),
+                ..Default::default()
+            },
+        ];
+        let visible = visible_speakers(&s.discord, s.now, Duration::from_millis(700), false);
+        assert_eq!(
+            visible
+                .iter()
+                .map(|speaker| speaker.user_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "linger"]
+        );
+        assert_eq!(
+            visible_speakers(&s.discord, s.now, Duration::from_millis(699), false).len(),
+            2
+        );
+        assert_eq!(
+            visible_speakers(&s.discord, s.now, Duration::from_millis(700), true).len(),
+            4
+        );
+
+        let one = Renderer::new().render(
+            &s,
+            OverlayOptions {
+                discord_max_speakers: 1,
+                discord_show_channel: true,
+                ..Default::default()
+            },
+            &golden_view(),
+        );
+        let many = Renderer::new().render(
+            &s,
+            OverlayOptions {
+                discord_max_speakers: 2,
+                discord_show_channel: true,
+                ..Default::default()
+            },
+            &golden_view(),
+        );
+        assert!(
+            !one.equal(&many),
+            "one/two speaker and +N layouts must differ"
+        );
+
+        for speaker in &mut s.discord.speakers {
+            speaker.speaking = false;
+            speaker.stopped_at = Some(now - Duration::from_millis(701));
+        }
+        assert!(
+            Renderer::new()
+                .render(&s, OverlayOptions::default(), &golden_view())
+                .equal(&dashboard),
+            "expired overlay must restore the exact dashboard"
+        );
+    }
+
+    #[test]
     fn iec_formatting_matches_go() {
         let cases = [
             (20u64 << 30, 32u64 << 30, 38, "20/32GiB"),

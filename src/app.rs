@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::hardware_test::{self, TestConfig, Transport};
 use crate::input::Event;
 use crate::logging::Level;
-use crate::model::{Metric, MetricKey, Reading, ReadingsSnapshot, Snapshot};
+use crate::model::{DiscordState, Metric, MetricKey, Reading, ReadingsSnapshot, Snapshot};
 use crate::providers::{ccd, clock, cpu, memory};
 use crate::render::renderer::{OverlayOptions, Renderer, View};
 use crate::slots::Manager;
@@ -146,7 +146,9 @@ pub fn run(opts: RunOptions) -> i32 {
     // Providers.
     let mut cpu_provider = cpu::CpuLoadProvider::new();
     let telemetry_runtime = crate::telemetry::spawn(&cfg);
+    let discord_runtime = crate::providers::discord::spawn(&cfg);
     let mut telemetry = crate::telemetry::Update::default();
+    let mut discord = DiscordState::default();
     let mut renderer = Renderer::new();
     let slots = Manager::new(&cfg, [0; 4]);
     let mut slot_indexes: [usize; 4] = [0; 4];
@@ -167,7 +169,17 @@ pub fn run(opts: RunOptions) -> i32 {
             while let Ok(update) = telemetry_runtime.updates.try_recv() {
                 telemetry = update;
             }
-            snapshot = build_snapshot(&cfg, &topology, &mut cpu_provider, &telemetry, slot_indexes);
+            while let Ok(update) = discord_runtime.updates.try_recv() {
+                discord = update;
+            }
+            snapshot = build_snapshot(
+                &cfg,
+                &topology,
+                &mut cpu_provider,
+                &telemetry,
+                &discord,
+                slot_indexes,
+            );
         }
 
         if now.duration_since(last_render) >= cfg.render_interval {
@@ -244,6 +256,7 @@ pub fn run(opts: RunOptions) -> i32 {
                             cfg.safe_mode = true;
                         }
                         telemetry_runtime.update_config(&cfg);
+                        discord_runtime.update_config(&cfg);
                         slots.apply(&cfg);
                         crate::log_info!("configuration reloaded");
                     }
@@ -295,6 +308,7 @@ pub fn run_hardware_test(
         &topology,
         &mut cpu_provider,
         &crate::telemetry::Update::default(),
+        &DiscordState::default(),
         [0; 4],
     );
     let dashboard = crate::render::renderer::Renderer::new().render(
@@ -402,6 +416,7 @@ fn build_snapshot(
     topology: &ccd::CcdTopology,
     cpu_provider: &mut cpu::CpuLoadProvider,
     telemetry: &crate::telemetry::Update,
+    discord: &DiscordState,
     _slot_indexes: [usize; 4],
 ) -> Snapshot {
     let now = SystemTime::now();
@@ -434,6 +449,7 @@ fn build_snapshot(
         cpu_freq_load: Metric::valid(freq_load, now),
         headset: telemetry.headset.clone(),
         controller: telemetry.controller.clone(),
+        discord: discord.clone(),
         ..Default::default()
     };
 
@@ -468,6 +484,10 @@ fn build_snapshot(
     for (name, ok) in &telemetry.providers {
         snapshot.providers.insert(name.clone(), *ok);
     }
+    snapshot.providers.insert(
+        "Discord".into(),
+        snapshot.discord.connected && snapshot.discord.authenticated,
+    );
     snapshot
 }
 

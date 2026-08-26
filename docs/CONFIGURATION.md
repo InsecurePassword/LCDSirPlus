@@ -97,9 +97,21 @@ bounded device enumeration.
 
 ## Discord (Phase 3)
 
-`discord_enabled`, `discord_client_id` (digits), `discord_redirect_uri`,
-`discord_linger_ms` (0..10000), `discord_max_speakers` (1..4),
-`discord_show_self`, `discord_show_channel`.
+| Key | Default | Notes |
+|---|---|---|
+| `discord_enabled` | 1 | disabled, and always off in safe mode, means no IPC/token/network access |
+| `discord_client_id` | empty | numeric Discord developer application client ID |
+| `discord_redirect_uri` | `http://127.0.0.1` | must exactly match the developer application; LCDForge does not listen on it |
+| `discord_linger_ms` | 700 | 0..10000 after speaking stops |
+| `discord_max_speakers` | 2 | 1..4; additional visible speakers render as `+N` |
+| `discord_show_self` | 0 | include the current user in the speaking overlay |
+| `discord_show_channel` | 0 | use the selected voice-channel name as the title |
+
+No token or client secret belongs in this file. Use `--discord-authorize`; the
+resulting access/refresh record is current-user DPAPI protected under
+`%LOCALAPPDATA%\LCDForge2`. A confidential-client secret, when required, is
+accepted only from the temporary `LCDFORGE_DISCORD_CLIENT_SECRET` environment
+variable. Use `--discord-clear-token` to remove the local record.
 
 ## Hung-process guard (Phase 4)
 

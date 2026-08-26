@@ -245,8 +245,15 @@ pub struct Speaker {
 pub struct DiscordState {
     pub connected: bool,
     pub authenticated: bool,
+    pub channel_id: String,
     pub channel_name: String,
+    pub self_mute: bool,
+    pub self_deaf: bool,
+    pub voice_ping_ms: f64,
+    pub connection_state: String,
     pub speakers: Vec<Speaker>,
+    pub error: String,
+    pub updated: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug, Default)]

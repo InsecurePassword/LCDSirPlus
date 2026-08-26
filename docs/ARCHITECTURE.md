@@ -21,6 +21,7 @@ src\
 ├── providers\
 │   ├── clock.rs        Win32 NLS date/time formatting
 │   ├── cpu.rs          NtQuerySystemInformation per-LP deltas
+│   ├── discord.rs      verified desktop RPC, voice tracker, OAuth + DPAPI
 │   ├── memory.rs       GlobalMemoryStatusEx
 │   ├── ccd.rs          L3/NUMA topology + CPUID cache-size labeling
 │   ├── gpu.rs          trusted NVAPI/ADLX loading + canonical GPU metrics
@@ -47,6 +48,7 @@ src\
 | telemetry | fast native polls, stale state, provider health | snapshot channel |
 | telemetry-gpu | read-only NVAPI/ADLX calls | event channel |
 | telemetry-presentmon | target/capture lifecycle | update channel |
+| lcdforge-discord | verified pipe, authentication, subscriptions, reconnect | snapshot channel |
 | telemetry-lhm/headset | bounded blocking HTTP/HID | event channel |
 
 The backend thread is the only toucher of the device (mirrors the Go
@@ -98,6 +100,17 @@ Backend button reports flow back: `parse_input` → `ButtonTracker.observe`
 - HID opens are read/write shared on the vendor collection only; no
   unrelated interfaces are written (enumeration rejects non-matching
   identities with recorded reasons).
-- No secrets at rest in 0.3.0 (Discord DPAPI flow arrives in Phase 3).
+- Discord scans only `discord-ipc-0` through `-9` and accepts a server only
+  after same-session/current-user checks plus canonical local executable,
+  recognized Discord image, valid Authenticode, and `Discord Inc.` publisher
+  verification. Verification is bounded and fails closed before client ID or
+  token disclosure.
+- Discord RPC frames are bounded to 4 MiB. Remote messages and OAuth response
+  bodies are never included in errors. Token HTTPS responses are bounded to
+  1 MiB and credentials to 64 KiB.
+- Discord credentials are versioned and current-user DPAPI protected at rest.
+  Optional client secrets cross only the temporary environment boundary.
+- Authorization is local RPC plus outbound WinHTTP token exchange. There is no
+  callback listener, browser launch, bot/Gateway connection, or user token.
 - Diagnostics redaction expands in Phase 4; current logs contain no user
   data beyond window/metric values.
