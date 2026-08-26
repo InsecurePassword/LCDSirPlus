@@ -13,6 +13,16 @@ use crate::config::{
     MAX_CONFIG_TOKEN_BYTES, MAX_INCLUDES,
 };
 
+#[cfg(test)]
+thread_local! {
+    static LOAD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub fn test_load_calls() -> usize {
+    LOAD_CALLS.get()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParseError {
     pub file: String,
@@ -52,6 +62,8 @@ struct ParseContext {
 
 /// Load and parse a configuration file from disk (includes allowed).
 pub fn load(path: &Path) -> Result<LoadedConfig, ParseError> {
+    #[cfg(test)]
+    LOAD_CALLS.set(LOAD_CALLS.get() + 1);
     let canonical = std::fs::canonicalize(path).map_err(|e| ParseError {
         file: path.display().to_string(),
         line: 0,

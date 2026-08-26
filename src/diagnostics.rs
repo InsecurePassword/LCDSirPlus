@@ -1,13 +1,10 @@
 //! Offline, typed diagnostics bundle with a closed privacy allowlist.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Component, Path, PathBuf};
-
-use crate::config::Config;
-use crate::model::Snapshot;
 
 const MAX_BUNDLE_BYTES: usize = 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = 128 * 1024;
@@ -20,6 +17,13 @@ struct Entry {
 struct DirectoryBoundary {
     root: PathBuf,
     pins: Vec<File>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    volume: u32,
+    index: u64,
+    size: u64,
 }
 
 impl DirectoryBoundary {
@@ -81,14 +85,10 @@ impl DirectoryBoundary {
     }
 }
 
-pub fn write_bundle(
-    directory: &Path,
-    config: &Config,
-    snapshot: Option<&Snapshot>,
-) -> Result<PathBuf, String> {
+pub fn write_bundle(directory: &Path, safe_mode: bool) -> Result<PathBuf, String> {
     let boundary = DirectoryBoundary::open(directory)?;
-    let report = report(config, snapshot, &boundary.root);
-    let privacy = b"LCDForge diagnostics privacy notice\n\nIncluded: application version, build architecture, validated feature states, bounded cadence values, fixed G13 contract, closed provider-health states when supplied, and sizes/counts for known rotated log files.\nExcluded: raw logs, configuration files, credentials, Discord identifiers or content, window titles, process or filesystem paths, network targets and addresses, environment variables, command lines, registry values, serial numbers, arbitrary directory listings, and device paths.\nCollection is local and offline. No HID, provider, Discord, network, or hung-action work is started. Stable identifier hashes are not used. Review the bundle before sharing it.\n".to_vec();
+    let report = report(safe_mode, &boundary.root);
+    let privacy = b"LCDForge diagnostics privacy notice\n\nIncluded: application version, build architecture, CLI safe-mode state, compile-time schema/G13 contract facts, closed not-collected provider states, and sizes/counts for known rotated log files.\nExcluded: configuration reads, raw logs, configuration files, credentials, Discord identifiers or content, window titles, process or filesystem paths, network targets and addresses, environment variables, command lines, registry values, serial numbers, arbitrary directory listings, and device paths.\nCollection is local and offline. The --config argument is ignored. No HID, provider, Discord, network, or hung-action work is started. Stable identifier hashes are not used. Review the bundle before sharing it.\n".to_vec();
     let manifest = format!(
         "LCDForge diagnostics manifest v1\nprivacy.txt {} {}\nreport.txt {} {}\nmanifest.txt self-excluded\n",
         privacy.len(),
@@ -114,14 +114,7 @@ pub fn write_bundle(
     write_atomic(&boundary, &entries)
 }
 
-fn report(config: &Config, snapshot: Option<&Snapshot>, log_dir: &Path) -> String {
-    fn known<'a>(value: &'a str, allowed: &[&str]) -> &'a str {
-        if allowed.contains(&value) {
-            value
-        } else {
-            "invalid"
-        }
-    }
+fn report(safe_mode: bool, log_dir: &Path) -> String {
     fn enabled(value: bool) -> &'static str {
         if value {
             "enabled"
@@ -129,55 +122,16 @@ fn report(config: &Config, snapshot: Option<&Snapshot>, log_dir: &Path) -> Strin
             "disabled"
         }
     }
-    fn provider(snapshot: Option<&Snapshot>, name: &str) -> &'static str {
-        match snapshot.and_then(|snapshot| snapshot.providers.get(name)) {
-            Some(true) => "healthy",
-            Some(false) => "degraded",
-            None => "not-collected",
-        }
-    }
-
     let mut output = format!(
-        "LCDForge diagnostics report v1\napp_version={}\nbuild_arch={}\nos_family={}\ncollection_mode=offline\nsafe_mode={}\npreview_mode={}\npreview_scale={}\nlogitech_backend={}\nlogitech_orientation={}\nlogitech_invert={}\nlhm_mode={}\ngpu_provider={}\npresentmon={}\nheadset={}\ncontroller={}\nnetwork_probe={}\nnetwork_probe_method={}\naudio={}\ndiscord={}\nhang_detection={}\ntelemetry_interval_ms={}\nrender_interval_ms={}\nlog_max_bytes={}\nlog_backups={}\ng13_geometry=160x43\ng13_vid=046d\ng13_pid=c21c\ng13_usage=ff00:0000\nprovider_cpu={}\nprovider_memory={}\nprovider_gpu={}\nprovider_lhm={}\nprovider_presentmon={}\nprovider_headset={}\nprovider_controller={}\nprovider_network={}\nprovider_audio={}\nprovider_discord={}\nprovider_hang={}\n",
+        "LCDForge diagnostics report v1\napp_version={}\nbuild_arch={}\nos_family={}\ncollection_mode=offline\nconfig_not_read=privacy_offline\nsafe_mode_cli={}\nconfig_schema=2\ng13_geometry=160x43\ng13_vid=046d\ng13_pid=c21c\ng13_usage=ff00:0000\nprovider_cpu=not-collected\nprovider_memory=not-collected\nprovider_gpu=not-collected\nprovider_lhm=not-collected\nprovider_presentmon=not-collected\nprovider_headset=not-collected\nprovider_controller=not-collected\nprovider_network=not-collected\nprovider_audio=not-collected\nprovider_discord=not-collected\nprovider_hang=not-collected\n",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::ARCH,
         std::env::consts::OS,
-        enabled(config.safe_mode),
-        known(&config.preview_mode, &["auto", "always", "never"]),
-        config.preview_scale.clamp(1, 8),
-        known(&config.logitech_backend, &["auto", "hid", "virtual"]),
-        known(&config.logitech_orientation, &["normal", "flip_x", "flip_y", "rotate_180"]),
-        enabled(config.logitech_invert),
-        known(&config.lhm_mode, &["auto", "on", "off"]),
-        known(&config.gpu_provider, &["auto", "nvapi", "adlx", "off"]),
-        enabled(config.presentmon_enabled),
-        enabled(config.headset_enabled),
-        enabled(config.controller_enabled),
-        enabled(config.network_probe_enabled),
-        known(&config.network_probe_method, &["auto", "icmp", "tcp"]),
-        enabled(config.audio_enabled),
-        enabled(config.discord_enabled),
-        enabled(config.hang_enabled),
-        config.telemetry_interval.as_millis().min(u64::MAX as u128),
-        config.render_interval.as_millis().min(u64::MAX as u128),
-        config.log_max_bytes.min(MAX_BUNDLE_BYTES as u64 * 64),
-        config.log_backups.clamp(0, 32),
-        provider(snapshot, "cpu"),
-        provider(snapshot, "memory"),
-        provider(snapshot, "gpu"),
-        provider(snapshot, "lhm"),
-        provider(snapshot, "presentmon"),
-        provider(snapshot, "headset"),
-        provider(snapshot, "controller"),
-        provider(snapshot, "network"),
-        provider(snapshot, "audio"),
-        provider(snapshot, "discord"),
-        provider(snapshot, "hang"),
+        enabled(safe_mode),
     );
     let mut count = 0u32;
     let mut bytes = 0u64;
-    let backups = config.log_backups.clamp(0, 32);
-    for index in 0..=backups {
+    for index in 0..=20 {
         let path = if index == 0 {
             log_dir.join("lcdforge.log")
         } else {
@@ -199,6 +153,22 @@ fn report(config: &Config, snapshot: Option<&Snapshot>, log_dir: &Path) -> Strin
 }
 
 fn write_atomic(boundary: &DirectoryBoundary, entries: &[Entry]) -> Result<PathBuf, String> {
+    write_atomic_with(boundary, entries, |_| Ok(()))
+}
+
+fn write_atomic_with<F>(
+    boundary: &DirectoryBoundary,
+    entries: &[Entry],
+    before_publish: F,
+) -> Result<PathBuf, String>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
+    use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        CREATE_NEW, DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
     let nonce = random_nonce()?;
     let temporary = boundary
         .root
@@ -206,30 +176,35 @@ fn write_atomic(boundary: &DirectoryBoundary, entries: &[Entry]) -> Result<PathB
     let final_path = boundary
         .root
         .join(format!("LCDForge-Diagnostics-{nonce}.zip"));
-    if final_path.exists() {
-        return Err("diagnostic output already exists".into());
-    }
-    let mut owns_temporary = false;
+    boundary.validate()?;
+    let mut file = open_regular_no_reparse(
+        &temporary,
+        GENERIC_READ.0 | GENERIC_WRITE.0 | DELETE.0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        CREATE_NEW,
+    )?;
     let result = (|| {
-        boundary.validate()?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|_| "diagnostic temporary file could not be created")?;
-        owns_temporary = true;
-        validate_regular_handle(&file)?;
         write_zip(&mut file, entries)?;
         file.sync_all()
             .map_err(|_| "diagnostic bundle could not be synchronized")?;
-        validate_regular_handle(&file)?;
+        let expected = validate_regular_handle(&file)?;
         boundary.validate()?;
-        std::fs::rename(&temporary, &final_path)
-            .map_err(|_| "diagnostic bundle could not be published")?;
+        before_publish(&final_path)?;
+        move_no_replace(&temporary, &final_path)?;
+        boundary.validate()?;
+        let published = open_regular_no_reparse(
+            &final_path,
+            GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            OPEN_EXISTING,
+        )?;
+        if validate_regular_handle(&published)? != expected {
+            return Err("diagnostic published file identity changed".into());
+        }
         Ok(final_path.clone())
     })();
-    if result.is_err() && owns_temporary {
-        let _ = std::fs::remove_file(&temporary);
+    if result.is_err() {
+        let _ = delete_owned_handle(&file);
     }
     result
 }
@@ -347,6 +322,39 @@ fn random_nonce() -> Result<String, String> {
     Ok(crate::sha256::hex(&bytes))
 }
 
+fn move_no_replace(from: &Path, to: &Path) -> Result<(), String> {
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe {
+        MoveFileExW(
+            windows::core::PCWSTR(from.as_ptr()),
+            windows::core::PCWSTR(to.as_ptr()),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|_| "diagnostic bundle could not be published".to_string())
+}
+
+fn delete_owned_handle(file: &File) -> Result<(), String> {
+    use windows::Win32::Foundation::BOOLEAN;
+    use windows::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+    let disposition = FILE_DISPOSITION_INFO {
+        DeleteFile: BOOLEAN(1),
+    };
+    unsafe {
+        SetFileInformationByHandle(
+            windows::Win32::Foundation::HANDLE(file.as_raw_handle().cast()),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    }
+    .map_err(|_| "diagnostic owned file could not be removed".to_string())
+}
+
 fn open_directory_no_reparse(path: &Path) -> Result<File, String> {
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -394,17 +402,33 @@ fn validate_directory_handle(file: &File) -> Result<(), String> {
 fn open_regular_read(path: &Path) -> Result<File, String> {
     use windows::Win32::Foundation::GENERIC_READ;
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, OPEN_EXISTING,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    open_regular_no_reparse(
+        path,
+        GENERIC_READ.0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        OPEN_EXISTING,
+    )
+}
+
+fn open_regular_no_reparse(
+    path: &Path,
+    access: u32,
+    share: windows::Win32::Storage::FileSystem::FILE_SHARE_MODE,
+    disposition: windows::Win32::Storage::FileSystem::FILE_CREATION_DISPOSITION,
+) -> Result<File, String> {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
     };
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let handle = unsafe {
         CreateFileW(
             windows::core::PCWSTR(wide.as_ptr()),
-            GENERIC_READ.0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            access,
+            share,
             None,
-            OPEN_EXISTING,
+            disposition,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
             None,
         )
@@ -415,7 +439,7 @@ fn open_regular_read(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
-fn validate_regular_handle(file: &File) -> Result<(), String> {
+fn validate_regular_handle(file: &File) -> Result<FileIdentity, String> {
     use windows::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_REPARSE_POINT,
@@ -433,7 +457,11 @@ fn validate_regular_handle(file: &File) -> Result<(), String> {
     {
         return Err("diagnostic file must be regular, non-reparse, and single-linked".into());
     }
-    Ok(())
+    Ok(FileIdentity {
+        volume: info.dwVolumeSerialNumber,
+        index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+        size: ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64,
+    })
 }
 
 #[cfg(test)]
@@ -480,54 +508,7 @@ mod tests {
         let secret = "PRIVATE-SENTINEL-user@example.test-C:\\Users\\Secret-203.0.113.9";
         let dir = temp_dir("privacy");
         std::fs::write(dir.join("lcdforge.log"), format!("error: {secret}")).unwrap();
-        let config = Config {
-            path: secret.into(),
-            logitech_friendly_name: secret.into(),
-            lhm_url: secret.into(),
-            presentmon_path: secret.into(),
-            presentmon_process_name: secret.into(),
-            network_probe_target: secret.into(),
-            discord_client_id: secret.into(),
-            discord_redirect_uri: secret.into(),
-            preview_mode: secret.into(),
-            ..Default::default()
-        };
-        let mut snapshot = Snapshot {
-            date_text: secret.into(),
-            game: crate::model::GameStats {
-                process_name: secret.into(),
-                game_name: secret.into(),
-                ..Default::default()
-            },
-            discord: crate::model::DiscordState {
-                channel_id: secret.into(),
-                channel_name: secret.into(),
-                error: secret.into(),
-                ..Default::default()
-            },
-            alerts: vec![crate::model::Alert {
-                title: secret.into(),
-                detail: secret.into(),
-                ..Default::default()
-            }],
-            hung: vec![crate::model::HungTarget {
-                image_path: secret.into(),
-                process_name: secret.into(),
-                title: secret.into(),
-                ..Default::default()
-            }],
-            readings: crate::model::ReadingsSnapshot {
-                metrics: vec![crate::model::Reading {
-                    hardware_id: secret.into(),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        snapshot.providers.insert(secret.into(), true);
-
-        let path = write_bundle(&dir, &config, Some(&snapshot)).unwrap();
+        let path = write_bundle(&dir, false).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         assert!(bytes.len() <= MAX_BUNDLE_BYTES);
         assert!(!String::from_utf8_lossy(&bytes).contains(secret));
@@ -582,6 +563,40 @@ mod tests {
         }];
         assert!(write_atomic(&boundary, &invalid).is_err());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        drop(boundary);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn publication_race_preserves_attacker_destination_and_removes_owned_temp() {
+        let dir = temp_dir("publication-race");
+        let boundary = DirectoryBoundary::open(&dir).unwrap();
+        let entries = [
+            Entry {
+                name: "privacy.txt",
+                data: b"privacy".to_vec(),
+            },
+            Entry {
+                name: "report.txt",
+                data: b"report".to_vec(),
+            },
+            Entry {
+                name: "manifest.txt",
+                data: b"manifest".to_vec(),
+            },
+        ];
+        assert!(write_atomic_with(&boundary, &entries, |final_path| {
+            std::fs::write(final_path, b"attacker-owned")
+                .map_err(|_| "race injection failed".to_string())
+        })
+        .is_err());
+        let paths: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"attacker-owned");
+        assert_eq!(paths[0].extension().unwrap(), "zip");
         drop(boundary);
         let _ = std::fs::remove_dir_all(dir);
     }

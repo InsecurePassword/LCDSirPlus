@@ -88,7 +88,8 @@ diagnostics output directory. The bundle is capped at 1 MiB and contains only a
 typed report, privacy notice, and SHA-256 manifest. It never includes raw logs,
 configuration files, credentials, Discord data, window/process details, paths,
 network targets, environment values, registry values, serials, or device paths;
-collection does not start hardware, providers, probes, or actions.
+collection does not start hardware, providers, probes, or actions. `--config`
+is deliberately ignored in diagnostics mode, including UNC paths and includes.
 
 ## Verification status
 

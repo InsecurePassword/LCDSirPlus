@@ -154,19 +154,26 @@ normal slot action. A cleared episode rearms if it later recurs.
 Startup fails explicitly if the selected log directory or file cannot be
 opened. A later write/rotation failure leaves stdout logging active, drops the
 failed line, and disables file output rather than risking an unbounded file.
+Initialization atomically trims every retained file to the configured cap and
+removes slots above `log_backups`. Backups are atomic ring slots
+`lcdforge.log.1` through `.N`; modification time, not suffix, gives newest to
+oldest order. Rotation fully prepares and flushes a bounded replacement before
+replacing the next slot, then truncates the current log.
 
 ## Diagnostics
 
-`lcdforge.exe --diagnostics [--config PATH] [--diagnostic-dir PATH]` validates
-configuration and writes a uniquely named, atomic ZIP without starting HID,
-providers, Discord, network probes, or hung actions. The archive is store-only,
-has fixed entries (`privacy.txt`, `report.txt`, `manifest.txt`), per-entry caps,
-and a 1 MiB total cap. The selected directory must be a regular non-reparse
-directory on a fixed local volume; existing destination files are not replaced.
+`lcdforge.exe --diagnostics [--config PATH] [--diagnostic-dir PATH]` ignores
+`--config` without resolving, opening, or parsing it, then writes a uniquely
+named atomic ZIP without starting HID, providers, Discord, network probes, or
+hung actions. The archive is store-only, has fixed entries (`privacy.txt`,
+`report.txt`, `manifest.txt`), per-entry caps, and a 1 MiB total cap. The
+selected directory must be a regular non-reparse directory on a fixed local
+volume; native no-replace publication refuses an existing destination and
+verifies the final file's pinned identity and size.
 
-The report uses a closed allowlist of version/build, validated modes, booleans,
-bounded cadences, fixed G13 contract values, closed provider states, and size
-totals for known rotated log names. Raw logs/configuration and user, credential,
+The report uses a closed allowlist of version/build, CLI safe-mode state,
+compile-time schema/G13 facts, closed provider states, and size totals for known
+rotated log names. Raw logs/configuration and user, credential,
 Discord, title, path, address/target, environment, command-line, registry,
 serial, arbitrary-listing, and device-path data are excluded.
 

@@ -157,6 +157,20 @@ fn parse_args() -> Result<Cli, String> {
     Ok(cli)
 }
 
+fn run_diagnostics(cli: &Cli) -> i32 {
+    let directory = cli.diagnostic_dir.clone().unwrap_or_else(app::log_dir);
+    match diagnostics::write_bundle(&directory, cli.safe_mode) {
+        Ok(path) => {
+            println!("Diagnostics written to {}", path.display());
+            0
+        }
+        Err(error) => {
+            eprintln!("diagnostics failed: {error}");
+            1
+        }
+    }
+}
+
 fn main() {
     let cli = match parse_args() {
         Ok(cli) => cli,
@@ -196,6 +210,10 @@ fn main() {
     if command_count > 1 {
         eprintln!("error: select only one command");
         std::process::exit(2);
+    }
+
+    if cli.diagnostics {
+        std::process::exit(run_diagnostics(&cli));
     }
 
     if cli.hang_test_harness {
@@ -249,34 +267,6 @@ fn main() {
             outcome => {
                 eprintln!("INVALID: {}", outcome.message);
                 std::process::exit(2);
-            }
-        }
-    }
-
-    if cli.diagnostics {
-        let path = cli
-            .config
-            .clone()
-            .unwrap_or_else(app::default_config_path_pub);
-        let mut config = match parser::load(&path) {
-            Ok(loaded) => loaded.config,
-            Err(_) => {
-                eprintln!("diagnostics failed: configuration is invalid or unavailable");
-                std::process::exit(2);
-            }
-        };
-        if cli.safe_mode {
-            config.safe_mode = true;
-        }
-        let directory = cli.diagnostic_dir.clone().unwrap_or_else(app::log_dir);
-        match diagnostics::write_bundle(&directory, &config, None) {
-            Ok(path) => {
-                println!("Diagnostics written to {}", path.display());
-                return;
-            }
-            Err(error) => {
-                eprintln!("diagnostics failed: {error}");
-                std::process::exit(1);
             }
         }
     }
@@ -374,4 +364,56 @@ fn main() {
     });
     drop(instance);
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_ignore_unreachable_unc_config_without_calling_parser() {
+        let directory = std::env::temp_dir().join(format!(
+            "lcdforge-cli-offline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cli = Cli {
+            config: Some(r"\\unreachable.invalid\share\lcdforge.txt".into()),
+            validate: false,
+            preview: false,
+            hardware_test: false,
+            hardware_discover: false,
+            diagnostics: true,
+            discord_authorize: false,
+            discord_clear_token: false,
+            hang_test_harness: false,
+            hang_detector_smoke: false,
+            hang_action_smoke: false,
+            hang_action_negative_smoke: false,
+            instance_smoke: false,
+            instance_smoke_child: false,
+            backend: backends::BackendKind::Hid,
+            duration: Duration::from_secs(30),
+            safe_mode: true,
+            diagnostic_dir: Some(directory.clone()),
+            version: false,
+            help: false,
+        };
+        let before = parser::test_load_calls();
+        assert_eq!(run_diagnostics(&cli), 0);
+        assert_eq!(parser::test_load_calls(), before);
+        let bundles: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(bundles.len(), 1);
+        assert!(
+            !String::from_utf8_lossy(&std::fs::read(&bundles[0]).unwrap())
+                .contains("unreachable.invalid")
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
 }

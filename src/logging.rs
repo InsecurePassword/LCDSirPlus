@@ -1,8 +1,10 @@
 //! Leveled logging to stdout with size-capped, rotated file output.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -45,14 +47,23 @@ struct RotatingFile {
     size: u64,
     max_bytes: u64,
     backups: i32,
+    next_slot: i32,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RotationFault {
+    None,
+    Prepare,
+    Publish,
+}
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl RotatingFile {
     fn open(path: PathBuf, max_bytes: u64, backups: i32) -> io::Result<Self> {
-        if existing_len(&path) > max_bytes {
-            rotate(&path, backups)?;
-        }
-        let size = existing_len(&path);
+        normalize_set(&path, max_bytes, backups)?;
+        let size = existing_len(&path)?;
+        let next_slot = next_backup_slot(&path, backups)?;
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             path,
@@ -60,6 +71,7 @@ impl RotatingFile {
             size,
             max_bytes,
             backups,
+            next_slot,
         })
     }
 
@@ -71,8 +83,7 @@ impl RotatingFile {
             ));
         }
         if self.size.saturating_add(bytes.len() as u64) > self.max_bytes {
-            self.file.take();
-            if let Err(error) = rotate(&self.path, self.backups) {
+            if let Err(error) = self.rotate(RotationFault::None) {
                 self.file = OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -80,19 +91,28 @@ impl RotatingFile {
                     .ok();
                 return Err(error);
             }
-            self.file = Some(
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.path)?,
-            );
-            self.size = 0;
         }
         self.file
             .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "log file closed"))?
             .write_all(bytes)?;
         self.size += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn rotate(&mut self, fault: RotationFault) -> io::Result<()> {
+        self.file.take();
+        let backup = backup_path(&self.path, self.next_slot);
+        rotate_to(&self.path, &backup, self.max_bytes, fault)?;
+        self.file = Some(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&self.path)?,
+        );
+        self.size = 0;
+        self.next_slot = self.next_slot % self.backups + 1;
         Ok(())
     }
 }
@@ -141,27 +161,135 @@ pub fn log(level: Level, message: &str) {
     }
 }
 
-fn rotate(path: &Path, backups: i32) -> io::Result<()> {
-    // lcdforge.log -> lcdforge.log.1 -> ... -> lcdforge.log.N (dropped)
-    let oldest = path.with_extension(format!("log.{}", backups));
-    if oldest.exists() {
-        std::fs::remove_file(oldest)?;
-    }
-    for i in (1..backups).rev() {
-        let from = path.with_extension(format!("log.{}", i));
-        let to = path.with_extension(format!("log.{}", i + 1));
-        if from.exists() {
-            std::fs::rename(from, to)?;
+fn normalize_set(path: &Path, max_bytes: u64, backups: i32) -> io::Result<()> {
+    let retained: Vec<_> = std::iter::once(path.to_path_buf())
+        .chain((1..=backups).map(|index| backup_path(path, index)))
+        .collect();
+    let mut oversized = Vec::new();
+    for candidate in &retained {
+        match std::fs::metadata(candidate) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "log path is not a regular file",
+                ));
+            }
+            Ok(metadata) if metadata.len() > max_bytes => {
+                oversized.push(candidate.clone());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
-    if path.exists() {
-        std::fs::rename(path, path.with_extension("log.1"))?;
+    for candidate in oversized {
+        let temporary = prepare_tail(&candidate, max_bytes)?;
+        if let Err(error) = replace_file(&temporary, &candidate) {
+            let _ = std::fs::remove_file(temporary);
+            return Err(error);
+        }
+    }
+    for index in backups + 1..=20 {
+        let extra = backup_path(path, index);
+        match std::fs::remove_file(extra) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
 
-fn existing_len(path: &Path) -> u64 {
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+fn rotate_to(
+    current: &Path,
+    backup: &Path,
+    max_bytes: u64,
+    fault: RotationFault,
+) -> io::Result<()> {
+    if fault == RotationFault::Prepare {
+        return Err(io::Error::other("injected rotation preparation failure"));
+    }
+    let temporary = prepare_tail(current, max_bytes)?;
+    if fault == RotationFault::Publish {
+        let _ = std::fs::remove_file(temporary);
+        return Err(io::Error::other("injected rotation publication failure"));
+    }
+    if let Err(error) = replace_file(&temporary, backup) {
+        let _ = std::fs::remove_file(temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn prepare_tail(source: &Path, max_bytes: u64) -> io::Result<PathBuf> {
+    let temporary = source.with_extension(format!(
+        "log.{}.{}.tmp",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        let mut input = File::open(source)?;
+        let length = input.metadata()?.len();
+        input.seek(SeekFrom::Start(length.saturating_sub(max_bytes)))?;
+        io::copy(&mut input.take(max_bytes), &mut output)?;
+        output.sync_all()
+    })();
+    if let Err(error) = result {
+        drop(output);
+        let _ = std::fs::remove_file(temporary);
+        return Err(error);
+    }
+    drop(output);
+    Ok(temporary)
+}
+
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe {
+        MoveFileExW(
+            windows::core::PCWSTR(from.as_ptr()),
+            windows::core::PCWSTR(to.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(io::Error::other)
+}
+
+fn next_backup_slot(path: &Path, backups: i32) -> io::Result<i32> {
+    let mut oldest = None;
+    for index in 1..=backups {
+        match std::fs::metadata(backup_path(path, index)) {
+            Ok(metadata) => {
+                let modified = metadata.modified()?;
+                if oldest.is_none_or(|(_, time)| modified < time) {
+                    oldest = Some((index, modified));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(index),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(oldest.map_or(1, |(index, _)| index))
+}
+
+fn backup_path(path: &Path, index: i32) -> PathBuf {
+    path.with_extension(format!("log.{index}"))
+}
+
+fn existing_len(path: &Path) -> io::Result<u64> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error),
+    }
 }
 
 fn chrono_friendly_now() -> String {
@@ -255,6 +383,7 @@ mod tests {
         for line in [b"one\n".as_slice(), b"two\n", b"three\n", b"four\n"] {
             file.write(line).unwrap();
         }
+        file.write(b"x\n").unwrap();
         drop(file);
         assert!(std::fs::metadata(&path).unwrap().len() <= 12);
         assert!(
@@ -262,6 +391,15 @@ mod tests {
                 .unwrap()
                 .len()
                 <= 12
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"x\n");
+        assert_eq!(
+            std::fs::read(path.with_extension("log.1")).unwrap(),
+            b"one\ntwo\n"
+        );
+        assert_eq!(
+            std::fs::read(path.with_extension("log.2")).unwrap(),
+            b"three\nfour\n"
         );
         assert!(!path.with_extension("log.3").exists());
         let _ = std::fs::remove_dir_all(dir);
@@ -304,7 +442,52 @@ mod tests {
     }
 
     #[test]
-    fn open_and_rotation_fail_without_panicking_or_overwriting() {
+    fn initialization_caps_existing_files_and_removes_excess_backups() {
+        let dir = temp_dir("initial-cap");
+        let path = dir.join("lcdforge.log");
+        std::fs::write(&path, b"0123456789ABCDEFGHIJ").unwrap();
+        std::fs::write(path.with_extension("log.1"), b"abcdefghijklmnop").unwrap();
+        std::fs::write(path.with_extension("log.2"), b"ABCDEFGHIJKLMNOP").unwrap();
+        std::fs::write(path.with_extension("log.3"), b"retired").unwrap();
+        drop(RotatingFile::open(path.clone(), 10, 2).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"ABCDEFGHIJ");
+        assert_eq!(
+            std::fs::read(path.with_extension("log.1")).unwrap(),
+            b"ghijklmnop"
+        );
+        assert_eq!(
+            std::fs::read(path.with_extension("log.2")).unwrap(),
+            b"GHIJKLMNOP"
+        );
+        assert!(!path.with_extension("log.3").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rotation_failures_preserve_the_bounded_set_and_clean_preparation() {
+        for fault in [RotationFault::Prepare, RotationFault::Publish] {
+            let dir = temp_dir(if fault == RotationFault::Prepare {
+                "prepare-failure"
+            } else {
+                "publish-failure"
+            });
+            let path = dir.join("lcdforge.log");
+            std::fs::write(&path, b"current\n").unwrap();
+            std::fs::write(path.with_extension("log.1"), b"backup\n").unwrap();
+            let mut file = RotatingFile::open(path.clone(), 8, 1).unwrap();
+            assert!(file.rotate(fault).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"current\n");
+            assert_eq!(
+                std::fs::read(path.with_extension("log.1")).unwrap(),
+                b"backup\n"
+            );
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn invalid_log_paths_fail_without_panicking_or_overwriting() {
         let dir = temp_dir("failure");
         let parent_file = dir.join("not-a-directory");
         std::fs::write(&parent_file, b"sentinel").unwrap();

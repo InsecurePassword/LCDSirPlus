@@ -164,4 +164,6 @@ Discord speaker overlay, then dashboard.
   credentials, Discord content/identifiers, titles, paths, addresses/targets,
   environment/command-line/registry values, serials, listings, and device paths
   are never archive inputs. Collection starts no HID, providers, probes, RPC,
-  or actions, and output rejects reparse directories and linked files.
+  actions, or configuration reads. Output rejects reparse directories and
+  linked files; native no-replace publication verifies the final volume, file
+  identity, link count, and size before releasing the owned handle.
