@@ -68,7 +68,7 @@ LGS/direct-HID writers without blocking unrelated G HUB processes.
 - PresentMon: optional FPS/frame timing.
 - Arctis 7P+ USB HID: optional headset battery.
 - Discord local RPC: verified active-speaker overlay with RPC OAuth and
-  current-user DPAPI credential storage.
+  active-account-bound, per-Discord-user DPAPI credential storage.
 
 ## Operational requirements
 

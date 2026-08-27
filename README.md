@@ -78,8 +78,8 @@ LCDSirPlus.exe [--config PATH] [COMMAND]
   --hardware-test    Run the deterministic 10-step G13 test sequence
   --hardware-discover  Passive read-only G13 HID enumeration
   --diagnostics      Write a bounded offline diagnostics ZIP and exit
-  --discord-authorize  Authorize Discord local RPC for the current user
-  --discord-clear-token  Remove the current-user Discord credential
+  --discord-authorize  Authorize RPC for Discord Desktop's active account
+  --discord-clear-token  Remove all LCDSirPlus Discord credentials
   --backend auto|sdk|hid|virtual  Backend for --hardware-test (default hid)
   --duration-secs N  Visible duration for --hardware-test (default 30)
   --safe-mode        Providers/destructive actions disabled
@@ -174,7 +174,7 @@ external prerequisites and are not redistributed.
   XInput, Core Audio, and PresentMon. Vendor hardware, LHM, and the PresentMon
   console remain optional runtime prerequisites; absence renders unavailable.
 - **P3 complete**: verified Discord desktop IPC active-speaker overlay,
-  RPC OAuth authorization, refresh, and current-user DPAPI credential storage.
+  RPC OAuth authorization, refresh, and per-Discord-account DPAPI credential storage.
 - **P4 complete**: guarded hung-process termination, alerts,
   single-instance ownership, startup registration, preview fallback, and
   optional network-quality probes, offline diagnostics, and transactional
@@ -188,23 +188,38 @@ account to be added as an application tester. Register the redirect URI used in
 Desktop, then authorize:
 
 ```powershell
-$env:LCDSIRPLUS_DISCORD_CLIENT_SECRET = '<temporary secret only if required>'
+$env:LCDSIRPLUS_DISCORD_CLIENT_SECRET = '<secret only if required>'
 .\LCDSirPlus.exe --discord-authorize
 Remove-Item Env:\LCDSIRPLUS_DISCORD_CLIENT_SECRET -ErrorAction SilentlyContinue
 ```
 
-The secret is never accepted in configuration or process arguments. The
-access/refresh credential is stored at
-`%LOCALAPPDATA%\LCDSirPlus\discord.token`, encrypted for the current Windows
-user with DPAPI. `--discord-clear-token` removes only that local copy; revoke
-the application in Discord separately when needed. Credential access rejects
-reparse points and hard links and verifies the pinned local path boundary.
+The secret is never accepted in configuration or process arguments. If supplied,
+it is retained with the access/refresh credential for refresh. Version 2 records
+are stored as `%LOCALAPPDATA%\LCDSirPlus\discord-<Discord user ID>.token`, encrypted
+for the current Windows user with DPAPI. Each Account Switcher account must be
+active and authorized once; authorizing another account preserves prior account
+records. `--discord-clear-token` removes all exact LCDSirPlus per-account records
+and the legacy exact `discord.token`, but no unrelated files. Revoke the
+application in Discord separately when needed. Credential access rejects reparse
+points and hard links and verifies the pinned local path boundary.
 
 Authorization uses Discord's verified local named-pipe `AUTHORIZE` flow with
 scopes `identify`, `rpc`, and `rpc.voice.read`. LCDSirPlus opens no callback
 listener and launches no browser. The only Discord network request is the
-HTTPS token exchange/refresh, which has a finite 20-second deadline. Discord
-pipe operations are cancelable during shutdown and configuration reload.
+HTTPS token exchange/refresh. Runtime refresh has a 20-second deadline, while
+authorization is bounded by its 120-second command deadline. Discord pipe
+operations are cancelable during shutdown and configuration reload. The
+trusted pipe's `READY.user.id`, stored record, and `AUTHENTICATE` user must match
+before voice state is accepted. After authorization and token exchange, the
+initial pipe is dropped; a fresh trusted pipe must report the same READY account
+before the token is sent exactly once, authenticated, monitored for account
+updates, and saved. A rotated refresh credential is saved immediately because
+the old refresh token may already be invalid, then its access token is sent only
+after a fresh trusted pipe reports the same account. Runtime requires the
+account-update subscription before any voice query or authenticated publication.
+Account changes clear voice state and reconnect; with multiple Discord
+editions/endpoints, the first trusted endpoint remains the current implementation
+ceiling.
 
 The application otherwise remains local-first. Optional network quality uses
 only the configured IP literal with a bounded ICMP/TCP deadline and is disabled

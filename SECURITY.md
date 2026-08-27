@@ -21,9 +21,13 @@ serials, arbitrary listings, and device paths. Review a bundle before sharing.
 
 Never put Discord client secrets or tokens in configuration, command arguments,
 issues, diagnostics, logs, screenshots, or package fixtures. If Discord requires
-a client secret, expose it only through the temporary
-`LCDSIRPLUS_DISCORD_CLIENT_SECRET` environment variable for authorization and
-remove it immediately afterward. Revoke exposed credentials with Discord.
+a client secret, expose it only through `LCDSIRPLUS_DISCORD_CLIENT_SECRET` for
+authorization and remove the environment variable immediately afterward. The
+secret is retained only inside that account's DPAPI-protected v2 credential so
+refresh can use it. Runtime accepts a credential only when its immutable Discord
+user ID and client ID match the trusted pipe's current `READY` session and the
+authenticated user has all required scopes. Revoke exposed credentials with
+Discord.
 
 ## Reporting
 

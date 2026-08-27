@@ -41,8 +41,8 @@ fn print_usage() {
          \x20 --preview          Run with the virtual preview forced on\n\
          \x20 --hardware-test    Run the deterministic 10-step G13 test sequence\n\
          \x20 --diagnostics      Write a bounded offline diagnostics ZIP and exit\n\
-         \x20 --discord-authorize  Authorize Discord RPC for the current user\n\
-         \x20 --discord-clear-token  Remove the current-user Discord credential\n\
+         \x20 --discord-authorize  Authorize RPC for Discord Desktop's active account\n\
+         \x20 --discord-clear-token  Remove all LCDSirPlus Discord credentials\n\
          \x20 --backend auto|sdk|hid|virtual  Backend for --hardware-test (default hid)\n\
          \x20 --duration-secs N  Visible-sequence duration for --hardware-test\n\
          \x20 --safe-mode        Run with providers/destructive actions disabled\n\
@@ -286,7 +286,7 @@ fn main() {
             std::process::exit(2);
         }
         match providers::discord::clear_token() {
-            Ok(()) => println!("Discord token removed."),
+            Ok(()) => println!("All LCDSirPlus Discord credentials removed."),
             Err(error) => {
                 eprintln!("error: {}", error);
                 std::process::exit(1);
@@ -309,9 +309,7 @@ fn main() {
         };
         let secret = std::env::var("LCDSIRPLUS_DISCORD_CLIENT_SECRET").unwrap_or_default();
         match providers::discord::authorize(&cfg, &secret) {
-            Ok(()) => println!(
-                "Discord authorization complete. The token is protected with Windows DPAPI."
-            ),
+            Ok(()) => println!("Discord authorization stored for the current Discord account."),
             Err(error) => {
                 eprintln!("Discord authorization failed: {}", error);
                 std::process::exit(1);

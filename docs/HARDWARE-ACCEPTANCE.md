@@ -46,12 +46,15 @@ requires a complete rerun.
 - Use a dedicated developer application/test account and register the configured
   redirect URI. Never record the client secret or DPAPI token bytes.
 - Authorize with Discord Desktop running; confirm no listener/browser is opened
-  and clear the temporary secret environment variable.
+  and clear the client-secret environment variable. Switch to a second dedicated
+  test account, authorize it once, and confirm switching either direction uses
+  only that account's voice session without another authorization.
 - Join a voice channel with another participant. Confirm channel label,
   self/other speaking order, mute/deafen transitions, linger, leave/rejoin,
   Discord restart, LCDSirPlus restart, and token refresh.
-- Revoke authorization and run `--discord-clear-token`; confirm the overlay
-  becomes unavailable without leaking remote error content.
+- Revoke authorization and run `--discord-clear-token`; confirm all LCDSirPlus
+  Discord account records are removed and the overlay becomes unavailable
+  without leaking remote error content.
 
 ## Guarded Hung Action
 

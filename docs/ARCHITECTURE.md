@@ -198,8 +198,10 @@ Discord speaker overlay, then dashboard.
 - Discord RPC frames are bounded to 4 MiB. Remote messages and OAuth response
   bodies are never included in errors. Token HTTPS responses are bounded to
   1 MiB and credentials to 64 KiB.
-- Discord credentials are versioned and current-user DPAPI protected at rest.
-  Optional client secrets cross only the temporary environment boundary.
+- Discord credentials are v2, keyed by immutable Discord user ID, and
+  current-Windows-user DPAPI protected at rest. Optional client secrets enter
+  through the authorization environment variable and remain encrypted with the
+  account record for refresh.
 - Authorization is local RPC plus outbound WinHTTP token exchange. There is no
   callback listener, browser launch, bot/Gateway connection, or user token.
 - Diagnostics are a separate offline privacy boundary: a closed typed allowlist

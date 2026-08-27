@@ -128,11 +128,14 @@ standard-library DNS resolution cannot be canceled with the required shutdown bo
 | `discord_show_self` | 0 | include the current user in the speaking overlay |
 | `discord_show_channel` | 0 | use the selected voice-channel name as the title |
 
-No token or client secret belongs in this file. Use `--discord-authorize`; the
-resulting access/refresh record is current-user DPAPI protected under
-`%LOCALAPPDATA%\LCDSirPlus`. A confidential-client secret, when required, is
-accepted only from the temporary `LCDSIRPLUS_DISCORD_CLIENT_SECRET` environment
-variable. Use `--discord-clear-token` to remove the local record.
+No token or client secret belongs in this file. Use `--discord-authorize` once
+while each Discord Account Switcher account is active. Its v2 access/refresh
+record is stored under the immutable Discord user ID and current-Windows-user
+DPAPI protected in `%LOCALAPPDATA%\LCDSirPlus`. A confidential-client secret,
+when required, is accepted only from `LCDSIRPLUS_DISCORD_CLIENT_SECRET` during
+authorization and retained inside that encrypted record for refresh; remove the
+environment variable afterward. Use `--discord-clear-token` to remove all exact
+LCDSirPlus Discord credential records, including the old global record.
 
 ## Hung-process guard
 

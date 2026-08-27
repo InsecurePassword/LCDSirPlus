@@ -24,6 +24,7 @@ const MAX_TOKEN_RESPONSE: usize = 1024 * 1024;
 const MAX_CREDENTIAL: usize = 64 * 1024;
 const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(20);
+const REQUIRED_SCOPES: [&str; 3] = ["rpc", "identify", "rpc.voice.read"];
 
 #[derive(Clone, Debug)]
 struct Payload {
@@ -281,6 +282,92 @@ fn user_id(value: &Json) -> String {
         .unwrap_or_else(|| field(value, "user_id"))
 }
 
+fn validate_user_id(id: &str) -> Result<&str, String> {
+    if id.is_empty()
+        || id.len() > 20
+        || !id.bytes().all(|byte| byte.is_ascii_digit())
+        || id.starts_with('0')
+        || id.parse::<u64>().is_err()
+    {
+        return Err("Discord user ID is not a canonical numeric Snowflake".into());
+    }
+    Ok(id)
+}
+
+fn ready_user_id(data: &Json) -> Result<String, String> {
+    let id = data
+        .get("user")
+        .map(|user| field(user, "id"))
+        .unwrap_or_default();
+    validate_user_id(&id)?;
+    Ok(id)
+}
+
+fn has_required_scopes<'a>(scopes: impl Iterator<Item = &'a str> + Clone) -> bool {
+    REQUIRED_SCOPES
+        .iter()
+        .all(|required| scopes.clone().any(|scope| scope == *required))
+}
+
+fn scope_string_is_valid(scope: &str) -> bool {
+    has_required_scopes(scope.split_ascii_whitespace())
+}
+
+fn authenticated_user_id(data: &Json) -> Result<String, String> {
+    let id = data
+        .get("user")
+        .map(|user| field(user, "id"))
+        .unwrap_or_default();
+    validate_user_id(&id)?;
+    let scopes = data
+        .get("scopes")
+        .and_then(Json::as_arr)
+        .ok_or("Discord authentication response omitted scopes")?;
+    if scopes.iter().any(|scope| scope.as_str().is_none())
+        || !has_required_scopes(scopes.iter().filter_map(Json::as_str))
+    {
+        return Err("Discord authentication response omitted required scopes".into());
+    }
+    Ok(id)
+}
+
+fn validate_authentication(
+    data: &Json,
+    ready_id: &str,
+    credential: &TokenRecord,
+    client_id: &str,
+) -> Result<(), String> {
+    credential.validate_for(ready_id, client_id)?;
+    let authenticated_id = authenticated_user_id(data)?;
+    if authenticated_id != ready_id || authenticated_id != credential.user_id {
+        return Err(
+            "Discord authenticated account does not match the current READY account".into(),
+        );
+    }
+    Ok(())
+}
+
+fn current_user_changed(event: &str, data: &Json, ready_id: &str) -> Result<bool, String> {
+    if event != "CURRENT_USER_UPDATE" {
+        return Ok(false);
+    }
+    let id = data
+        .get("user")
+        .map(|user| field(user, "id"))
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| field(data, "id"));
+    validate_user_id(&id)?;
+    Ok(id != ready_id)
+}
+
+fn disconnected_account_state() -> DiscordState {
+    DiscordState {
+        error: "Discord current account changed; reconnecting".into(),
+        updated: Some(SystemTime::now()),
+        ..Default::default()
+    }
+}
+
 fn display_name(voice: &Json, user: &Json, id: &str) -> String {
     [
         field(voice, "nick"),
@@ -305,6 +392,7 @@ fn tail(value: &str, count: usize) -> &str {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct TokenRecord {
     version: u32,
+    user_id: String,
     client_id: String,
     client_secret: String,
     access_token: String,
@@ -326,16 +414,22 @@ struct TokenResponse {
 
 impl TokenRecord {
     fn from_response(
+        user_id: &str,
         client_id: &str,
         client_secret: &str,
         response: TokenResponse,
         now: u64,
     ) -> Result<Self, String> {
+        validate_user_id(user_id)?;
         if response.access_token.trim().is_empty() {
             return Err("Discord token response contained no access_token".into());
         }
+        if !scope_string_is_valid(&response.scope) {
+            return Err("Discord token response omitted required scopes".into());
+        }
         Ok(Self {
-            version: 1,
+            version: 2,
+            user_id: user_id.into(),
             client_id: client_id.into(),
             client_secret: client_secret.into(),
             access_token: response.access_token,
@@ -353,8 +447,9 @@ impl TokenRecord {
 
     fn encode(&self) -> Vec<u8> {
         format!(
-            "{{\"version\":{},\"clientId\":{},\"clientSecret\":{},\"accessToken\":{},\"refreshToken\":{},\"tokenType\":{},\"scope\":{},\"expiresAt\":{},\"updatedAt\":{}}}",
+            "{{\"version\":{},\"userId\":{},\"clientId\":{},\"clientSecret\":{},\"accessToken\":{},\"refreshToken\":{},\"tokenType\":{},\"scope\":{},\"expiresAt\":{},\"updatedAt\":{}}}",
             self.version,
+            json_string(&self.user_id),
             json_string(&self.client_id),
             json_string(&self.client_secret),
             json_string(&self.access_token),
@@ -375,6 +470,7 @@ impl TokenRecord {
                 .get("version")
                 .and_then(Json::as_f64)
                 .unwrap_or_default() as u32,
+            user_id: field(&value, "userId"),
             client_id: field(&value, "clientId"),
             client_secret: field(&value, "clientSecret"),
             access_token: field(&value, "accessToken"),
@@ -390,7 +486,7 @@ impl TokenRecord {
                 .and_then(Json::as_f64)
                 .unwrap_or_default() as u64,
         };
-        if record.version != 1 {
+        if record.version != 2 {
             return Err(format!(
                 "unsupported Discord credential version {}",
                 record.version
@@ -399,7 +495,25 @@ impl TokenRecord {
         if record.access_token.trim().is_empty() {
             return Err("Discord credential contains no access token".into());
         }
+        validate_user_id(&record.user_id)?;
+        if !scope_string_is_valid(&record.scope) {
+            return Err("Discord credential omits required scopes".into());
+        }
         Ok(record)
+    }
+
+    fn validate_for(&self, user_id: &str, client_id: &str) -> Result<(), String> {
+        validate_user_id(user_id)?;
+        if self.user_id != user_id {
+            return Err("stored Discord credential belongs to another account".into());
+        }
+        if self.client_id != client_id {
+            return Err("stored Discord credential belongs to another client ID".into());
+        }
+        if !scope_string_is_valid(&self.scope) {
+            return Err("stored Discord credential omits required scopes".into());
+        }
+        Ok(())
     }
 }
 
@@ -418,9 +532,9 @@ fn parse_token_response(body: &[u8]) -> Result<TokenResponse, String> {
     })
 }
 
-fn retain_refresh_token(response: &mut TokenResponse, current: &str) {
-    if response.refresh_token.is_empty() {
-        response.refresh_token = current.into();
+fn retain_if_empty(value: &mut String, current: &str) {
+    if value.is_empty() {
+        *value = current.into();
     }
 }
 
@@ -461,8 +575,18 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-pub fn credential_path() -> Result<PathBuf, String> {
-    Ok(credential_root()?.join("discord.token"))
+fn credential_path_at(root: &Path, user_id: &str) -> Result<PathBuf, String> {
+    validate_user_id(user_id)?;
+    Ok(root.join(format!("discord-{}.token", user_id)))
+}
+
+pub fn credential_path(user_id: &str) -> Result<PathBuf, String> {
+    credential_path_at(&credential_root()?, user_id)
+}
+
+fn credential_user_id(name: &str) -> Option<&str> {
+    let id = name.strip_prefix("discord-")?.strip_suffix(".token")?;
+    validate_user_id(id).ok()
 }
 
 // Platform and runtime implementation follows the pure protocol/state core.
@@ -599,10 +723,6 @@ impl CredentialBoundary {
         })
     }
 
-    fn token_path(&self) -> PathBuf {
-        self.root.join("discord.token")
-    }
-
     fn validate(&self) -> Result<(), String> {
         verify_handle_path(
             self.pins
@@ -714,7 +834,7 @@ fn save_token(path: &Path, record: &TokenRecord) -> Result<(), String> {
         .parent()
         .ok_or("Discord credential path has no parent")?;
     let boundary = CredentialBoundary::open(parent, true)?;
-    if boundary.token_path() != path {
+    if credential_path_at(parent, &record.user_id)? != path {
         return Err("Discord credential path is outside its pinned boundary".into());
     }
     boundary.validate()?;
@@ -765,7 +885,7 @@ fn save_token(path: &Path, record: &TokenRecord) -> Result<(), String> {
     Ok(())
 }
 
-fn load_token(path: &Path) -> Result<Option<TokenRecord>, String> {
+fn load_token(path: &Path, user_id: &str, client_id: &str) -> Result<Option<TokenRecord>, String> {
     use windows::Win32::Foundation::GENERIC_READ;
     use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, OPEN_EXISTING};
     let parent = path
@@ -776,7 +896,7 @@ fn load_token(path: &Path) -> Result<Option<TokenRecord>, String> {
         Err(_) if !parent.exists() => return Ok(None),
         Err(error) => return Err(error),
     };
-    if boundary.token_path() != path {
+    if credential_path_at(parent, user_id)? != path {
         return Err("Discord credential path is outside its pinned boundary".into());
     }
     boundary.validate()?;
@@ -792,11 +912,40 @@ fn load_token(path: &Path) -> Result<Option<TokenRecord>, String> {
     if protected.len() > MAX_CREDENTIAL {
         return Err("Discord credential file exceeds 65536-byte limit".into());
     }
-    TokenRecord::decode(&dpapi(&protected, false)?).map(Some)
+    let record = TokenRecord::decode(&dpapi(&protected, false)?)?;
+    record.validate_for(user_id, client_id)?;
+    Ok(Some(record))
 }
 
 pub fn clear_token() -> Result<(), String> {
-    clear_token_at(&credential_path()?)
+    clear_tokens_at(&credential_root()?)
+}
+
+fn clear_tokens_at(root: &Path) -> Result<(), String> {
+    let boundary = match CredentialBoundary::open(root, false) {
+        Ok(boundary) => boundary,
+        Err(_) if !root.exists() => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    boundary.validate()?;
+    let mut owned = Vec::new();
+    for entry in std::fs::read_dir(root)
+        .map_err(|_| "Discord credential directory could not be enumerated")?
+    {
+        let entry = entry.map_err(|_| "Discord credential directory entry is unavailable")?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name == "discord.token" || credential_user_id(name).is_some() {
+            owned.push(entry.path());
+        }
+    }
+    drop(boundary);
+    for path in owned {
+        clear_token_at(&path)?;
+    }
+    Ok(())
 }
 
 fn clear_token_at(path: &Path) -> Result<(), String> {
@@ -1559,9 +1708,9 @@ fn refresh_token_if_needed(
     config: &Config,
     mut current: TokenRecord,
     token_owner: &TokenExchangeOwner,
-) -> Result<TokenRecord, String> {
+) -> Result<(TokenRecord, bool), String> {
     if !current.needs_refresh(unix_now()) {
-        return Ok(current);
+        return Ok((current, false));
     }
     if current.refresh_token.is_empty() {
         return Err(
@@ -1582,15 +1731,49 @@ fn refresh_token_if_needed(
         &form_encode(&fields),
         Instant::now() + TOKEN_TIMEOUT,
     )?;
-    retain_refresh_token(&mut response, &current.refresh_token);
+    retain_if_empty(&mut response.refresh_token, &current.refresh_token);
+    retain_if_empty(&mut response.scope, &current.scope);
     current = TokenRecord::from_response(
-        &config.discord_client_id,
+        &current.user_id,
+        &current.client_id,
         &current.client_secret,
         response,
         unix_now(),
     )?;
-    save_token(&credential_path()?, &current)?;
-    Ok(current)
+    Ok((current, true))
+}
+
+fn persist_rotated_refresh(
+    path: &Path,
+    credential: &TokenRecord,
+    refreshed: bool,
+) -> Result<(), String> {
+    if refreshed {
+        // OAuth refresh-token rotation may invalidate the old record before IPC validation.
+        save_token(path, credential)?;
+    }
+    Ok(())
+}
+
+fn require_same_ready_user(
+    initial: &str,
+    fresh: &str,
+    credential: &TokenRecord,
+) -> Result<(), String> {
+    validate_user_id(initial)?;
+    validate_user_id(fresh)?;
+    if initial != fresh || fresh != credential.user_id {
+        return Err("Discord current account changed before authentication".into());
+    }
+    Ok(())
+}
+
+fn require_current_user_subscription(subscribed: bool) -> Result<(), String> {
+    if subscribed {
+        Ok(())
+    } else {
+        Err("Discord current-account monitor is not established".into())
+    }
 }
 
 struct Rpc<'a> {
@@ -1601,13 +1784,38 @@ struct Rpc<'a> {
     config: &'a Arc<RwLock<Config>>,
     shutdown: &'a AtomicBool,
     session_config: Config,
+    ready_user_id: String,
     nonce: u64,
+    account_changed: bool,
+    current_user_subscribed: bool,
     pending_refresh: bool,
     global_subscribed: bool,
     channel_subscribed: String,
 }
 
 impl Rpc<'_> {
+    fn clear_session(&mut self) {
+        self.account_changed = true;
+        let state = disconnected_account_state();
+        *self.latest.lock().unwrap_or_else(|e| e.into_inner()) = state.clone();
+        let _ = self.updates.send(state);
+    }
+
+    fn handle_event(&mut self, event: &str, data: &Json) -> Result<bool, String> {
+        match current_user_changed(event, data, &self.ready_user_id) {
+            Ok(true) => {
+                self.clear_session();
+                return Err("Discord current account changed".into());
+            }
+            Err(error) => {
+                self.clear_session();
+                return Err(error);
+            }
+            Ok(false) => {}
+        }
+        self.tracker.handle(event, data, SystemTime::now())
+    }
+
     fn read(&mut self) -> Result<(u32, Vec<u8>), String> {
         let shutdown = self.shutdown;
         let config = self.config;
@@ -1667,12 +1875,11 @@ impl Rpc<'_> {
                         Err(_) => continue,
                     };
                     if !payload.event.is_empty() && payload.nonce != nonce {
-                        let changed = self
-                            .tracker
-                            .handle(&payload.event, &payload.data, SystemTime::now())
-                            .unwrap_or(false);
+                        let changed = self.handle_event(&payload.event, &payload.data)?;
                         self.pending_refresh |= changed;
-                        self.publish();
+                        if self.current_user_subscribed {
+                            self.publish();
+                        }
                         continue;
                     }
                     if payload.nonce != nonce {
@@ -1694,6 +1901,7 @@ impl Rpc<'_> {
             "SPEAKING_START",
             "SPEAKING_STOP",
         ];
+        require_current_user_subscription(self.current_user_subscribed)?;
         for _ in 0..3 {
             self.pending_refresh = false;
             let response = self.command("GET_SELECTED_VOICE_CHANNEL", "", None)?;
@@ -1744,6 +1952,47 @@ impl Rpc<'_> {
     }
 }
 
+fn new_rpc<'a>(
+    file: Pipe,
+    config: Config,
+    shared: &'a Arc<RwLock<Config>>,
+    shutdown: &'a AtomicBool,
+    updates: &'a mpsc::Sender<DiscordState>,
+    latest: &'a Mutex<DiscordState>,
+) -> Rpc<'a> {
+    Rpc {
+        file,
+        tracker: Tracker::default(),
+        updates,
+        latest,
+        config: shared,
+        shutdown,
+        session_config: config,
+        ready_user_id: String::new(),
+        nonce: 0,
+        account_changed: false,
+        current_user_subscribed: false,
+        pending_refresh: false,
+        global_subscribed: false,
+        channel_subscribed: String::new(),
+    }
+}
+
+fn runtime_handshake(rpc: &mut Rpc<'_>, client_id: &str) -> Result<String, String> {
+    let handshake = format!("{{\"v\":1,\"client_id\":{}}}", json_string(client_id));
+    rpc.write(OP_HANDSHAKE, handshake.as_bytes())?;
+    let (opcode, body) = rpc.read()?;
+    if opcode != OP_FRAME {
+        return Err(format!("Discord handshake returned opcode {}", opcode));
+    }
+    let ready = decode_payload(&body)?;
+    payload_error(&ready)?;
+    if ready.event != "READY" {
+        return Err("Discord handshake did not return READY".into());
+    }
+    ready_user_id(&ready.data)
+}
+
 fn connect_and_serve(
     config: Config,
     shared: &Arc<RwLock<Config>>,
@@ -1756,60 +2005,44 @@ fn connect_and_serve(
         return Err("discord_client_id is not configured".into());
     }
     let (file, _) = open_pipe()?;
-    let mut rpc = Rpc {
-        file,
-        tracker: Tracker::default(),
-        updates,
-        latest,
-        config: shared,
-        shutdown,
-        session_config: config.clone(),
-        nonce: 0,
-        pending_refresh: false,
-        global_subscribed: false,
-        channel_subscribed: String::new(),
+    let mut rpc = new_rpc(file, config.clone(), shared, shutdown, updates, latest);
+    let ready_id = runtime_handshake(&mut rpc, &config.discord_client_id)?;
+    let path = credential_path(&ready_id)?;
+    let credential = match load_token(&path, &ready_id, &config.discord_client_id)? {
+        Some(record) => record,
+        None if credential_root()?.join("discord.token").exists() => {
+            return Err("legacy Discord credential is unsupported; run --discord-clear-token, then authorize the current account".into())
+        }
+        None => return Err("Discord current account is not authorized; run LCDSirPlus.exe --discord-authorize".into()),
     };
-    let handshake = format!(
-        "{{\"v\":1,\"client_id\":{}}}",
-        json_string(&config.discord_client_id)
-    );
-    rpc.write(OP_HANDSHAKE, handshake.as_bytes())?;
-    let (opcode, body) = rpc.read()?;
-    if opcode != OP_FRAME {
-        return Err(format!("Discord handshake returned opcode {}", opcode));
+    let (credential, refreshed) = refresh_token_if_needed(&config, credential, token_owner)?;
+    persist_rotated_refresh(&path, &credential, refreshed)?;
+    if refreshed {
+        drop(rpc);
+        let (file, _) = open_pipe()?;
+        rpc = new_rpc(file, config.clone(), shared, shutdown, updates, latest);
+        let fresh_ready_id = runtime_handshake(&mut rpc, &config.discord_client_id)?;
+        require_same_ready_user(&ready_id, &fresh_ready_id, &credential)?;
     }
-    let ready = decode_payload(&body)?;
-    payload_error(&ready)?;
-    if ready.event != "READY" {
-        return Err("Discord handshake did not return READY".into());
-    }
-    rpc.tracker.self_id = ready
-        .data
-        .get("user")
-        .map(|user| field(user, "id"))
-        .unwrap_or_default();
-    let credential = load_token(&credential_path()?)?
-        .ok_or("Discord is not authorized; run LCDSirPlus.exe --discord-authorize")?;
-    if !credential.client_id.is_empty() && credential.client_id != config.discord_client_id {
-        return Err(
-            "stored Discord credential belongs to another client ID; clear and authorize again"
-                .into(),
-        );
-    }
-    let credential = refresh_token_if_needed(&config, credential, token_owner)?;
+    rpc.ready_user_id = ready_id.clone();
+    rpc.tracker.self_id = ready_id.clone();
     let args = format!(
         "{{\"access_token\":{}}}",
         json_string(&credential.access_token)
     );
     let authenticated = rpc.command("AUTHENTICATE", "", Some(&args))?;
-    if let Some(user) = authenticated.data.get("user") {
-        let id = field(user, "id");
-        if !id.is_empty() {
-            rpc.tracker.self_id = id;
-        }
-    }
-    rpc.publish();
+    validate_authentication(
+        &authenticated.data,
+        &ready_id,
+        &credential,
+        &config.discord_client_id,
+    )?;
+    rpc.command("SUBSCRIBE", "CURRENT_USER_UPDATE", None)?;
+    rpc.current_user_subscribed = true;
     if let Err(error) = rpc.refresh_channel() {
+        if rpc.account_changed {
+            return Err(error);
+        }
         crate::log_warn!("Discord initial channel query failed: {}", error);
     }
     loop {
@@ -1825,16 +2058,13 @@ fn connect_and_serve(
                 if payload_error(&payload).is_err() || payload.event.is_empty() {
                     continue;
                 }
-                let changed =
-                    match rpc
-                        .tracker
-                        .handle(&payload.event, &payload.data, SystemTime::now())
-                    {
-                        Ok(changed) => changed,
-                        Err(_) => continue,
-                    };
+                let changed = rpc.handle_event(&payload.event, &payload.data)?;
                 if changed {
-                    let _ = rpc.refresh_channel();
+                    if let Err(error) = rpc.refresh_channel() {
+                        if rpc.account_changed {
+                            return Err(error);
+                        }
+                    }
                 }
                 rpc.publish();
             }
@@ -1843,9 +2073,8 @@ fn connect_and_serve(
     }
 }
 
-fn unavailable(previous: &DiscordState, error: &str) -> DiscordState {
+fn unavailable(_previous: &DiscordState, error: &str) -> DiscordState {
     DiscordState {
-        channel_name: previous.channel_name.clone(),
         error: error.into(),
         updated: Some(SystemTime::now()),
         ..Default::default()
@@ -1960,7 +2189,62 @@ pub fn spawn(config: &Config) -> Runtime {
     }
 }
 
-fn authorize_rpc(file: &mut Pipe, config: &Config, deadline: Instant) -> Result<String, String> {
+fn pipe_command(
+    file: &mut Pipe,
+    command: &str,
+    event: &str,
+    args: Option<&str>,
+    ready_id: &str,
+    deadline: Instant,
+) -> Result<Payload, String> {
+    let canceled = || Instant::now() >= deadline;
+    let nonce = random_nonce()?;
+    let mut body = format!(
+        "{{\"cmd\":{},\"nonce\":{}",
+        json_string(command),
+        json_string(&nonce)
+    );
+    if !event.is_empty() {
+        body.push_str(&format!(",\"evt\":{}", json_string(event)));
+    }
+    if let Some(args) = args {
+        body.push_str(",\"args\":");
+        body.push_str(args);
+    }
+    body.push('}');
+    file.write_packet(OP_FRAME, body.as_bytes(), &canceled)?;
+    loop {
+        let (opcode, body) = file.read_packet(&canceled)?;
+        match opcode {
+            OP_PING => file.write_packet(OP_PONG, &body, &canceled)?,
+            OP_CLOSE => return Err(close_error(&body)),
+            OP_FRAME => {
+                let payload = match decode_payload(&body) {
+                    Ok(payload) => payload,
+                    Err(_) => continue,
+                };
+                if payload.event == "CURRENT_USER_UPDATE" {
+                    if current_user_changed(&payload.event, &payload.data, ready_id)? {
+                        return Err("Discord current account changed during authorization".into());
+                    }
+                    continue;
+                }
+                if payload.nonce != nonce {
+                    continue;
+                }
+                payload_error(&payload)?;
+                return Ok(payload);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn authorization_handshake(
+    file: &mut Pipe,
+    config: &Config,
+    deadline: Instant,
+) -> Result<String, String> {
     let canceled = || Instant::now() >= deadline;
     let handshake = format!(
         "{{\"v\":1,\"client_id\":{}}}",
@@ -1979,34 +2263,23 @@ fn authorize_rpc(file: &mut Pipe, config: &Config, deadline: Instant) -> Result<
     if ready.event != "READY" {
         return Err("Discord authorization handshake did not return READY".into());
     }
-    let nonce = random_nonce()?;
+    ready_user_id(&ready.data)
+}
+
+fn authorize_rpc(
+    file: &mut Pipe,
+    config: &Config,
+    deadline: Instant,
+) -> Result<(String, String), String> {
+    let ready_id = authorization_handshake(file, config, deadline)?;
     let args = format!(
         "{{\"client_id\":{},\"scopes\":[\"identify\",\"rpc\",\"rpc.voice.read\"],\"redirect_uri\":{}}}",
         json_string(&config.discord_client_id),
         json_string(&config.discord_redirect_uri)
     );
-    let body = format!(
-        "{{\"cmd\":\"AUTHORIZE\",\"args\":{},\"nonce\":{}}}",
-        args,
-        json_string(&nonce)
-    );
-    file.write_packet(OP_FRAME, body.as_bytes(), &canceled)?;
-    loop {
-        let (opcode, body) = file.read_packet(&canceled)?;
-        match opcode {
-            OP_PING => file.write_packet(OP_PONG, &body, &canceled)?,
-            OP_CLOSE => return Err(close_error(&body)),
-            OP_FRAME => {
-                let payload = match decode_payload(&body) {
-                    Ok(payload) if payload.nonce == nonce => payload,
-                    _ => continue,
-                };
-                payload_error(&payload)?;
-                return authorization_code(&payload, &nonce);
-            }
-            _ => {}
-        }
-    }
+    let response = pipe_command(file, "AUTHORIZE", "", Some(&args), &ready_id, deadline)?;
+    let code = authorization_code(&response, &response.nonce)?;
+    Ok((ready_id, code))
 }
 
 fn authorization_code(payload: &Payload, nonce: &str) -> Result<String, String> {
@@ -2028,7 +2301,7 @@ pub fn authorize(config: &Config, client_secret: &str) -> Result<(), String> {
     }
     let deadline = Instant::now() + Duration::from_secs(120);
     let (mut file, _) = open_pipe()?;
-    let code = authorize_rpc(&mut file, config, deadline)?;
+    let (ready_id, code) = authorize_rpc(&mut file, config, deadline)?;
     let mut fields = vec![
         ("client_id", config.discord_client_id.as_str()),
         ("grant_type", "authorization_code"),
@@ -2041,12 +2314,41 @@ pub fn authorize(config: &Config, client_secret: &str) -> Result<(), String> {
     let token_owner = TokenExchangeOwner::default();
     let response = exchange_token(&token_owner, &form_encode(&fields), deadline)?;
     let record = TokenRecord::from_response(
+        &ready_id,
         &config.discord_client_id,
         client_secret,
         response,
         unix_now(),
     )?;
-    save_token(&credential_path()?, &record)
+    drop(file);
+
+    let (mut file, _) = open_pipe()?;
+    let fresh_ready_id = authorization_handshake(&mut file, config, deadline)?;
+    require_same_ready_user(&ready_id, &fresh_ready_id, &record)?;
+    let args = format!("{{\"access_token\":{}}}", json_string(&record.access_token));
+    let authenticated = pipe_command(
+        &mut file,
+        "AUTHENTICATE",
+        "",
+        Some(&args),
+        &fresh_ready_id,
+        deadline,
+    )?;
+    validate_authentication(
+        &authenticated.data,
+        &fresh_ready_id,
+        &record,
+        &config.discord_client_id,
+    )?;
+    pipe_command(
+        &mut file,
+        "SUBSCRIBE",
+        "CURRENT_USER_UPDATE",
+        None,
+        &fresh_ready_id,
+        deadline,
+    )?;
+    save_token(&credential_path(&ready_id)?, &record)
 }
 
 #[cfg(test)]
@@ -2068,6 +2370,18 @@ mod tests {
     impl Drop for TestDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn token_record(user_id: &str, client_id: &str, access_token: &str) -> TokenRecord {
+        TokenRecord {
+            version: 2,
+            user_id: user_id.into(),
+            client_id: client_id.into(),
+            access_token: access_token.into(),
+            refresh_token: format!("refresh-{access_token}"),
+            scope: "identify rpc rpc.voice.read".into(),
+            ..Default::default()
         }
     }
 
@@ -2230,16 +2544,81 @@ mod tests {
         let response = TokenResponse {
             access_token: "access".into(),
             refresh_token: "refresh".into(),
+            scope: "rpc.voice.read identify rpc".into(),
             expires_in: 7 * 86400,
             ..Default::default()
         };
-        let record = TokenRecord::from_response("123", "secret", response, 1000).unwrap();
+        let record = TokenRecord::from_response("111", "123", "secret", response, 1000).unwrap();
         assert_eq!(TokenRecord::decode(&record.encode()).unwrap(), record);
+        assert!(record.validate_for("111", "123").is_ok());
+        assert!(record.validate_for("222", "123").is_err());
+        assert!(record.validate_for("111", "456").is_err());
         assert!(!record.needs_refresh(1000));
         assert!(record.needs_refresh(record.expires_at - 23 * 3600));
         assert_eq!(form_encode(&[("code", "a b&c")]), "code=a+b%26c");
         assert!(TokenRecord::decode(br#"{"version":2,"accessToken":"x"}"#).is_err());
-        assert!(TokenRecord::decode(br#"{"version":1,"accessToken":""}"#).is_err());
+        assert!(TokenRecord::decode(br#"{"version":1,"accessToken":"x"}"#).is_err());
+        let mut invalid = record.clone();
+        invalid.scope = "identify rpc".into();
+        assert!(TokenRecord::decode(&invalid.encode()).is_err());
+    }
+
+    #[test]
+    fn ready_authentication_and_account_updates_are_identity_bound() {
+        let ready = Json::parse(r#"{"user":{"id":"111"}}"#).unwrap();
+        assert_eq!(ready_user_id(&ready).unwrap(), "111");
+        for invalid in [
+            r#"{}"#,
+            r#"{"user":{"id":"../111"}}"#,
+            r#"{"user":{"id":"0111"}}"#,
+        ] {
+            assert!(ready_user_id(&Json::parse(invalid).unwrap()).is_err());
+        }
+        let record = token_record("111", "123", "access-a");
+        let auth_a =
+            Json::parse(r#"{"user":{"id":"111"},"scopes":["rpc","identify","rpc.voice.read"]}"#)
+                .unwrap();
+        let auth_b =
+            Json::parse(r#"{"user":{"id":"222"},"scopes":["rpc","identify","rpc.voice.read"]}"#)
+                .unwrap();
+        assert!(validate_authentication(&auth_a, "111", &record, "123").is_ok());
+        assert!(validate_authentication(&auth_b, "111", &record, "123").is_err());
+        assert!(
+            validate_authentication(&auth_a, "111", &token_record("222", "123", "b"), "123")
+                .is_err()
+        );
+        assert!(validate_authentication(
+            &Json::parse(r#"{"user":{"id":"111"},"scopes":["rpc","identify"]}"#).unwrap(),
+            "111",
+            &record,
+            "123"
+        )
+        .is_err());
+        assert!(validate_authentication(
+            &Json::parse(r#"{"user":{"id":"111"},"scopes":["rpc","identify","rpc.voice.read",7]}"#)
+                .unwrap(),
+            "111",
+            &record,
+            "123"
+        )
+        .is_err());
+        assert!(!current_user_changed(
+            "CURRENT_USER_UPDATE",
+            &Json::parse(r#"{"id":"111"}"#).unwrap(),
+            "111"
+        )
+        .unwrap());
+        assert!(current_user_changed(
+            "CURRENT_USER_UPDATE",
+            &Json::parse(r#"{"id":"222"}"#).unwrap(),
+            "111"
+        )
+        .unwrap());
+        let state = disconnected_account_state();
+        assert!(!state.connected && !state.authenticated);
+        assert!(state.channel_id.is_empty() && state.speakers.is_empty());
+        assert!(require_current_user_subscription(false).is_err());
+        assert!(require_current_user_subscription(true).is_ok());
     }
 
     #[test]
@@ -2255,11 +2634,13 @@ mod tests {
         let mut body = vec![0; MAX_TOKEN_RESPONSE];
         assert!(append_token_body(&mut body, &[1]).is_err());
         let mut response = TokenResponse::default();
-        retain_refresh_token(&mut response, "old-refresh");
+        retain_if_empty(&mut response.refresh_token, "old-refresh");
         assert_eq!(response.refresh_token, "old-refresh");
         response.refresh_token = "new-refresh".into();
-        retain_refresh_token(&mut response, "old-refresh");
+        retain_if_empty(&mut response.refresh_token, "old-refresh");
         assert_eq!(response.refresh_token, "new-refresh");
+        retain_if_empty(&mut response.scope, "identify rpc rpc.voice.read");
+        assert!(scope_string_is_valid(&response.scope));
     }
 
     #[test]
@@ -2296,19 +2677,27 @@ mod tests {
     }
 
     #[test]
-    fn credential_boundary_round_trip_pins_and_clears_by_handle() {
+    fn per_account_credentials_are_independent_and_path_bound() {
         let temp = TestDir::new();
         let root = temp.0.join("runtime");
-        let path = root.join("discord.token");
-        let record = TokenRecord {
-            version: 1,
-            client_id: "123".into(),
-            access_token: "private-access".into(),
-            refresh_token: "private-refresh".into(),
-            ..Default::default()
-        };
-        save_token(&path, &record).unwrap();
-        assert_eq!(load_token(&path).unwrap(), Some(record));
+        let path_a = credential_path_at(&root, "111").unwrap();
+        let path_b = credential_path_at(&root, "222").unwrap();
+        let record_a = token_record("111", "123", "private-a");
+        let record_b = token_record("222", "123", "private-b");
+        save_token(&path_a, &record_a).unwrap();
+        save_token(&path_b, &record_b).unwrap();
+        assert_eq!(
+            load_token(&path_a, "111", "123").unwrap(),
+            Some(record_a.clone())
+        );
+        assert_eq!(
+            load_token(&path_b, "222", "123").unwrap(),
+            Some(record_b.clone())
+        );
+        assert!(save_token(&path_a, &record_b).is_err());
+        assert_eq!(load_token(&path_a, "111", "123").unwrap(), Some(record_a));
+        assert!(credential_path_at(&root, "../111").is_err());
+        assert!(credential_path_at(&root, "123456789012345678901").is_err());
 
         let boundary = CredentialBoundary::open(&root, false).unwrap();
         let moved = temp.0.join("moved");
@@ -2320,9 +2709,55 @@ mod tests {
             drop(boundary);
         }
 
-        clear_token_at(&path).unwrap();
-        assert!(!path.exists());
-        clear_token_at(&path).unwrap();
+        clear_token_at(&path_a).unwrap();
+        assert!(!path_a.exists() && path_b.exists());
+        clear_token_at(&path_a).unwrap();
+    }
+
+    #[test]
+    fn rotated_refresh_persists_for_original_user_before_later_rpc_failure() {
+        let temp = TestDir::new();
+        let root = temp.0.join("runtime");
+        let path = credential_path_at(&root, "111").unwrap();
+        let other_path = credential_path_at(&root, "222").unwrap();
+        let old = token_record("111", "123", "old-access");
+        let other = token_record("222", "123", "other-access");
+        save_token(&path, &old).unwrap();
+        save_token(&other_path, &other).unwrap();
+        let refreshed = token_record("111", "123", "refreshed-access");
+        persist_rotated_refresh(&path, &refreshed, true).unwrap();
+        let mismatched =
+            Json::parse(r#"{"user":{"id":"222"},"scopes":["rpc","identify","rpc.voice.read"]}"#)
+                .unwrap();
+        assert!(validate_authentication(&mismatched, "111", &refreshed, "123").is_err());
+        assert_eq!(
+            load_token(&path, "111", "123").unwrap(),
+            Some(refreshed.clone())
+        );
+        assert!(persist_rotated_refresh(&other_path, &refreshed, true).is_err());
+        assert_eq!(load_token(&other_path, "222", "123").unwrap(), Some(other));
+        assert!(require_same_ready_user("111", "222", &refreshed).is_err());
+        assert!(require_same_ready_user("111", "111", &refreshed).is_ok());
+    }
+
+    #[test]
+    fn clear_removes_only_exact_owned_credentials_and_legacy() {
+        let temp = TestDir::new();
+        let root = temp.0.join("runtime");
+        let owned = credential_path_at(&root, "111").unwrap();
+        save_token(&owned, &token_record("111", "123", "private")).unwrap();
+        let legacy = root.join("discord.token");
+        let unrelated = root.join("notes.txt");
+        let malformed = root.join("discord-../111.token");
+        std::fs::write(&legacy, b"legacy").unwrap();
+        std::fs::write(&unrelated, b"keep").unwrap();
+        std::fs::write(&malformed, b"keep").unwrap_err();
+        let malformed = root.join("discord-abc.token");
+        std::fs::write(&malformed, b"keep").unwrap();
+        clear_tokens_at(&root).unwrap();
+        assert!(!owned.exists() && !legacy.exists());
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep");
+        assert_eq!(std::fs::read(&malformed).unwrap(), b"keep");
     }
 
     #[test]
@@ -2332,10 +2767,10 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let outside = temp.0.join("outside.token");
         std::fs::write(&outside, b"private").unwrap();
-        let hard_link = root.join("discord.token");
+        let hard_link = root.join("discord-111.token");
         match std::fs::hard_link(&outside, &hard_link) {
             Ok(()) => {
-                let error = load_token(&hard_link).unwrap_err();
+                let error = load_token(&hard_link, "111", "123").unwrap_err();
                 assert_eq!(error, "Discord credential file must not be a hard link");
                 assert_eq!(std::fs::read(&outside).unwrap(), b"private");
             }
