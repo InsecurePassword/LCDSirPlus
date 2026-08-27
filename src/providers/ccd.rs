@@ -13,8 +13,10 @@
 
 #![cfg(windows)]
 
+use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows::Win32::System::SystemInformation::{
-    GetLogicalProcessorInformationEx, LOGICAL_PROCESSOR_RELATIONSHIP,
+    GetLogicalProcessorInformationEx, CACHE_RELATIONSHIP, GROUP_AFFINITY,
+    LOGICAL_PROCESSOR_RELATIONSHIP, NUMA_NODE_RELATIONSHIP, PROCESSOR_RELATIONSHIP,
     SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
 };
 
@@ -109,16 +111,24 @@ fn l3_domain_masks() -> Vec<u64> {
     let records = query_information_ex(LOGICAL_PROCESSOR_RELATIONSHIP(2)); // RelationCache
     let mut out: Vec<u64> = Vec::new();
     for record in &records {
-        if record.Relationship != LOGICAL_PROCESSOR_RELATIONSHIP(2) {
+        if record_relationship(record) != Some(LOGICAL_PROCESSOR_RELATIONSHIP(2)) {
             continue;
         }
-        // RelationCache arms are CACHE_RELATIONSHIP: Level + GroupMask union.
-        let cache = unsafe { &record.Anonymous.Cache };
-        if cache.Level != 3 {
+        let body = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous);
+        let Some(level) = read_u8(
+            record,
+            body + std::mem::offset_of!(CACHE_RELATIONSHIP, Level),
+        ) else {
+            return Vec::new();
+        };
+        let group = body + std::mem::offset_of!(CACHE_RELATIONSHIP, Anonymous);
+        let Some((group_mask, group_number)) = read_group_affinity(record, group) else {
+            return Vec::new();
+        };
+        if level != 3 {
             continue;
         }
-        let group_mask = unsafe { cache.Anonymous.GroupMask };
-        let mask = (group_mask.Mask as u64) | ((group_mask.Group as u64) << 32);
+        let mask = (group_mask as u64) | ((group_number as u64) << 32);
         if mask != 0 && !out.contains(&mask) {
             out.push(mask);
         }
@@ -130,11 +140,15 @@ fn numa_node_masks() -> Vec<u64> {
     let records = query_information_ex(LOGICAL_PROCESSOR_RELATIONSHIP(1)); // RelationNumaNode
     let mut out: Vec<u64> = Vec::new();
     for record in &records {
-        if record.Relationship != LOGICAL_PROCESSOR_RELATIONSHIP(1) {
+        if record_relationship(record) != Some(LOGICAL_PROCESSOR_RELATIONSHIP(1)) {
             continue;
         }
-        let group_mask = unsafe { record.Anonymous.NumaNode.Anonymous.GroupMask };
-        let mask = (group_mask.Mask as u64) | ((group_mask.Group as u64) << 32);
+        let body = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous);
+        let group = body + std::mem::offset_of!(NUMA_NODE_RELATIONSHIP, Anonymous);
+        let Some((group_mask, group_number)) = read_group_affinity(record, group) else {
+            return Vec::new();
+        };
+        let mask = (group_mask as u64) | ((group_number as u64) << 32);
         if mask != 0 && !out.contains(&mask) {
             out.push(mask);
         }
@@ -146,49 +160,120 @@ fn all_lp_mask() -> u64 {
     let records = query_information_ex(LOGICAL_PROCESSOR_RELATIONSHIP(0)); // RelationProcessorCore
     let mut mask: u64 = 0;
     for record in &records {
-        if record.Relationship != LOGICAL_PROCESSOR_RELATIONSHIP(0) {
+        if record_relationship(record) != Some(LOGICAL_PROCESSOR_RELATIONSHIP(0)) {
             continue;
         }
-        for group_mask in unsafe { &record.Anonymous.Processor.GroupMask } {
-            mask |= (group_mask.Mask as u64) | ((group_mask.Group as u64) << 32);
+        let body = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous);
+        let count_offset = body + std::mem::offset_of!(PROCESSOR_RELATIONSHIP, GroupCount);
+        let group_offset = body + std::mem::offset_of!(PROCESSOR_RELATIONSHIP, GroupMask);
+        let Some(group_count) = read_u16(record, count_offset) else {
+            return 0;
+        };
+        for index in 0..group_count as usize {
+            let Some(offset) = index
+                .checked_mul(std::mem::size_of::<GROUP_AFFINITY>())
+                .and_then(|distance| group_offset.checked_add(distance))
+            else {
+                return 0;
+            };
+            let Some((group_mask, group_number)) = read_group_affinity(record, offset) else {
+                return 0;
+            };
+            mask |= (group_mask as u64) | ((group_number as u64) << 32);
         }
     }
     mask
 }
 
-fn query_information_ex(
-    relationship: LOGICAL_PROCESSOR_RELATIONSHIP,
-) -> Vec<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX> {
+fn query_information_ex(relationship: LOGICAL_PROCESSOR_RELATIONSHIP) -> Vec<Vec<u8>> {
     unsafe {
         let mut needed = 0u32;
-        if GetLogicalProcessorInformationEx(relationship, None, &mut needed).is_err() || needed == 0
-        {
+        let probe = GetLogicalProcessorInformationEx(relationship, None, &mut needed);
+        if !valid_size_probe(probe, needed) {
             return Vec::new();
         }
-        let mut buffer = vec![0u8; needed as usize];
+        let words = (needed as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buffer = vec![0usize; words];
         if GetLogicalProcessorInformationEx(
             relationship,
-            Some(buffer.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX),
+            Some(buffer.as_mut_ptr().cast()),
             &mut needed,
         )
         .is_err()
         {
             return Vec::new();
         }
-        let mut out = Vec::new();
-        let mut offset = 0usize;
-        while offset + std::mem::size_of::<u32>() * 2 <= buffer.len() {
-            let record =
-                &*(buffer.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX);
-            if record.Size == 0 {
-                break;
-            }
-            // Copy out to detach from the byte buffer.
-            out.push(std::ptr::read(record));
-            offset += record.Size as usize;
+        let byte_capacity = buffer.len() * std::mem::size_of::<usize>();
+        if needed as usize > byte_capacity {
+            return Vec::new();
         }
-        out
+        let bytes = std::slice::from_raw_parts(buffer.as_ptr().cast(), needed as usize);
+        parse_records(bytes)
+            .map(|records| records.into_iter().map(<[u8]>::to_vec).collect())
+            .unwrap_or_default()
     }
+}
+
+fn parse_records(bytes: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut records = Vec::new();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let remaining = bytes.get(offset..)?;
+        let size = read_u32(remaining, 4)? as usize;
+        if size < 8 {
+            return None;
+        }
+        let end = offset.checked_add(size)?;
+        records.push(bytes.get(offset..end)?);
+        offset = end;
+    }
+    Some(records)
+}
+
+fn record_relationship(record: &[u8]) -> Option<LOGICAL_PROCESSOR_RELATIONSHIP> {
+    Some(LOGICAL_PROCESSOR_RELATIONSHIP(read_i32(record, 0)?))
+}
+
+fn read_group_affinity(record: &[u8], offset: usize) -> Option<(usize, u16)> {
+    record.get(offset..offset.checked_add(std::mem::size_of::<GROUP_AFFINITY>())?)?;
+    let mask = read_usize(
+        record,
+        offset.checked_add(std::mem::offset_of!(GROUP_AFFINITY, Mask))?,
+    )?;
+    let group = read_u16(
+        record,
+        offset.checked_add(std::mem::offset_of!(GROUP_AFFINITY, Group))?,
+    )?;
+    Some((mask, group))
+}
+
+fn read_bytes<const N: usize>(record: &[u8], offset: usize) -> Option<[u8; N]> {
+    record.get(offset..offset.checked_add(N)?)?.try_into().ok()
+}
+
+fn read_u8(record: &[u8], offset: usize) -> Option<u8> {
+    Some(read_bytes::<1>(record, offset)?[0])
+}
+
+fn read_u16(record: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_ne_bytes(read_bytes(record, offset)?))
+}
+
+fn read_u32(record: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_ne_bytes(read_bytes(record, offset)?))
+}
+
+fn read_i32(record: &[u8], offset: usize) -> Option<i32> {
+    Some(i32::from_ne_bytes(read_bytes(record, offset)?))
+}
+
+fn read_usize(record: &[u8], offset: usize) -> Option<usize> {
+    Some(usize::from_ne_bytes(read_bytes(record, offset)?))
+}
+
+fn valid_size_probe(result: windows::core::Result<()>, needed: u32) -> bool {
+    needed > 0
+        && matches!(result, Err(error) if error.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult())
 }
 
 /// Label two CCD masks: the die with the larger L3 (CPUID Fn8000_001D) is the
@@ -208,9 +293,11 @@ fn l3_size_for_mask(mask: u64) -> u64 {
     if first_bit >= 64 {
         return 0;
     }
-    pin_to(first_bit);
+    let Some(previous) = pin_to(first_bit) else {
+        return 0;
+    };
     let size = cpuid_l3_size();
-    unpin();
+    restore_affinity(previous);
     size
 }
 
@@ -227,11 +314,10 @@ fn pin_to(lp: u32) -> Option<usize> {
     }
 }
 
-fn unpin() {
+fn restore_affinity(mask: usize) {
     unsafe {
         use windows::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
-        // Restore to the process-wide affinity (all allowed processors).
-        let _ = SetThreadAffinityMask(GetCurrentThread(), usize::MAX);
+        let _ = SetThreadAffinityMask(GetCurrentThread(), mask);
     }
 }
 
@@ -285,5 +371,47 @@ mod tests {
         assert!(group_of(1u64 << 40) > group_of(1));
         assert!(lowest_bit(0b1000) < lowest_bit(0b10000));
         assert_eq!(lowest_bit(0), u32::MAX);
+    }
+
+    #[test]
+    fn size_probe_requires_insufficient_buffer_and_nonzero_size() {
+        use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+        assert!(valid_size_probe(ERROR_INSUFFICIENT_BUFFER.ok(), 1));
+        assert!(!valid_size_probe(Ok(()), 1));
+        assert!(!valid_size_probe(ERROR_ACCESS_DENIED.ok(), 1));
+        assert!(!valid_size_probe(ERROR_INSUFFICIENT_BUFFER.ok(), 0));
+    }
+
+    #[test]
+    fn raw_records_reject_truncated_inventory_without_partial_results() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0i32.to_ne_bytes());
+        bytes.extend_from_slice(&8u32.to_ne_bytes());
+        bytes.extend_from_slice(&0i32.to_ne_bytes());
+        bytes.extend_from_slice(&16u32.to_ne_bytes());
+        assert!(parse_records(&bytes).is_none());
+    }
+
+    #[test]
+    #[ignore = "native 9950X3D topology check"]
+    fn live_9950x3d_topology() {
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
+
+        let thread = unsafe { GetCurrentThread() };
+        let before = unsafe { SetThreadAffinityMask(thread, usize::MAX) };
+        assert_ne!(before, 0, "failed to probe affinity before detect");
+        assert_ne!(unsafe { SetThreadAffinityMask(thread, before) }, 0);
+        let topology = detect();
+        let after = unsafe { SetThreadAffinityMask(thread, usize::MAX) };
+        assert_ne!(after, 0, "failed to probe affinity after detect");
+        assert_ne!(unsafe { SetThreadAffinityMask(thread, after) }, 0);
+        println!("affinity before=0x{before:x} after=0x{after:x}; {topology:?}");
+        assert_eq!(before, after);
+        assert!(topology.dual);
+        assert_eq!(topology.cache_mask, 0xFFFF);
+        assert_eq!(topology.freq_mask, 0xFFFF0000);
+        assert_eq!(topology.lp_count, 32);
+        assert!(topology.detail.starts_with("L3 cache domains:"));
     }
 }
