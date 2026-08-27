@@ -236,7 +236,13 @@ impl Renderer {
         let width = w - 2;
         let module = module.to_uppercase();
         match module.as_str() {
-            "HEADSET_BATTERY" => headset_slot(f, left, width, &s.headset),
+            "HEADSET_BATTERY" => headset_slot(
+                f,
+                left,
+                width,
+                &s.headset,
+                s.providers.get("safe-mode") == Some(&true),
+            ),
             "CONTROLLER_BATTERY" => controller_slot(f, left, width, &s.controller),
             "FPS_CURRENT" => self.numeric_slot(f, left, width, "FPS", s.game.fps, 0, ""),
             "FPS_1LOW" => self.numeric_slot(f, left, width, "1% LOW", s.game.one_percent, 0, ""),
@@ -657,8 +663,12 @@ fn hang_slot(f: &mut Frame, hung: &[HungTarget], v: &View) {
 }
 
 #[allow(clippy::needless_range_loop)]
-fn headset_slot(f: &mut Frame, x: i32, w: i32, b: &HeadsetBattery) {
+fn headset_slot(f: &mut Frame, x: i32, w: i32, b: &HeadsetBattery, disabled: bool) {
     f.text_centered(x, w, 27, "7P+", 1, true);
+    if disabled {
+        f.text_centered(x, w, 35, "DISABLED", 1, true);
+        return;
+    }
     if b.stale {
         f.text_centered(x, w, 35, "STALE", 1, true);
         return;
@@ -1426,9 +1436,13 @@ mod tests {
         };
         let mut missing = Frame::new();
         r.slot(&mut missing, 0, "HEADSET_BATTERY", &s);
+        s.providers.insert("safe-mode".into(), true);
+        let mut disabled = Frame::new();
+        r.slot(&mut disabled, 0, "HEADSET_BATTERY", &s);
         assert!(!online.equal(&stale));
         assert!(!stale.equal(&missing));
         assert!(!online.equal(&missing));
+        assert!(!missing.equal(&disabled));
     }
 
     #[test]
