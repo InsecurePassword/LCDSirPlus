@@ -14,8 +14,8 @@ use std::sync::{Mutex, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, InvalidateRect, SetDIBitsToDevice, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, PAINTSTRUCT,
+    BeginPaint, EndPaint, InvalidateRect, SetStretchBltMode, StretchDIBits, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, COLORONCOLOR, DIB_RGB_COLORS, HDC, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
@@ -37,6 +37,42 @@ const WM_APP_FRAME: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
 const ID_MENU_SHOW: usize = 1001;
 const ID_MENU_EXIT: usize = 1002;
+
+fn preview_size(scale: i32) -> (i32, i32) {
+    (FRAME_W as i32 * scale, FRAME_H as i32 * scale)
+}
+
+unsafe fn paint_frame(hdc: HDC, pixels: &[u8], scale: i32) {
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: FRAME_W as i32,
+            biHeight: -(FRAME_H as i32), // top-down
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (client_w, client_h) = preview_size(scale);
+    let _ = SetStretchBltMode(hdc, COLORONCOLOR);
+    let _ = StretchDIBits(
+        hdc,
+        0,
+        0,
+        client_w,
+        client_h,
+        0,
+        0,
+        FRAME_W as i32,
+        FRAME_H as i32,
+        Some(pixels.as_ptr() as *const core::ffi::c_void),
+        &bmi,
+        DIB_RGB_COLORS,
+        SRCCOPY,
+    );
+}
 
 /// Events the UI sends back to the application.
 #[derive(Clone, Copy, Debug)]
@@ -164,8 +200,9 @@ fn ui_main(frame_rx: std::sync::mpsc::Receiver<Vec<u8>>) {
         let scale = UI.scale.load(Ordering::Relaxed) as i32;
         let mut rect = windows::Win32::Foundation::RECT::default();
         let _ = AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false);
-        let width = (FRAME_W as i32 * scale) + (rect.right - rect.left);
-        let height = (FRAME_H as i32 * scale) + (rect.bottom - rect.top);
+        let (client_w, client_h) = preview_size(scale);
+        let width = client_w + (rect.right - rect.left);
+        let height = client_h + (rect.bottom - rect.top);
         let window_name: Vec<u16> = "LCDSirPlus Preview\0".encode_utf16().collect();
         let Ok(hwnd) = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -213,34 +250,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let scale = UI.scale.load(Ordering::Relaxed) as i32;
             if let Ok(pixels) = UI.pixels.lock() {
                 if pixels.len() == (FRAME_W * FRAME_H * 4) as usize {
-                    let bmi = BITMAPINFO {
-                        bmiHeader: BITMAPINFOHEADER {
-                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                            biWidth: FRAME_W as i32,
-                            biHeight: -(FRAME_H as i32), // top-down
-                            biPlanes: 1,
-                            biBitCount: 32,
-                            biCompression: BI_RGB.0,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    };
-                    let client_w = FRAME_W as i32 * scale;
-                    let client_h = FRAME_H as i32 * scale;
-                    let _ = SetDIBitsToDevice(
-                        hdc,
-                        0,
-                        0,
-                        client_w as u32,
-                        client_h as u32,
-                        0,
-                        0,
-                        0,
-                        FRAME_H,
-                        pixels.as_ptr() as *const core::ffi::c_void,
-                        &bmi,
-                        DIB_RGB_COLORS,
-                    );
+                    paint_frame(hdc, &pixels, scale);
                 }
             }
             let _ = EndPaint(hwnd, &ps);
@@ -360,4 +370,34 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
         ..Default::default()
     };
     let _ = Shell_NotifyIconW(NOTIFY_ICON_MESSAGE(0x00000002), &nid); // NIM_DELETE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetPixel, PatBlt,
+        SelectObject, WHITENESS,
+    };
+
+    #[test]
+    fn preview_scale_four_fills_the_configured_client() {
+        unsafe {
+            let (width, height) = preview_size(4);
+            let dc = CreateCompatibleDC(None);
+            assert!(!dc.0.is_null());
+            let bitmap = CreateCompatibleBitmap(dc, width, height);
+            assert!(!bitmap.0.is_null());
+            let previous = SelectObject(dc, bitmap);
+            let _ = PatBlt(dc, 0, 0, width, height, WHITENESS);
+            paint_frame(dc, &vec![0; (FRAME_W * FRAME_H * 4) as usize], 4);
+            assert_eq!(
+                (GetPixel(dc, 0, 0).0, GetPixel(dc, width - 1, height - 1).0),
+                (0, 0)
+            );
+            let _ = SelectObject(dc, previous);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(dc);
+        }
+    }
 }

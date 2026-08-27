@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -1067,6 +1067,20 @@ unsafe extern "system" fn harness_wndproc(
 }
 
 pub fn run_harness(duration: Duration) -> i32 {
+    let current = match std::env::current_exe() {
+        Ok(current) => current,
+        Err(_) => {
+            eprintln!("hang harness failed: current executable unavailable");
+            return 1;
+        }
+    };
+    if current
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("LCDSirPlus.exe"))
+    {
+        return run_owned_harness(&current, duration);
+    }
     match create_harness_window(duration) {
         Ok(()) => 0,
         Err(error) => {
@@ -1074,6 +1088,28 @@ pub fn run_harness(duration: Duration) -> i32 {
             1
         }
     }
+}
+
+fn run_owned_harness(source: &Path, duration: Duration) -> i32 {
+    let mut cleanup = match spawn_renamed_harness(source, duration, false) {
+        Ok(cleanup) => cleanup,
+        Err(error) => {
+            eprintln!("hang harness failed: {error}");
+            return 1;
+        }
+    };
+    let status = match wait_harness(&mut cleanup, duration + Duration::from_secs(2)) {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("hang harness failed: {error}");
+            return 1;
+        }
+    };
+    if let Err(error) = cleanup.remove_tree() {
+        eprintln!("hang harness failed: temporary harness cleanup failed: {error}");
+        return 1;
+    }
+    status.code().unwrap_or(1)
 }
 
 fn create_harness_window(duration: Duration) -> Result<(), &'static str> {
@@ -1161,10 +1197,13 @@ impl Drop for HarnessCleanup {
     }
 }
 
-fn spawn_harness(duration_secs: u64) -> Result<HarnessCleanup, String> {
-    let source = smoke_source()?;
+fn spawn_renamed_harness(
+    source: &Path,
+    duration: Duration,
+    quiet: bool,
+) -> Result<HarnessCleanup, String> {
     let root = std::env::temp_dir().join(format!(
-        "lcdsirplus-hang-smoke-{}-{}",
+        "lcdsirplus-hang-harness-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1174,23 +1213,31 @@ fn spawn_harness(duration_secs: u64) -> Result<HarnessCleanup, String> {
     std::fs::create_dir(&root).map_err(|_| "temporary harness directory creation failed")?;
     let mut cleanup = HarnessCleanup { child: None, root };
     let harness = cleanup.root.join("LCDSirPlusHangHarness.exe");
-    if let Err(error) = std::fs::copy(&source, &harness) {
+    if let Err(error) = std::fs::copy(source, &harness) {
         return Err(format!("temporary harness copy failed: {error}"));
     }
+    let mut command = std::process::Command::new(&harness);
+    command.args([
+        "--hang-test-harness",
+        "--duration-secs",
+        &duration.as_secs().to_string(),
+    ]);
+    if quiet {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    }
     cleanup.child = Some(
-        std::process::Command::new(&harness)
-            .args([
-                "--hang-test-harness",
-                "--duration-secs",
-                &duration_secs.to_string(),
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+        command
             .spawn()
             .map_err(|error| format!("temporary harness start failed: {error}"))?,
     );
     Ok(cleanup)
+}
+
+fn spawn_harness(duration_secs: u64) -> Result<HarnessCleanup, String> {
+    spawn_renamed_harness(&smoke_source()?, Duration::from_secs(duration_secs), true)
 }
 
 fn detect_harness(pid: u32) -> Result<HungTarget, String> {
@@ -1223,28 +1270,77 @@ fn detect_harness(pid: u32) -> Result<HungTarget, String> {
     })
 }
 
-fn wait_harness(cleanup: &mut HarnessCleanup, timeout: Duration) -> Result<(), String> {
+fn wait_harness(cleanup: &mut HarnessCleanup, timeout: Duration) -> Result<ExitStatus, String> {
     let exit_deadline = Instant::now() + timeout;
     loop {
         match cleanup.child.as_mut().unwrap().try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => return Ok(status),
             Ok(None) if Instant::now() < exit_deadline => std::thread::sleep(TICK),
             Ok(None) => return Err("temporary harness did not exit within its bound".into()),
             Err(_) => return Err("temporary harness status unavailable".into()),
         }
     }
-    Ok(())
 }
 
 fn smoke() -> Result<HungTarget, String> {
-    let mut cleanup = spawn_harness(6)?;
-    let pid = cleanup.child.as_ref().unwrap().id();
-    let result = detect_harness(pid);
-    wait_harness(&mut cleanup, Duration::from_secs(8))?;
-    cleanup
-        .remove_tree()
-        .map_err(|_| "temporary harness cleanup failed")?;
-    result
+    use std::io::BufRead;
+
+    let source = smoke_source()?;
+    if source.file_name().and_then(|name| name.to_str()) != Some("LCDSirPlus.exe") {
+        return Err("public harness executable must be named LCDSirPlus.exe".into());
+    }
+    let owner = std::process::Command::new(&source)
+        .args(["--hang-test-harness", "--duration-secs", "6"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("public harness start failed: {error}"))?;
+    let mut owner = HarnessCleanup {
+        child: Some(owner),
+        root: PathBuf::new(),
+    };
+    let stdout = owner.child.as_mut().unwrap().stdout.take().unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = std::io::BufReader::new(stdout)
+            .read_line(&mut line)
+            .map(|_| line);
+        let _ = ready_tx.send(result);
+    });
+    let observed = (|| -> Result<(HungTarget, PathBuf), String> {
+        let line = ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "public harness child did not become ready")?
+            .map_err(|_| "public harness output unavailable")?;
+        let pid = line
+            .trim()
+            .strip_prefix("HANG-HARNESS READY pid=")
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .ok_or("public harness did not report its renamed child")?;
+        let target = detect_harness(pid)?;
+        if !target
+            .process_name
+            .eq_ignore_ascii_case("LCDSirPlusHangHarness.exe")
+        {
+            return Err("public harness child retained the ignored production basename".into());
+        }
+        let owned_root = Path::new(&target.image_path)
+            .parent()
+            .ok_or("public harness child path unavailable")?
+            .to_path_buf();
+        Ok((target, owned_root))
+    })();
+    let status = wait_harness(&mut owner, Duration::from_secs(8))?;
+    if !status.success() {
+        return Err(format!("public harness owner exited with {status}"));
+    }
+    let (target, owned_root) = observed?;
+    if owned_root.exists() {
+        return Err("public harness owner did not clean its temporary tree".into());
+    }
+    Ok(target)
 }
 
 pub fn run_action_smoke(negative: bool) -> i32 {
@@ -2190,7 +2286,7 @@ mod tests {
     #[test]
     #[ignore = "starts a visible purpose-built Windows window for bounded native smoke"]
     fn disposable_harness_is_detected_and_cleans_up() {
-        assert!(smoke().is_ok());
+        smoke().unwrap();
     }
 
     #[test]
