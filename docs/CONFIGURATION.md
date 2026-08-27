@@ -122,7 +122,7 @@ standard-library DNS resolution cannot be canceled with the required shutdown bo
 |---|---|---|
 | `discord_enabled` | 1 | disabled, and always off in safe mode, means no IPC/token/network access |
 | `discord_client_id` | empty | numeric Discord developer application client ID |
-| `discord_redirect_uri` | `http://127.0.0.1` | must exactly match the developer application; LCDSirPlus does not listen on it |
+| `discord_redirect_uri` | `http://127.0.0.1` | legacy accepted/no-op key; not sent by the RPC OAuth flow |
 | `discord_linger_ms` | 700 | 0..10000 after speaking stops |
 | `discord_max_speakers` | 2 | 1..4; additional visible speakers render as `+N` |
 | `discord_show_self` | 0 | include the current user in the speaking overlay |
@@ -136,6 +136,8 @@ when required, is accepted only from `LCDSIRPLUS_DISCORD_CLIENT_SECRET` during
 authorization and retained inside that encrypted record for refresh; remove the
 environment variable afterward. Use `--discord-clear-token` to remove all exact
 LCDSirPlus Discord credential records, including the old global record.
+RPC authorization opens no listener, uses no redirect URI, and requires no
+portal redirect registration.
 
 ## Hung-process guard
 

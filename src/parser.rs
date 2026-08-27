@@ -660,6 +660,13 @@ mod tests {
     }
 
     #[test]
+    fn legacy_discord_redirect_uri_is_accepted_as_a_no_op() {
+        let cfg =
+            parse_standalone(b"discord_redirect_uri https://legacy.invalid/callback\n").unwrap();
+        assert_eq!(cfg.discord_redirect_uri, "https://legacy.invalid/callback");
+    }
+
+    #[test]
     fn duplicate_keys_rejected_with_line_diagnostics() {
         let err = parse_standalone(b"preview_scale 3\npreview_scale 4\n").unwrap_err();
         assert_eq!(err.line, 2);

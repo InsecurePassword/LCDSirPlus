@@ -121,7 +121,43 @@ fn payload_error(payload: &Payload) -> Result<(), String> {
         .get("code")
         .and_then(Json::as_f64)
         .ok_or("Discord RPC error payload is malformed")?;
-    Err(format!("Discord RPC error code {}", code as i64))
+    let code = code as i64;
+    let detail = (code == 5000).then(|| {
+        classify_oauth_error(
+            payload
+                .data
+                .get("message")
+                .and_then(Json::as_str)
+                .unwrap_or(""),
+        )
+    });
+    Err(match detail {
+        Some(detail) => format!("Discord RPC error code {code}: {detail}"),
+        None => format!("Discord RPC error code {code}"),
+    })
+}
+
+fn classify_oauth_error(message: &str) -> &'static str {
+    let message = message.to_ascii_lowercase();
+    if message.contains("redirect_uri") || message.contains("redirect uri") {
+        "RPC OAuth redirect URI rejected"
+    } else if message.contains("scope") {
+        "RPC OAuth scope rejected"
+    } else if message.contains("client secret")
+        || message.contains("client_secret")
+        || message.contains("client id")
+        || message.contains("client_id")
+        || message.contains("invalid client")
+    {
+        "RPC OAuth client credentials rejected"
+    } else if message.contains("application tester")
+        || message.contains("app tester")
+        || message.contains("not a tester")
+    {
+        "RPC application tester access rejected"
+    } else {
+        "OAuth2 error"
+    }
 }
 
 fn close_error(body: &[u8]) -> String {
@@ -416,7 +452,7 @@ impl TokenRecord {
     fn from_response(
         user_id: &str,
         client_id: &str,
-        client_secret: &str,
+        client_secret: Option<&str>,
         response: TokenResponse,
         now: u64,
     ) -> Result<Self, String> {
@@ -431,7 +467,7 @@ impl TokenRecord {
             version: 2,
             user_id: user_id.into(),
             client_id: client_id.into(),
-            client_secret: client_secret.into(),
+            client_secret: client_secret.unwrap_or_default().into(),
             access_token: response.access_token,
             refresh_token: response.refresh_token,
             token_type: response.token_type,
@@ -472,7 +508,7 @@ impl TokenRecord {
                 .unwrap_or_default() as u32,
             user_id: field(&value, "userId"),
             client_id: field(&value, "clientId"),
-            client_secret: field(&value, "clientSecret"),
+            client_secret: field(&value, "clientSecret").trim().into(),
             access_token: field(&value, "accessToken"),
             refresh_token: field(&value, "refreshToken"),
             token_type: field(&value, "tokenType"),
@@ -549,15 +585,21 @@ fn append_token_body(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), String> {
 fn form_encode(fields: &[(&str, &str)]) -> String {
     fields
         .iter()
-        .map(|(key, value)| format!("{}={}", percent_encode(key), percent_encode(value)))
+        .map(|(key, value)| {
+            format!(
+                "{}={}",
+                form_component_encode(key),
+                form_component_encode(value)
+            )
+        })
         .collect::<Vec<_>>()
         .join("&")
 }
 
-fn percent_encode(value: &str) -> String {
+fn form_component_encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'*' | b'-' | b'.' | b'_') {
             out.push(byte as char);
         } else if byte == b' ' {
             out.push('+');
@@ -566,6 +608,11 @@ fn percent_encode(value: &str) -> String {
         }
     }
     out
+}
+
+fn normalized_client_secret(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
 }
 
 fn unix_now() -> u64 {
@@ -1481,7 +1528,6 @@ fn session_config_changed(a: &Config, b: &Config) -> bool {
     a.discord_enabled != b.discord_enabled
         || a.safe_mode != b.safe_mode
         || a.discord_client_id != b.discord_client_id
-        || a.discord_redirect_uri != b.discord_redirect_uri
         || a.discord_linger != b.discord_linger
         || a.discord_max_speakers != b.discord_max_speakers
         || a.discord_show_self != b.discord_show_self
@@ -1718,13 +1764,14 @@ fn refresh_token_if_needed(
                 .into(),
         );
     }
+    let client_secret = normalized_client_secret(&current.client_secret).map(str::to_owned);
     let mut fields = vec![
         ("client_id", config.discord_client_id.as_str()),
         ("grant_type", "refresh_token"),
         ("refresh_token", current.refresh_token.as_str()),
     ];
-    if !current.client_secret.is_empty() {
-        fields.push(("client_secret", current.client_secret.as_str()));
+    if let Some(client_secret) = client_secret.as_deref() {
+        fields.push(("client_secret", client_secret));
     }
     let mut response = exchange_token(
         token_owner,
@@ -1736,7 +1783,7 @@ fn refresh_token_if_needed(
     current = TokenRecord::from_response(
         &current.user_id,
         &current.client_id,
-        &current.client_secret,
+        client_secret.as_deref(),
         response,
         unix_now(),
     )?;
@@ -2272,14 +2319,29 @@ fn authorize_rpc(
     deadline: Instant,
 ) -> Result<(String, String), String> {
     let ready_id = authorization_handshake(file, config, deadline)?;
-    let args = format!(
-        "{{\"client_id\":{},\"scopes\":[\"identify\",\"rpc\",\"rpc.voice.read\"],\"redirect_uri\":{}}}",
-        json_string(&config.discord_client_id),
-        json_string(&config.discord_redirect_uri)
-    );
+    let args = authorize_args(&config.discord_client_id);
     let response = pipe_command(file, "AUTHORIZE", "", Some(&args), &ready_id, deadline)?;
     let code = authorization_code(&response, &response.nonce)?;
     Ok((ready_id, code))
+}
+
+fn authorize_args(client_id: &str) -> String {
+    format!(
+        "{{\"client_id\":{},\"scopes\":[\"identify\",\"rpc\",\"rpc.voice.read\"]}}",
+        json_string(client_id)
+    )
+}
+
+fn authorization_code_body(client_id: &str, code: &str, client_secret: Option<&str>) -> String {
+    let mut fields = vec![
+        ("client_id", client_id),
+        ("grant_type", "authorization_code"),
+        ("code", code),
+    ];
+    if let Some(client_secret) = client_secret {
+        fields.push(("client_secret", client_secret));
+    }
+    form_encode(&fields)
 }
 
 fn authorization_code(payload: &Payload, nonce: &str) -> Result<String, String> {
@@ -2299,20 +2361,16 @@ pub fn authorize(config: &Config, client_secret: &str) -> Result<(), String> {
     if config.discord_client_id.trim().is_empty() {
         return Err("discord_client_id is not configured".into());
     }
+    let client_secret = normalized_client_secret(client_secret);
     let deadline = Instant::now() + Duration::from_secs(120);
     let (mut file, _) = open_pipe()?;
     let (ready_id, code) = authorize_rpc(&mut file, config, deadline)?;
-    let mut fields = vec![
-        ("client_id", config.discord_client_id.as_str()),
-        ("grant_type", "authorization_code"),
-        ("code", code.as_str()),
-        ("redirect_uri", config.discord_redirect_uri.as_str()),
-    ];
-    if !client_secret.trim().is_empty() {
-        fields.push(("client_secret", client_secret));
-    }
     let token_owner = TokenExchangeOwner::default();
-    let response = exchange_token(&token_owner, &form_encode(&fields), deadline)?;
+    let response = exchange_token(
+        &token_owner,
+        &authorization_code_body(&config.discord_client_id, &code, client_secret),
+        deadline,
+    )?;
     let record = TokenRecord::from_response(
         &ready_id,
         &config.discord_client_id,
@@ -2437,21 +2495,67 @@ mod tests {
     }
 
     #[test]
-    fn remote_errors_never_echo_untrusted_content() {
-        let secret = "PRIVATE_REMOTE_SECRET";
+    fn remote_errors_never_include_remote_text() {
+        let private = [
+            "FAKE_REMOTE_SECRET",
+            "FAKE_REMOTE_TOKEN",
+            "FAKE_REMOTE_NONCE",
+        ];
         let payload = decode_payload(
             format!(
-                r#"{{"evt":"ERROR","data":{{"code":4000,"message":"{}"}}}}"#,
-                secret
+                r#"{{"evt":"ERROR","data":{{"code":4000,"message":"Bad request {} {} {}"}}}}"#,
+                private[0], private[1], private[2]
             )
             .as_bytes(),
         )
         .unwrap();
         let error = payload_error(&payload).unwrap_err();
         assert_eq!(error, "Discord RPC error code 4000");
-        let close = close_error(format!(r#"{{"code":4014,"message":"{}"}}"#, secret).as_bytes());
+        let close =
+            close_error(format!(r#"{{"code":4014,"message":"{}"}}"#, private.join(" ")).as_bytes());
         assert_eq!(close, "Discord closed RPC code 4014");
-        assert!(!error.contains(secret) && !close.contains(secret));
+        assert!(private
+            .iter()
+            .all(|value| !error.contains(value) && !close.contains(value)));
+    }
+
+    #[test]
+    fn rpc_oauth_errors_use_only_fixed_local_classifications() {
+        let private = "FAKE_MESSAGE_SECRET FAKE_MESSAGE_TOKEN FAKE_MESSAGE_NONCE";
+        for (message, expected) in [
+            (
+                format!("Redirect URI cannot be used in this RPC flow {private}"),
+                "RPC OAuth redirect URI rejected",
+            ),
+            (
+                format!("invalid scope {private}"),
+                "RPC OAuth scope rejected",
+            ),
+            (
+                format!("invalid client_secret {private}"),
+                "RPC OAuth client credentials rejected",
+            ),
+            (
+                format!("not an application tester {private}"),
+                "RPC application tester access rejected",
+            ),
+            (format!("unknown OAuth problem {private}"), "OAuth2 error"),
+        ] {
+            let payload = Payload {
+                event: "ERROR".into(),
+                data: Json::parse(&format!(
+                    r#"{{"code":5000,"message":{}}}"#,
+                    json_string(&message)
+                ))
+                .unwrap(),
+                ..Default::default()
+            };
+            let error = payload_error(&payload).unwrap_err();
+            assert_eq!(error, format!("Discord RPC error code 5000: {expected}"));
+            assert!(private
+                .split_whitespace()
+                .all(|value| !error.contains(value)));
+        }
     }
 
     #[test]
@@ -2548,14 +2652,15 @@ mod tests {
             expires_in: 7 * 86400,
             ..Default::default()
         };
-        let record = TokenRecord::from_response("111", "123", "secret", response, 1000).unwrap();
+        let record =
+            TokenRecord::from_response("111", "123", Some("secret"), response, 1000).unwrap();
         assert_eq!(TokenRecord::decode(&record.encode()).unwrap(), record);
         assert!(record.validate_for("111", "123").is_ok());
         assert!(record.validate_for("222", "123").is_err());
         assert!(record.validate_for("111", "456").is_err());
         assert!(!record.needs_refresh(1000));
         assert!(record.needs_refresh(record.expires_at - 23 * 3600));
-        assert_eq!(form_encode(&[("code", "a b&c")]), "code=a+b%26c");
+        assert_eq!(form_component_encode(" *~%é"), "+*%7E%25%C3%A9");
         assert!(TokenRecord::decode(br#"{"version":2,"accessToken":"x"}"#).is_err());
         assert!(TokenRecord::decode(br#"{"version":1,"accessToken":"x"}"#).is_err());
         let mut invalid = record.clone();
@@ -2856,6 +2961,47 @@ mod tests {
     }
 
     #[test]
+    fn rpc_authorization_payloads_follow_the_redirectless_flow() {
+        let args = authorize_args("123456");
+        assert_eq!(
+            args,
+            r#"{"client_id":"123456","scopes":["identify","rpc","rpc.voice.read"]}"#
+        );
+        assert!(!args.contains("redirect_uri"));
+
+        let secret = normalized_client_secret("  secret+x  ");
+        let body = authorization_code_body("123456", " *~%é", secret);
+        assert_eq!(
+            body,
+            "client_id=123456&grant_type=authorization_code&code=+*%7E%25%C3%A9&client_secret=secret%2Bx"
+        );
+        assert!(!body.contains("redirect_uri"));
+
+        let empty_secret = normalized_client_secret(" \t ");
+        assert_eq!(
+            authorization_code_body("123456", "code", empty_secret),
+            "client_id=123456&grant_type=authorization_code&code=code"
+        );
+        let response = TokenResponse {
+            access_token: "access".into(),
+            scope: "identify rpc rpc.voice.read".into(),
+            ..Default::default()
+        };
+        let record =
+            TokenRecord::from_response("111", "123456", secret, response.clone(), 1).unwrap();
+        assert_eq!(record.client_secret, "secret+x");
+        assert_eq!(TokenRecord::decode(&record.encode()).unwrap(), record);
+
+        let empty_record =
+            TokenRecord::from_response("111", "123456", empty_secret, response, 1).unwrap();
+        assert!(empty_record.client_secret.is_empty());
+        assert!(TokenRecord::decode(&empty_record.encode())
+            .unwrap()
+            .client_secret
+            .is_empty());
+    }
+
+    #[test]
     fn lifecycle_fingerprint_safe_mode_and_backoff_are_bounded() {
         let base = Config::default();
         assert!(provider_enabled(&base));
@@ -2869,7 +3015,6 @@ mod tests {
         for change in [
             |config: &mut Config| config.discord_enabled = !config.discord_enabled,
             |config: &mut Config| config.discord_client_id = "123".into(),
-            |config: &mut Config| config.discord_redirect_uri.push_str("/changed"),
             |config: &mut Config| config.discord_linger += Duration::from_millis(1),
             |config: &mut Config| config.discord_max_speakers += 1,
             |config: &mut Config| config.discord_show_self = !config.discord_show_self,
@@ -2879,6 +3024,9 @@ mod tests {
             change(&mut changed);
             assert!(session_config_changed(&base, &changed));
         }
+        let mut legacy_redirect = base.clone();
+        legacy_redirect.discord_redirect_uri.push_str("/changed");
+        assert!(!session_config_changed(&base, &legacy_redirect));
         let mut delay = Duration::from_secs(1);
         for expected in [2, 4, 8, 16, 30, 30] {
             delay = next_backoff(delay);

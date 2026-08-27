@@ -195,14 +195,16 @@ Discord speaker overlay, then dashboard.
   recognized Discord image, valid Authenticode, and `Discord Inc.` publisher
   verification. Verification is bounded and fails closed before client ID or
   token disclosure.
-- Discord RPC frames are bounded to 4 MiB. Remote messages and OAuth response
-  bodies are never included in errors. Token HTTPS responses are bounded to
-  1 MiB and credentials to 64 KiB.
+- Discord RPC frames are bounded to 4 MiB. RPC errors include only the numeric
+  code and, for OAuth failures, a fixed local classification; remote messages,
+  raw payloads, and OAuth response bodies are never included. Token HTTPS
+  responses are bounded to 1 MiB and credentials to 64 KiB.
 - Discord credentials are v2, keyed by immutable Discord user ID, and
   current-Windows-user DPAPI protected at rest. Optional client secrets enter
   through the authorization environment variable and remain encrypted with the
   account record for refresh.
-- Authorization is local RPC plus outbound WinHTTP token exchange. There is no
+- Authorization is local RPC plus outbound WinHTTP token exchange. Both the RPC
+  request and authorization-code exchange omit `redirect_uri`; there is no
   callback listener, browser launch, bot/Gateway connection, or user token.
 - Diagnostics are a separate offline privacy boundary: a closed typed allowlist
   is written atomically as a store-only ZIP capped at 1 MiB. Raw logs/config,

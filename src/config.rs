@@ -143,6 +143,7 @@ pub struct Config {
 
     pub discord_enabled: bool,
     pub discord_client_id: String,
+    // Legacy configuration key accepted for compatibility; Discord RPC OAuth ignores it.
     pub discord_redirect_uri: String,
     pub discord_linger: Duration,
     pub discord_max_speakers: i32,

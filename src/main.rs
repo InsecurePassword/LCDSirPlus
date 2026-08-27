@@ -41,7 +41,7 @@ fn print_usage() {
          \x20 --preview          Run with the virtual preview forced on\n\
          \x20 --hardware-test    Run the deterministic 10-step G13 test sequence\n\
          \x20 --diagnostics      Write a bounded offline diagnostics ZIP and exit\n\
-         \x20 --discord-authorize  Authorize RPC for Discord Desktop's active account\n\
+         \x20 --discord-authorize  Authorize local RPC (no browser or redirect listener)\n\
          \x20 --discord-clear-token  Remove all LCDSirPlus Discord credentials\n\
          \x20 --backend auto|sdk|hid|virtual  Backend for --hardware-test (default hid)\n\
          \x20 --duration-secs N  Visible-sequence duration for --hardware-test\n\

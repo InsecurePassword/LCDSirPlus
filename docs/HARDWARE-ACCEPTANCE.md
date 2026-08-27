@@ -43,8 +43,8 @@ requires a complete rerun.
 
 ## Discord
 
-- Use a dedicated developer application/test account and register the configured
-  redirect URI. Never record the client secret or DPAPI token bytes.
+- Use a dedicated developer application/test account. No portal redirect is
+  required. Never record the client secret or DPAPI token bytes.
 - Authorize with Discord Desktop running; confirm no listener/browser is opened
   and clear the client-secret environment variable. Switch to a second dedicated
   test account, authorize it once, and confirm switching either direction uses

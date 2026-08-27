@@ -6,6 +6,7 @@ LCDSirPlus is a per-user, local-first Windows application. It opens the selected
 G13 HID interface, optional local provider interfaces, Discord Desktop's local
 named pipe, and explicitly configured outbound endpoints. It does not install a
 service, driver, listener, browser extension, or elevated component.
+Discord RPC authorization sends no redirect URI and opens no callback listener.
 
 Packages are not code-signed. Verify `LCDSirPlus-0.3.0-SHA256SUMS.txt` and the package's sorted
 `PACKAGE-MANIFEST.txt` before running an executable or installer. The installer

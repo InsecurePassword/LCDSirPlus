@@ -78,7 +78,7 @@ LCDSirPlus.exe [--config PATH] [COMMAND]
   --hardware-test    Run the deterministic 10-step G13 test sequence
   --hardware-discover  Passive read-only G13 HID enumeration
   --diagnostics      Write a bounded offline diagnostics ZIP and exit
-  --discord-authorize  Authorize RPC for Discord Desktop's active account
+  --discord-authorize  Authorize local RPC (no browser or redirect listener)
   --discord-clear-token  Remove all LCDSirPlus Discord credentials
   --backend auto|sdk|hid|virtual  Backend for --hardware-test (default hid)
   --duration-secs N  Visible duration for --hardware-test (default 30)
@@ -183,9 +183,8 @@ external prerequisites and are not redistributed.
 ## Discord authorization
 
 Discord access requires a developer application client ID and may require the
-account to be added as an application tester. Register the redirect URI used in
-`lcdsirplus.txt` (default `http://127.0.0.1`), set `discord_client_id`, run Discord
-Desktop, then authorize:
+account to be added as an application tester. Set `discord_client_id`, run
+Discord Desktop, then authorize:
 
 ```powershell
 $env:LCDSIRPLUS_DISCORD_CLIENT_SECRET = '<secret only if required>'
@@ -204,9 +203,11 @@ application in Discord separately when needed. Credential access rejects reparse
 points and hard links and verifies the pinned local path boundary.
 
 Authorization uses Discord's verified local named-pipe `AUTHORIZE` flow with
-scopes `identify`, `rpc`, and `rpc.voice.read`. LCDSirPlus opens no callback
-listener and launches no browser. The only Discord network request is the
-HTTPS token exchange/refresh. Runtime refresh has a 20-second deadline, while
+scopes `identify`, `rpc`, and `rpc.voice.read`. The RPC request and subsequent
+authorization-code exchange omit `redirect_uri`; no portal redirect registration
+is needed. LCDSirPlus opens no callback listener and launches no browser. The
+only Discord network request is the HTTPS token exchange/refresh. Runtime refresh
+has a 20-second deadline, while
 authorization is bounded by its 120-second command deadline. Discord pipe
 operations are cancelable during shutdown and configuration reload. The
 trusted pipe's `READY.user.id`, stored record, and `AUTHENTICATE` user must match
