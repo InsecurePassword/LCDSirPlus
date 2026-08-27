@@ -466,13 +466,22 @@ impl HidDevice {
     /// Blank the panel, cancel any pending I/O, and close handles.
     pub fn close(&mut self) -> Result<(), String> {
         let blank_result = self.write_report(&super::g13::blank_report());
+        self.close_handles();
+        blank_result.map_err(|e| format!("HID blank on close: {e}"))
+    }
+
+    /// Close immediately without a final write when LCore has taken ownership.
+    pub fn close_without_blank(&mut self) {
+        self.close_handles();
+    }
+
+    fn close_handles(&mut self) {
         unsafe {
             let _ = CancelIoEx(self.handle, None);
             let _ = CloseHandle(self.handle);
             let _ = CloseHandle(self.read_event);
             let _ = CloseHandle(self.write_event);
         }
-        blank_result.map_err(|e| format!("HID blank on close: {e}"))
     }
 }
 

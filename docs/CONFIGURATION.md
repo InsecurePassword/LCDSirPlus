@@ -65,7 +65,7 @@ dashboard to the one-bar CPU layout automatically.
 
 | Key | Default | Range / values |
 |---|---|---|
-| `logitech_backend` | `auto` | `auto` \| `hid` \| `virtual` (SDK retired) |
+| `logitech_backend` | `auto` | `auto` \| `sdk` \| `hid` \| `virtual` |
 | `logitech_reconnect_ms` | 5000 (`auto`) | 250..300000 |
 | `logitech_reconnect_max_ms` | 60000 (`auto`) | ≥ reconnect, ≤ 600000 |
 | `logitech_button_poll_ms` | 50 (`auto`) | 10..1000 |
@@ -74,11 +74,11 @@ dashboard to the one-bar CPU layout automatically.
 | `logitech_orientation` | `normal` | `normal` \| `flip_x` \| `flip_y` \| `rotate_180` |
 | `logitech_invert` | 0 | bool |
 
-`auto` and `hid` require Logitech Gaming Software to be exited. If exact
-process name `LCore.exe` is present, LCDSirPlus keeps the backend unavailable,
-shows the automatic preview, and retries with the configured bounded backoff.
-It never terminates Logitech software and does not reject unrelated G HUB
-background components.
+`auto` selects the trusted SDK while exact process name `LCore.exe` is present
+and direct HID while it is absent. Explicit `sdk` never falls back to HID;
+explicit `hid` waits while LCore owns the display. Ownership changes close the
+old transport before reevaluation. It never terminates Logitech software or
+blocks unrelated G HUB background components.
 
 ## LibreHardwareMonitor (optional temperature fallback)
 

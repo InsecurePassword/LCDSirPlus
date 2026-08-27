@@ -1,13 +1,14 @@
 //! LCD backend worker: owns the physical device thread, serializes all
 //! device I/O, and exposes a message surface to the application.
 //!
-//! Backend selection: `auto` = hid -> virtual (SDK mode is retired: the
-//! Logitech runtime triggers the G HUB conflict on the target machine).
+//! Backend selection is ownership-driven: `auto` uses SDK while LCore owns
+//! the device and direct HID only while LCore is absent.
 //! The worker suppresses unchanged frames and reconnects with bounded,
 //! capped backoff. Device loss emits canceled button releases.
 
 pub mod g13;
 pub mod hid;
+pub mod sdk;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
@@ -17,10 +18,14 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::input::{ButtonTracker, Event};
-use g13::{pack_report, parse_input, G13_OUTPUT_REPORT_LENGTH};
+#[cfg(test)]
+use g13::G13_OUTPUT_REPORT_LENGTH;
+use g13::{pack_report, parse_input};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
+    Auto,
+    Sdk,
     Hid,
     Virtual,
 }
@@ -28,6 +33,8 @@ pub enum BackendKind {
 impl BackendKind {
     pub fn name(self) -> &'static str {
         match self {
+            BackendKind::Auto => "auto",
+            BackendKind::Sdk => "sdk",
             BackendKind::Hid => "hid",
             BackendKind::Virtual => "virtual",
         }
@@ -99,6 +106,7 @@ impl Backend {
         let debounce = cfg.logitech_button_debounce;
         let orientation = cfg.logitech_orientation.clone();
         let invert = cfg.logitech_invert;
+        let friendly_name = cfg.logitech_friendly_name.clone();
         let worker_commands = Arc::clone(&commands);
         let thread = std::thread::Builder::new()
             .name("lcdsirplus-backend".into())
@@ -114,6 +122,7 @@ impl Backend {
                     debounce,
                     orientation,
                     invert,
+                    friendly_name,
                 )
             })
             .expect("spawn backend thread");
@@ -131,10 +140,19 @@ impl Backend {
     }
 
     pub fn shutdown(mut self) {
+        self.stop();
+    }
+
+    fn stop(&mut self) {
         self.commands.shutdown();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+
+    pub fn reconfigure(&mut self, kind: BackendKind, cfg: &Config) {
+        self.stop();
+        *self = Self::spawn(kind, cfg);
     }
 }
 
@@ -161,12 +179,14 @@ fn worker(
     debounce: Duration,
     orientation: String,
     invert: bool,
+    friendly_name: String,
 ) {
     let _ = msg_tx.send(Message::State(BackendState::Discovering));
     match kind {
         BackendKind::Virtual => virtual_worker(commands, wake_rx, msg_tx),
-        BackendKind::Hid => {
-            hid_worker(
+        BackendKind::Auto | BackendKind::Sdk | BackendKind::Hid => {
+            physical_worker(
+                kind,
                 &commands,
                 &wake_rx,
                 &msg_tx,
@@ -176,17 +196,18 @@ fn worker(
                 debounce,
                 orientation,
                 invert,
+                friendly_name,
             );
             let _ = msg_tx.send(Message::State(BackendState::ShutDown));
         }
     }
 }
 
-fn transform_frame(
+fn transform_pixels(
     frame: &[u8; crate::model::WIDTH * crate::model::HEIGHT],
     orientation: &str,
     invert: bool,
-) -> [u8; G13_OUTPUT_REPORT_LENGTH] {
+) -> crate::render::Frame {
     // Build a temporary logical view, apply orientation/invert, then pack.
     let mut transformed = crate::render::Frame::new();
     for y in 0..crate::model::HEIGHT {
@@ -204,11 +225,119 @@ fn transform_frame(
             transformed.set(x as i32, y as i32, on);
         }
     }
-    pack_report(&transformed)
+    transformed
+}
+
+#[cfg(test)]
+fn transform_frame(
+    frame: &[u8; crate::model::WIDTH * crate::model::HEIGHT],
+    orientation: &str,
+    invert: bool,
+) -> [u8; G13_OUTPUT_REPORT_LENGTH] {
+    pack_report(&transform_pixels(frame, orientation, invert))
+}
+
+enum PhysicalDevice {
+    Hid(hid::HidDevice),
+    Sdk(sdk::SdkDevice),
+}
+
+impl PhysicalDevice {
+    fn kind(&self) -> BackendKind {
+        match self {
+            Self::Hid(_) => BackendKind::Hid,
+            Self::Sdk(_) => BackendKind::Sdk,
+        }
+    }
+
+    fn submit(&self, frame: &crate::render::Frame) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Hid(device) => {
+                let report = pack_report(frame);
+                device.write_report(&report)?;
+                Ok(report.to_vec())
+            }
+            Self::Sdk(device) => {
+                let bytes = frame.logitech_bytes();
+                device.submit(bytes.clone())?;
+                Ok(bytes)
+            }
+        }
+    }
+
+    fn poll(&self, timeout: Duration) -> Result<Option<[bool; 4]>, String> {
+        match self {
+            Self::Hid(device) => {
+                let mut raw = [0u8; 8];
+                if device.read_input_timeout(&mut raw, timeout)? {
+                    parse_input(&raw).map(Some)
+                } else {
+                    Ok(None)
+                }
+            }
+            Self::Sdk(device) => {
+                let (connected, buttons) = device.poll()?;
+                if connected {
+                    Ok(Some(buttons))
+                } else {
+                    Err("Logitech SDK reports the monochrome LCD disconnected".into())
+                }
+            }
+        }
+    }
+
+    fn close(&mut self, blank: bool) -> Result<(), String> {
+        match self {
+            Self::Hid(device) if blank => device.close(),
+            Self::Hid(device) => {
+                device.close_without_blank();
+                Ok(())
+            }
+            Self::Sdk(device) => device.close(blank),
+        }
+    }
+}
+
+fn open_physical(kind: BackendKind, friendly_name: &str) -> Result<PhysicalDevice, String> {
+    if sdk::circuit_open() {
+        return Err("physical backend circuit is open after an unreturning SDK owner".into());
+    }
+    let owner = sdk::lcore()?;
+    match (select_physical_kind(kind, owner.is_some())?, owner) {
+        (BackendKind::Sdk, Some(owner)) => {
+            sdk::SdkDevice::open(&owner, friendly_name).map(PhysicalDevice::Sdk)
+        }
+        (BackendKind::Hid, None) => {
+            hid::HidDevice::open().map(|(device, _)| PhysicalDevice::Hid(device))
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn select_physical_kind(kind: BackendKind, lcore_present: bool) -> Result<BackendKind, String> {
+    match (kind, lcore_present) {
+        (BackendKind::Auto, true) | (BackendKind::Sdk, true) => Ok(BackendKind::Sdk),
+        (BackendKind::Auto, false) | (BackendKind::Hid, false) => Ok(BackendKind::Hid),
+        (BackendKind::Sdk, false) => {
+            Err("Logitech SDK mode requires a running trusted LCore.exe".into())
+        }
+        (BackendKind::Hid, true) => {
+            Err("direct HID is refused while LCore.exe owns the G13 LCD".into())
+        }
+        (BackendKind::Virtual, _) => Err("virtual is not a physical backend".into()),
+    }
+}
+
+fn ownership_changed(device: &PhysicalDevice) -> Result<bool, String> {
+    Ok(matches!(
+        (device.kind(), sdk::lcore()?),
+        (BackendKind::Hid, Some(_)) | (BackendKind::Sdk, None)
+    ))
 }
 
 #[allow(clippy::too_many_arguments, unused_assignments)]
-fn hid_worker(
+fn physical_worker(
+    kind: BackendKind,
     commands: &CommandQueue,
     wake_rx: &Receiver<()>,
     msg_tx: &std::sync::mpsc::Sender<Message>,
@@ -218,14 +347,15 @@ fn hid_worker(
     debounce: Duration,
     orientation: String,
     invert: bool,
+    friendly_name: String,
 ) {
     let mut backoff = reconnect;
-    let mut last_sent: Option<[u8; G13_OUTPUT_REPORT_LENGTH]> = None;
+    let mut replay: Option<Pixels> = None;
+    let mut current: Option<Pixels> = None;
     let mut tracker = ButtonTracker::default();
 
     'outer: loop {
-        // --- discovery/open with bounded, capped backoff ---
-        match hid::HidDevice::open() {
+        match open_physical(kind, &friendly_name) {
             Err(reason) => {
                 let _ = msg_tx.send(Message::State(BackendState::Disconnected { reason }));
                 if sleep_interruptible(commands, wake_rx, backoff) {
@@ -234,24 +364,49 @@ fn hid_worker(
                 backoff = (backoff * 2).min(reconnect_max);
                 continue 'outer;
             }
-            Ok((mut device, _discovery)) => {
+            Ok(mut device) => {
+                let active_kind = device.kind();
                 let _ = msg_tx.send(Message::State(BackendState::Connected {
-                    kind: BackendKind::Hid,
+                    kind: active_kind,
                 }));
-                let _ = msg_tx.send(Message::Buttons(tracker.disconnect(Instant::now(), "hid")));
-                last_sent = None;
+                let _ = msg_tx.send(Message::Buttons(
+                    tracker.disconnect(Instant::now(), active_kind.name()),
+                ));
+                let mut last_sent: Option<Vec<u8>> = None;
                 backoff = reconnect;
 
-                // --- connected loop ---
                 loop {
                     if commands.is_shutdown() {
-                        if let Err(reason) = device.close() {
+                        if let Err(reason) = device.close(true) {
                             let _ =
                                 msg_tx.send(Message::State(BackendState::Disconnected { reason }));
                         }
                         break 'outer;
                     }
-                    let mut pixels = commands.take_latest();
+                    match ownership_changed(&device) {
+                        Ok(true) => {
+                            if replay.is_none() {
+                                replay = current.take();
+                            }
+                            let _ = device.close(false);
+                            let _ = msg_tx.send(Message::State(BackendState::Discovering));
+                            let _ = msg_tx.send(Message::Buttons(
+                                tracker.disconnect(Instant::now(), active_kind.name()),
+                            ));
+                            continue 'outer;
+                        }
+                        Err(reason) => {
+                            if replay.is_none() {
+                                replay = current.take();
+                            }
+                            let _ = device.close(false);
+                            let _ =
+                                msg_tx.send(Message::State(BackendState::Disconnected { reason }));
+                            continue 'outer;
+                        }
+                        Ok(false) => {}
+                    }
+                    let mut pixels = replay.take().or_else(|| commands.take_latest());
                     if pixels.is_none() {
                         match wake_rx.recv_timeout(button_poll) {
                             Ok(()) | Err(RecvTimeoutError::Timeout) => {}
@@ -264,12 +419,21 @@ fn hid_worker(
                     }
 
                     if let Some(pixels) = pixels {
-                        let report = transform_frame(&pixels, &orientation, invert);
-                        if last_sent.as_ref() != Some(&report) {
-                            match device.write_report(&report) {
-                                Ok(()) => last_sent = Some(report),
+                        let frame = transform_pixels(&pixels, &orientation, invert);
+                        let key = match active_kind {
+                            BackendKind::Hid => pack_report(&frame).to_vec(),
+                            BackendKind::Sdk => frame.logitech_bytes(),
+                            _ => unreachable!(),
+                        };
+                        if last_sent.as_ref() != Some(&key) {
+                            match device.submit(&frame) {
+                                Ok(sent) => {
+                                    last_sent = Some(sent);
+                                    current = Some(pixels);
+                                }
                                 Err(mut reason) => {
-                                    if let Err(close_error) = device.close() {
+                                    replay = Some(pixels);
+                                    if let Err(close_error) = device.close(true) {
                                         reason.push_str("; ");
                                         reason.push_str(&close_error);
                                     }
@@ -278,7 +442,7 @@ fn hid_worker(
                                             reason,
                                         }));
                                     let _ = msg_tx.send(Message::Buttons(
-                                        tracker.disconnect(Instant::now(), "hid"),
+                                        tracker.disconnect(Instant::now(), active_kind.name()),
                                     ));
                                     if sleep_interruptible(commands, wake_rx, backoff) {
                                         break 'outer;
@@ -287,50 +451,38 @@ fn hid_worker(
                                     continue 'outer;
                                 }
                             }
+                        } else {
+                            current = Some(pixels);
                         }
                     }
 
-                    let mut raw = [0u8; 8];
-                    match device
-                        .read_input_timeout(&mut raw, button_poll.max(Duration::from_millis(10)))
-                    {
-                        Ok(true) => match parse_input(&raw) {
-                            Ok(buttons) => {
-                                let events =
-                                    tracker.observe(Instant::now(), buttons, debounce, "hid");
-                                if !events.is_empty() {
-                                    let _ = msg_tx.send(Message::Buttons(events));
-                                }
+                    match device.poll(button_poll.max(Duration::from_millis(10))) {
+                        Ok(Some(buttons)) => {
+                            let events = tracker.observe(
+                                Instant::now(),
+                                buttons,
+                                debounce,
+                                active_kind.name(),
+                            );
+                            if !events.is_empty() {
+                                let _ = msg_tx.send(Message::Buttons(events));
                             }
-                            Err(reason) => {
-                                let mut reason = reason;
-                                if let Err(close_error) = device.close() {
-                                    reason.push_str("; ");
-                                    reason.push_str(&close_error);
-                                }
-                                let _ = msg_tx
-                                    .send(Message::State(BackendState::Disconnected { reason }));
-                                let _ = msg_tx.send(Message::Buttons(
-                                    tracker.disconnect(Instant::now(), "hid"),
-                                ));
-                                if sleep_interruptible(commands, wake_rx, backoff) {
-                                    break 'outer;
-                                }
-                                backoff = (backoff * 2).min(reconnect_max);
-                                continue 'outer;
-                            }
-                        },
-                        Ok(false) => {}
+                        }
+                        Ok(None) => {}
                         Err(reason) => {
+                            if replay.is_none() {
+                                replay = current.take();
+                            }
                             let mut reason = reason;
-                            if let Err(close_error) = device.close() {
+                            if let Err(close_error) = device.close(true) {
                                 reason.push_str("; ");
                                 reason.push_str(&close_error);
                             }
                             let _ =
                                 msg_tx.send(Message::State(BackendState::Disconnected { reason }));
-                            let _ = msg_tx
-                                .send(Message::Buttons(tracker.disconnect(Instant::now(), "hid")));
+                            let _ = msg_tx.send(Message::Buttons(
+                                tracker.disconnect(Instant::now(), active_kind.name()),
+                            ));
                             if sleep_interruptible(commands, wake_rx, backoff) {
                                 break 'outer;
                             }
@@ -396,8 +548,11 @@ fn virtual_worker(
 /// Resolve configured backend selection to a concrete kind for startup.
 pub fn resolve_kind(config_backend: &str) -> BackendKind {
     match config_backend {
+        "auto" => BackendKind::Auto,
+        "sdk" => BackendKind::Sdk,
+        "hid" => BackendKind::Hid,
         "virtual" => BackendKind::Virtual,
-        _ => BackendKind::Hid, // "auto" and "hid" both start with direct HID
+        _ => BackendKind::Auto,
     }
 }
 
@@ -489,8 +644,23 @@ mod tests {
 
     #[test]
     fn resolve_kind_maps_config() {
-        assert_eq!(resolve_kind("auto"), BackendKind::Hid);
+        assert_eq!(resolve_kind("auto"), BackendKind::Auto);
+        assert_eq!(resolve_kind("sdk"), BackendKind::Sdk);
         assert_eq!(resolve_kind("hid"), BackendKind::Hid);
         assert_eq!(resolve_kind("virtual"), BackendKind::Virtual);
+    }
+
+    #[test]
+    fn arbitration_never_cross_falls_back() {
+        assert_eq!(
+            select_physical_kind(BackendKind::Auto, true).unwrap(),
+            BackendKind::Sdk
+        );
+        assert_eq!(
+            select_physical_kind(BackendKind::Auto, false).unwrap(),
+            BackendKind::Hid
+        );
+        assert!(select_physical_kind(BackendKind::Sdk, false).is_err());
+        assert!(select_physical_kind(BackendKind::Hid, true).is_err());
     }
 }

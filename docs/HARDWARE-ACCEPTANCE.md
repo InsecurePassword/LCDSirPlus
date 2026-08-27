@@ -26,6 +26,12 @@ requires a complete rerun.
   visually confirm STEP 01-10, correct geometry, no tearing or full-screen
   disappear/return flicker, and blank-on-close.
 - Press each physical LCD button during the test and record down/release events.
+- Start Logitech Gaming Software normally, verify signed `LCore.exe` is running,
+  then run `LCDSirPlus.exe --hardware-test --backend sdk --duration-secs 60`.
+  Confirm STEP 01-10, all four buttons, and blank-on-close. Do not copy or load
+  any SDK DLL outside its canonical LCore installation.
+- In normal `auto` mode, start and exit LGS normally. Confirm one clean
+  HID-to-SDK and SDK-to-HID transition with no overlap or flicker.
 - Start normal mode and verify all four slot buttons, alert acknowledgement,
   preview fallback, tray controls, orientation, and inversion.
 - Unplug/replug during normal operation; confirm bounded reconnect, preview

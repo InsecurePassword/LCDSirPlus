@@ -151,4 +151,16 @@ mod tests {
         assert!(f.get(2, 2) && f.get(5, 2) && f.get(2, 4) && f.get(5, 4));
         assert!(!f.get(3, 3));
     }
+
+    #[test]
+    fn logitech_sdk_bitmap_is_exact_row_major_bytes() {
+        let mut frame = Frame::new();
+        frame.set(0, 0, true);
+        frame.set(159, 42, true);
+        let bytes = frame.logitech_bytes();
+        assert_eq!(bytes.len(), 6880);
+        assert_eq!(bytes[0], 255);
+        assert_eq!(bytes[159 + 42 * 160], 255);
+        assert_eq!(bytes[1], 0);
+    }
 }

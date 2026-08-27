@@ -10,9 +10,8 @@ a smaller footprint and fewer dependencies:
 LCDSirPlus is not affiliated with or endorsed by the original LCDSirReal developer.
 
 - **Single native executable** with no bundled runtime or installer framework.
-- **No Logitech runtime dependency**: direct-HID G13 backend (the proven path
-  from the 0.2.0 repair, with no administrator rights). Logitech Gaming
-  Software must be exited because its `LCore.exe` process also owns the LCD.
+- **Safe Logitech ownership arbitration**: `auto` uses the installed Logitech
+  LCD SDK while `LCore.exe` owns the G13 and direct HID only while it is absent.
 - **No Process Lasso**: Cache/Frequency CCD bars come from native topology
   detection (L3/NUMA domains + CPUID L3-size labeling of the 3D V-Cache die).
 - **Native-first telemetry**: CPU load from scheduler accounting deltas,
@@ -58,6 +57,9 @@ Enumerated strictly via SetupAPI; exactly one candidate accepted:
 - Overlapped I/O, 1 s op timeout, bounded reconnect backoff, blank-on-close
 - Direct HID refuses to open while exact process name `LCore.exe` is running,
   preventing competing LCD writers. It does not blanket-block G HUB services.
+- SDK loading is absolute-path-only from the running signed LCore installation,
+  after Program Files, reparse/ACL, AMD64 PE, export, signature, and product
+  metadata validation. All SDK calls run on one bounded owner thread.
 - Static frames are submitted once; animated hardware-test frames are capped at
   10 updates per second while button polling continues independently.
 
@@ -73,7 +75,7 @@ LCDSirPlus.exe [--config PATH] [COMMAND]
   --diagnostics      Write a bounded offline diagnostics ZIP and exit
   --discord-authorize  Authorize Discord local RPC for the current user
   --discord-clear-token  Remove the current-user Discord credential
-  --backend hid|virtual  Backend for --hardware-test (default hid)
+  --backend auto|sdk|hid|virtual  Backend for --hardware-test (default hid)
   --duration-secs N  Visible duration for --hardware-test (default 30)
   --safe-mode        Providers/destructive actions disabled
   --diagnostic-dir PATH  Log/diagnostic output directory
@@ -151,7 +153,7 @@ external prerequisites and are not redistributed.
   passes end to end.
 - **Pending human acceptance**: physical display of the STEP 01–10 sequence
   on the G13, physical button presses, unplug/replug recovery, and the
-  sustained run. Run `--hardware-test --backend hid --duration-secs 60` and
+  sustained run. Run both documented HID and LGS/SDK hardware tests and
   observe. Software transport results are never physical confirmation.
 - **Pending Discord acceptance**: developer-application authorization and live
   voice-channel speaker/channel/reconnect/refresh behavior require the user's

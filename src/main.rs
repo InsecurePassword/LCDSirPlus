@@ -43,7 +43,7 @@ fn print_usage() {
          \x20 --diagnostics      Write a bounded offline diagnostics ZIP and exit\n\
          \x20 --discord-authorize  Authorize Discord RPC for the current user\n\
          \x20 --discord-clear-token  Remove the current-user Discord credential\n\
-         \x20 --backend hid|virtual  Backend for --hardware-test (default hid)\n\
+         \x20 --backend auto|sdk|hid|virtual  Backend for --hardware-test (default hid)\n\
          \x20 --duration-secs N  Visible-sequence duration for --hardware-test\n\
          \x20 --safe-mode        Run with providers/destructive actions disabled\n\
          \x20 --diagnostic-dir PATH  Log/diagnostic output directory\n\
@@ -123,10 +123,15 @@ fn parse_args() -> Result<Cli, String> {
             "--backend" => {
                 i += 1;
                 match args.get(i).map(|s| s.as_str()) {
+                    Some("auto") => cli.backend = backends::BackendKind::Auto,
+                    Some("sdk") => cli.backend = backends::BackendKind::Sdk,
                     Some("hid") => cli.backend = backends::BackendKind::Hid,
                     Some("virtual") => cli.backend = backends::BackendKind::Virtual,
                     other => {
-                        return Err(format!("--backend must be hid or virtual, got {:?}", other))
+                        return Err(format!(
+                            "--backend must be auto, sdk, hid, or virtual, got {:?}",
+                            other
+                        ))
                     }
                 }
             }
@@ -320,7 +325,7 @@ fn main() {
     }
 
     if cli.hardware_test {
-        let instance = if cli.backend == backends::BackendKind::Hid {
+        let instance = if cli.backend != backends::BackendKind::Virtual {
             match runtime::InstanceGuard::acquire() {
                 Ok(Some(guard)) => Some(guard),
                 Ok(None) => {

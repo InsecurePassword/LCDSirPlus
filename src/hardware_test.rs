@@ -8,7 +8,9 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::backends::g13::{pack_report, parse_input, G13_OUTPUT_REPORT_LENGTH};
+#[cfg(test)]
+use crate::backends::g13::G13_OUTPUT_REPORT_LENGTH;
+use crate::backends::g13::{pack_report, parse_input};
 use crate::render::Frame;
 
 pub const STEP_DURATION: Duration = Duration::from_secs(2);
@@ -20,6 +22,7 @@ const SUBMIT_INTERVAL: Duration = Duration::from_millis(100);
 /// no-device smoke path.
 pub enum Transport<'a> {
     DirectHid(&'a crate::backends::hid::HidDevice),
+    DirectSdk(&'a crate::backends::sdk::SdkDevice),
     Virtual,
     #[cfg(test)]
     Fake(&'a dyn FakeTransport),
@@ -91,9 +94,16 @@ impl Clock for RealClock {
     }
 }
 
-#[derive(Default)]
 struct ButtonTransitions {
     prior: Option<[bool; 4]>,
+}
+
+impl Default for ButtonTransitions {
+    fn default() -> Self {
+        Self {
+            prior: Some([false; 4]),
+        }
+    }
 }
 
 impl ButtonTransitions {
@@ -228,7 +238,7 @@ fn run_with_clock(
         let hold_until = clock.now() + remaining;
         while clock.now() < hold_until {
             let tick_started = clock.now();
-            let report = pack_report(&hold_frame);
+            let report = encode(transport, &hold_frame);
             if last_report.as_ref() != Some(&report) {
                 if submit(transport, &report).is_err() {
                     break;
@@ -267,7 +277,7 @@ fn run_step(
     step_duration: Duration,
     submit_interval: Duration,
     clock: &dyn Clock,
-    last_report: &mut Option<[u8; G13_OUTPUT_REPORT_LENGTH]>,
+    last_report: &mut Option<Vec<u8>>,
     button_transitions: &mut ButtonTransitions,
 ) -> (usize, Vec<ButtonObservation>, Option<String>) {
     let mut buttons = Vec::new();
@@ -278,7 +288,7 @@ fn run_step(
         let tick_started = clock.now();
         let mut frame = draw(tick);
         stamp_step(&mut frame, step);
-        let report = pack_report(&frame);
+        let report = encode(transport, &frame);
         if last_report.as_ref() != Some(&report) {
             if let Err(e) = submit(transport, &report) {
                 error = Some(e);
@@ -305,15 +315,28 @@ fn run_step(
     (submissions, buttons, error)
 }
 
-fn submit(
-    transport: &Transport<'_>,
-    report: &[u8; G13_OUTPUT_REPORT_LENGTH],
-) -> Result<(), String> {
+fn submit(transport: &Transport<'_>, report: &[u8]) -> Result<(), String> {
     match transport {
-        Transport::DirectHid(device) => device.write_report(report),
+        Transport::DirectHid(device) => device.write_report(
+            report
+                .try_into()
+                .map_err(|_| "invalid 992-byte HID test report")?,
+        ),
+        Transport::DirectSdk(device) => device.submit(report.to_vec()),
         Transport::Virtual => Ok(()),
         #[cfg(test)]
-        Transport::Fake(fake) => fake.write(report),
+        Transport::Fake(fake) => fake.write(
+            report
+                .try_into()
+                .map_err(|_| "invalid fake HID test report")?,
+        ),
+    }
+}
+
+fn encode(transport: &Transport<'_>, frame: &Frame) -> Vec<u8> {
+    match transport {
+        Transport::DirectSdk(_) => frame.logitech_bytes(),
+        _ => pack_report(frame).to_vec(),
     }
 }
 
@@ -327,6 +350,14 @@ fn poll_buttons(
     let mut raw = [0u8; 8];
     let read = match transport {
         Transport::DirectHid(device) => device.read_input_timeout(&mut raw, timeout),
+        Transport::DirectSdk(device) => {
+            let (connected, states) = device.poll()?;
+            if !connected {
+                return Err("Logitech SDK reports the monochrome LCD disconnected".into());
+            }
+            buttons.extend(transitions.observe(now, states));
+            return Ok(());
+        }
         Transport::Virtual => Ok(false),
         #[cfg(test)]
         Transport::Fake(fake) => fake.read(&mut raw, timeout),
@@ -565,6 +596,14 @@ mod tests {
         assert_eq!(events.len(), 8);
         assert_eq!(events.iter().filter(|event| event.down).count(), 4);
         assert!(events.iter().all(|event| !event.canceled));
+    }
+
+    #[test]
+    fn first_held_report_emits_down_from_released_baseline() {
+        let events =
+            ButtonTransitions::default().observe(Instant::now(), [true, false, false, false]);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].down && events[0].index == 0);
     }
 
     fn short_test() -> TestConfig {

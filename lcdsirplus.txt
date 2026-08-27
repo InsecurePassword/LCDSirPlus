@@ -45,12 +45,10 @@ ccd_cache_processors    auto
 ccd_frequency_processors auto
 
 ##############################################################################
-# Logitech G13 backend. The SDK mode is retired: the Logitech runtime
-# triggers the G HUB compatibility conflict. Exit Logitech Gaming Software
-# (LCore.exe) before direct HID; LCDSirPlus refuses competing LCD ownership.
-# Unrelated G HUB services are not blocked. Direct HID needs no administrator.
+# Logitech G13 backend. Auto uses the trusted SDK while LCore.exe owns the LCD
+# and direct HID only while LCore is absent. Explicit modes never fall back.
 #
-# logitech_backend       auto | hid | virtual   (auto = hid with reconnect)
+# logitech_backend       auto | sdk | hid | virtual
 
 logitech_backend        auto
 logitech_reconnect_ms   auto          # 5000, doubles to reconnect_max on failure

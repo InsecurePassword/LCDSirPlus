@@ -79,3 +79,4 @@ Write-Host ''
 Write-Host 'ALL GATES PASSED' -ForegroundColor Green
 Write-Host 'Physical acceptance (human) is intentionally NOT part of this script:'
 Write-Host '  .\target\release\LCDSirPlus.exe --hardware-test --backend hid --duration-secs 60'
+Write-Host '  .\target\release\LCDSirPlus.exe --hardware-test --backend sdk --duration-secs 60  # with LGS running'

@@ -47,7 +47,8 @@ src\
 | Thread | Owns | Communicates via |
 |---|---|---|
 | main/app | config, slots, providers, renderer, loop timing | channels |
-| lcdsirplus-backend | HID handles, all device I/O | `Command` in / `Message` out |
+| lcdsirplus-backend | physical arbitration and HID handles | latest frame in / state/buttons out |
+| lcdsirplus-sdk-owner | trusted DLL lifetime and all Logitech SDK calls | bounded request/reply |
 | lcdsirplus-ui | HWND, tray, GDI | frames in / `UiEvent` out |
 | frame pump | latest-frame handoff to UI | `PostMessageW` wake |
 | telemetry | fast native polls, stale state, provider health | snapshot channel |
@@ -63,10 +64,12 @@ The backend thread is the only toucher of the device (mirrors the Go
 edges are debounced in the backend thread and delivered as events. The UI
 producer atomically replaces one pending frame slot, so slow I/O and reconnect
 retain only the newest frame while shutdown uses a separate reliable signal.
-Before any direct-HID device open, a read-only ToolHelp snapshot rejects exact
-case-insensitive `LCore.exe` ownership with an actionable unavailable state.
-No device handle exists and no blank is sent on this refusal path; normal
-bounded reconnect continues so exiting LGS allows recovery.
+Before each physical open, a read-only ToolHelp snapshot arbitrates exact
+case-insensitive `LCore.exe` ownership. LCore present means SDK only; absent
+means HID only. If LCore appears during HID operation, writes stop and HID
+closes without a final blank. SDK calls own their buffers, time out after three
+seconds, and permanently open a process-wide physical circuit if a native owner
+does not return.
 
 Normal runtime and direct-HID hardware tests acquire the per-session
 `Local\\LCDSirPlus.Runtime` mutex before opening a backend/device. Read-only CLI
@@ -95,8 +98,9 @@ clock + CPU/memory + NVAPI/ADLX + optional LHM + PresentMon
   → Snapshot { date/time, cpu_dual, cache/freq/total load, mem, readings }
   → Renderer::render(snapshot, overlay opts, view{slot modules})
   → Frame (160x43 bytes)
-  ├── backend.submit → transform (orientation/invert) → pack_report
-  │     → WriteFile 992 bytes (skipped if unchanged)
+  ├── backend.submit → transform (orientation/invert)
+  │     ├── HID pack_report → WriteFile 992 bytes
+  │     └── SDK row-major 6880 bytes → set background + update
   └── ui.show_frame → BGRA → SetDIBitsToDevice
 ```
 

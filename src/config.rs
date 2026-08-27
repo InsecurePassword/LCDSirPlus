@@ -90,7 +90,7 @@ pub struct Config {
     pub ccd_cache_processors: Option<Vec<u32>>,
     pub ccd_frequency_processors: Option<Vec<u32>>,
 
-    // Logitech G13 backend. SDK mode is retired (LCore/G HUB conflict).
+    // Logitech G13 backend. Auto arbitrates between LCore's SDK and direct HID.
     pub logitech_backend: String,
     pub logitech_reconnect: Duration,
     pub logitech_reconnect_max: Duration,
@@ -354,8 +354,11 @@ pub fn validate(c: &Config) -> Result<(), String> {
             return Err("ccd_cache_processors and ccd_frequency_processors overlap".into());
         }
     }
-    if !matches!(c.logitech_backend.as_str(), "auto" | "hid" | "virtual") {
-        return Err("logitech_backend must be auto, hid, or virtual".into());
+    if !matches!(
+        c.logitech_backend.as_str(),
+        "auto" | "sdk" | "hid" | "virtual"
+    ) {
+        return Err("logitech_backend must be auto, sdk, hid, or virtual".into());
     }
     check_range_u64(
         "logitech_reconnect_ms",
@@ -382,8 +385,8 @@ pub fn validate(c: &Config) -> Result<(), String> {
         10,
         500,
     )?;
-    if c.logitech_friendly_name.trim().is_empty() {
-        return Err("logitech_friendly_name cannot be empty".into());
+    if c.logitech_friendly_name.trim().is_empty() || c.logitech_friendly_name.contains('\0') {
+        return Err("logitech_friendly_name cannot be empty or contain NUL".into());
     }
     if !matches!(
         c.logitech_orientation.as_str(),
@@ -740,12 +743,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_retired_keys_semantics() {
+    fn accepts_sdk_and_rejects_retired_ccd_source() {
         let c = Config {
             logitech_backend: "sdk".into(),
             ..Config::default()
         };
-        assert!(validate(&c).is_err(), "SDK backend must be retired");
+        assert!(validate(&c).is_ok(), "SDK backend is supported");
         let c = Config {
             ccd_source: "lasso".into(),
             ..Config::default()

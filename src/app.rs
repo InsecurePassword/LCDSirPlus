@@ -137,7 +137,7 @@ pub fn run(opts: RunOptions) -> i32 {
 
     // Backend.
     let backend_kind = crate::backends::resolve_kind(&cfg.logitech_backend);
-    let backend = Backend::spawn(backend_kind, &cfg);
+    let mut backend = Backend::spawn(backend_kind, &cfg);
     crate::log_info!("backend: {}", backend_kind.name());
 
     // UI (tray + preview per mode).
@@ -187,6 +187,7 @@ pub fn run(opts: RunOptions) -> i32 {
                         if let Some(audit) = hang_hold.cancel_reload() {
                             log_hang_audit(&audit);
                         }
+                        let backend_changed = backend_config_changed(&cfg, &loaded.config);
                         cfg = loaded.config;
                         if opts.safe_mode {
                             cfg.safe_mode = true;
@@ -194,6 +195,13 @@ pub fn run(opts: RunOptions) -> i32 {
                         telemetry_runtime.update_config(&cfg);
                         discord_runtime.update_config(&cfg);
                         slots.apply(&cfg);
+                        if backend_changed {
+                            backend.reconfigure(
+                                crate::backends::resolve_kind(&cfg.logitech_backend),
+                                &cfg,
+                            );
+                            backend_state = BackendState::Discovering;
+                        }
                         sync_startup_if_needed(
                             &cfg,
                             startup_executable.as_deref(),
@@ -276,7 +284,10 @@ pub fn run(opts: RunOptions) -> i32 {
                             && cfg.preview_mode == "auto"
                             && !cfg.start_minimized
                         {
-                            ui.set_preview_auto_visible(kind != BackendKind::Hid);
+                            ui.set_preview_auto_visible(!matches!(
+                                kind,
+                                BackendKind::Hid | BackendKind::Sdk
+                            ));
                         }
                     }
                     BackendState::Disconnected { reason } => {
@@ -349,10 +360,21 @@ fn preview_for_backend(cfg: &Config, state: &BackendState) -> bool {
         _ => !matches!(
             state,
             BackendState::Connected {
-                kind: BackendKind::Hid
+                kind: BackendKind::Hid | BackendKind::Sdk
             }
         ),
     }
+}
+
+fn backend_config_changed(old: &Config, new: &Config) -> bool {
+    old.logitech_backend != new.logitech_backend
+        || old.logitech_reconnect != new.logitech_reconnect
+        || old.logitech_reconnect_max != new.logitech_reconnect_max
+        || old.logitech_button_poll != new.logitech_button_poll
+        || old.logitech_button_debounce != new.logitech_button_debounce
+        || old.logitech_friendly_name != new.logitech_friendly_name
+        || old.logitech_orientation != new.logitech_orientation
+        || old.logitech_invert != new.logitech_invert
 }
 
 fn apply_preview_policy(ui: &Ui, cfg: &Config, state: &BackendState) {
@@ -440,7 +462,55 @@ pub fn run_hardware_test(
         },
     );
 
+    let backend = if backend == BackendKind::Auto {
+        match crate::backends::sdk::lcore() {
+            Ok(Some(_)) => BackendKind::Sdk,
+            Ok(None) => BackendKind::Hid,
+            Err(error) => {
+                eprintln!("hardware test ownership discovery failed: {error}");
+                return 3;
+            }
+        }
+    } else {
+        backend
+    };
+
     match backend {
+        BackendKind::Auto => unreachable!(),
+        BackendKind::Sdk => {
+            let owner = match crate::backends::sdk::lcore() {
+                Ok(Some(owner)) => owner,
+                Ok(None) => {
+                    eprintln!("hardware test: SDK mode requires running LCore.exe");
+                    return 3;
+                }
+                Err(error) => {
+                    eprintln!("hardware test ownership discovery failed: {error}");
+                    return 3;
+                }
+            };
+            let mut device =
+                match crate::backends::sdk::SdkDevice::open(&owner, &cfg.logitech_friendly_name) {
+                    Ok(device) => device,
+                    Err(error) => {
+                        eprintln!("hardware test SDK open failed: {error}");
+                        return 3;
+                    }
+                };
+            let test = TestConfig {
+                duration,
+                backend_name: "sdk",
+                dashboard: Some(dashboard),
+                ..Default::default()
+            };
+            let (results, buttons) = hardware_test::run(&Transport::DirectSdk(&device), &test);
+            let code = report_test_results(&results, &buttons);
+            if let Err(error) = device.close(true) {
+                eprintln!("hardware test SDK close failed: {error}");
+                return 1;
+            }
+            code
+        }
         BackendKind::Hid => {
             let (mut device, discovery) = match crate::backends::hid::HidDevice::open() {
                 Ok(ok) => ok,
@@ -795,12 +865,18 @@ mod tests {
     }
 
     #[test]
-    fn preview_policy_tracks_only_physical_hid_availability() {
+    fn preview_policy_tracks_physical_availability() {
         let mut cfg = Config::default();
         assert!(!preview_for_backend(
             &cfg,
             &BackendState::Connected {
                 kind: BackendKind::Hid
+            }
+        ));
+        assert!(!preview_for_backend(
+            &cfg,
+            &BackendState::Connected {
+                kind: BackendKind::Sdk
             }
         ));
         assert!(preview_for_backend(
@@ -819,6 +895,16 @@ mod tests {
         assert!(!preview_for_backend(&cfg, &BackendState::Discovering));
         cfg.preview_mode = "always".into();
         assert!(preview_for_backend(&cfg, &BackendState::Discovering));
+    }
+
+    #[test]
+    fn only_backend_settings_trigger_backend_reload() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.date_format = "%Y".into();
+        assert!(!backend_config_changed(&old, &new));
+        new.logitech_backend = "sdk".into();
+        assert!(backend_config_changed(&old, &new));
     }
 
     #[test]

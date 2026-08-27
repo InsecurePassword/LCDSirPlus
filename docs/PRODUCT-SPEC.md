@@ -50,15 +50,12 @@ Detection is native and automatic:
 
 ## G13 backend
 
-Direct HID only. The Logitech SDK backend is retired (its runtime triggers
-the G HUB conflict on the reference machine; the direct-HID path was
-physically confirmed during the 0.2.0 repair). Modes: `auto` (= hid),
-`hid`, `virtual`. Exact device contract and I/O discipline are documented in
-README.md and enforced in `src/backends/g13.rs` + `src/backends/hid.rs`.
-Direct HID refuses to open while Logitech Gaming Software's exact `LCore.exe`
-process is running, because simultaneous LGS and direct-HID LCD ownership was
-physically proven to flicker. Unrelated G HUB background processes are not
-blocked without equivalent evidence.
+Modes are `auto`, `sdk`, `hid`, and `virtual`. `auto` uses only the trusted
+Logitech LCD SDK while LCore owns the display and direct HID only while LCore is
+absent. The SDK is loaded only from the canonical signed LCore installation and
+all calls are serialized on one bounded owner thread. Explicit modes retry
+their selected transport and never cross-fallback. This prevents simultaneous
+LGS/direct-HID writers without blocking unrelated G HUB processes.
 
 ## Required telemetry sources
 
