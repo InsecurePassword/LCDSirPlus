@@ -652,7 +652,7 @@ fn hang_slot(f: &mut Frame, hung: &[HungTarget], v: &View) {
     f.text_centered(left, width, 35, &fit_text(text, width, 1), 1, true);
     if v.hung_hold > 0.0 {
         let fill = (width as f64 * v.hung_hold.min(1.0)) as i32;
-        f.h_line(left, left + fill - 1, 42, true);
+        f.h_line(left, left + fill - 1, 26, true);
     }
 }
 
@@ -1512,7 +1512,7 @@ mod tests {
         only_hung.discord = Default::default();
         let expected = Renderer::new().render(&only_hung, OverlayOptions::default(), &hold_view);
         assert!(with_priority.equal(&expected));
-        assert!((81..100).all(|x| with_priority.get(x, 42)));
+        assert!((81..100).all(|x| with_priority.get(x, 26)));
 
         normal.hung.clear();
         normal.alerts.clear();

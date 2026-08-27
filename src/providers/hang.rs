@@ -21,10 +21,11 @@ use windows::Win32::System::Threading::{
     PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, EnumWindows, GetAncestor, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, RegisterClassW,
-    SendMessageTimeoutW, ShowWindow, CW_USEDEFAULT, GA_ROOT, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT,
-    SW_SHOW, WM_NULL, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, EnumWindows, GetAncestor,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+    PeekMessageW, RegisterClassW, SendMessageTimeoutW, ShowWindow, TranslateMessage, CW_USEDEFAULT,
+    GA_ROOT, MSG, PM_REMOVE, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SW_SHOW, WM_NULL, WNDCLASSW,
+    WS_OVERLAPPEDWINDOW,
 };
 
 use crate::config::Config;
@@ -432,10 +433,18 @@ fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Send
     let mut cadence = Cadence::default();
     let mut current_policy = None;
     let mut disabled_published = false;
+    let mut published_available = None;
+    let mut published_targets = None;
     while !shutdown.load(Ordering::Relaxed) {
         let cfg = config.read().unwrap_or_else(|e| e.into_inner()).clone();
         let policy = Policy::from(&cfg);
         if reset_on_policy_change(&mut current_policy, &policy, &mut tracker, &mut cadence) {
+            log_worker_transition(
+                &mut published_available,
+                &mut published_targets,
+                policy.active(),
+                0,
+            );
             if tx
                 .send(Update {
                     targets: Vec::new(),
@@ -452,15 +461,15 @@ fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Send
         if !policy.active() {
             tracker.clear();
             cadence.poll_due(&policy, started.elapsed());
-            if !disabled_published
-                && tx
-                    .send(Update {
-                        targets: Vec::new(),
-                        available: false,
-                        error: None,
-                    })
-                    .is_err()
-            {
+            if !disabled_published && {
+                log_worker_transition(&mut published_available, &mut published_targets, false, 0);
+                tx.send(Update {
+                    targets: Vec::new(),
+                    available: false,
+                    error: None,
+                })
+                .is_err()
+            } {
                 return;
             }
             disabled_published = true;
@@ -483,6 +492,12 @@ fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Send
                 &mut cadence,
             );
             disabled_published = !latest_policy.active();
+            log_worker_transition(
+                &mut published_available,
+                &mut published_targets,
+                latest_policy.active(),
+                0,
+            );
             if tx
                 .send(Update {
                     targets: Vec::new(),
@@ -515,9 +530,31 @@ fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Send
                 }
             }
         };
+        log_worker_transition(
+            &mut published_available,
+            &mut published_targets,
+            update.available,
+            update.targets.len(),
+        );
         if tx.send(update).is_err() {
             return;
         }
+    }
+}
+
+fn log_worker_transition(
+    available: &mut Option<bool>,
+    targets: &mut Option<usize>,
+    next_available: bool,
+    next_targets: usize,
+) {
+    if *available != Some(next_available) {
+        crate::log_info!("hung-window detector available={next_available}");
+        *available = Some(next_available);
+    }
+    if *targets != Some(next_targets) {
+        crate::log_info!("hung-window detector confirmed_targets={next_targets}");
+        *targets = Some(next_targets);
     }
 }
 
@@ -1063,6 +1100,10 @@ unsafe extern "system" fn harness_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
+    if message == WM_NULL {
+        std::thread::sleep(Duration::from_secs(1));
+        return windows::Win32::Foundation::LRESULT(0);
+    }
     DefWindowProcW(hwnd, message, wparam, lparam)
 }
 
@@ -1148,7 +1189,17 @@ fn create_harness_window(duration: Duration) -> Result<(), &'static str> {
         let _ = UpdateWindow(hwnd);
     }
     println!("HANG-HARNESS READY pid={pid}");
-    std::thread::sleep(duration);
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        let mut message = MSG::default();
+        unsafe {
+            while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        std::thread::sleep(TICK);
+    }
     Ok(())
 }
 
@@ -1268,6 +1319,36 @@ fn detect_harness(pid: u32) -> Result<HungTarget, String> {
             .unwrap_or("purpose-built hung window was not confirmed")
             .into()
     })
+}
+
+#[cfg(test)]
+fn detect_harness_with_shipped_policy(pid: u32) -> Result<HungTarget, String> {
+    let policy = Policy::from(&Config::default());
+    let started = Instant::now();
+    let mut tracker = Tracker::default();
+    let mut cadence = Cadence::default();
+    while started.elapsed() < Duration::from_secs(15) {
+        if !cadence.poll_due(&policy, started.elapsed()) {
+            std::thread::sleep(TICK);
+            continue;
+        }
+        let observations =
+            enumerate_and_probe(policy.timeout, &policy.ignore, None).map_err(str::to_string)?;
+        if let Some(target) = tracker
+            .update(
+                started.elapsed(),
+                observations,
+                policy.failures,
+                policy.minimum,
+            )
+            .into_iter()
+            .find(|target| target.pid == pid)
+        {
+            return Ok(target);
+        }
+        std::thread::sleep(TICK);
+    }
+    Err("purpose-built hung window was not confirmed with shipped policy".into())
 }
 
 fn wait_harness(cleanup: &mut HarnessCleanup, timeout: Duration) -> Result<ExitStatus, String> {
@@ -2287,6 +2368,18 @@ mod tests {
     #[ignore = "starts a visible purpose-built Windows window for bounded native smoke"]
     fn disposable_harness_is_detected_and_cleans_up() {
         smoke().unwrap();
+    }
+
+    #[test]
+    #[ignore = "runs the pumping native timeout harness through the shipped unrestricted policy"]
+    fn disposable_harness_pumps_until_shipped_policy_confirms_timeouts() {
+        let mut cleanup = spawn_harness(20).unwrap();
+        let pid = cleanup.child.as_ref().unwrap().id();
+        detect_harness_with_shipped_policy(pid).unwrap();
+        assert!(matches!(
+            cleanup.child.as_mut().unwrap().try_wait(),
+            Ok(None)
+        ));
     }
 
     #[test]
