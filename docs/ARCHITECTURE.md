@@ -71,6 +71,25 @@ closes without a final blank. SDK calls own their buffers, time out after three
 seconds, and permanently open a process-wide physical circuit if a native owner
 does not return.
 
+SDK discovery, trust validation, loading, and initialization share that same
+three-second supervised owner operation. LCore, `LogitechLcd.dll`, and the DLL
+parent chain are opened non-reparse with sharing that denies writes/deletes.
+Both files must be regular, fixed-volume, single-linked objects. Validation
+requires cached whole-chain Authenticode revocation success, exact signer
+organization `Logitech Inc`, an identical SHA-256 signer certificate, exact
+company `Logitech Inc.`, product `Logitech Gaming Framework`, full file-version
+equality, AMD64 PE, and all six exports. After absolute `LoadLibraryExW`, the
+loaded module is reopened and its volume serial, file index, size, and link
+count must match the pinned DLL before `LogiLcdInit`; mismatch frees the module
+and opens the circuit. Pins remain alive until SDK shutdown and `FreeLibrary`.
+
+The final HID output handle is opened with no sharing, after an LCore precheck,
+then LCore is checked again. Every write repeats the check, while idle polling
+checks at `logitech_button_poll_ms` (bounded to 10-1000 ms). Windows handle
+sharing prevents a later LCore handle from sharing the collection; process
+observation itself is not claimed atomic, so the exclusive handle is the
+contention barrier during the bounded observation interval.
+
 Normal runtime and direct-HID hardware tests acquire the per-session
 `Local\\LCDSirPlus.Runtime` mutex before opening a backend/device. Read-only CLI
 commands and virtual tests do not acquire it. The RAII owner closes the handle

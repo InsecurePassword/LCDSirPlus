@@ -329,10 +329,23 @@ fn select_physical_kind(kind: BackendKind, lcore_present: bool) -> Result<Backen
 }
 
 fn ownership_changed(device: &PhysicalDevice) -> Result<bool, String> {
-    Ok(matches!(
-        (device.kind(), sdk::lcore()?),
-        (BackendKind::Hid, Some(_)) | (BackendKind::Sdk, None)
-    ))
+    Ok(ownership_conflict(device.kind(), sdk::lcore()?.is_some()))
+}
+
+fn ownership_conflict(kind: BackendKind, lcore_present: bool) -> bool {
+    matches!(
+        (kind, lcore_present),
+        (BackendKind::Hid, true) | (BackendKind::Sdk, false)
+    )
+}
+
+fn next_frame(commands: &CommandQueue, replay: &mut Option<Pixels>) -> Option<Pixels> {
+    if let Some(newest) = commands.take_latest() {
+        *replay = None;
+        Some(newest)
+    } else {
+        replay.take()
+    }
 }
 
 #[allow(clippy::too_many_arguments, unused_assignments)]
@@ -406,7 +419,7 @@ fn physical_worker(
                         }
                         Ok(false) => {}
                     }
-                    let mut pixels = replay.take().or_else(|| commands.take_latest());
+                    let mut pixels = next_frame(commands, &mut replay);
                     if pixels.is_none() {
                         match wake_rx.recv_timeout(button_poll) {
                             Ok(()) | Err(RecvTimeoutError::Timeout) => {}
@@ -415,7 +428,7 @@ fn physical_worker(
                         if commands.is_shutdown() {
                             continue;
                         }
-                        pixels = commands.take_latest();
+                        pixels = next_frame(commands, &mut replay);
                     }
 
                     if let Some(pixels) = pixels {
@@ -662,5 +675,26 @@ mod tests {
         );
         assert!(select_physical_kind(BackendKind::Sdk, false).is_err());
         assert!(select_physical_kind(BackendKind::Hid, true).is_err());
+    }
+
+    #[test]
+    fn ownership_transition_matrix_closes_hid_and_never_falls_back_from_sdk() {
+        assert!(!ownership_conflict(BackendKind::Hid, false));
+        assert!(ownership_conflict(BackendKind::Hid, true));
+        assert!(!ownership_conflict(BackendKind::Sdk, true));
+        assert!(ownership_conflict(BackendKind::Sdk, false));
+        assert!(select_physical_kind(BackendKind::Auto, true).is_ok());
+        assert!(select_physical_kind(BackendKind::Hid, true).is_err());
+    }
+
+    #[test]
+    fn newest_pending_frame_replaces_stale_transition_replay() {
+        let (queue, _) = command_queue();
+        let mut replay = Some(pixels(1));
+        queue.submit(pixels(2));
+        queue.submit(pixels(3));
+        assert_eq!(next_frame(&queue, &mut replay).unwrap()[0], 3);
+        assert!(replay.is_none());
+        assert!(next_frame(&queue, &mut replay).is_none());
     }
 }

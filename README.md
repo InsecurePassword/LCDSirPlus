@@ -58,8 +58,13 @@ Enumerated strictly via SetupAPI; exactly one candidate accepted:
 - Direct HID refuses to open while exact process name `LCore.exe` is running,
   preventing competing LCD writers. It does not blanket-block G HUB services.
 - SDK loading is absolute-path-only from the running signed LCore installation,
-  after Program Files, reparse/ACL, AMD64 PE, export, signature, and product
-  metadata validation. All SDK calls run on one bounded owner thread.
+  after pinned-object Program Files, reparse/ACL/hard-link, AMD64 PE/export,
+  cached-revocation, exact signer-certificate, product, and full-version
+  validation. The loaded module identity must match the pinned DLL before any
+  SDK call. All SDK calls run on one bounded owner thread.
+- Direct HID takes a non-shared output handle, rechecks LCore after open and
+  before every write, and polls ownership while idle. LCore detection closes
+  HID without a final blank.
 - Static frames are submitted once; animated hardware-test frames are capped at
   10 updates per second while button polling continues independently.
 

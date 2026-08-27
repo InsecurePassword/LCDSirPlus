@@ -32,6 +32,8 @@ requires a complete rerun.
   any SDK DLL outside its canonical LCore installation.
 - In normal `auto` mode, start and exit LGS normally. Confirm one clean
   HID-to-SDK and SDK-to-HID transition with no overlap or flicker.
+- Confirm STEP 07 names the selected `HID` or `SDK` transport. A failure during
+  the STEP 10 remainder or final blank/shutdown must produce a failed verdict.
 - Start normal mode and verify all four slot buttons, alert acknowledgement,
   preview fallback, tray controls, orientation, and inversion.
 - Unplug/replug during normal operation; confirm bounded reconnect, preview

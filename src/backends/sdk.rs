@@ -7,8 +7,10 @@
 use std::collections::HashSet;
 use std::ffi::{c_void, CString, OsStr};
 use std::fs;
+use std::fs::File;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -16,11 +18,14 @@ use std::time::{Duration, Instant};
 
 use windows::core::{PCSTR, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, FreeLibrary, ERROR_ACCESS_DENIED, ERROR_NO_MORE_FILES, GENERIC_WRITE, HANDLE,
+    CloseHandle, FreeLibrary, ERROR_ACCESS_DENIED, ERROR_NO_MORE_FILES, GENERIC_READ,
+    GENERIC_WRITE, HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, GetDriveTypeW, GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_MODE,
+    CreateFileW, GetDriveTypeW, GetFileInformationByHandle, GetFileVersionInfoSizeW,
+    GetFileVersionInfoW, VerQueryValueW, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_MODE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, VS_FIXEDFILEINFO,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -28,7 +33,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::LibraryLoader::{
-    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    GetModuleFileNameW, GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -41,6 +47,9 @@ use windows::Win32::UI::Shell::{
 const LCD_TYPE_MONO: i32 = 1;
 const CALL_TIMEOUT: Duration = Duration::from_secs(3);
 const PIXELS: usize = crate::model::WIDTH * crate::model::HEIGHT;
+const EXPECTED_SIGNER_ORGANIZATION: &str = "Logitech Inc";
+const EXPECTED_COMPANY: &str = "Logitech Inc.";
+const EXPECTED_PRODUCT: &str = "Logitech Gaming Framework";
 const EXPORTS: [&str; 6] = [
     "LogiLcdInit",
     "LogiLcdIsConnected",
@@ -50,15 +59,59 @@ const EXPORTS: [&str; 6] = [
     "LogiLcdShutdown",
 ];
 static CIRCUIT_OPEN: AtomicBool = AtomicBool::new(false);
+static SDK_OWNER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub fn circuit_open() -> bool {
     CIRCUIT_OPEN.load(Ordering::Acquire)
+}
+
+fn claim_sdk_owner() -> Result<(), String> {
+    SDK_OWNER_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| ())
+        .map_err(|_| "Logitech SDK discovery/owner operation is already active".into())
+}
+
+fn wait_ready(receiver: &Receiver<Result<(), String>>, timeout: Duration) -> Result<(), String> {
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => {
+            CIRCUIT_OPEN.store(true, Ordering::Release);
+            Err("Logitech SDK discovery/initialization timed out; owner quarantined and circuit opened".into())
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct LCore {
     pub path: PathBuf,
     pub pid: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    volume: u32,
+    index: u64,
+    size: u64,
+    links: u32,
+}
+
+struct PinnedFile {
+    file: File,
+    identity: FileIdentity,
+}
+
+struct PinnedSdk {
+    path: PathBuf,
+    dll: PinnedFile,
+    _lcore: PinnedFile,
+    _boundaries: Vec<File>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuthenticodeIdentity {
+    organization: String,
+    thumbprint: Vec<u8>,
 }
 
 pub fn lcore() -> Result<Option<LCore>, String> {
@@ -118,7 +171,7 @@ pub fn lcore() -> Result<Option<LCore>, String> {
     }
 }
 
-pub fn discover_trusted_dll(owner: &LCore) -> Result<PathBuf, String> {
+fn expected_dll_path(owner: &LCore) -> Result<PathBuf, String> {
     if !owner
         .path
         .file_name()
@@ -141,8 +194,29 @@ pub fn discover_trusted_dll(owner: &LCore) -> Result<PathBuf, String> {
             owner.path.display()
         ));
     }
-    let expected = install.join(r"SDK\LCD\x64\LogitechLcd.dll");
-    validate_candidate(&owner.path, &expected)
+    Ok(install.join(r"SDK\LCD\x64\LogitechLcd.dll"))
+}
+
+fn discover_pinned(owner: &LCore) -> Result<PinnedSdk, String> {
+    let expected = expected_dll_path(owner)?;
+    let roots = program_files_roots()?;
+    reject_reparse_and_writable_chain(&owner.path, &roots)?;
+    reject_reparse_and_writable_chain(&expected, &roots)?;
+    let boundaries = pin_parent_chain(&expected, &roots)?;
+    let lcore = pin_file(&owner.path)?;
+    let dll = pin_file(&expected)?;
+    let path = validate_candidate(&owner.path, &expected)?;
+    let lcore_after = file_identity(&lcore.file, false)?;
+    let dll_after = file_identity(&dll.file, false)?;
+    if lcore.identity != lcore_after || dll.identity != dll_after {
+        return Err("trusted object identity changed during validation".into());
+    }
+    Ok(PinnedSdk {
+        path,
+        dll,
+        _lcore: lcore,
+        _boundaries: boundaries,
+    })
 }
 
 fn validate_candidate(lcore: &Path, candidate: &Path) -> Result<PathBuf, String> {
@@ -153,7 +227,7 @@ trait TrustProvider {
     fn canonicalize(&self, path: &Path) -> Result<PathBuf, String>;
     fn roots(&self) -> Result<Vec<PathBuf>, String>;
     fn require_immutable(&self, path: &Path, roots: &[PathBuf]) -> Result<(), String>;
-    fn signer(&self, path: &Path) -> Result<String, String>;
+    fn signer(&self, path: &Path) -> Result<AuthenticodeIdentity, String>;
     fn version(&self, path: &Path) -> Result<[u16; 4], String>;
     fn metadata(&self, path: &Path) -> Result<(String, String), String>;
     fn pe(&self, path: &Path) -> Result<(), String>;
@@ -172,8 +246,8 @@ impl TrustProvider for WindowsTrust {
     fn require_immutable(&self, path: &Path, roots: &[PathBuf]) -> Result<(), String> {
         reject_reparse_and_writable_chain(path, roots)
     }
-    fn signer(&self, path: &Path) -> Result<String, String> {
-        crate::providers::discord::verify_authenticode(path)
+    fn signer(&self, path: &Path) -> Result<AuthenticodeIdentity, String> {
+        verify_authenticode(path)
     }
     fn version(&self, path: &Path) -> Result<[u16; 4], String> {
         file_version(path)
@@ -218,26 +292,30 @@ fn validate_candidate_with(
     }
     trust.require_immutable(&dll, &roots)?;
     let signer = trust.signer(&dll)?;
-    if !signer.to_ascii_lowercase().contains("logitech") {
-        return Err(format!("SDK signer is not Logitech: {signer}"));
+    if signer.organization != EXPECTED_SIGNER_ORGANIZATION {
+        return Err(format!(
+            "SDK signer organization is not exactly {EXPECTED_SIGNER_ORGANIZATION}"
+        ));
     }
     let lcore_signer = trust.signer(lcore)?;
-    if !lcore_signer.to_ascii_lowercase().contains("logitech") {
-        return Err(format!("LCore signer is not Logitech: {lcore_signer}"));
+    if lcore_signer.organization != EXPECTED_SIGNER_ORGANIZATION {
+        return Err(format!(
+            "LCore signer organization is not exactly {EXPECTED_SIGNER_ORGANIZATION}"
+        ));
+    }
+    if signer.thumbprint != lcore_signer.thumbprint {
+        return Err("LCore and SDK signer certificates differ".into());
     }
     let exe_version = trust.version(lcore)?;
     let dll_version = trust.version(&dll)?;
-    if exe_version[..2] != dll_version[..2] {
+    if exe_version != dll_version {
         return Err(format!(
-            "LCore/SDK product versions are incompatible: {}.{} vs {}.{}",
-            exe_version[0], exe_version[1], dll_version[0], dll_version[1]
+            "LCore/SDK full file versions differ: {exe_version:?} vs {dll_version:?}"
         ));
     }
     for path in [lcore, dll.as_path()] {
         let (company, product) = trust.metadata(path)?;
-        if !company.to_ascii_lowercase().contains("logitech")
-            || !product.to_ascii_lowercase().contains("logitech")
-        {
+        if company != EXPECTED_COMPANY || product != EXPECTED_PRODUCT {
             return Err(format!(
                 "Logitech product metadata is incompatible for {}: company={company:?} product={product:?}",
                 path.display()
@@ -356,6 +434,197 @@ fn can_open_for_write(path: &Path, directory: bool) -> Result<bool, String> {
         }
         Err(error) if error.code() == ERROR_ACCESS_DENIED.to_hresult() => Ok(false),
         Err(error) => Err(format!("check write access to {}: {error}", path.display())),
+    }
+}
+
+fn pin_file(path: &Path) -> Result<PinnedFile, String> {
+    let wide = wide(path);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(|e| format!("pin trusted file {}: {e}", path.display()))?;
+    let file = unsafe { File::from_raw_handle(handle.0) };
+    let identity = file_identity(&file, false)?;
+    Ok(PinnedFile { file, identity })
+}
+
+fn pin_directory(path: &Path) -> Result<File, String> {
+    let wide = wide(path);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(|e| format!("pin trusted directory {}: {e}", path.display()))?;
+    let file = unsafe { File::from_raw_handle(handle.0) };
+    let _ = file_identity(&file, true)?;
+    Ok(file)
+}
+
+fn file_identity(file: &File, directory: bool) -> Result<FileIdentity, String> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle().cast()), &mut info) }
+        .map_err(|e| format!("pinned object identity is unavailable: {e}"))?;
+    let is_directory = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+    if is_directory != directory || info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Err("pinned object is not the required regular non-reparse type".into());
+    }
+    if !directory && info.nNumberOfLinks != 1 {
+        return Err("trusted executable/DLL must have exactly one hard link".into());
+    }
+    Ok(FileIdentity {
+        volume: info.dwVolumeSerialNumber,
+        index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+        size: ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64,
+        links: info.nNumberOfLinks,
+    })
+}
+
+fn require_same_identity(expected: &FileIdentity, loaded: &FileIdentity) -> Result<(), String> {
+    if expected != loaded || loaded.links != 1 {
+        Err("loaded SDK module identity differs from pinned verified DLL".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn pin_parent_chain(path: &Path, roots: &[PathBuf]) -> Result<Vec<File>, String> {
+    let root = roots
+        .iter()
+        .find(|root| path_within(path, root))
+        .ok_or("trusted path escaped Program Files")?;
+    let mut pins = vec![pin_directory(root)?];
+    let mut current = root.clone();
+    let parent = path.parent().ok_or("trusted file has no parent")?;
+    for component in parent.components().skip(root.components().count()) {
+        current.push(component);
+        pins.push(pin_directory(&current)?);
+    }
+    Ok(pins)
+}
+
+fn verify_authenticode(path: &Path) -> Result<AuthenticodeIdentity, String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Security::Cryptography::{
+        CertGetCertificateContextProperty, CertGetNameStringW, CERT_NAME_ATTR_TYPE,
+        CERT_SHA256_HASH_PROP_ID,
+    };
+    use windows::Win32::Security::WinTrust::*;
+
+    let wide = wide(path);
+    let mut file_info = WINTRUST_FILE_INFO {
+        cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: PCWSTR(wide.as_ptr()),
+        hFile: HANDLE::default(),
+        pgKnownSubject: std::ptr::null_mut(),
+    };
+    let mut data = WINTRUST_DATA {
+        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_WHOLECHAIN,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: WINTRUST_DATA_0 {
+            pFile: &mut file_info,
+        },
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL
+            | WTD_DISABLE_MD2_MD4
+            | WTD_REVOCATION_CHECK_CHAIN,
+        dwUIContext: WTD_UICONTEXT_EXECUTE,
+        ..Default::default()
+    };
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    unsafe {
+        let status = WinVerifyTrustEx(HWND::default(), &mut action, &mut data);
+        if status != 0 || data.hWVTStateData.is_invalid() {
+            data.dwStateAction = WTD_STATEACTION_CLOSE;
+            let _ = WinVerifyTrustEx(HWND::default(), &mut action, &mut data);
+            return Err(format!(
+                "cached whole-chain Authenticode verification failed: 0x{status:08x}"
+            ));
+        }
+        let provider = WTHelperProvDataFromStateData(data.hWVTStateData);
+        let signer = if provider.is_null() {
+            std::ptr::null_mut()
+        } else {
+            WTHelperGetProvSignerFromChain(provider, 0, false, 0)
+        };
+        let provider_cert = if signer.is_null() {
+            std::ptr::null_mut()
+        } else {
+            WTHelperGetProvCertFromChain(signer, 0)
+        };
+        let cert = if provider_cert.is_null() {
+            std::ptr::null()
+        } else {
+            (*provider_cert).pCert
+        };
+        let oid = b"2.5.4.10\0";
+        let required = if cert.is_null() {
+            0
+        } else {
+            CertGetNameStringW(
+                cert,
+                CERT_NAME_ATTR_TYPE,
+                0,
+                Some(PCSTR(oid.as_ptr()).0.cast()),
+                None,
+            )
+        };
+        let mut organization = String::new();
+        if required > 1 && required <= 1024 {
+            let mut output = vec![0u16; required as usize];
+            if CertGetNameStringW(
+                cert,
+                CERT_NAME_ATTR_TYPE,
+                0,
+                Some(PCSTR(oid.as_ptr()).0.cast()),
+                Some(&mut output),
+            ) == required
+            {
+                organization = String::from_utf16_lossy(&output[..required as usize - 1]);
+            }
+        }
+        let mut hash_len = 0u32;
+        let hash_size = if cert.is_null() {
+            Err(windows::core::Error::from_win32())
+        } else {
+            CertGetCertificateContextProperty(cert, CERT_SHA256_HASH_PROP_ID, None, &mut hash_len)
+        };
+        let mut thumbprint = vec![0u8; hash_len as usize];
+        let hash_result = hash_size.and_then(|_| {
+            CertGetCertificateContextProperty(
+                cert,
+                CERT_SHA256_HASH_PROP_ID,
+                Some(thumbprint.as_mut_ptr().cast()),
+                &mut hash_len,
+            )
+        });
+        data.dwStateAction = WTD_STATEACTION_CLOSE;
+        let _ = WinVerifyTrustEx(HWND::default(), &mut action, &mut data);
+        hash_result.map_err(|_| "signer SHA-256 thumbprint is unavailable")?;
+        thumbprint.truncate(hash_len as usize);
+        if organization.is_empty() || thumbprint.len() != 32 {
+            return Err("verified signer identity is incomplete".into());
+        }
+        Ok(AuthenticodeIdentity {
+            organization,
+            thumbprint,
+        })
     }
 }
 
@@ -547,17 +816,41 @@ struct Native {
     background: SetBackground,
     update: Update,
     shutdown_fn: Shutdown,
+    _pinned: PinnedSdk,
 }
 
 impl Native {
-    unsafe fn load(path: &Path, friendly_name: &str) -> Result<Self, String> {
-        let path_wide = wide(path);
+    unsafe fn load(pinned: PinnedSdk, friendly_name: &str) -> Result<Self, String> {
+        let path_wide = wide(&pinned.path);
         let library = LoadLibraryExW(
             PCWSTR(path_wide.as_ptr()),
             None,
             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
         )
-        .map_err(|e| format!("secure LoadLibraryExW {}: {e}", path.display()))?;
+        .map_err(|e| format!("secure LoadLibraryExW {}: {e}", pinned.path.display()))?;
+        let mut module_path = vec![0u16; 32768];
+        let module_len = GetModuleFileNameW(library, &mut module_path) as usize;
+        if module_len == 0 || module_len >= module_path.len() {
+            let _ = FreeLibrary(library);
+            CIRCUIT_OPEN.store(true, Ordering::Release);
+            return Err("loaded SDK module path is unavailable; circuit opened".into());
+        }
+        let loaded_path = PathBuf::from(String::from_utf16_lossy(&module_path[..module_len]));
+        let loaded = match pin_file(&loaded_path) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = FreeLibrary(library);
+                CIRCUIT_OPEN.store(true, Ordering::Release);
+                return Err(format!(
+                    "loaded SDK module cannot be pinned: {error}; circuit opened"
+                ));
+            }
+        };
+        if let Err(error) = require_same_identity(&pinned.dll.identity, &loaded.identity) {
+            let _ = FreeLibrary(library);
+            CIRCUIT_OPEN.store(true, Ordering::Release);
+            return Err(format!("{error}; circuit opened"));
+        }
         macro_rules! proc {
             ($name:literal, $ty:ty) => {{
                 let name = CString::new($name).unwrap();
@@ -576,6 +869,7 @@ impl Native {
             background: proc!("LogiLcdMonoSetBackground", SetBackground),
             update: proc!("LogiLcdUpdate", Update),
             shutdown_fn: proc!("LogiLcdShutdown", Shutdown),
+            _pinned: pinned,
         };
         let friendly: Vec<u16> = friendly_name.encode_utf16().chain(Some(0)).collect();
         if init(friendly.as_ptr(), LCD_TYPE_MONO) == 0 {
@@ -657,29 +951,25 @@ impl SdkDevice {
         if CIRCUIT_OPEN.load(Ordering::Acquire) {
             return Err("Logitech SDK circuit is open after an unreturning native owner".into());
         }
-        let path = discover_trusted_dll(owner)?;
+        claim_sdk_owner()?;
         let expected_owner = owner.clone();
         let friendly_name = friendly_name.to_string();
         let (requests, receiver) = mpsc::sync_channel(1);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        std::thread::Builder::new()
+        let spawn = std::thread::Builder::new()
             .name("lcdsirplus-sdk-owner".into())
             .spawn(move || unsafe {
-                match lcore() {
+                let result = match lcore() {
                     Ok(Some(current))
                         if current.pid == expected_owner.pid
-                            && current.path == expected_owner.path => {}
-                    Ok(_) => {
-                        let _ =
-                            ready_tx.send(Err("LCore.exe identity changed before SDK load".into()));
-                        return;
+                            && current.path == expected_owner.path =>
+                    {
+                        discover_pinned(&current)
                     }
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error));
-                        return;
-                    }
-                }
-                match Native::load(&path, &friendly_name) {
+                    Ok(_) => Err("LCore.exe identity changed before SDK discovery".into()),
+                    Err(error) => Err(error),
+                };
+                match result.and_then(|pinned| Native::load(pinned, &friendly_name)) {
                     Ok(native) => {
                         let _ = ready_tx.send(Ok(()));
                         owner_loop(Box::new(native), receiver);
@@ -688,10 +978,14 @@ impl SdkDevice {
                         let _ = ready_tx.send(Err(error));
                     }
                 }
-            })
-            .map_err(|e| format!("spawn Logitech SDK owner: {e}"))?;
-        match ready_rx.recv_timeout(CALL_TIMEOUT) {
-            Ok(Ok(())) => {
+                SDK_OWNER_ACTIVE.store(false, Ordering::Release);
+            });
+        if let Err(error) = spawn {
+            SDK_OWNER_ACTIVE.store(false, Ordering::Release);
+            return Err(format!("spawn Logitech SDK owner: {error}"));
+        }
+        match wait_ready(&ready_rx, CALL_TIMEOUT) {
+            Ok(()) => {
                 let device = Self {
                     requests: Some(requests),
                 };
@@ -712,14 +1006,7 @@ impl SdkDevice {
                     }
                 }
             }
-            Ok(Err(error)) => Err(error),
-            Err(_) => {
-                CIRCUIT_OPEN.store(true, Ordering::Release);
-                Err(
-                    "Logitech SDK initialization timed out; owner quarantined and circuit opened"
-                        .into(),
-                )
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -855,6 +1142,10 @@ mod tests {
 
     struct FakeTrust {
         signer: &'static str,
+        company: &'static str,
+        product: &'static str,
+        lcore_thumbprint: u8,
+        dll_thumbprint: u8,
         immutable: bool,
         pe: bool,
         dll_version: [u16; 4],
@@ -863,7 +1154,11 @@ mod tests {
     impl Default for FakeTrust {
         fn default() -> Self {
             Self {
-                signer: "Logitech Inc.",
+                signer: EXPECTED_SIGNER_ORGANIZATION,
+                company: EXPECTED_COMPANY,
+                product: EXPECTED_PRODUCT,
+                lcore_thumbprint: 1,
+                dll_thumbprint: 1,
                 immutable: true,
                 pe: true,
                 dll_version: [9, 4, 0, 0],
@@ -883,18 +1178,28 @@ mod tests {
                 .then_some(())
                 .ok_or_else(|| "writable path".into())
         }
-        fn signer(&self, _path: &Path) -> Result<String, String> {
-            Ok(self.signer.into())
+        fn signer(&self, path: &Path) -> Result<AuthenticodeIdentity, String> {
+            Ok(AuthenticodeIdentity {
+                organization: self.signer.into(),
+                thumbprint: vec![
+                    if path.extension().is_some_and(|value| value == "dll") {
+                        self.dll_thumbprint
+                    } else {
+                        self.lcore_thumbprint
+                    };
+                    32
+                ],
+            })
         }
         fn version(&self, path: &Path) -> Result<[u16; 4], String> {
             Ok(if path.extension().is_some_and(|value| value == "dll") {
                 self.dll_version
             } else {
-                [9, 4, 12, 0]
+                [9, 4, 0, 0]
             })
         }
         fn metadata(&self, _path: &Path) -> Result<(String, String), String> {
-            Ok(("Logitech Inc.".into(), "Logitech Gaming Software".into()))
+            Ok((self.company.into(), self.product.into()))
         }
         fn pe(&self, _path: &Path) -> Result<(), String> {
             self.pe.then_some(()).ok_or_else(|| "bad PE".into())
@@ -963,7 +1268,7 @@ mod tests {
         );
 
         let mut trust = FakeTrust {
-            signer: "Other Corp",
+            signer: "Not Logitech Inc.",
             ..Default::default()
         };
         assert!(validate_candidate_with(exe, dll, &trust).is_err());
@@ -978,10 +1283,77 @@ mod tests {
         };
         assert!(validate_candidate_with(exe, dll, &trust).is_err());
         trust = FakeTrust {
-            dll_version: [8, 0, 0, 0],
+            dll_version: [9, 4, 0, 1],
             ..Default::default()
         };
         assert!(validate_candidate_with(exe, dll, &trust).is_err());
+        trust = FakeTrust {
+            dll_thumbprint: 2,
+            ..Default::default()
+        };
+        assert!(validate_candidate_with(exe, dll, &trust).is_err());
+        trust = FakeTrust {
+            company: "Not Logitech Inc.",
+            ..Default::default()
+        };
+        assert!(validate_candidate_with(exe, dll, &trust).is_err());
+        trust = FakeTrust {
+            product: "Logitech Gaming Framework Extra",
+            ..Default::default()
+        };
+        assert!(validate_candidate_with(exe, dll, &trust).is_err());
+    }
+
+    #[test]
+    fn native_pin_rejects_hard_linked_file() {
+        let root = std::env::temp_dir().join(format!(
+            "lcdsirplus-sdk-hardlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let original = root.join("LogitechLcd.dll");
+        let alias = root.join("alias.dll");
+        fs::write(&original, b"test").unwrap();
+        fs::hard_link(&original, &alias).unwrap();
+        assert!(pin_file(&original).err().unwrap().contains("hard link"));
+        fs::remove_file(alias).unwrap();
+        fs::remove_file(original).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn loaded_object_identity_rejects_substitution() {
+        let expected = FileIdentity {
+            volume: 1,
+            index: 2,
+            size: 3,
+            links: 1,
+        };
+        assert!(require_same_identity(&expected, &expected).is_ok());
+        let swapped = FileIdentity {
+            index: 4,
+            ..expected.clone()
+        };
+        assert!(require_same_identity(&expected, &swapped).is_err());
+    }
+
+    #[test]
+    #[ignore = "read-only installed Logitech signature/version/object policy"]
+    fn installed_sdk_policy_read_only() {
+        let roots = program_files_roots().unwrap();
+        let Some(exe) = roots
+            .into_iter()
+            .map(|root| root.join(r"Logitech Gaming Software\LCore.exe"))
+            .find(|path| path.is_file())
+        else {
+            return;
+        };
+        let pinned = discover_pinned(&LCore { path: exe, pid: 0 }).unwrap();
+        assert_eq!(pinned.dll.identity.links, 1);
     }
 
     #[test]
@@ -998,6 +1370,26 @@ mod tests {
             .unwrap();
         assert!(error.contains("timed out") && circuit_open());
         device.requests.take();
+        thread.join().unwrap();
+        CIRCUIT_OPEN.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn stalled_owned_discovery_opens_circuit_and_blocks_overlap() {
+        CIRCUIT_OPEN.store(false, Ordering::Release);
+        SDK_OWNER_ACTIVE.store(false, Ordering::Release);
+        claim_sdk_owner().unwrap();
+        assert!(claim_sdk_owner().is_err());
+        let (ready, receiver) = mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            let owned = String::from("owned validation data");
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(owned, "owned validation data");
+            let _ = ready.send(Ok(()));
+            SDK_OWNER_ACTIVE.store(false, Ordering::Release);
+        });
+        assert!(wait_ready(&receiver, Duration::from_millis(1)).is_err());
+        assert!(circuit_open() && claim_sdk_owner().is_err());
         thread.join().unwrap();
         CIRCUIT_OPEN.store(false, Ordering::Release);
     }

@@ -1131,7 +1131,7 @@ fn canonical_process_image(process: windows::Win32::Foundation::HANDLE) -> Resul
     Ok(canonical)
 }
 
-pub(crate) fn verify_authenticode(path: &Path) -> Result<String, String> {
+fn verify_authenticode(path: &Path) -> Result<String, String> {
     use windows::core::{PCSTR, PCWSTR};
     use windows::Win32::Foundation::{HANDLE, HWND};
     use windows::Win32::Security::Cryptography::{CertGetNameStringW, CERT_NAME_ATTR_TYPE};

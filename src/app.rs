@@ -503,13 +503,12 @@ pub fn run_hardware_test(
                 dashboard: Some(dashboard),
                 ..Default::default()
             };
-            let (results, buttons) = hardware_test::run(&Transport::DirectSdk(&device), &test);
-            let code = report_test_results(&results, &buttons);
+            let (mut results, buttons) = hardware_test::run(&Transport::DirectSdk(&device), &test);
             if let Err(error) = device.close(true) {
                 eprintln!("hardware test SDK close failed: {error}");
-                return 1;
+                hardware_test::record_final_error(&mut results, "SDK shutdown", error);
             }
-            code
+            report_test_results(&results, &buttons)
         }
         BackendKind::Hid => {
             let (mut device, discovery) = match crate::backends::hid::HidDevice::open() {
@@ -531,14 +530,13 @@ pub fn run_hardware_test(
                 dashboard: Some(dashboard),
                 ..Default::default()
             };
-            let (results, buttons) = hardware_test::run(&Transport::DirectHid(&device), &test);
-            let code = report_test_results(&results, &buttons);
+            let (mut results, buttons) = hardware_test::run(&Transport::DirectHid(&device), &test);
             if let Err(error) = device.close() {
                 crate::log_error!("hardware test close failed: {}", error);
                 eprintln!("hardware test close failed: {error}");
-                return 1;
+                hardware_test::record_final_error(&mut results, "HID shutdown", error);
             }
-            code
+            report_test_results(&results, &buttons)
         }
         BackendKind::Virtual => {
             let test = TestConfig {

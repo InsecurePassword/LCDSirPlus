@@ -56,6 +56,14 @@ fn owner_gate(processes: Result<Vec<String>, String>) -> Result<(), String> {
     Ok(())
 }
 
+fn owner_guarded<T>(
+    processes: Result<Vec<String>, String>,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    owner_gate(processes)?;
+    operation()
+}
+
 fn running_process_names() -> Result<Vec<String>, String> {
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
@@ -234,13 +242,16 @@ unsafe fn interface_detail(
 }
 
 unsafe fn open_attributes(device_path: &str) -> Result<CandidateInfo, String> {
-    let handle = open_path(device_path)?;
+    let handle = open_path(
+        device_path,
+        FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0),
+    )?;
     let info = describe(handle, device_path);
     let _ = CloseHandle(handle);
     info
 }
 
-unsafe fn open_path(device_path: &str) -> Result<HANDLE, String> {
+unsafe fn open_path(device_path: &str, share: FILE_SHARE_MODE) -> Result<HANDLE, String> {
     let wide: Vec<u16> = device_path
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -248,7 +259,7 @@ unsafe fn open_path(device_path: &str) -> Result<HANDLE, String> {
     CreateFileW(
         PCWSTR::from_raw(wide.as_ptr()),
         GENERIC_READ.0 | GENERIC_WRITE.0,
-        FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0),
+        share,
         None,
         OPEN_EXISTING,
         FILE_FLAG_OVERLAPPED,
@@ -326,7 +337,15 @@ impl HidDevice {
                 )
             });
         };
-        let handle = unsafe { open_path(&candidate.device_path)? };
+        let handle = unsafe { open_path(&candidate.device_path, FILE_SHARE_MODE(0))? };
+        if let Err(error) = owner_gate(running_process_names()) {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return Err(format!(
+                "LCore ownership changed after exclusive HID open: {error}"
+            ));
+        }
         let (read_event, write_event) = create_io_events(
             handle,
             || unsafe { CreateEventW(None, true, false, None) }.map_err(|e| e.to_string()),
@@ -346,6 +365,15 @@ impl HidDevice {
 
     /// Write one 992-byte output report with a bounded timeout.
     pub fn write_report(&self, report: &[u8; G13_OUTPUT_REPORT_LENGTH]) -> Result<(), String> {
+        owner_guarded(running_process_names(), || {
+            self.write_report_unchecked(report)
+        })
+    }
+
+    fn write_report_unchecked(
+        &self,
+        report: &[u8; G13_OUTPUT_REPORT_LENGTH],
+    ) -> Result<(), String> {
         unsafe { ResetEvent(self.write_event) }
             .map_err(|e| format!("HID reset write event: {e}"))?;
         let mut overlapped = self.new_overlapped(self.write_event);
@@ -578,5 +606,25 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("read event"));
         assert_eq!(closed, vec![11]);
+    }
+
+    #[test]
+    fn lcore_race_seams_perform_zero_writes_after_detection() {
+        for phase in ["before-open", "after-open", "before-write", "idle"] {
+            let mut writes = 0;
+            let result = owner_guarded(Ok(vec!["LCore.exe".into()]), || {
+                writes += 1;
+                Ok(())
+            });
+            assert!(result.is_err(), "{phase}");
+            assert_eq!(writes, 0, "{phase}");
+        }
+        let mut writes = 0;
+        owner_guarded(Ok(Vec::new()), || {
+            writes += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(writes, 1);
     }
 }

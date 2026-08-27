@@ -8,8 +8,6 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
-#[cfg(test)]
-use crate::backends::g13::G13_OUTPUT_REPORT_LENGTH;
 use crate::backends::g13::{pack_report, parse_input};
 use crate::render::Frame;
 
@@ -26,11 +24,13 @@ pub enum Transport<'a> {
     Virtual,
     #[cfg(test)]
     Fake(&'a dyn FakeTransport),
+    #[cfg(test)]
+    FakeSdk(&'a dyn FakeTransport),
 }
 
 #[cfg(test)]
 pub(crate) trait FakeTransport {
-    fn write(&self, report: &[u8; G13_OUTPUT_REPORT_LENGTH]) -> Result<(), String>;
+    fn write(&self, report: &[u8]) -> Result<(), String>;
     fn read(&self, buffer: &mut [u8; 8], timeout: Duration) -> Result<bool, String>;
 }
 
@@ -40,6 +40,12 @@ pub struct StepResult {
     pub name: &'static str,
     pub submissions: usize,
     pub error: Option<String>,
+}
+
+pub fn record_final_error(results: &mut [StepResult], context: &str, error: String) {
+    if let Some(final_step) = results.last_mut() {
+        final_step.error = Some(format!("{context}: {error}"));
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -189,6 +195,7 @@ fn run_with_clock(
             tick,
             test.step_duration,
             test.submit_interval,
+            test.backend_name,
             clock,
             &mut last_report,
             &mut button_transitions,
@@ -220,6 +227,7 @@ fn run_with_clock(
             tick,
             test.step_duration,
             test.submit_interval,
+            test.backend_name,
             clock,
             &mut last_report,
             &mut button_transitions,
@@ -231,6 +239,10 @@ fn run_with_clock(
             submissions: result,
             error,
         });
+        if results.last().is_some_and(|result| result.error.is_some()) {
+            buttons.extend(button_transitions.disconnect(clock.now()));
+            return (results, buttons);
+        }
         // Hold the dashboard for the remaining duration.
         let remaining = test
             .duration
@@ -240,20 +252,20 @@ fn run_with_clock(
             let tick_started = clock.now();
             let report = encode(transport, &hold_frame);
             if last_report.as_ref() != Some(&report) {
-                if submit(transport, &report).is_err() {
+                if let Err(error) = submit(transport, &report) {
+                    results.last_mut().unwrap().error = Some(error);
                     break;
                 }
                 last_report = Some(report);
             }
-            if poll_buttons(
+            if let Err(error) = poll_buttons(
                 transport,
                 &mut buttons,
                 &mut button_transitions,
                 test.submit_interval,
                 clock.now(),
-            )
-            .is_err()
-            {
+            ) {
+                results.last_mut().unwrap().error = Some(error);
                 break;
             }
             clock.sleep(
@@ -276,6 +288,7 @@ fn run_step(
     mut tick: u64,
     step_duration: Duration,
     submit_interval: Duration,
+    backend_name: &str,
     clock: &dyn Clock,
     last_report: &mut Option<Vec<u8>>,
     button_transitions: &mut ButtonTransitions,
@@ -286,7 +299,11 @@ fn run_step(
     let deadline = clock.now() + step_duration;
     while clock.now() < deadline && error.is_none() {
         let tick_started = clock.now();
-        let mut frame = draw(tick);
+        let mut frame = if step == 7 {
+            identity_for(backend_name)
+        } else {
+            draw(tick)
+        };
         stamp_step(&mut frame, step);
         let report = encode(transport, &frame);
         if last_report.as_ref() != Some(&report) {
@@ -325,17 +342,15 @@ fn submit(transport: &Transport<'_>, report: &[u8]) -> Result<(), String> {
         Transport::DirectSdk(device) => device.submit(report.to_vec()),
         Transport::Virtual => Ok(()),
         #[cfg(test)]
-        Transport::Fake(fake) => fake.write(
-            report
-                .try_into()
-                .map_err(|_| "invalid fake HID test report")?,
-        ),
+        Transport::Fake(fake) | Transport::FakeSdk(fake) => fake.write(report),
     }
 }
 
 fn encode(transport: &Transport<'_>, frame: &Frame) -> Vec<u8> {
     match transport {
         Transport::DirectSdk(_) => frame.logitech_bytes(),
+        #[cfg(test)]
+        Transport::FakeSdk(_) => frame.logitech_bytes(),
         _ => pack_report(frame).to_vec(),
     }
 }
@@ -360,7 +375,7 @@ fn poll_buttons(
         }
         Transport::Virtual => Ok(false),
         #[cfg(test)]
-        Transport::Fake(fake) => fake.read(&mut raw, timeout),
+        Transport::Fake(fake) | Transport::FakeSdk(fake) => fake.read(&mut raw, timeout),
     }?;
     if read {
         buttons.extend(transitions.observe(now, parse_input(&raw)?));
@@ -431,6 +446,10 @@ fn horizontal_rows(_tick: u64) -> Frame {
 }
 
 fn identity(_tick: u64) -> Frame {
+    identity_for("HID")
+}
+
+fn identity_for(backend_name: &str) -> Frame {
     let mut f = Frame::new();
     f.rect(0, 0, 160, 43, true);
     f.text_centered(3, 154, 6, "LCDSIRPLUS", 2, true);
@@ -438,7 +457,11 @@ fn identity(_tick: u64) -> Frame {
         3,
         154,
         22,
-        &format!("V{} BACKEND HID", env!("CARGO_PKG_VERSION")),
+        &format!(
+            "V{} BACKEND {}",
+            env!("CARGO_PKG_VERSION"),
+            backend_name.to_ascii_uppercase()
+        ),
         1,
         true,
     );
@@ -504,7 +527,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeIo {
-        writes: RefCell<Vec<[u8; G13_OUTPUT_REPORT_LENGTH]>>,
+        writes: RefCell<Vec<Vec<u8>>>,
         reads: RefCell<VecDeque<[u8; 8]>>,
         fail_write_at: Cell<Option<usize>>,
         read_count: Cell<usize>,
@@ -512,11 +535,11 @@ mod tests {
     }
 
     impl FakeTransport for FakeIo {
-        fn write(&self, report: &[u8; G13_OUTPUT_REPORT_LENGTH]) -> Result<(), String> {
+        fn write(&self, report: &[u8]) -> Result<(), String> {
             if self.fail_write_at.get() == Some(self.writes.borrow().len()) {
                 return Err("injected write failure".into());
             }
-            self.writes.borrow_mut().push(*report);
+            self.writes.borrow_mut().push(report.to_vec());
             Ok(())
         }
 
@@ -557,6 +580,17 @@ mod tests {
     }
 
     #[test]
+    fn identity_screen_uses_configured_backend_name() {
+        let sdk = identity_for("sdk");
+        assert!(sdk.equal(&identity_for("SDK")));
+        assert!(!sdk.equal(&identity_for("hid")));
+        assert!(
+            sdk.equal(&identity_for("sdk")),
+            "identity rendering is deterministic"
+        );
+    }
+
+    #[test]
     fn static_step_submits_once_and_immediate_reads_cannot_burst() {
         let io = FakeIo::default();
         io.reads.borrow_mut().extend([[1, 0, 0, 0, 0, 0, 0, 0]; 5]);
@@ -571,6 +605,7 @@ mod tests {
             0,
             Duration::from_millis(500),
             Duration::from_millis(100),
+            "HID",
             &clock,
             &mut last,
             &mut transitions,
@@ -676,5 +711,37 @@ mod tests {
         assert!(results.iter().all(|r| r.submissions >= 1));
         assert_eq!(results[0].name, "all-pixels-off");
         assert_eq!(results[9].name, "normal-dashboard");
+    }
+
+    #[test]
+    fn late_sdk_hold_failure_marks_step_ten_failed() {
+        let io = FakeIo::default();
+        io.fail_read_at.set(Some(20));
+        let test = TestConfig {
+            duration: Duration::from_millis(25),
+            backend_name: "sdk",
+            dashboard: None,
+            step_duration: Duration::from_millis(2),
+            submit_interval: Duration::from_millis(1),
+        };
+        let (results, _) = run_with_clock(&Transport::FakeSdk(&io), &test, &FakeClock::new());
+        assert_eq!(results.len(), 10);
+        assert!(results[9]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("injected read failure")));
+        assert!(io.writes.borrow().iter().all(|write| write.len() == 6880));
+    }
+
+    #[test]
+    fn shutdown_failure_changes_final_verdict() {
+        let mut results = vec![StepResult {
+            step: 10,
+            name: "normal-dashboard",
+            submissions: 1,
+            error: None,
+        }];
+        record_final_error(&mut results, "SDK shutdown", "injected".into());
+        assert_eq!(results[0].error.as_deref(), Some("SDK shutdown: injected"));
     }
 }
