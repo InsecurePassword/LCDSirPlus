@@ -93,7 +93,7 @@ try {
     $env:CARGO_ENCODED_RUSTFLAGS = $remapFlags -join [char]0x1f
     Write-Host '== quality gate ==' -ForegroundColor Cyan
     & (Join-Path $PSScriptRoot 'Test.ps1')
-    if ($LASTEXITCODE -ne 0) { throw 'quality gate failed' }
+    if (-not $?) { throw 'quality gate failed' }
     if (@(git status --porcelain).Count -ne 0 -or (git rev-parse HEAD).Trim() -ne $head) { throw 'source changed during quality gate' }
 
     if ([IO.Directory]::Exists($output)) { Remove-Item -LiteralPath $output -Recurse -Force }
