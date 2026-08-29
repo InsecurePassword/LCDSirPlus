@@ -184,8 +184,8 @@ fn parse_args_from(args: impl IntoIterator<Item = impl Into<String>>) -> Result<
         if cli.backend_supplied {
             return Err("--backend requires --hardware-test".into());
         }
-        if cli.duration_supplied {
-            return Err("--duration-secs requires --hardware-test".into());
+        if cli.duration_supplied && !cli.hang_test_harness {
+            return Err("--duration-secs requires --hardware-test or --hang-test-harness".into());
         }
     }
     Ok(cli)
@@ -556,8 +556,11 @@ mod tests {
         );
         assert_eq!(
             parse_args_from(["--duration-secs", "1"]).err().unwrap(),
-            "--duration-secs requires --hardware-test"
+            "--duration-secs requires --hardware-test or --hang-test-harness"
         );
+        let harness = parse_args_from(["--hang-test-harness", "--duration-secs", "120"]).unwrap();
+        assert!(harness.hang_test_harness && harness.duration_supplied);
+        assert_eq!(harness.duration, Duration::from_secs(120));
         let cli = parse_args_from([
             "--hardware-test",
             "--backend",
