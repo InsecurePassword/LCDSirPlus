@@ -4,11 +4,12 @@
 # Blank lines and lines beginning with # are ignored. Each setting is a key
 # followed by whitespace-separated values. The physical 160x43 layout is
 # fixed; these settings select data sources, thresholds, and the ordered
-# module list for each LCD button. Saving a valid file hot-reloads it;
-# invalid changes are rejected with file/line diagnostics and the prior
-# valid configuration stays active.
+# module list for each LCD button. Saving a valid file hot-reloads it. Parse or
+# token errors identify the source line; final range or cross-field errors can
+# report line 0. Invalid changes are rejected; the prior valid config stays active.
 #
-# Every selector that supports one defaults to "auto".
+# Selectors generally default to "auto"; network_probe_method accepts "auto"
+# but intentionally defaults to "icmp".
 
 config_refresh_ms       1000
 telemetry_interval_ms   auto          # 300
@@ -28,8 +29,8 @@ time_format             HH:mm:ss
 
 slot_0  HEADSET_BATTERY CPU_TEMP CONTROLLER_BATTERY
 slot_1  FPS_CURRENT FPS_1LOW FRAME_TIME SESSION_TIME
-slot_2  GPU_TEMP PING JITTER AUDIO
-slot_3  PACKET_LOSS MIC_STATUS SESSION_SUMMARY PROVIDER_STATUS
+slot_2  PROC_HANG GPU_TEMP PING JITTER AUDIO
+slot_3  THERMALS PACKET_LOSS MIC_STATUS SESSION_SUMMARY PROVIDER_STATUS
 
 ##############################################################################
 # Cache/Frequency CCD bars (dual-CCD Ryzen). Detection is fully native:
@@ -60,10 +61,10 @@ logitech_orientation    normal        # normal | flip_x | flip_y | rotate_180
 logitech_invert         0
 
 ##############################################################################
-# LibreHardwareMonitor: demoted to an optional temps-only fallback (Phase 2).
-# In auto mode it supplies CPU temperature and only supplies GPU temperature
-# when the native vendor DLL cannot. Healthy temperatures reduce its cadence.
-# Its loopback web server must be enabled on port 8085.
+# Native Win32/vendor APIs are used first. HWiNFO, then exact/automatic LHM,
+# covers only readings with no safe native source. LCDSirPlus never probes raw
+# MSRs, SMBus, EC, or Super-I/O. LHM is user-managed: explicitly start it and
+# safely enable its loopback web server (normally port 8085).
 
 lhm_mode                auto          # auto | on | off
 lhm_url                 auto          # http://127.0.0.1:8085/data.json
@@ -72,13 +73,42 @@ lhm_stale_ms            auto          # 3000
 # Optional stable SensorId overrides from a diagnostic bundle:
 # lhm_cpu_temp_sensor    /amdcpu/0/temperature/2
 # lhm_gpu_temp_sensor    /lpc/it8720f/temperature/2
+# lhm_vrm_temp_sensor
+# lhm_chipset_temp_sensor
+# lhm_motherboard_temp_sensor
+# lhm_cpu_fan_control_sensor
+# lhm_cpu_fan_rpm_sensor
+# lhm_pump_control_sensor
+# lhm_pump_rpm_sensor
+# lhm_total_power_sensor
+# lhm_cpu_power_sensor
+# lhm_gpu_power_sensor
+cpu_fan_max_rpm         0
+pump_max_rpm            0
+
+# Exact, case-sensitive HWiNFO original-label pairs. Leave both values blank by
+# omitting a pair. Exact HWiNFO CPU temperature is preferred over LHM. Enter
+# labels shown by your own HWiNFO; LCDSirPlus only reads shared memory and never
+# starts or configures HWiNFO. Start Sensors-only, enable Shared Memory Support,
+# then run LCDSirPlus.exe --list-hwinfo-sensors. HWiNFO64 Free shared memory is
+# limited to 12 hours; use HWiNFO32 or appropriately licensed Pro for unattended
+# use according to vendor terms.
+# hwinfo_cpu_temp_sensor "<exact sensor original label>"
+# hwinfo_cpu_temp_reading "<exact temperature original label>"
+# hwinfo_total_power_sensor "System"
+# hwinfo_total_power_reading "Total Power"
+# hwinfo_cpu_power_sensor "CPU [#0]"
+# hwinfo_cpu_power_reading "CPU Package Power"
+# hwinfo_gpu_power_sensor "GPU [#0]"
+# hwinfo_gpu_power_reading "GPU Power"
+hwinfo_stale_ms         5000
 
 # Native GPU provider (Phase 2): auto tries nvapi then adlx; off disables it.
 gpu_provider            auto          # auto | nvapi | adlx | off
 
 ##############################################################################
-# PresentMon game performance provider (Phase 2).
-# The external PresentMon console is optional and is not redistributed.
+# Official signed PresentMon v2.5.1 console bundled for frame/FPS timing only.
+# LCDSirPlus owns it only during active capture; no service/MSI/API is installed.
 
 presentmon_enabled      1
 presentmon_path         auto
@@ -86,10 +116,15 @@ presentmon_interval_ms  auto          # 1000
 presentmon_window_ms    auto          # 60000
 presentmon_target_mode  foreground    # foreground | process_name | disabled
 presentmon_process_name ""
+# presentmon_exclude dwm.exe explorer.exe applicationframehost.exe textinputhost.exe searchhost.exe lcdsirplus.exe lcdsirplus.console.exe
 stutter_threshold_ms    33.34
 
 ##############################################################################
-# SteelSeries Arctis 7P+ (VID 1038 / PID 2212) — Phase 2.
+# Explicitly supported SteelSeries wireless USB receiver families (VID 1038).
+# Includes selected Arctis 1, 7X/7P, 9, Pro Wireless, 7+/7P+, Nova 3/5/7, and
+# GameBuds profiles; not generic support for every SteelSeries, Bluetooth, or
+# wired device. See docs/CONFIGURATION.md for the exact 32 PIDs across eight
+# protocols and battery granularity. GG is not required as a data source.
 
 headset_enabled         1
 headset_poll_ms         auto          # 15000
@@ -111,6 +146,22 @@ network_probe_target    1.1.1.1       # IP literal; optional TCP port
 network_probe_interval_ms auto        # 1000
 network_probe_timeout_ms auto         # 1500
 network_probe_window    30
+# Every graph covers exactly the trailing 30 seconds. Fixed scales only; numeric
+# values are never clipped. Network/disk range 1..100000; FPS range 1..1000.
+network_graph_ceiling_mbps 1000
+disk_graph_ceiling_mbps 1000
+fps_graph_ceiling       240
+
+# Selected CPU/GPU temperature panes invert every 100 ms at the max threshold.
+# warning=1 requires render_interval_ms <=100. Other alert types remain.
+warning                 1
+cpu_temp_max_c          90
+gpu_temp_max_c          90
+bottleneck_cpu_percent  90
+bottleneck_gpu_percent  95
+bottleneck_memory_percent 90
+bottleneck_disk_mbps    500
+bottleneck_sustain_ms   2000
 
 # Windows default audio endpoints — Phase 2.
 audio_enabled           1
@@ -131,11 +182,12 @@ discord_show_self       0
 discord_show_channel    0
 
 ##############################################################################
-# Hung-window detector and guarded Phase 4 action. Physical button 3 is fixed;
-# safe mode keeps ordinary short-press cycling but cannot bind/terminate.
+# Hung-window detector and guarded action. PROC_HANG may occur only once; while
+# selected, its slot's physical button owns the binding. No target dynamically
+# shows the next token without changing selection. Safe mode cannot terminate.
 
 hang_enabled            1
-hang_button             3
+hang_button             3             # Legacy accepted; selected PROC_HANG slot owns runtime button.
 hang_hold_ms            2000
 hang_probe_interval_ms  2000
 hang_probe_timeout_ms   350
@@ -158,8 +210,5 @@ critical_alert_linger_ms 3000
 log_level               info          # debug | info | warn | error
 log_max_bytes           2097152
 log_backups             3
-
-# Personal overrides can be kept separately:
-# include lcdsirplus.local.txt
 
 # end of file

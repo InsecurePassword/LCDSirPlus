@@ -26,7 +26,6 @@ pub struct CcdTopology {
     /// Kernel logical-processor masks (single-group systems).
     pub cache_mask: u64,
     pub freq_mask: u64,
-    pub lp_count: usize,
     pub detail: String,
 }
 
@@ -36,7 +35,6 @@ impl CcdTopology {
             dual: false,
             cache_mask: mask,
             freq_mask: 0,
-            lp_count: mask.count_ones() as usize,
             detail: detail.into(),
         }
     }
@@ -58,12 +56,10 @@ pub fn detect() -> CcdTopology {
         sorted.sort_by_key(|m| (group_of(*m), lowest_bit(*m)));
         let (a, b) = (sorted[0], sorted[1]);
         let (cache, freq) = label_by_l3_size(a, b);
-        let lp_count = (a | b).count_ones() as usize;
         return CcdTopology {
             dual: true,
             cache_mask: cache,
             freq_mask: freq,
-            lp_count,
             detail: format!("{}: cache=0x{:x} frequency=0x{:x}", source, cache, freq),
         };
     }
@@ -87,7 +83,6 @@ pub fn from_lists(cache: &[u32], freq: &[u32]) -> CcdTopology {
             dual: true,
             cache_mask,
             freq_mask,
-            lp_count: (cache_mask | freq_mask).count_ones() as usize,
             detail: "manual processor lists".into(),
         }
     } else {
@@ -356,7 +351,6 @@ mod tests {
         assert!(t.dual);
         assert_eq!(t.cache_mask, 0b1111);
         assert_eq!(t.freq_mask, 0b1111_0000);
-        assert_eq!(t.lp_count, 8);
     }
 
     #[test]
@@ -411,7 +405,6 @@ mod tests {
         assert!(topology.dual);
         assert_eq!(topology.cache_mask, 0xFFFF);
         assert_eq!(topology.freq_mask, 0xFFFF0000);
-        assert_eq!(topology.lp_count, 32);
         assert!(topology.detail.starts_with("L3 cache domains:"));
     }
 }

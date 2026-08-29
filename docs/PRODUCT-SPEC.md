@@ -4,9 +4,10 @@
 
 LCDSirPlus provides a modern fixed dashboard for the Logitech G13 160×43
 monochrome LCD when games occupy the user's normal displays. The 0.3.0 Rust
-port preserves the 0.2.0 product contract while removing three dependencies:
-the Logitech runtime, Process Lasso, and per-tick network polling for
-core telemetry.
+port preserves the 0.2.0 product contract while removing Process Lasso and
+per-tick network polling for core telemetry. Direct HID requires no Logitech
+runtime, while the supported SDK path interoperates with a trusted running
+LCore installation.
 
 ## Normal screen
 
@@ -19,6 +20,12 @@ The normal screen always shows:
 - GPU load and VRAM load from available native vendor providers, with explicit
   unavailable state when prerequisites are absent;
 - four button-aligned configurable telemetry modules.
+
+The slot registry contains exactly 53 tokens. Graph variants show exactly the
+trailing 30 seconds; configured ceilings affect graph scale only. Native system,
+disk, connection, battery, and vendor GPU sources require no helper. Board,
+cooling, total-power, and CPU-temperature fallbacks fail closed when their exact
+optional source is unavailable.
 
 The fixed layout is intentionally static. The lower slot contents are the
 user-customizable surface.
@@ -63,10 +70,13 @@ LGS/direct-HID writers without blocking unrelated G HUB processes.
 - Windows scheduler: per-logical-processor CPU load (CCD aggregation).
 - GlobalMemoryStatusEx: memory load.
 - NVIDIA NVAPI / AMD ADLX vendor DLLs provide GPU load, VRAM, and temperature;
-  LibreHardwareMonitor loopback JSON is an optional temperatures-only fallback
-  when available.
-- PresentMon: optional FPS/frame timing.
-- Arctis 7P+ USB HID: optional headset battery.
+  NVML can provide safely aligned NVIDIA power. HWiNFO shared memory and
+  LibreHardwareMonitor loopback JSON are optional fallbacks only where no safe
+  native source exists.
+- Official signed bundled PresentMon v2.5.1 console: FPS/frame timing only;
+  launched and owned only during active capture, with no service/MSI/API.
+- Explicitly profiled SteelSeries Arctis/GameBuds wireless USB receiver
+  families: optional battery, connection, and model-dependent charging state.
 - Discord local RPC: verified active-speaker overlay with RPC OAuth and
   active-account-bound, per-Discord-user DPAPI credential storage; authorization
   uses no redirect URI or callback listener.
@@ -85,7 +95,10 @@ LGS/direct-HID writers without blocking unrelated G HUB processes.
 - A local-only diagnostics command produces an atomic, redacted ZIP capped at
   1 MiB from typed offline facts; it excludes raw logs/configuration and private
   identifiers/content and starts no hardware, provider, network, or action path.
-- Single native binary; no framework/runtime installation.
+- One native LCDSirPlus application executable plus the bundled PresentMon
+  console helper; no framework/runtime installation.
+- No raw MSR, SMBus, EC, or Super-I/O probing. Optional HWiNFO/LHM processes
+  remain user-managed and are never bundled, started, or configured.
 - One normal/direct-HID runtime per Windows session; read-only and virtual test
   commands remain available alongside it.
 - Optional network-quality probes are disabled by default, bounded to one
@@ -100,15 +113,18 @@ LGS/direct-HID writers without blocking unrelated G HUB processes.
 ## Alerts and preview
 
 Current CPU/GPU temperature, memory/VRAM load, and headset battery readings
-produce deterministic configured alert episodes. Hung-target interaction has
-highest display priority, followed by unacknowledged alerts, Discord speakers,
-and the dashboard. Physical button 4 acknowledges the highest episode; an
-episode rearms only after clearing and recurring.
+produce deterministic configured alert episodes. With `warning=1`, selected
+temperature panes at their shared graph/warning threshold invert on alternating
+100 ms phases instead of using full-screen CPU/GPU temperature overlays; other
+alerts remain. Hung-target interaction has highest display priority, followed
+by remaining unacknowledged overlays, Discord speakers, and the dashboard.
+Physical button 4 acknowledges the highest episode; an episode rearms only
+after clearing and recurring.
 
-Preview mode `auto` follows physical HID availability, `always` starts visible
-unless minimized, and `never` starts hidden. Backend reconnect state changes
-reuse the existing preview window rather than creating another UI owner and do
-not override a manual tray toggle.
+Preview mode `auto` hides the preview when either HID or SDK is connected as a
+physical backend, `always` starts visible unless minimized, and `never` starts
+hidden. Backend reconnect state changes reuse the existing preview window
+rather than creating another UI owner and do not override a manual tray toggle.
 
 ## Hung-window detector
 
@@ -120,7 +136,10 @@ absence, identity replacement, safe mode, or disabling the detector removes it
 immediately. A detector publication is display input only and is never sufficient
 authorization for the guarded action.
 
-The guarded action binds the exact selected target only at physical button-down.
+The guarded action binds the exact selected target only at physical button-down
+on the slot whose currently selected token is `PROC_HANG`; the legacy
+`hang_button` value does not choose the runtime button. `PROC_HANG` is globally
+unique, and no-target display fallback does not change its selection.
 The same input source must remain continuously held and release after the
 configured duration; full progress alone does nothing. Recovery, disappearance,
 identity or selection change, device loss, provider failure, safe mode, disable,
@@ -131,7 +150,7 @@ It never elevates or retries with broader access.
 
 ## Non-goals
 
-- G19 color LCD; direct Logitech SDK/LCore support.
+- G19 color LCD.
 - Steam/NVIDIA overlay hooking; kernel-driver sensor access.
 - Email integration; remote telemetry/control; arbitrary third-party
   modules; layout editor; Process Lasso integration.

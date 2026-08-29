@@ -12,12 +12,24 @@ use windows::Win32::NetworkManagement::Ndis::IF_OPER_STATUS;
 const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
 const IF_OPER_STATUS_UP: i32 = 1;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct NetThroughput {
     /// Receive bytes/second across all physical interfaces.
     pub in_bps: f64,
     /// Transmit bytes/second across all physical interfaces.
     pub out_bps: f64,
+    /// Wall-clock time of the counter sample used for this rate.
+    pub sampled_at: std::time::SystemTime,
+}
+
+impl Default for NetThroughput {
+    fn default() -> Self {
+        Self {
+            in_bps: 0.0,
+            out_bps: 0.0,
+            sampled_at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -65,15 +77,27 @@ impl NetProvider {
     /// Sample throughput. `Ok(None)` means a baseline was captured but no
     /// rate exists yet; a real idle delta is `Ok(Some(0, 0))`.
     pub fn update(&mut self) -> Result<Option<NetThroughput>, String> {
-        self.update_from(snapshot(), std::time::Instant::now())
+        self.update_from(
+            snapshot(),
+            std::time::Instant::now(),
+            std::time::SystemTime::now(),
+        )
     }
 
     fn update_from(
         &mut self,
         current: Result<SystemCounters, String>,
         now: std::time::Instant,
+        sampled_at: std::time::SystemTime,
     ) -> Result<Option<NetThroughput>, String> {
-        let current = current?;
+        let current = match current {
+            Ok(current) => current,
+            Err(error) => {
+                self.prev = None;
+                self.prev_at = None;
+                return Err(error);
+            }
+        };
         let Some(prev) = self.prev.take() else {
             self.prev = Some(current);
             self.prev_at = Some(now);
@@ -83,7 +107,10 @@ impl NetProvider {
             .duration_since(self.prev_at.unwrap_or(now))
             .as_secs_f64();
         self.prev_at = Some(now);
-        let mut result = NetThroughput::default();
+        let mut result = NetThroughput {
+            sampled_at,
+            ..Default::default()
+        };
         if elapsed <= 0.0 {
             self.prev = Some(current);
             return Ok(Some(result));
@@ -109,24 +136,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn baseline_idle_and_failure_are_distinct() {
+    fn failure_clears_baseline_and_recovery_requires_a_new_interval() {
         let mut p = NetProvider::new();
         let now = std::time::Instant::now();
-        let counters = || SystemCounters {
-            entries: vec![(1, 100, 200)],
+        let counters = |in_octets, out_octets| SystemCounters {
+            entries: vec![(1, in_octets, out_octets)],
         };
-        assert!(p.update_from(Ok(counters()), now).unwrap().is_none());
+        let sampled_at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        assert!(p
+            .update_from(Ok(counters(100, 200)), now, sampled_at)
+            .unwrap()
+            .is_none());
         let n = p
-            .update_from(Ok(counters()), now + std::time::Duration::from_secs(1))
+            .update_from(
+                Ok(counters(100, 200)),
+                now + std::time::Duration::from_secs(1),
+                sampled_at + std::time::Duration::from_secs(1),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(n.in_bps, 0.0);
         assert_eq!(n.out_bps, 0.0);
+        assert_eq!(n.sampled_at, sampled_at + std::time::Duration::from_secs(1));
         assert!(p
             .update_from(
                 Err("failed".into()),
-                now + std::time::Duration::from_secs(2)
+                now + std::time::Duration::from_secs(2),
+                sampled_at + std::time::Duration::from_secs(2),
             )
             .is_err());
+        assert!(p.prev.is_none());
+        assert!(p.prev_at.is_none());
+
+        assert!(p
+            .update_from(
+                Ok(counters(10_000, 20_000)),
+                now + std::time::Duration::from_secs(3),
+                sampled_at + std::time::Duration::from_secs(3),
+            )
+            .unwrap()
+            .is_none());
+        let recovered = p
+            .update_from(
+                Ok(counters(10_100, 20_200)),
+                now + std::time::Duration::from_secs(4),
+                sampled_at + std::time::Duration::from_secs(4),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.in_bps, 100.0);
+        assert_eq!(recovered.out_bps, 200.0);
+        assert_eq!(
+            recovered.sampled_at,
+            sampled_at + std::time::Duration::from_secs(4)
+        );
     }
 }

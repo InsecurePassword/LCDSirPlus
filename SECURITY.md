@@ -8,7 +8,21 @@ named pipe, and explicitly configured outbound endpoints. It does not install a
 service, driver, listener, browser extension, or elevated component.
 Discord RPC authorization sends no redirect URI and opens no callback listener.
 
-Packages are not code-signed. Verify `LCDSirPlus-0.3.0-SHA256SUMS.txt` and the package's sorted
+Telemetry is native-first. LCDSirPlus uses documented Win32/vendor APIs and
+never probes raw MSRs, SMBus, EC, or Super-I/O registers. Optional HWiNFO access
+is read-only shared memory; LCDSirPlus does not start or configure it. Optional
+LibreHardwareMonitor access is HTTP restricted to loopback, but the user is
+responsible for safely enabling and operating that web server.
+
+Packages bundle the official Intel-signed PresentMon v2.5.1 console and exact
+`licenses/PresentMon/LICENSE.txt`/`THIRD_PARTY.txt` notices. LCDSirPlus validates
+the automatic artifact, starts it without a shell only for active frame capture,
+and terminates only its owned child. It installs no PresentMon service, MSI,
+GUI, or API. Local ETW policy can require Performance Log Users membership or
+elevation for capture; neither is granted by LCDSirPlus.
+
+LCDSirPlus packages are not code-signed even though the bundled PresentMon
+binary is. Verify `LCDSirPlus-0.3.0-SHA256SUMS.txt` and the package's sorted
 `PACKAGE-MANIFEST.txt` before running an executable or installer. The installer
 performs the same member hash, size, name, reparse, and hard-link checks and
 refuses foreign Start Menu or HKCU Run ownership.

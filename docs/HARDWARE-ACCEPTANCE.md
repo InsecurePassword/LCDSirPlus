@@ -60,9 +60,11 @@ requires a complete rerun.
 
 - Use only `LCDSirPlus.exe --hang-test-harness`; never use an application with
   unsaved data.
-- Confirm short press only cycles, early release does not terminate, target/
-  identity/recovery/config/safe-mode/device changes cancel, and only a completed
-  continuous physical hold followed by release terminates the disposable child.
+- Confirm a bound short release navigates target detail/selection without
+  terminating; with no bound target it performs ordinary slot cycling. Confirm
+  target/identity/recovery/config/safe-mode/device changes cancel, only a
+  qualified continuous physical hold followed by release can terminate the
+  disposable child, and an overlong stale release is refused.
 - Record positive and negative harness results. Do not treat software unit tests
   as physical-button authorization evidence.
 

@@ -4,8 +4,9 @@
 //! key/value lines, ordered `slot_0`..`slot_3` module lists, `include`
 //! override files, hot reload with last-valid-state preservation.
 //!
-//! Every selector that supports one defaults to `auto`. The v2 schema
-//! removes the retired Process Lasso and Logitech SDK keys.
+//! Selectors generally default to `auto`; `network_probe_method` accepts
+//! `auto` but intentionally defaults to `icmp`. The v2 schema removes the
+//! retired Process Lasso and Logitech SDK keys.
 
 use std::time::Duration;
 
@@ -23,8 +24,9 @@ pub const MAX_CONFIG_LIST_ITEMS: usize = 256;
 pub const DEFAULT_SLOTS: [&[&str]; 4] = [
     &["HEADSET_BATTERY", "CPU_TEMP", "CONTROLLER_BATTERY"],
     &["FPS_CURRENT", "FPS_1LOW", "FRAME_TIME", "SESSION_TIME"],
-    &["GPU_TEMP", "PING", "JITTER", "AUDIO"],
+    &["PROC_HANG", "GPU_TEMP", "PING", "JITTER", "AUDIO"],
     &[
+        "THERMALS",
         "PACKET_LOSS",
         "MIC_STATUS",
         "SESSION_SUMMARY",
@@ -43,6 +45,10 @@ pub const MODULES: &[&str] = &[
     "GPU_TEMP",
     "NET_IN",
     "NET_OUT",
+    "NET_BOTH",
+    "NET_IN_GRAPH",
+    "NET_OUT_GRAPH",
+    "NET_GRAPH",
     "PING",
     "JITTER",
     "PACKET_LOSS",
@@ -60,6 +66,28 @@ pub const MODULES: &[&str] = &[
     "VRAM_USAGE",
     "CPU_CACHE_TEMP",
     "CPU_FREQ_TEMP",
+    "CPU_LOAD_GRAPH",
+    "GPU_LOAD_GRAPH",
+    "CPU_TEMP_GRAPH",
+    "GPU_TEMP_GRAPH",
+    "VRM_TEMP",
+    "CPU_FAN",
+    "PUMP_RPM",
+    "POWER_LIMIT",
+    "CPU_GPU_POWER",
+    "CHIPSET_TEMP",
+    "MOTHERBOARD_TEMP",
+    "DISK_IO",
+    "DISK_IO_GRAPH",
+    "RAM_DETAIL",
+    "FPS_GRAPH",
+    "THERMALS",
+    "CONNECTIONS",
+    "NET_HEALTH",
+    "SYSTEM_BATTERY",
+    "HARD_FAULTS",
+    "BOTTLENECK",
+    "PROC_HANG",
 ];
 
 pub fn valid_module(s: &str) -> bool {
@@ -106,6 +134,18 @@ pub struct Config {
     pub lhm_interval: Duration,
     pub lhm_stale_after: Duration,
     pub lhm_sensors: std::collections::BTreeMap<String, String>,
+    pub cpu_fan_max_rpm: u32,
+    pub pump_max_rpm: u32,
+
+    pub hwinfo_cpu_temp_sensor: String,
+    pub hwinfo_cpu_temp_reading: String,
+    pub hwinfo_total_power_sensor: String,
+    pub hwinfo_total_power_reading: String,
+    pub hwinfo_cpu_power_sensor: String,
+    pub hwinfo_cpu_power_reading: String,
+    pub hwinfo_gpu_power_sensor: String,
+    pub hwinfo_gpu_power_reading: String,
+    pub hwinfo_stale_after: Duration,
 
     // GPU provider selection: native NVAPI -> ADLX in auto.
     pub gpu_provider: String,
@@ -137,6 +177,19 @@ pub struct Config {
     pub network_probe_interval: Duration,
     pub network_probe_timeout: Duration,
     pub network_probe_window: i32,
+    pub network_graph_ceiling_mbps: f64,
+    pub disk_graph_ceiling_mbps: f64,
+    pub fps_graph_ceiling: f64,
+
+    pub warning: bool,
+    pub cpu_temp_max_c: f64,
+    pub gpu_temp_max_c: f64,
+
+    pub bottleneck_cpu_percent: f64,
+    pub bottleneck_gpu_percent: f64,
+    pub bottleneck_memory_percent: f64,
+    pub bottleneck_disk_mbps: f64,
+    pub bottleneck_sustain: Duration,
 
     pub audio_enabled: bool,
     pub audio_poll: Duration,
@@ -151,6 +204,7 @@ pub struct Config {
     pub discord_show_channel: bool,
 
     pub hang_enabled: bool,
+    // Legacy persisted binding; PROC_HANG slot/button behavior is resolved separately.
     pub hang_button: i32,
     pub hang_hold: Duration,
     pub hang_probe_interval: Duration,
@@ -208,6 +262,17 @@ impl Default for Config {
             lhm_interval: Duration::from_millis(300),
             lhm_stale_after: Duration::from_secs(3),
             lhm_sensors: Default::default(),
+            cpu_fan_max_rpm: 0,
+            pump_max_rpm: 0,
+            hwinfo_cpu_temp_sensor: String::new(),
+            hwinfo_cpu_temp_reading: String::new(),
+            hwinfo_total_power_sensor: String::new(),
+            hwinfo_total_power_reading: String::new(),
+            hwinfo_cpu_power_sensor: String::new(),
+            hwinfo_cpu_power_reading: String::new(),
+            hwinfo_gpu_power_sensor: String::new(),
+            hwinfo_gpu_power_reading: String::new(),
+            hwinfo_stale_after: Duration::from_secs(5),
             gpu_provider: "auto".into(),
             presentmon_enabled: true,
             presentmon_path: "auto".into(),
@@ -244,6 +309,17 @@ impl Default for Config {
             network_probe_interval: Duration::from_secs(1),
             network_probe_timeout: Duration::from_millis(1500),
             network_probe_window: 30,
+            network_graph_ceiling_mbps: 1000.0,
+            disk_graph_ceiling_mbps: 1000.0,
+            fps_graph_ceiling: 240.0,
+            warning: true,
+            cpu_temp_max_c: 90.0,
+            gpu_temp_max_c: 90.0,
+            bottleneck_cpu_percent: 90.0,
+            bottleneck_gpu_percent: 95.0,
+            bottleneck_memory_percent: 90.0,
+            bottleneck_disk_mbps: 500.0,
+            bottleneck_sustain: Duration::from_secs(2),
             audio_enabled: true,
             audio_poll: Duration::from_secs(1),
             discord_enabled: true,
@@ -338,6 +414,9 @@ pub fn validate(c: &Config) -> Result<(), String> {
         25,
         5000,
     )?;
+    if c.warning && c.render_interval > Duration::from_millis(100) {
+        return Err("render_interval_ms must be <=100 when warning=1".into());
+    }
     if !matches!(c.preview_mode.as_str(), "auto" | "always" | "never") {
         return Err("preview_mode must be auto, always, or never".into());
     }
@@ -410,6 +489,43 @@ pub fn validate(c: &Config) -> Result<(), String> {
     if c.lhm_stale_after < c.lhm_interval || c.lhm_stale_after > Duration::from_secs(300) {
         return Err("lhm_stale_ms must be >= lhm_interval_ms and <= 300000".into());
     }
+    if c.cpu_fan_max_rpm > 30000 || c.pump_max_rpm > 30000 {
+        return Err("cpu_fan_max_rpm and pump_max_rpm must be 0..30000".into());
+    }
+    for (sensor, reading, name) in [
+        (
+            &c.hwinfo_cpu_temp_sensor,
+            &c.hwinfo_cpu_temp_reading,
+            "cpu_temp",
+        ),
+        (
+            &c.hwinfo_total_power_sensor,
+            &c.hwinfo_total_power_reading,
+            "total_power",
+        ),
+        (
+            &c.hwinfo_cpu_power_sensor,
+            &c.hwinfo_cpu_power_reading,
+            "cpu_power",
+        ),
+        (
+            &c.hwinfo_gpu_power_sensor,
+            &c.hwinfo_gpu_power_reading,
+            "gpu_power",
+        ),
+    ] {
+        if sensor.is_empty() != reading.is_empty() {
+            return Err(format!(
+                "hwinfo_{name}_sensor and hwinfo_{name}_reading must both be blank or both nonblank"
+            ));
+        }
+    }
+    check_range_u64(
+        "hwinfo_stale_ms",
+        c.hwinfo_stale_after.as_millis() as u64,
+        1000,
+        60000,
+    )?;
     if !matches!(c.gpu_provider.as_str(), "auto" | "nvapi" | "adlx" | "off") {
         return Err("gpu_provider must be auto, nvapi, adlx, or off".into());
     }
@@ -495,6 +611,51 @@ pub fn validate(c: &Config) -> Result<(), String> {
         50,
         30000,
     )?;
+    check_range_f64(
+        "network_graph_ceiling_mbps",
+        c.network_graph_ceiling_mbps,
+        1.0,
+        100000.0,
+    )?;
+    check_range_f64(
+        "disk_graph_ceiling_mbps",
+        c.disk_graph_ceiling_mbps,
+        1.0,
+        100000.0,
+    )?;
+    check_range_f64("fps_graph_ceiling", c.fps_graph_ceiling, 1.0, 1000.0)?;
+    check_range_f64("cpu_temp_max_c", c.cpu_temp_max_c, 1.0, 150.0)?;
+    check_range_f64("gpu_temp_max_c", c.gpu_temp_max_c, 1.0, 150.0)?;
+    check_range_f64(
+        "bottleneck_cpu_percent",
+        c.bottleneck_cpu_percent,
+        1.0,
+        100.0,
+    )?;
+    check_range_f64(
+        "bottleneck_gpu_percent",
+        c.bottleneck_gpu_percent,
+        1.0,
+        100.0,
+    )?;
+    check_range_f64(
+        "bottleneck_memory_percent",
+        c.bottleneck_memory_percent,
+        1.0,
+        100.0,
+    )?;
+    check_range_f64(
+        "bottleneck_disk_mbps",
+        c.bottleneck_disk_mbps,
+        1.0,
+        100000.0,
+    )?;
+    check_range_u64(
+        "bottleneck_sustain_ms",
+        c.bottleneck_sustain.as_millis() as u64,
+        0,
+        60000,
+    )?;
     for (name, v) in [
         ("cpu_temp_warning", c.cpu_temp_warning),
         ("cpu_temp_critical", c.cpu_temp_critical),
@@ -524,9 +685,7 @@ pub fn validate(c: &Config) -> Result<(), String> {
     if !c.discord_client_id.is_empty() && !c.discord_client_id.chars().all(|r| r.is_ascii_digit()) {
         return Err("discord_client_id must contain digits only".into());
     }
-    if c.hang_button != 3 {
-        return Err("hang_button is fixed to physical button 3".into());
-    }
+    check_range_i32("hang_button", c.hang_button, 1, 4)?;
     check_range_u64("hang_hold_ms", c.hang_hold.as_millis() as u64, 1000, 10000)?;
     check_range_u64(
         "hang_probe_interval_ms",
@@ -561,6 +720,15 @@ pub fn validate(c: &Config) -> Result<(), String> {
                 return Err(format!("slot_{} contains unknown module {:?}", i, module));
             }
         }
+    }
+    let proc_hang_count = c
+        .slots
+        .iter()
+        .flatten()
+        .filter(|module| module.eq_ignore_ascii_case("PROC_HANG"))
+        .count();
+    if proc_hang_count > 1 {
+        return Err("PROC_HANG may occur only once across all slots".into());
     }
     if !matches!(c.log_level.as_str(), "debug" | "info" | "warn" | "error") {
         return Err("log_level must be debug, info, warn, or error".into());
@@ -721,26 +889,105 @@ mod tests {
     }
 
     #[test]
+    fn network_graph_ceiling_is_positive_finite_and_bounded() {
+        for module in [
+            "NET_IN",
+            "NET_OUT",
+            "NET_BOTH",
+            "NET_IN_GRAPH",
+            "NET_OUT_GRAPH",
+            "NET_GRAPH",
+        ] {
+            assert!(valid_module(module));
+        }
+        for value in [0.0, f64::NAN, f64::INFINITY, 100001.0] {
+            let cfg = Config {
+                network_graph_ceiling_mbps: value,
+                ..Config::default()
+            };
+            assert!(validate(&cfg).is_err(), "accepted {value}");
+        }
+        let cfg = Config {
+            network_graph_ceiling_mbps: 100000.0,
+            ..Config::default()
+        };
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
     fn default_slots_match_shipped_portable_config() {
-        let c = Config::default();
-        assert_eq!(
-            c.slots[0],
-            vec!["HEADSET_BATTERY", "CPU_TEMP", "CONTROLLER_BATTERY"]
-        );
-        assert_eq!(
-            c.slots[1],
-            vec!["FPS_CURRENT", "FPS_1LOW", "FRAME_TIME", "SESSION_TIME"]
-        );
-        assert_eq!(c.slots[2], vec!["GPU_TEMP", "PING", "JITTER", "AUDIO"]);
-        assert_eq!(
-            c.slots[3],
-            vec![
-                "PACKET_LOSS",
-                "MIC_STATUS",
-                "SESSION_SUMMARY",
-                "PROVIDER_STATUS"
-            ]
-        );
+        let shipped = crate::parser::parse_standalone(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/lcdsirplus.txt"
+        )))
+        .expect("canonical shipped configuration must parse");
+        assert_eq!(Config::default().slots, shipped.slots);
+    }
+
+    #[test]
+    fn module_registry_is_exact_unique_and_case_insensitive() {
+        assert_eq!(MODULES.len(), 53);
+        let unique: std::collections::HashSet<_> = MODULES.iter().collect();
+        assert_eq!(unique.len(), MODULES.len());
+        assert!(MODULES
+            .iter()
+            .all(|module| valid_module(&module.to_lowercase())));
+    }
+
+    #[test]
+    fn module_expansion_ranges_and_hwinfo_pairs_validate() {
+        let defaults = Config::default();
+        assert!(defaults.hwinfo_cpu_temp_sensor.is_empty());
+        assert!(defaults.hwinfo_cpu_temp_reading.is_empty());
+        let mut cfg = Config {
+            hwinfo_cpu_temp_sensor: "CPU [#0]".into(),
+            ..Config::default()
+        };
+        assert!(validate(&cfg).is_err());
+        cfg.hwinfo_cpu_temp_reading = "CPU (Tctl/Tdie)".into();
+        assert!(validate(&cfg).is_ok());
+        cfg.hwinfo_total_power_sensor = "System".into();
+        assert!(validate(&cfg).is_err());
+        cfg.hwinfo_total_power_reading = "Total Power".into();
+        assert!(validate(&cfg).is_ok());
+        cfg.cpu_fan_max_rpm = 30001;
+        assert!(validate(&cfg).is_err());
+        cfg.cpu_fan_max_rpm = 0;
+        cfg.cpu_temp_max_c = f64::NAN;
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn proc_hang_is_globally_unique_and_legacy_button_is_accepted() {
+        let mut cfg = Config {
+            hang_button: 1,
+            ..Config::default()
+        };
+        assert!(validate(&cfg).is_ok());
+        cfg.slots[0].push("PROC_HANG".into());
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn warning_requires_rendering_each_hundred_millisecond_transition() {
+        assert!(validate(&Config {
+            warning: true,
+            render_interval: Duration::from_millis(100),
+            ..Config::default()
+        })
+        .is_ok());
+        assert!(validate(&Config {
+            warning: true,
+            render_interval: Duration::from_millis(101),
+            ..Config::default()
+        })
+        .is_err());
+        assert!(validate(&Config {
+            warning: false,
+            render_interval: Duration::from_secs(5),
+            ..Config::default()
+        })
+        .is_ok());
     }
 
     #[test]

@@ -40,9 +40,9 @@ FPS 144, 1% low 118, GPU temp 74 °C; slots
 
 | Variant | Logical pixel-buffer SHA-256 |
 |---|---|
-| Normal (dual-CCD) | `16eaeeb02f8ed4b89f721cad9557b749ad5ca2c24a7a9ff41b9682d678cec9a4` |
-| Bars unavailable | `0ba19f9f03f908986009a86c3766755b5570e699fb97409dbabaa55a941a6940` |
-| Bars stale | `2905e74cd8844a8b168a7575b663b889232c04aa8b0dedac7b57f58d42208854` |
+| Normal (dual-CCD) | `e44f9a1646d9e091fd1482dc5147f0cd9e639f0dd6b7fbb93edcf5d10da2757b` |
+| Bars unavailable | `0561081d2f5ee1930177a40d7f4425ac32d84a53bde0aaf92e49f8e616033576` |
+| Bars stale | `bd3e659e30ecb742c0a97aa331c74388608053a6a534496fd8cbfc635fb14cd0` |
 
 These hashes are release invariants inherited from the Go 0.2.0 renderer. A
 change to any of them is a fixed-layout change and requires explicit visual

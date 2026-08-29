@@ -1,17 +1,10 @@
 //! Four button-aligned cycling slot windows.
 #![allow(dead_code)]
 
-use std::sync::RwLock;
-
 use crate::config::Config;
 
 #[derive(Debug)]
 pub struct Manager {
-    inner: RwLock<Inner>,
-}
-
-#[derive(Debug)]
-struct Inner {
     modules: [Vec<String>; 4],
     indexes: [usize; 4],
 }
@@ -42,66 +35,61 @@ impl Manager {
             normalized_index(initial_indexes[2], modules[2].len()),
             normalized_index(initial_indexes[3], modules[3].len()),
         ];
-        Manager {
-            inner: RwLock::new(Inner { modules, indexes }),
-        }
+        Manager { modules, indexes }
     }
 
     /// Apply a new configuration. Identical module lists preserve the current
     /// selection index; changed lists preserve the previously selected module
     /// when it still exists, otherwise select index 0.
-    pub fn apply(&self, cfg: &Config) {
-        let mut inner = self.inner.write().unwrap();
+    pub fn apply(&mut self, cfg: &Config) {
         for i in 0..4 {
             let next = cfg.slots[i].clone();
-            if inner.modules[i] == next {
-                inner.indexes[i] = normalized_index(inner.indexes[i] as i64, next.len());
+            if self.modules[i] == next {
+                self.indexes[i] = normalized_index(self.indexes[i] as i64, next.len());
                 continue;
             }
-            let old = inner.modules[i]
-                .get(inner.indexes[i])
+            let old = self.modules[i]
+                .get(self.indexes[i])
                 .cloned()
                 .unwrap_or_default();
-            inner.modules[i] = next;
-            inner.indexes[i] = inner.modules[i].iter().position(|m| *m == old).unwrap_or(0);
+            self.modules[i] = next;
+            self.indexes[i] = self.modules[i].iter().position(|m| *m == old).unwrap_or(0);
         }
     }
 
     pub fn current(&self, slot: usize) -> String {
-        let inner = self.inner.read().unwrap();
-        match inner.modules.get(slot) {
+        match self.modules.get(slot) {
             Some(modules) if !modules.is_empty() => {
-                modules[inner.indexes[slot] % modules.len()].clone()
+                modules[self.indexes[slot] % modules.len()].clone()
             }
             _ => String::new(),
         }
     }
 
-    pub fn cycle(&self, slot: usize, delta: i64) -> String {
-        let mut inner = self.inner.write().unwrap();
-        if slot >= 4 || inner.modules[slot].is_empty() {
+    pub fn cycle(&mut self, slot: usize, delta: i64) -> String {
+        if slot >= 4 || self.modules[slot].is_empty() {
             return String::new();
         }
-        let n = inner.modules[slot].len() as i64;
-        let mut index = (inner.indexes[slot] as i64 + delta) % n;
+        let n = self.modules[slot].len() as i64;
+        let mut index = (self.indexes[slot] as i64 + delta) % n;
         if index < 0 {
             index += n;
         }
-        inner.indexes[slot] = index as usize;
-        inner.modules[slot][inner.indexes[slot]].clone()
+        self.indexes[slot] = index as usize;
+        self.modules[slot][self.indexes[slot]].clone()
     }
 
-    pub fn indexes(&self) -> [usize; 4] {
-        self.inner.read().unwrap().indexes
-    }
-
-    pub fn set_index(&self, slot: usize, index: i64) {
-        let mut inner = self.inner.write().unwrap();
-        if let Some(modules) = inner.modules.get(slot) {
-            if !modules.is_empty() {
-                inner.indexes[slot] = normalized_index(index, modules.len());
-            }
-        }
+    /// Return the next configured module not in `excluded`, without changing selection.
+    pub fn next_except(&self, slot: usize, excluded: &[&str]) -> Option<String> {
+        let modules = self.modules.get(slot)?;
+        (1..=modules.len())
+            .map(|offset| &modules[(self.indexes[slot] + offset) % modules.len()])
+            .find(|module| {
+                !excluded
+                    .iter()
+                    .any(|item| module.eq_ignore_ascii_case(item))
+            })
+            .cloned()
     }
 }
 
@@ -118,7 +106,7 @@ mod tests {
 
     #[test]
     fn cycle_wraps_forward_and_backward() {
-        let m = Manager::new(&Config::default(), [0; 4]);
+        let mut m = Manager::new(&Config::default(), [0; 4]);
         assert_eq!(m.cycle(0, 1), "CPU_TEMP");
         assert_eq!(m.cycle(0, 1), "CONTROLLER_BATTERY");
         assert_eq!(m.cycle(0, 1), "HEADSET_BATTERY", "wraps forward");
@@ -128,7 +116,7 @@ mod tests {
     #[test]
     fn apply_preserves_selected_module_when_it_survives() {
         let c = cfg_with(1, &["FPS_CURRENT", "FPS_1LOW"]);
-        let m = Manager::new(&c, [0; 4]);
+        let mut m = Manager::new(&c, [0; 4]);
         m.cycle(1, 1);
         assert_eq!(m.current(1), "FPS_1LOW");
         m.apply(&cfg_with(1, &["FPS_CURRENT", "FPS_1LOW", "FRAME_TIME"]));
@@ -142,16 +130,29 @@ mod tests {
     #[test]
     fn identical_list_preserves_index() {
         let c = Config::default();
-        let m = Manager::new(&c, [0; 4]);
+        let mut m = Manager::new(&c, [0; 4]);
         m.cycle(2, 2);
-        assert_eq!(m.current(2), "JITTER");
+        assert_eq!(m.current(2), "PING");
         m.apply(&Config::default());
-        assert_eq!(m.current(2), "JITTER");
+        assert_eq!(m.current(2), "PING");
     }
 
     #[test]
     fn negative_initial_index_normalizes() {
         let m = Manager::new(&Config::default(), [-1, 0, 0, 0]);
         assert_eq!(m.current(0), "CONTROLLER_BATTERY");
+    }
+
+    #[test]
+    fn dynamic_default_falls_through_without_mutating_selection() {
+        let manager = Manager::new(&Config::default(), [0; 4]);
+        assert_eq!(manager.current(2), "PROC_HANG");
+        assert_eq!(
+            manager.next_except(2, &["PROC_HANG", "BOTTLENECK"]),
+            Some("GPU_TEMP".into())
+        );
+        assert_eq!(manager.current(2), "PROC_HANG");
+        let manager = Manager::new(&cfg_with(0, &["PROC_HANG", "BOTTLENECK"]), [0; 4]);
+        assert_eq!(manager.next_except(0, &["PROC_HANG", "BOTTLENECK"]), None);
     }
 }

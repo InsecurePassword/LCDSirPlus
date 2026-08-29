@@ -26,10 +26,6 @@ impl Frame {
         Frame::default()
     }
 
-    pub fn clear(&mut self) {
-        self.pixels = [0u8; WIDTH * HEIGHT];
-    }
-
     pub fn set(&mut self, x: i32, y: i32, on: bool) {
         if x < 0 || x >= WIDTH as i32 || y < 0 || y >= HEIGHT as i32 {
             return;
@@ -103,27 +99,6 @@ impl Frame {
 
     pub fn equal(&self, other: &Frame) -> bool {
         self.pixels == other.pixels
-    }
-
-    /// Deterministic PNG at integer scale (on = black, off = white, matching
-    /// the reference-sample convention).
-    pub fn png_bytes(&self, scale: u32) -> Vec<u8> {
-        let scale = scale.max(1);
-        let w = WIDTH as u32 * scale;
-        let h = HEIGHT as u32 * scale;
-        let mut img = vec![0u8; (w * h) as usize];
-        for y in 0..HEIGHT {
-            for x in 0..WIDTH {
-                let c: u8 = if self.get(x as i32, y as i32) { 0 } else { 255 };
-                for sy in 0..scale {
-                    for sx in 0..scale {
-                        let px = ((y as u32 * scale + sy) * w) + (x as u32 * scale + sx);
-                        img[px as usize] = c;
-                    }
-                }
-            }
-        }
-        crate::png::write_gray_png(&img, w, h)
     }
 }
 

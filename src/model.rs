@@ -8,7 +8,7 @@
 //! projections for the fixed bars.
 
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Logical framebuffer geometry. Fixed by product contract.
 pub const WIDTH: usize = 160;
@@ -21,6 +21,9 @@ pub enum ValueKind {
     Bytes,
     ByteRate,
     Celsius,
+    Watts,
+    Rpm,
+    Count,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -52,6 +55,24 @@ pub enum MetricKey {
     VRAMUsed,
     VRAMTotal,
     CPUCCDTemp,
+    CPUPeakUtilization,
+    VRMTemp,
+    ChipsetTemp,
+    MotherboardTemp,
+    CPUFanControl,
+    CPUFanRpm,
+    CPUFanPercent,
+    PumpControl,
+    PumpRpm,
+    PumpPercent,
+    TotalPower,
+    CPUPower,
+    GPUPower,
+    CPUGPUPower,
+    DiskReadBytesPerSec,
+    DiskWriteBytesPerSec,
+    PageReadsPerSec,
+    EstablishedConnections,
 }
 
 /// One canonical reading published by a provider.
@@ -98,9 +119,19 @@ impl Reading {
     }
 
     pub fn current_celsius(key: MetricKey, value: f64, hardware_id: &str, at: SystemTime) -> Self {
+        Self::current_number(key, ValueKind::Celsius, value, hardware_id, at)
+    }
+
+    pub fn current_number(
+        key: MetricKey,
+        kind: ValueKind,
+        value: f64,
+        hardware_id: &str,
+        at: SystemTime,
+    ) -> Self {
         Reading {
             key,
-            kind: ValueKind::Celsius,
+            kind,
             number: value,
             has_value: true,
             availability: Availability::Available,
@@ -124,9 +155,13 @@ impl Reading {
     pub fn legacy_metric(&self) -> Metric {
         let mut metric = Metric {
             stale: self.freshness == Freshness::Stale,
+            updated: self.sampled_at,
             ..Metric::default()
         };
-        if self.has_value && (self.kind == ValueKind::Percent || self.kind == ValueKind::Celsius) {
+        if self.has_value
+            && self.availability == Availability::Available
+            && self.kind != ValueKind::Bytes
+        {
             metric.value = self.number;
             metric.valid = true;
         }
@@ -275,6 +310,145 @@ pub struct HungTarget {
     pub title: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AcState {
+    Offline,
+    Online,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemBattery {
+    pub ac: AcState,
+    pub battery_present: Option<bool>,
+    pub charging: bool,
+    pub percent: Option<u8>,
+    pub freshness: Freshness,
+    pub sampled_at: Option<SystemTime>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BottleneckState {
+    #[default]
+    Unavailable,
+    None,
+    Cpu,
+    Gpu,
+    Mem,
+    DiskIo,
+}
+
+impl BottleneckState {
+    pub fn token(self) -> Option<&'static str> {
+        match self {
+            Self::Unavailable => None,
+            Self::None => Some("NONE"),
+            Self::Cpu => Some("CPU"),
+            Self::Gpu => Some("GPU"),
+            Self::Mem => Some("MEM"),
+            Self::DiskIo => Some("DISK I/O"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BottleneckReading {
+    pub state: BottleneckState,
+    pub freshness: Freshness,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BottleneckThresholds {
+    pub cpu_percent: f64,
+    pub gpu_percent: f64,
+    pub memory_percent: f64,
+    pub disk_mbps: f64,
+    pub sustain: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BottleneckInputs {
+    pub cpu_peak_percent: Option<f64>,
+    pub gpu_percent: Option<f64>,
+    pub ram_percent: Option<f64>,
+    pub vram_percent: Option<f64>,
+    pub disk_mbps: Option<f64>,
+}
+
+#[derive(Debug, Default)]
+pub struct BottleneckDetector {
+    thresholds: Option<BottleneckThresholds>,
+    candidates: [Option<Instant>; 4],
+}
+
+impl BottleneckDetector {
+    pub fn update(
+        &mut self,
+        thresholds: BottleneckThresholds,
+        input: BottleneckInputs,
+        now: Instant,
+    ) -> BottleneckReading {
+        if self.thresholds != Some(thresholds) {
+            self.thresholds = Some(thresholds);
+            self.candidates = [None; 4];
+        }
+        let memory = match (input.ram_percent, input.vram_percent) {
+            (Some(ram), Some(vram)) => Some(ram.max(vram)),
+            (ram, None) => ram,
+            (None, vram) => vram,
+        };
+        let values = [
+            (
+                BottleneckState::Cpu,
+                input.cpu_peak_percent,
+                thresholds.cpu_percent,
+            ),
+            (
+                BottleneckState::Gpu,
+                input.gpu_percent,
+                thresholds.gpu_percent,
+            ),
+            (BottleneckState::Mem, memory, thresholds.memory_percent),
+            (
+                BottleneckState::DiskIo,
+                input.disk_mbps,
+                thresholds.disk_mbps,
+            ),
+        ];
+        let mut best = None;
+        for (index, (state, value, threshold)) in values.into_iter().enumerate() {
+            let ratio = value
+                .filter(|value| value.is_finite() && *value >= threshold)
+                .map(|value| value / threshold);
+            let Some(ratio) = ratio else {
+                self.candidates[index] = None;
+                continue;
+            };
+            let since = *self.candidates[index].get_or_insert(now);
+            if now.saturating_duration_since(since) >= thresholds.sustain
+                && best.is_none_or(|(_, best_ratio)| ratio > best_ratio)
+            {
+                best = Some((state, ratio));
+            }
+        }
+        if !input
+            .cpu_peak_percent
+            .is_some_and(|value| value.is_finite())
+            || !input.ram_percent.is_some_and(|value| value.is_finite())
+            || !input.disk_mbps.is_some_and(|value| value.is_finite())
+        {
+            return BottleneckReading::default();
+        }
+        BottleneckReading {
+            state: best
+                .map(|(state, _)| state)
+                .unwrap_or(BottleneckState::None),
+            freshness: Freshness::Current,
+        }
+    }
+}
+
 /// Full display input for one render tick.
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
@@ -305,6 +479,8 @@ pub struct Snapshot {
     pub alerts: Vec<Alert>,
     pub discord: DiscordState,
     pub hung: Vec<HungTarget>,
+    pub system_battery: SystemBattery,
+    pub bottleneck: BottleneckReading,
 }
 
 /// Session duration helper shared by slot modules.
@@ -317,11 +493,6 @@ pub fn session_duration(s: &Snapshot) -> Duration {
 
 /// `h:mm` above one hour, otherwise `mm:ss`.
 pub fn format_duration(d: Duration) -> String {
-    let d = if d > Duration::ZERO {
-        d
-    } else {
-        Duration::ZERO
-    };
     let h = d.as_secs() / 3600;
     let m = (d.as_secs() % 3600) / 60;
     let sec = d.as_secs() % 60;
@@ -369,6 +540,219 @@ mod tests {
         let r = Reading::current_bytes(MetricKey::RAMUsed, 5, "mem", at);
         assert!(!r.legacy_metric().valid);
         assert_eq!(r.byte_value(), Some(5));
+    }
+
+    #[test]
+    fn legacy_metric_preserves_source_timestamp() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(9);
+        let metric =
+            Reading::current_number(MetricKey::CPUPower, ValueKind::Watts, 65.0, "cpu", at)
+                .legacy_metric();
+        assert_eq!(metric.updated, Some(at));
+    }
+
+    #[test]
+    fn bottleneck_sustains_normalizes_and_resets() {
+        let thresholds = BottleneckThresholds {
+            cpu_percent: 90.0,
+            gpu_percent: 95.0,
+            memory_percent: 90.0,
+            disk_mbps: 500.0,
+            sustain: Duration::from_secs(2),
+        };
+        let at = Instant::now();
+        let mut detector = BottleneckDetector::default();
+        let both = BottleneckInputs {
+            cpu_peak_percent: Some(99.0),
+            gpu_percent: Some(100.0),
+            ram_percent: Some(20.0),
+            disk_mbps: Some(0.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            detector.update(thresholds, both, at).state,
+            BottleneckState::None
+        );
+        assert_eq!(
+            detector
+                .update(thresholds, both, at + Duration::from_secs(2))
+                .state,
+            BottleneckState::Cpu
+        );
+        let clear = BottleneckInputs {
+            cpu_peak_percent: Some(1.0),
+            ram_percent: Some(1.0),
+            disk_mbps: Some(1.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            detector
+                .update(thresholds, clear, at + Duration::from_secs(3))
+                .state,
+            BottleneckState::None
+        );
+        assert_eq!(
+            detector
+                .update(thresholds, BottleneckInputs::default(), at)
+                .state,
+            BottleneckState::Unavailable
+        );
+        assert_eq!(
+            detector
+                .update(
+                    thresholds,
+                    BottleneckInputs {
+                        cpu_peak_percent: Some(f64::NAN),
+                        ram_percent: Some(1.0),
+                        disk_mbps: Some(1.0),
+                        ..Default::default()
+                    },
+                    at,
+                )
+                .state,
+            BottleneckState::Unavailable
+        );
+        let changed = BottleneckThresholds {
+            cpu_percent: 99.0,
+            ..thresholds
+        };
+        assert_eq!(
+            detector
+                .update(changed, both, at + Duration::from_secs(4))
+                .state,
+            BottleneckState::None
+        );
+
+        let exact_tie = BottleneckInputs {
+            cpu_peak_percent: Some(90.0),
+            gpu_percent: Some(95.0),
+            ram_percent: Some(1.0),
+            disk_mbps: Some(1.0),
+            ..Default::default()
+        };
+        let immediate = BottleneckThresholds {
+            sustain: Duration::ZERO,
+            ..thresholds
+        };
+        assert_eq!(
+            BottleneckDetector::default()
+                .update(immediate, exact_tie, at)
+                .state,
+            BottleneckState::Cpu,
+            "normalized ties use stable CPU-first classification"
+        );
+    }
+
+    #[test]
+    fn bottleneck_classifies_gpu_memory_and_disk() {
+        let thresholds = BottleneckThresholds {
+            cpu_percent: 90.0,
+            gpu_percent: 95.0,
+            memory_percent: 90.0,
+            disk_mbps: 500.0,
+            sustain: Duration::ZERO,
+        };
+        let at = Instant::now();
+        for (expected, input) in [
+            (
+                BottleneckState::Gpu,
+                BottleneckInputs {
+                    cpu_peak_percent: Some(1.0),
+                    gpu_percent: Some(96.0),
+                    ram_percent: Some(1.0),
+                    disk_mbps: Some(1.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                BottleneckState::Mem,
+                BottleneckInputs {
+                    cpu_peak_percent: Some(1.0),
+                    ram_percent: Some(1.0),
+                    vram_percent: Some(91.0),
+                    disk_mbps: Some(1.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                BottleneckState::DiskIo,
+                BottleneckInputs {
+                    cpu_peak_percent: Some(1.0),
+                    ram_percent: Some(1.0),
+                    disk_mbps: Some(501.0),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            assert_eq!(
+                BottleneckDetector::default()
+                    .update(thresholds, input, at)
+                    .state,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn bottleneck_candidates_sustain_independently_across_winner_changes() {
+        let thresholds = BottleneckThresholds {
+            cpu_percent: 90.0,
+            gpu_percent: 90.0,
+            memory_percent: 90.0,
+            disk_mbps: 100.0,
+            sustain: Duration::from_secs(2),
+        };
+        let start = Instant::now();
+        let mut detector = BottleneckDetector::default();
+        let input = |cpu, gpu| BottleneckInputs {
+            cpu_peak_percent: Some(cpu),
+            gpu_percent: Some(gpu),
+            ram_percent: Some(1.0),
+            disk_mbps: Some(0.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            detector.update(thresholds, input(95.0, 1.0), start).state,
+            BottleneckState::None
+        );
+        assert_eq!(
+            detector
+                .update(
+                    thresholds,
+                    input(95.0, 100.0),
+                    start + Duration::from_secs(1),
+                )
+                .state,
+            BottleneckState::None
+        );
+        assert_eq!(
+            detector
+                .update(
+                    thresholds,
+                    input(95.0, 100.0),
+                    start + Duration::from_secs(2),
+                )
+                .state,
+            BottleneckState::Cpu,
+            "brief ratio winner changes do not reset CPU sustain"
+        );
+        assert_eq!(
+            detector
+                .update(
+                    thresholds,
+                    input(95.0, 100.0),
+                    start + Duration::from_secs(3),
+                )
+                .state,
+            BottleneckState::Gpu
+        );
+        assert_eq!(
+            detector
+                .update(thresholds, input(95.0, 1.0), start + Duration::from_secs(4),)
+                .state,
+            BottleneckState::Cpu,
+            "only the stopped GPU candidate is cleared"
+        );
     }
 
     #[test]

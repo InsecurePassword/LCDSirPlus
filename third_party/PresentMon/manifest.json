@@ -1,0 +1,36 @@
+{
+  "name": "PresentMon",
+  "version": "v2.5.1",
+  "commit": "3e06c7dcb922e411bae38503b51ab501be61c37f",
+  "artifact": {
+    "file": "PresentMon.exe",
+    "url": "https://github.com/GameTechDev/PresentMon/releases/download/v2.5.1/PresentMon-2.5.1-x64.exe",
+    "size": 956768,
+    "sha256": "9bec3083069f58f911e6a512f4806db51a27bd096103087bc1d05ef54c80a191",
+    "authenticodeSigner": "Intel Corporation"
+  },
+  "licenses": [
+    {
+      "file": "LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/GameTechDev/PresentMon/3e06c7dcb922e411bae38503b51ab501be61c37f/LICENSE.txt",
+      "size": 1067,
+      "sha256": "4c949341b1893c8c6ad82f7fb4eedf622cd1fd9c22a9af8f19b2dac19d1947b6"
+    },
+    {
+      "file": "THIRD_PARTY.txt",
+      "url": "https://raw.githubusercontent.com/GameTechDev/PresentMon/3e06c7dcb922e411bae38503b51ab501be61c37f/THIRD_PARTY.txt",
+      "size": 6471,
+      "sha256": "e039937f1a2fc2eb8f24a25b4229551a5a8056026d2da878507e20269eb56267"
+    }
+  ],
+  "requiredFlags": [
+    "--process_id",
+    "--output_stdout",
+    "--no_console_stats",
+    "--terminate_on_proc_exit",
+    "--session_name",
+    "--stop_existing_session",
+    "--v2_metrics",
+    "--exclude_dropped"
+  ]
+}

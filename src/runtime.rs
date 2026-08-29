@@ -25,7 +25,11 @@ pub struct InstanceGuard(HANDLE);
 
 impl InstanceGuard {
     pub fn acquire() -> Result<Option<Self>, String> {
-        let name = wide(INSTANCE_NAME);
+        Self::acquire_named(INSTANCE_NAME)
+    }
+
+    fn acquire_named(name: &str) -> Result<Option<Self>, String> {
+        let name = wide(name);
         unsafe {
             windows::Win32::Foundation::SetLastError(ERROR_SUCCESS);
             let handle = CreateMutexW(None, false, PCWSTR(name.as_ptr()))
@@ -244,9 +248,12 @@ mod tests {
 
     #[test]
     fn named_mutex_rejects_second_owner_and_releases() {
-        let first = InstanceGuard::acquire().unwrap().expect("first owner");
-        assert!(InstanceGuard::acquire().unwrap().is_none());
+        let name = format!("Local\\LCDSirPlus.Runtime.Test.{}", std::process::id());
+        let first = InstanceGuard::acquire_named(&name)
+            .unwrap()
+            .expect("first owner");
+        assert!(InstanceGuard::acquire_named(&name).unwrap().is_none());
         drop(first);
-        assert!(InstanceGuard::acquire().unwrap().is_some());
+        assert!(InstanceGuard::acquire_named(&name).unwrap().is_some());
     }
 }

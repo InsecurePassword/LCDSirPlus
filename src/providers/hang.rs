@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,7 @@ const MAX_TITLE_CHARS: usize = 256;
 
 #[derive(Clone, Debug, Default)]
 pub struct Update {
+    pub generation: u64,
     pub targets: Vec<HungTarget>,
     pub available: bool,
     pub error: Option<&'static str>,
@@ -107,11 +108,32 @@ pub enum HoldCommand {
 #[derive(Default)]
 pub struct HoldState {
     presses: [Option<Press>; 4],
+    owner: Option<usize>,
+    owner_resolved: bool,
     pub hung_index: usize,
     pub hung_detail: bool,
 }
 
 impl HoldState {
+    pub fn set_owner(&mut self, owner: Option<usize>) -> Option<Audit> {
+        self.owner_resolved = true;
+        self.owner = owner;
+        for (index, press) in self.presses.iter_mut().enumerate() {
+            let Some(press) = press else { continue };
+            let Some((_, target, _)) = &press.bound else {
+                continue;
+            };
+            if !press.canceled && Some(index) != owner {
+                press.canceled = true;
+                return Some(Audit {
+                    target: target.clone(),
+                    outcome: "canceled-slot-owner",
+                });
+            }
+        }
+        None
+    }
+
     pub fn reconcile(
         &mut self,
         cfg: &Config,
@@ -119,7 +141,12 @@ impl HoldState {
         provider_available: bool,
     ) -> Option<Audit> {
         let policy = Policy::from(cfg);
-        for press in self.presses.iter_mut().flatten() {
+        for (button, press) in self
+            .presses
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, p)| p.as_mut().map(|p| (i, p)))
+        {
             let Some((index, target, bound_policy)) = &press.bound else {
                 continue;
             };
@@ -127,6 +154,7 @@ impl HoldState {
                 && (!provider_available
                     || !policy.active()
                     || &policy != bound_policy
+                    || (self.owner_resolved && self.owner != Some(button))
                     || targets.get(*index) != Some(target))
             {
                 press.canceled = true;
@@ -177,7 +205,11 @@ impl HoldState {
         if event.index >= self.presses.len() {
             return HoldCommand::None;
         }
-        let button = cfg.hang_button.saturating_sub(1) as usize;
+        let button = if self.owner_resolved {
+            self.owner
+        } else {
+            Some(cfg.hang_button.saturating_sub(1) as usize)
+        };
         if let Some((owner, press)) = self.presses.iter().enumerate().find_map(|(index, press)| {
             press
                 .as_ref()
@@ -194,7 +226,7 @@ impl HoldState {
                     return HoldCommand::None;
                 }
             }
-            let bound = if event.index == button
+            let bound = if Some(event.index) == button
                 && cfg.hang_enabled
                 && !cfg.safe_mode
                 && provider_available
@@ -227,7 +259,7 @@ impl HoldState {
             if event.canceled || event.at < press.started {
                 return HoldCommand::None;
             }
-            if event.index == button && !cfg.safe_mode && !targets.is_empty() {
+            if Some(event.index) == button && !cfg.safe_mode && !targets.is_empty() {
                 return HoldCommand::None;
             }
             return HoldCommand::Cycle {
@@ -417,17 +449,33 @@ impl Tracker {
 
 pub fn spawn(
     config: Arc<RwLock<Config>>,
+    generation: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
 ) -> (mpsc::Receiver<Update>, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("telemetry-hang".into())
-        .spawn(move || worker(config, shutdown, tx))
+        .spawn(move || worker(config, generation, shutdown, tx))
         .expect("hung detector thread");
     (rx, thread)
 }
 
-fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Sender<Update>) {
+fn current_request(config: &RwLock<Config>, generation: &AtomicU64) -> (u64, Config) {
+    loop {
+        let before = generation.load(Ordering::SeqCst);
+        let config = config.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if before == generation.load(Ordering::SeqCst) {
+            return (before, config);
+        }
+    }
+}
+
+fn worker(
+    config: Arc<RwLock<Config>>,
+    generation: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
+    tx: mpsc::Sender<Update>,
+) {
     let started = Instant::now();
     let mut tracker = Tracker::default();
     let mut cadence = Cadence::default();
@@ -435,8 +483,27 @@ fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Send
     let mut disabled_published = false;
     let mut published_available = None;
     let mut published_targets = None;
+    let mut current_generation = 0;
     while !shutdown.load(Ordering::Relaxed) {
-        let cfg = config.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let (request_generation, cfg) = current_request(&config, &generation);
+        if request_generation != current_generation {
+            current_generation = request_generation;
+            tracker.clear();
+            cadence.last_attempt = None;
+            current_policy = None;
+            disabled_published = false;
+            published_available = None;
+            published_targets = None;
+            if tx
+                .send(Update {
+                    generation: request_generation,
+                    ..Default::default()
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
         let policy = Policy::from(&cfg);
         if reset_on_policy_change(&mut current_policy, &policy, &mut tracker, &mut cadence) {
             log_worker_transition(
@@ -447,6 +514,7 @@ fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Send
             );
             if tx
                 .send(Update {
+                    generation: request_generation,
                     targets: Vec::new(),
                     available: policy.active(),
                     error: None,
@@ -464,6 +532,7 @@ fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Send
             if !disabled_published && {
                 log_worker_transition(&mut published_available, &mut published_targets, false, 0);
                 tx.send(Update {
+                    generation: request_generation,
                     targets: Vec::new(),
                     available: false,
                     error: None,
@@ -482,15 +551,14 @@ fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Send
             continue;
         }
         let result = enumerate_and_probe(policy.timeout, &policy.ignore, None);
-        let latest = config.read().unwrap_or_else(|e| e.into_inner());
-        let latest_policy = Policy::from(&*latest);
-        if !poll_policy_current(&policy, &latest_policy) {
-            reset_on_policy_change(
-                &mut current_policy,
-                &latest_policy,
-                &mut tracker,
-                &mut cadence,
-            );
+        let (latest_generation, latest) = current_request(&config, &generation);
+        let latest_policy = Policy::from(&latest);
+        if latest_generation != request_generation || !poll_policy_current(&policy, &latest_policy)
+        {
+            current_generation = latest_generation;
+            tracker.clear();
+            cadence.last_attempt = None;
+            current_policy = Some(latest_policy.clone());
             disabled_published = !latest_policy.active();
             log_worker_transition(
                 &mut published_available,
@@ -500,6 +568,7 @@ fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Send
             );
             if tx
                 .send(Update {
+                    generation: latest_generation,
                     targets: Vec::new(),
                     available: latest_policy.active(),
                     error: None,
@@ -512,6 +581,7 @@ fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Send
         }
         let update = match result {
             Ok(observations) => Update {
+                generation: request_generation,
                 targets: tracker.update(
                     started.elapsed(),
                     observations,
@@ -524,6 +594,7 @@ fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Send
             Err(error) => {
                 tracker.clear();
                 Update {
+                    generation: request_generation,
                     targets: Vec::new(),
                     available: false,
                     error: Some(error),
@@ -2145,6 +2216,51 @@ mod tests {
         );
         assert!(hold.cancel_reload().is_some());
         assert_eq!(hold.progress(started + base.hang_hold, &base), 0.0);
+    }
+
+    #[test]
+    fn resolved_proc_hang_owner_binds_each_slot_and_movement_cancels() {
+        let cfg = Config::default();
+        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        for owner in 0..4 {
+            let started = Instant::now();
+            let mut hold = HoldState::default();
+            hold.set_owner(Some(owner));
+            hold.event(
+                button(owner, true, started, "hid"),
+                &cfg,
+                std::slice::from_ref(&item),
+                true,
+            );
+            assert!(hold.presses[owner]
+                .as_ref()
+                .is_some_and(|press| press.bound.is_some()));
+            assert!(matches!(
+                hold.event(button(owner, false, started + cfg.hang_hold, "hid"), &cfg, std::slice::from_ref(&item), true),
+                HoldCommand::Terminate(ref bound) if bound == &item
+            ));
+        }
+
+        let started = Instant::now();
+        let mut hold = HoldState::default();
+        hold.set_owner(Some(0));
+        hold.event(
+            button(0, true, started, "hid"),
+            &cfg,
+            std::slice::from_ref(&item),
+            true,
+        );
+        assert!(hold.set_owner(Some(3)).is_some());
+        assert_eq!(hold.progress(started + cfg.hang_hold, &cfg), 0.0);
+        assert!(matches!(
+            hold.event(
+                button(0, false, started + cfg.hang_hold, "hid"),
+                &cfg,
+                std::slice::from_ref(&item),
+                true
+            ),
+            HoldCommand::Audit(_)
+        ));
     }
 
     struct FakeActionApi {

@@ -49,9 +49,7 @@ pub fn record_final_error(results: &mut [StepResult], context: &str, error: Stri
 }
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // t timestamps feed Phase 4 evidence records
 pub struct ButtonObservation {
-    pub at: Instant,
     pub index: usize,
     pub down: bool,
     pub canceled: bool,
@@ -113,7 +111,7 @@ impl Default for ButtonTransitions {
 }
 
 impl ButtonTransitions {
-    fn observe(&mut self, now: Instant, states: [bool; 4]) -> Vec<ButtonObservation> {
+    fn observe(&mut self, states: [bool; 4]) -> Vec<ButtonObservation> {
         let Some(prior) = self.prior.replace(states) else {
             return Vec::new();
         };
@@ -123,7 +121,6 @@ impl ButtonTransitions {
             .enumerate()
             .filter_map(|(index, (&down, was_down))| {
                 (down != was_down).then_some(ButtonObservation {
-                    at: now,
                     index,
                     down,
                     canceled: false,
@@ -132,7 +129,7 @@ impl ButtonTransitions {
             .collect()
     }
 
-    fn disconnect(&mut self, now: Instant) -> Vec<ButtonObservation> {
+    fn disconnect(&mut self) -> Vec<ButtonObservation> {
         self.prior
             .take()
             .unwrap_or_default()
@@ -140,7 +137,6 @@ impl ButtonTransitions {
             .enumerate()
             .filter_map(|(index, down)| {
                 down.then_some(ButtonObservation {
-                    at: now,
                     index,
                     down: false,
                     canceled: true,
@@ -240,7 +236,7 @@ fn run_with_clock(
             error,
         });
         if results.last().is_some_and(|result| result.error.is_some()) {
-            buttons.extend(button_transitions.disconnect(clock.now()));
+            buttons.extend(button_transitions.disconnect());
             return (results, buttons);
         }
         // Hold the dashboard for the remaining duration.
@@ -263,7 +259,6 @@ fn run_with_clock(
                 &mut buttons,
                 &mut button_transitions,
                 test.submit_interval,
-                clock.now(),
             ) {
                 results.last_mut().unwrap().error = Some(error);
                 break;
@@ -275,7 +270,7 @@ fn run_with_clock(
         }
     }
 
-    buttons.extend(button_transitions.disconnect(clock.now()));
+    buttons.extend(button_transitions.disconnect());
     (results, buttons)
 }
 
@@ -314,13 +309,7 @@ fn run_step(
             *last_report = Some(report);
             submissions += 1;
         }
-        if let Err(e) = poll_buttons(
-            transport,
-            &mut buttons,
-            button_transitions,
-            submit_interval,
-            clock.now(),
-        ) {
+        if let Err(e) = poll_buttons(transport, &mut buttons, button_transitions, submit_interval) {
             error = Some(e);
             break;
         }
@@ -360,7 +349,6 @@ fn poll_buttons(
     buttons: &mut Vec<ButtonObservation>,
     transitions: &mut ButtonTransitions,
     timeout: Duration,
-    now: Instant,
 ) -> Result<(), String> {
     let mut raw = [0u8; 8];
     let read = match transport {
@@ -370,7 +358,7 @@ fn poll_buttons(
             if !connected {
                 return Err("Logitech SDK reports the monochrome LCD disconnected".into());
             }
-            buttons.extend(transitions.observe(now, states));
+            buttons.extend(transitions.observe(states));
             return Ok(());
         }
         Transport::Virtual => Ok(false),
@@ -378,7 +366,7 @@ fn poll_buttons(
         Transport::Fake(fake) | Transport::FakeSdk(fake) => fake.read(&mut raw, timeout),
     }?;
     if read {
-        buttons.extend(transitions.observe(now, parse_input(&raw)?));
+        buttons.extend(transitions.observe(parse_input(&raw)?));
     }
     Ok(())
 }
@@ -618,15 +606,14 @@ mod tests {
 
     #[test]
     fn four_press_release_cycles_are_exactly_eight_transitions() {
-        let start = Instant::now();
         let mut tracker = ButtonTransitions::default();
-        assert!(tracker.observe(start, [false; 4]).is_empty());
+        assert!(tracker.observe([false; 4]).is_empty());
         let mut events = Vec::new();
         for index in 0..4 {
             let mut state = [false; 4];
             state[index] = true;
-            events.extend(tracker.observe(start, state));
-            events.extend(tracker.observe(start, [false; 4]));
+            events.extend(tracker.observe(state));
+            events.extend(tracker.observe([false; 4]));
         }
         assert_eq!(events.len(), 8);
         assert_eq!(events.iter().filter(|event| event.down).count(), 4);
@@ -635,8 +622,7 @@ mod tests {
 
     #[test]
     fn first_held_report_emits_down_from_released_baseline() {
-        let events =
-            ButtonTransitions::default().observe(Instant::now(), [true, false, false, false]);
+        let events = ButtonTransitions::default().observe([true, false, false, false]);
         assert_eq!(events.len(), 1);
         assert!(events[0].down && events[0].index == 0);
     }

@@ -25,8 +25,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DispatchMessageW, GetCursorPos, GetMessageW, LoadCursorW, LoadIconW, PostMessageW,
     PostQuitMessage, RegisterClassW, SetForegroundWindow, ShowWindow, TrackPopupMenu,
-    TranslateMessage, CW_USEDEFAULT, HMENU, IDC_ARROW, IDI_APPLICATION, MENU_ITEM_FLAGS, MSG,
-    SW_HIDE, SW_SHOW, TRACK_POPUP_MENU_FLAGS, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND,
+    TranslateMessage, CW_USEDEFAULT, HICON, HMENU, IDC_ARROW, IDI_APPLICATION, MENU_ITEM_FLAGS,
+    MSG, SW_HIDE, SW_SHOW, TRACK_POPUP_MENU_FLAGS, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND,
     WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_LBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WNDCLASSW,
     WS_OVERLAPPEDWINDOW,
 };
@@ -40,6 +40,12 @@ const ID_MENU_EXIT: usize = 1002;
 
 fn preview_size(scale: i32) -> (i32, i32) {
     (FRAME_W as i32 * scale, FRAME_H as i32 * scale)
+}
+
+unsafe fn load_app_icon(hinstance: HINSTANCE) -> HICON {
+    LoadIconW(hinstance, PCWSTR(1 as _))
+        .or_else(|_| LoadIconW(None, IDI_APPLICATION))
+        .unwrap_or_default()
 }
 
 unsafe fn paint_frame(hdc: HDC, pixels: &[u8], scale: i32) {
@@ -169,10 +175,13 @@ fn ui_main(frame_rx: std::sync::mpsc::Receiver<Vec<u8>>) {
         let Ok(hinstance) = GetModuleHandleW(None) else {
             return;
         };
+        let hinstance = HINSTANCE::from(hinstance);
+        let icon = load_app_icon(hinstance);
         let class_name: Vec<u16> = "LCDSIRPLUS_PREVIEW\0".encode_utf16().collect();
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
-            hInstance: hinstance.into(),
+            hInstance: hinstance,
+            hIcon: icon,
             lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             ..Default::default()
@@ -215,14 +224,14 @@ fn ui_main(frame_rx: std::sync::mpsc::Receiver<Vec<u8>>) {
             height,
             None,
             None,
-            HINSTANCE::from(hinstance),
+            hinstance,
             None,
         ) else {
             return;
         };
         UI.hwnd.store(hwnd.0 as isize, Ordering::Relaxed);
 
-        add_tray_icon(hwnd);
+        add_tray_icon(hwnd, icon);
 
         let visible = UI.preview_visible.load(Ordering::Relaxed);
         let _ = ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
@@ -346,13 +355,13 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     let _ = DestroyMenu(HMENU(menu.0));
 }
 
-unsafe fn add_tray_icon(hwnd: HWND) {
+unsafe fn add_tray_icon(hwnd: HWND, icon: HICON) {
     let mut nid = NOTIFYICONDATAW {
         hWnd: hwnd,
         uID: 1,
         uFlags: NOTIFY_ICON_DATA_FLAGS(0x01 | 0x02 | 0x04), // MESSAGE | ICON | TIP
         uCallbackMessage: WM_APP_TRAY,
-        hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+        hIcon: icon,
         ..Default::default()
     };
     for (i, c) in "LCDSirPlus\0".encode_utf16().enumerate() {
@@ -398,6 +407,14 @@ mod tests {
             let _ = SelectObject(dc, previous);
             let _ = DeleteObject(bitmap);
             let _ = DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn app_icon_falls_back_to_a_stock_icon() {
+        unsafe {
+            let module = GetModuleHandleW(None).unwrap();
+            assert!(!load_app_icon(HINSTANCE::from(module)).0.is_null());
         }
     }
 }

@@ -153,11 +153,9 @@ pub fn log(level: Level, message: &str) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(file) = guard.as_mut() {
-        if file.write(line.as_bytes()).is_err() {
-            // A runtime filesystem failure drops this line and disables file
-            // output; stdout logging remains available.
-            *guard = None;
-        }
+        // Drop only this line; retaining the sink lets a transient filesystem
+        // failure recover on the next independent log call without recursion.
+        let _ = file.write(line.as_bytes());
     }
 }
 
@@ -484,6 +482,24 @@ mod tests {
             assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    #[test]
+    fn transient_rotation_failure_recovers_on_the_next_write() {
+        let dir = temp_dir("rotation-retry");
+        let path = dir.join("lcdsirplus.log");
+        let backup = path.with_extension("log.1");
+        let mut file = RotatingFile::open(path.clone(), 8, 1).unwrap();
+        file.write(b"current\n").unwrap();
+        std::fs::create_dir(&backup).unwrap();
+        assert!(file.write(b"next\n").is_err());
+        assert!(file.file.is_some());
+        std::fs::remove_dir(&backup).unwrap();
+        file.write(b"next\n").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), b"next\n");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"current\n");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

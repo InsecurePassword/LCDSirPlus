@@ -31,6 +31,38 @@ function Expect-Failure {
     if (-not $failed) { throw $Message }
 }
 
+function Assert-PresentMonPayload {
+    param([string]$Root)
+    $files = @(
+        @('PresentMon.exe', [uint64]956768, '9bec3083069f58f911e6a512f4806db51a27bd096103087bc1d05ef54c80a191'),
+        @('licenses/PresentMon/LICENSE.txt', [uint64]1067, '4c949341b1893c8c6ad82f7fb4eedf622cd1fd9c22a9af8f19b2dac19d1947b6'),
+        @('licenses/PresentMon/THIRD_PARTY.txt', [uint64]6471, 'e039937f1a2fc2eb8f24a25b4229551a5a8056026d2da878507e20269eb56267')
+    )
+    foreach ($file in $files) {
+        $path = Join-Path $Root $file[0].Replace('/', '\')
+        $identity = Assert-RegularSingleLinkFile $path
+        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($identity.Size -ne $file[1] -or $hash -cne $file[2]) { throw "PresentMon payload identity mismatch: $($file[0])" }
+    }
+    $signature = Get-AuthenticodeSignature -FilePath (Join-Path $Root 'PresentMon.exe')
+    $certificate = $signature.SignerCertificate
+    $simpleName = if ($null -eq $certificate) { $null } else { $certificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) }
+    if ($signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or
+        $simpleName -cne 'Intel Corporation') {
+        throw "PresentMon Authenticode verification failed: $($signature.Status), $simpleName"
+    }
+}
+
+function Assert-ExpectedInventory {
+    param([object[]]$Entries, [string[]]$Expected, [string]$Label)
+    $actual = @(Get-OrdinalSorted @($Entries | ForEach-Object { $_.Path }))
+    $expectedSorted = @(Get-OrdinalSorted $Expected)
+    if ($actual.Count -ne $expectedSorted.Count) { throw "$Label package inventory mismatch" }
+    for ($index = 0; $index -lt $actual.Count; $index++) {
+        if ($actual[$index] -cne $expectedSorted[$index]) { throw "$Label package inventory mismatch" }
+    }
+}
+
 function Test-ArchiveInventory {
     param([string]$Archive, [string]$Prefix)
     Assert-RegularSingleLinkFile $Archive | Out-Null
@@ -154,31 +186,45 @@ try {
     $portable = Join-Path $portableExtract $portableName
     $installer = Join-Path $installerExtract $installerName
     $source = Join-Path $sourceExtract $sourceName
-    [void]@(Read-VerifiedManifest $portable)
-    [void]@(Read-VerifiedManifest $installer)
+    $portableEntries = @(Read-VerifiedManifest $portable)
+    $installerEntries = @(Read-VerifiedManifest $installer)
     [void]@(Read-VerifiedManifest $source)
+    $portableFiles = @(
+        'LCDSirPlus.exe', 'PresentMon.exe', 'lcdsirplus.txt', 'LICENSE', 'README.md', 'modules.md',
+        'RELEASE-NOTES.md', 'SECURITY.md', 'docs/CONFIGURATION.md',
+        'docs/HARDWARE-ACCEPTANCE.md', 'docs/INSTRUCTION-MANUAL.md',
+        'docs/LCDSirPlus-Instruction-Manual.pdf',
+        'licenses/PresentMon/LICENSE.txt', 'licenses/PresentMon/THIRD_PARTY.txt'
+    )
+    Assert-ExpectedInventory $portableEntries $portableFiles 'portable'
+    $installerFiles = @('Install.ps1', 'Package.Common.ps1', 'Uninstall.ps1')
+    $installerFiles += @($portableFiles | ForEach-Object { 'payload/' + $_ })
+    Assert-ExpectedInventory $installerEntries $installerFiles 'installer'
+    Assert-PresentMonPayload $portable
+    Assert-PresentMonPayload (Join-Path $installer 'payload')
 
     Write-Host '== portable clean-extraction smoke ==' -ForegroundColor Cyan
     $exe = Join-Path $portable 'LCDSirPlus.exe'
     $versionOutput = (& $exe --version | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $versionOutput -cne 'LCDSirPlus 0.3.0') { throw 'portable --version identity failed' }
     $helpOutput = (& $exe --help | Out-String)
-    if ($LASTEXITCODE -ne 0 -or $helpOutput -notmatch 'LCDSirPlus\.exe' -or $helpOutput -match ('lcd' + '([-_ ]?)' + 'for' + 'ge2?')) { throw 'portable --help identity failed' }
-    & $exe --validate-config --config (Join-Path $portable 'lcdsirplus.txt')
+    if ($LASTEXITCODE -ne 0 -or $helpOutput -notmatch 'LCDSirPlus\.exe' -or $helpOutput -notmatch '--help, -h' -or $helpOutput -notmatch '--version, -v' -or $helpOutput -match ('lcd' + '([-_ ]?)' + 'for' + 'ge2?')) { throw 'portable --help identity failed' }
+    & $exe --validate-config --config (Join-Path $portable 'lcdsirplus.txt') 2>&1 | Out-Host
     if ($LASTEXITCODE -ne 0) { throw 'portable --validate-config failed' }
     $diagnostics = Join-Path $testRoot 'diagnostics'
-    & $exe --config '\\unreachable.invalid\share\PACKAGE-PRIVATE-SENTINEL.txt' --diagnostics --diagnostic-dir $diagnostics
+    & $exe --config '\\unreachable.invalid\share\PACKAGE-PRIVATE-SENTINEL.txt' --diagnostics --diagnostic-dir $diagnostics 2>&1 | Out-Host
     if ($LASTEXITCODE -ne 0 -or @(Get-ChildItem -LiteralPath $diagnostics -Filter '*.zip').Count -ne 1) { throw 'portable diagnostics failed' }
     $diagnosticBundle = @(Get-ChildItem -LiteralPath $diagnostics -Filter '*.zip')[0].FullName
     if ([IO.Path]::GetFileName($diagnosticBundle) -notmatch '^LCDSirPlus-Diagnostics-[0-9a-f]+\.zip$') { throw 'diagnostics filename identity mismatch' }
     $diagnosticText = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($diagnosticBundle))
     if ($diagnosticText -match 'PACKAGE-PRIVATE-SENTINEL|unreachable\.invalid') { throw 'diagnostics leaked ignored config path' }
-    & $exe --hardware-test --backend virtual --duration-secs 1 --config (Join-Path $portable 'lcdsirplus.txt') --diagnostic-dir (Join-Path $testRoot 'logs')
+    & $exe --hardware-test --backend virtual --duration-secs 1 --config (Join-Path $portable 'lcdsirplus.txt') --diagnostic-dir (Join-Path $testRoot 'logs') 2>&1 | Out-Host
     if ($LASTEXITCODE -ne 0) { throw 'portable virtual hardware smoke failed' }
 
     Write-Host '== installer lifecycle fixtures ==' -ForegroundColor Cyan
     $installRoot = Join-Path $testRoot 'install-main'
     & (Join-Path $installer 'Install.ps1') -PackageRoot $installer -InstallRoot $installRoot -NoIntegration
+    Assert-PresentMonPayload $installRoot
     $configPath = Join-Path $installRoot 'lcdsirplus.txt'
     $customConfig = [Text.Encoding]::UTF8.GetBytes("# PACKAGE-CONFIG-SENTINEL`r`n")
     [IO.File]::WriteAllBytes($configPath, $customConfig)
@@ -206,6 +252,9 @@ try {
     & (Join-Path $installRoot 'Uninstall.ps1') -InstallRoot $installRoot -NoIntegration
     if (-not [IO.File]::Exists((Join-Path $installRoot 'unknown.keep')) -or -not [IO.File]::Exists($configPath)) { throw 'uninstall removed unknown file or configuration' }
     if ([IO.File]::Exists((Join-Path $installRoot 'LCDSirPlus.exe'))) { throw 'uninstall retained owned executable' }
+    foreach ($removed in @('PresentMon.exe', 'licenses\PresentMon\LICENSE.txt', 'licenses\PresentMon\THIRD_PARTY.txt')) {
+        if ([IO.File]::Exists((Join-Path $installRoot $removed))) { throw "uninstall retained owned PresentMon file: $removed" }
+    }
 
     $purgeInstall = Join-Path $testRoot 'install-purge'
     $userData = Join-Path $testRoot 'user-data'

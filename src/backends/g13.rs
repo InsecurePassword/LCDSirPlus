@@ -18,10 +18,6 @@ pub const G13_USAGE: u16 = 0x0000;
 pub const G13_INPUT_REPORT_LENGTH: usize = 8;
 pub const G13_OUTPUT_REPORT_LENGTH: usize = 992;
 pub const G13_LCD_HEADER_LENGTH: usize = 32;
-#[allow(dead_code)]
-pub const G13_LCD_STORAGE_HEIGHT: usize = 48;
-#[allow(dead_code)]
-pub const G13_LCD_PAYLOAD_LENGTH: usize = crate::model::WIDTH * G13_LCD_STORAGE_HEIGHT / 8;
 pub const G13_LCD_REPORT_ID: u8 = 0x03;
 pub const G13_INPUT_REPORT_ID: u8 = 0x01;
 

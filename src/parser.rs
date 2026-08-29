@@ -43,9 +43,6 @@ pub struct LoadedConfig {
     pub config: Config,
     /// Canonical paths of every file in the include graph, primary first.
     pub files: Vec<PathBuf>,
-    /// SHA-256 of each file in `files`, same order (Phase 4 evidence).
-    #[allow(dead_code)]
-    pub digests: Vec<String>,
 }
 
 struct ParseContext {
@@ -57,7 +54,6 @@ struct ParseContext {
     total_bytes: usize,
     total_lines: usize,
     include_directives: usize,
-    digests: HashMap<String, String>,
 }
 
 /// Load and parse a configuration file from disk (includes allowed).
@@ -78,7 +74,6 @@ pub fn load(path: &Path) -> Result<LoadedConfig, ParseError> {
         total_bytes: 0,
         total_lines: 0,
         include_directives: 0,
-        digests: HashMap::new(),
     };
     ctx.parse_file(&canonical, 0)?;
     ctx.cfg.path = ctx.files[0].display().to_string();
@@ -87,20 +82,9 @@ pub fn load(path: &Path) -> Result<LoadedConfig, ParseError> {
         line: 0,
         message,
     })?;
-    let files = ctx.files.clone();
-    let digests = files
-        .iter()
-        .map(|f| {
-            ctx.digests
-                .get(&f.display().to_string())
-                .cloned()
-                .unwrap_or_default()
-        })
-        .collect();
     Ok(LoadedConfig {
         config: ctx.cfg,
-        files,
-        digests,
+        files: ctx.files,
     })
 }
 
@@ -119,7 +103,6 @@ pub fn parse_standalone(contents: &[u8]) -> Result<Config, ParseError> {
         total_bytes: 0,
         total_lines: 0,
         include_directives: 0,
-        digests: HashMap::new(),
     };
     let text = std::str::from_utf8(contents).map_err(|_| ParseError {
         file: SOURCE.into(),
@@ -183,8 +166,6 @@ impl ParseContext {
             line: 0,
             message: "configuration must be valid UTF-8".into(),
         })?;
-        self.digests
-            .insert(key.clone(), crate::sha256::sha256_hex(&raw));
         self.files.push(path.to_path_buf());
         self.stack.push(key.clone());
         let source = path.display().to_string();
@@ -367,7 +348,7 @@ impl ParseContext {
             }
             "render_interval_ms" => cfg.render_interval = ms_auto(v, Duration::from_millis(100))?,
             "preview_mode" => cfg.preview_mode = lower_one(v)?,
-            "preview_scale" => cfg.preview_scale = intv(v)? as i32,
+            "preview_scale" => cfg.preview_scale = checked_i32(key, intv(v)?)?,
             "start_minimized" => cfg.start_minimized = boolv(v)?,
             "start_at_login" => cfg.start_at_login = boolv(v)?,
             "safe_mode" => cfg.safe_mode = boolv(v)?,
@@ -407,10 +388,32 @@ impl ParseContext {
             "lhm_url" => cfg.lhm_url = one(v)?,
             "lhm_interval_ms" => cfg.lhm_interval = ms_auto(v, Duration::from_millis(300))?,
             "lhm_stale_ms" => cfg.lhm_stale_after = ms_auto(v, Duration::from_secs(3))?,
-            "lhm_cpu_temp_sensor" | "lhm_gpu_temp_sensor" => {
+            "lhm_cpu_temp_sensor"
+            | "lhm_gpu_temp_sensor"
+            | "lhm_vrm_temp_sensor"
+            | "lhm_chipset_temp_sensor"
+            | "lhm_motherboard_temp_sensor"
+            | "lhm_cpu_fan_control_sensor"
+            | "lhm_cpu_fan_rpm_sensor"
+            | "lhm_pump_control_sensor"
+            | "lhm_pump_rpm_sensor"
+            | "lhm_total_power_sensor"
+            | "lhm_cpu_power_sensor"
+            | "lhm_gpu_power_sensor" => {
                 cfg.lhm_sensors
                     .insert(key.trim_start_matches("lhm_").to_string(), one(v)?);
             }
+            "cpu_fan_max_rpm" => cfg.cpu_fan_max_rpm = nonnegative_u32(key, intv(v)?)?,
+            "pump_max_rpm" => cfg.pump_max_rpm = nonnegative_u32(key, intv(v)?)?,
+            "hwinfo_cpu_temp_sensor" => cfg.hwinfo_cpu_temp_sensor = one(v)?,
+            "hwinfo_cpu_temp_reading" => cfg.hwinfo_cpu_temp_reading = one(v)?,
+            "hwinfo_total_power_sensor" => cfg.hwinfo_total_power_sensor = one(v)?,
+            "hwinfo_total_power_reading" => cfg.hwinfo_total_power_reading = one(v)?,
+            "hwinfo_cpu_power_sensor" => cfg.hwinfo_cpu_power_sensor = one(v)?,
+            "hwinfo_cpu_power_reading" => cfg.hwinfo_cpu_power_reading = one(v)?,
+            "hwinfo_gpu_power_sensor" => cfg.hwinfo_gpu_power_sensor = one(v)?,
+            "hwinfo_gpu_power_reading" => cfg.hwinfo_gpu_power_reading = one(v)?,
+            "hwinfo_stale_ms" => cfg.hwinfo_stale_after = msv(v)?,
             "gpu_provider" => cfg.gpu_provider = lower_one(v)?,
             "presentmon_enabled" => cfg.presentmon_enabled = boolv(v)?,
             "presentmon_path" => cfg.presentmon_path = joined(v)?,
@@ -430,11 +433,13 @@ impl ParseContext {
                 cfg.headset_query_timeout = ms_auto(v, Duration::from_millis(1200))?;
             }
             "headset_stale_ms" => cfg.headset_stale_after = ms_auto(v, Duration::from_secs(45))?,
-            "headset_warn_percent" => cfg.headset_warn_percent = intv(v)? as i32,
-            "headset_critical_percent" => cfg.headset_critical_percent = intv(v)? as i32,
+            "headset_warn_percent" => cfg.headset_warn_percent = checked_i32(key, intv(v)?)?,
+            "headset_critical_percent" => {
+                cfg.headset_critical_percent = checked_i32(key, intv(v)?)?
+            }
             "headset_estimate_hours" => cfg.headset_estimate_hours = boolv(v)?,
             "controller_enabled" => cfg.controller_enabled = boolv(v)?,
-            "controller_index" => cfg.controller_index = intv(v)? as i32,
+            "controller_index" => cfg.controller_index = checked_i32(key, intv(v)?)?,
             "controller_poll_ms" => cfg.controller_poll = ms_auto(v, Duration::from_secs(10))?,
             "network_probe_enabled" => cfg.network_probe_enabled = boolv(v)?,
             "network_probe_method" => cfg.network_probe_method = lower_one(v)?,
@@ -445,22 +450,33 @@ impl ParseContext {
             "network_probe_timeout_ms" => {
                 cfg.network_probe_timeout = ms_auto(v, Duration::from_millis(1500))?;
             }
-            "network_probe_window" => cfg.network_probe_window = intv(v)? as i32,
+            "network_probe_window" => cfg.network_probe_window = checked_i32(key, intv(v)?)?,
+            "network_graph_ceiling_mbps" => cfg.network_graph_ceiling_mbps = floatv(v)?,
+            "disk_graph_ceiling_mbps" => cfg.disk_graph_ceiling_mbps = floatv(v)?,
+            "fps_graph_ceiling" => cfg.fps_graph_ceiling = floatv(v)?,
+            "warning" => cfg.warning = boolv(v)?,
+            "cpu_temp_max_c" => cfg.cpu_temp_max_c = floatv(v)?,
+            "gpu_temp_max_c" => cfg.gpu_temp_max_c = floatv(v)?,
+            "bottleneck_cpu_percent" => cfg.bottleneck_cpu_percent = floatv(v)?,
+            "bottleneck_gpu_percent" => cfg.bottleneck_gpu_percent = floatv(v)?,
+            "bottleneck_memory_percent" => cfg.bottleneck_memory_percent = floatv(v)?,
+            "bottleneck_disk_mbps" => cfg.bottleneck_disk_mbps = floatv(v)?,
+            "bottleneck_sustain_ms" => cfg.bottleneck_sustain = msv(v)?,
             "audio_enabled" => cfg.audio_enabled = boolv(v)?,
             "audio_poll_ms" => cfg.audio_poll = ms_auto(v, Duration::from_secs(1))?,
             "discord_enabled" => cfg.discord_enabled = boolv(v)?,
             "discord_client_id" => cfg.discord_client_id = one(v)?,
             "discord_redirect_uri" => cfg.discord_redirect_uri = one(v)?,
             "discord_linger_ms" => cfg.discord_linger = msv(v)?,
-            "discord_max_speakers" => cfg.discord_max_speakers = intv(v)? as i32,
+            "discord_max_speakers" => cfg.discord_max_speakers = checked_i32(key, intv(v)?)?,
             "discord_show_self" => cfg.discord_show_self = boolv(v)?,
             "discord_show_channel" => cfg.discord_show_channel = boolv(v)?,
             "hang_enabled" => cfg.hang_enabled = boolv(v)?,
-            "hang_button" => cfg.hang_button = intv(v)? as i32,
+            "hang_button" => cfg.hang_button = checked_i32(key, intv(v)?)?,
             "hang_hold_ms" => cfg.hang_hold = msv(v)?,
             "hang_probe_interval_ms" => cfg.hang_probe_interval = msv(v)?,
             "hang_probe_timeout_ms" => cfg.hang_probe_timeout = msv(v)?,
-            "hang_failures_required" => cfg.hang_failures = intv(v)? as i32,
+            "hang_failures_required" => cfg.hang_failures = checked_i32(key, intv(v)?)?,
             "hang_minimum_ms" => cfg.hang_minimum = msv(v)?,
             "hang_ignore" => cfg.hang_ignore = v.to_vec(),
             "cpu_temp_warning" => cfg.cpu_temp_warning = floatv(v)?,
@@ -478,11 +494,19 @@ impl ParseContext {
                 }
                 cfg.log_max_bytes = n as u64;
             }
-            "log_backups" => cfg.log_backups = intv(v)? as i32,
+            "log_backups" => cfg.log_backups = checked_i32(key, intv(v)?)?,
             other => return Err(format!("unknown key {:?}", other)),
         }
         Ok(())
     }
+}
+
+fn nonnegative_u32(key: &str, value: i64) -> Result<u32, String> {
+    u32::try_from(value).map_err(|_| format!("{key} must be a non-negative integer"))
+}
+
+fn checked_i32(key: &str, value: i64) -> Result<i32, String> {
+    i32::try_from(value).map_err(|_| format!("{key} must fit in a 32-bit integer"))
 }
 
 fn resolve_include_path(source: &Path, include: &str) -> Result<PathBuf, String> {
@@ -676,9 +700,60 @@ mod tests {
     #[test]
     fn auto_intervals_map_to_defaults() {
         let cfg =
-            parse_standalone(b"telemetry_interval_ms auto\nrender_interval_ms 250\n").unwrap();
+            parse_standalone(b"warning 0\ntelemetry_interval_ms auto\nrender_interval_ms 250\n")
+                .unwrap();
         assert_eq!(cfg.telemetry_interval, Duration::from_millis(300));
         assert_eq!(cfg.render_interval, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn warning_render_interval_accepts_auto_and_rejects_slow_cadence() {
+        let cfg = parse_standalone(b"warning 1\nrender_interval_ms auto\n").unwrap();
+        assert_eq!(cfg.render_interval, Duration::from_millis(100));
+        assert!(parse_standalone(b"warning 1\nrender_interval_ms 101\n").is_err());
+        assert!(parse_standalone(b"warning 0\nrender_interval_ms 5000\n").is_ok());
+    }
+
+    #[test]
+    fn parses_network_modules_and_graph_ceiling() {
+        let cfg = parse_standalone(
+            b"slot_0 NET_IN NET_OUT NET_BOTH NET_IN_GRAPH NET_OUT_GRAPH NET_GRAPH\nnetwork_graph_ceiling_mbps 2500.5\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.network_graph_ceiling_mbps, 2500.5);
+        assert_eq!(
+            cfg.slots[0],
+            vec![
+                "NET_IN",
+                "NET_OUT",
+                "NET_BOTH",
+                "NET_IN_GRAPH",
+                "NET_OUT_GRAPH",
+                "NET_GRAPH"
+            ]
+        );
+        assert!(parse_standalone(b"network_graph_ceiling_mbps 0\n").is_err());
+        assert!(parse_standalone(b"network_graph_ceiling_mbps NaN\n").is_err());
+    }
+
+    #[test]
+    fn parses_module_expansion_contract_and_keeps_old_configs_valid() {
+        let cfg = parse_standalone(
+            b"warning 0\ncpu_temp_max_c 88\ngpu_temp_max_c 89\ndisk_graph_ceiling_mbps 2000\nfps_graph_ceiling 360\ncpu_fan_max_rpm 1800\nhwinfo_cpu_temp_sensor \"CPU Exact Case\"\nhwinfo_cpu_temp_reading \"CPU Package\"\nhwinfo_total_power_sensor System\nhwinfo_total_power_reading Total\nbottleneck_sustain_ms 0\nslot_0 cpu_load_graph system_battery bottleneck\n",
+        )
+        .unwrap();
+        assert!(!cfg.warning);
+        assert_eq!(
+            cfg.slots[0],
+            vec!["CPU_LOAD_GRAPH", "SYSTEM_BATTERY", "BOTTLENECK"]
+        );
+        assert_eq!(cfg.cpu_fan_max_rpm, 1800);
+        assert_eq!(cfg.hwinfo_cpu_temp_sensor, "CPU Exact Case");
+        assert_eq!(cfg.hwinfo_cpu_temp_reading, "CPU Package");
+        assert_eq!(cfg.bottleneck_sustain, Duration::ZERO);
+        assert!(parse_standalone(b"preview_scale 2\nhang_button 3\n").is_ok());
+        assert!(parse_standalone(b"hwinfo_cpu_temp_sensor CPU\n").is_err());
+        assert!(parse_standalone(b"hwinfo_cpu_power_sensor CPU\n").is_err());
     }
 
     #[test]
@@ -691,6 +766,33 @@ mod tests {
         // Tokenizer-level errors do carry line diagnostics.
         let err = parse_standalone(b"preview_scale 3\nbad \"quote\n").unwrap_err();
         assert_eq!(err.line, 2);
+    }
+
+    #[test]
+    fn integer_fields_reject_lossy_i32_conversion() {
+        for key in [
+            "preview_scale",
+            "headset_warn_percent",
+            "headset_critical_percent",
+            "controller_index",
+            "network_probe_window",
+            "discord_max_speakers",
+            "hang_button",
+            "hang_failures_required",
+            "log_backups",
+        ] {
+            for value in [i64::from(i32::MIN) - 1, i64::from(i32::MAX) + 1] {
+                let error = parse_standalone(format!("{key} {value}\n").as_bytes()).unwrap_err();
+                assert!(error.message.contains("32-bit"), "{key}: {error}");
+                assert_eq!(error.line, 1);
+            }
+        }
+        assert!(checked_i32("test", i64::from(i32::MIN)).is_ok());
+        assert!(checked_i32("test", i64::from(i32::MAX)).is_ok());
+        assert!(parse_standalone(b"cpu_fan_max_rpm 4294967296\n")
+            .unwrap_err()
+            .message
+            .contains("non-negative"));
     }
 
     #[test]

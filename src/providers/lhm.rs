@@ -8,6 +8,7 @@
 //! rejected rather than guessed.
 
 #![cfg(windows)]
+#![allow(dead_code)]
 
 use std::time::Duration;
 
@@ -27,40 +28,47 @@ pub struct Sensor {
 /// Flatten the LHM data.json tree into sensors with hardware context.
 pub fn collect(doc: &Json) -> Vec<Sensor> {
     let mut out = Vec::new();
-    if let Some(children) = doc.get("Children").and_then(|c| c.as_arr()) {
-        for hardware in children {
-            let hardware_name = hardware
-                .get("Text")
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string();
-            // Hardware nodes carry identifier? data.json nodes have "Path" only
-            // on leaves; hardware identity comes from leaf path prefixes.
-            if let Some(sections) = hardware.get("Children").and_then(|c| c.as_arr()) {
-                for section in sections {
-                    if let Some(leaves) = section.get("Children").and_then(|c| c.as_arr()) {
-                        for leaf in leaves {
-                            if let Some(sensor) = parse_leaf(leaf, &hardware_name) {
-                                out.push(sensor);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    collect_node(doc, "", "", &mut out);
     out
 }
 
-fn parse_leaf(leaf: &Json, hardware_name: &str) -> Option<Sensor> {
-    let id = leaf.get("Path").and_then(|p| p.as_str())?.to_string();
+fn collect_node(node: &Json, inherited_id: &str, inherited_type: &str, out: &mut Vec<Sensor>) {
+    let hardware_id = node
+        .get("HardwareId")
+        .and_then(|v| v.as_str())
+        .unwrap_or(inherited_id);
+    let hardware_type = node
+        .get("HardwareType")
+        .and_then(|v| v.as_str())
+        .unwrap_or(inherited_type);
+    if let Some(sensor) = parse_leaf(node, hardware_id, hardware_type) {
+        out.push(sensor);
+    }
+    if let Some(children) = node.get("Children").and_then(|c| c.as_arr()) {
+        for child in children {
+            collect_node(child, hardware_id, hardware_type, out);
+        }
+    }
+}
+
+fn parse_leaf(leaf: &Json, inherited_id: &str, inherited_type: &str) -> Option<Sensor> {
+    let id = leaf
+        .get("SensorId")
+        .or_else(|| leaf.get("Path"))
+        .and_then(|p| p.as_str())?
+        .to_string();
     let name = leaf
         .get("Text")
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .to_string();
-    let value_text = leaf.get("Value").and_then(|v| v.as_str()).unwrap_or("");
-    let (value, valid) = parse_value(value_text, &id);
+    let (value, valid) = match leaf.get("RawValue").and_then(|v| v.as_f64()) {
+        Some(value) => (value, value.is_finite()),
+        None => parse_value(
+            leaf.get("Value").and_then(|v| v.as_str()).unwrap_or(""),
+            &id,
+        ),
+    };
     let segments: Vec<&str> = id.split('/').collect();
     // /<hardware>/<index>/<type>/<n>
     let hardware_type = match segments.get(1).copied().unwrap_or("") {
@@ -70,9 +78,12 @@ fn parse_leaf(leaf: &Json, hardware_name: &str) -> Option<Sensor> {
         "nic" => "network",
         _ => "other",
     };
-    let kind = segments.get(3).copied().unwrap_or("").to_string();
-    let _ = hardware_name;
-    let hardware_id = format!(
+    let kind = leaf
+        .get("Type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| segments.get(3).copied().unwrap_or(""))
+        .to_ascii_lowercase();
+    let legacy_hardware_id = format!(
         "/{}/{}",
         segments.get(1).copied().unwrap_or(""),
         segments.get(2).copied().unwrap_or("0")
@@ -83,8 +94,16 @@ fn parse_leaf(leaf: &Json, hardware_name: &str) -> Option<Sensor> {
         kind,
         value,
         valid,
-        hardware_id,
-        hardware_type: hardware_type.into(),
+        hardware_id: if inherited_id.is_empty() {
+            legacy_hardware_id
+        } else {
+            inherited_id.to_string()
+        },
+        hardware_type: if inherited_type.is_empty() {
+            hardware_type.into()
+        } else {
+            inherited_type.to_ascii_lowercase()
+        },
     })
 }
 
@@ -139,6 +158,91 @@ pub struct Selection {
     pub errors: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ExtendedSelectors {
+    pub vrm_temp: String,
+    pub chipset_temp: String,
+    pub motherboard_temp: String,
+    pub cpu_fan_control: String,
+    pub cpu_fan_rpm: String,
+    pub pump_control: String,
+    pub pump_rpm: String,
+    pub total_power: String,
+    pub cpu_package_power: String,
+    pub gpu_board_power: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ExtendedSample {
+    pub legacy: Selection,
+    pub vrm_temp: Option<Sensor>,
+    pub chipset_temp: Option<Sensor>,
+    pub motherboard_temp: Option<Sensor>,
+    pub cpu_fan_control: Option<Sensor>,
+    pub cpu_fan_rpm: Option<Sensor>,
+    pub pump_control: Option<Sensor>,
+    pub pump_rpm: Option<Sensor>,
+    pub total_power: Option<Sensor>,
+    pub cpu_package_power: Option<Sensor>,
+    pub gpu_board_power: Option<Sensor>,
+    pub errors: Vec<String>,
+}
+
+fn exact(
+    sensors: &[Sensor],
+    id: &str,
+    kind: &str,
+    range: std::ops::RangeInclusive<f64>,
+) -> Result<Option<Sensor>, String> {
+    if id.is_empty() {
+        return Ok(None);
+    }
+    let mut matches = sensors.iter().filter(|sensor| sensor.id == id);
+    let sensor = matches.next();
+    if sensor.is_none() || matches.next().is_some() {
+        return Err(format!("LHM sensor ID {id:?} was missing or ambiguous"));
+    }
+    let sensor = sensor.unwrap();
+    if !sensor.valid
+        || sensor.kind != kind
+        || !sensor.value.is_finite()
+        || !range.contains(&sensor.value)
+    {
+        return Err(format!("LHM sensor ID {id:?} has invalid type or value"));
+    }
+    Ok(Some(sensor.clone()))
+}
+
+pub fn select_extended(
+    sensors: &[Sensor],
+    overrides: &std::collections::BTreeMap<String, String>,
+    selectors: &ExtendedSelectors,
+) -> ExtendedSample {
+    let mut out = ExtendedSample {
+        legacy: select(sensors, overrides),
+        ..Default::default()
+    };
+    macro_rules! assign {
+        ($field:ident, $kind:literal, $max:expr) => {
+            match exact(sensors, &selectors.$field, $kind, 0.0..=$max) {
+                Ok(value) => out.$field = value,
+                Err(error) => out.errors.push(error),
+            }
+        };
+    }
+    assign!(vrm_temp, "temperature", 200.0);
+    assign!(chipset_temp, "temperature", 200.0);
+    assign!(motherboard_temp, "temperature", 200.0);
+    assign!(cpu_fan_control, "control", 100.0);
+    assign!(cpu_fan_rpm, "fan", 100_000.0);
+    assign!(pump_control, "control", 100.0);
+    assign!(pump_rpm, "fan", 100_000.0);
+    assign!(total_power, "power", 100_000.0);
+    assign!(cpu_package_power, "power", 100_000.0);
+    assign!(gpu_board_power, "power", 100_000.0);
+    out
+}
+
 fn best(
     sensors: &[Sensor],
     mut filter: impl FnMut(&Sensor) -> bool,
@@ -175,27 +279,29 @@ pub fn select(
     overrides: &std::collections::BTreeMap<String, String>,
 ) -> Selection {
     let mut sel = Selection::default();
-    let by_id = |id: &str| sensors.iter().find(|s| s.id == id);
 
     let override_lookup =
         |sel: &mut Selection, key: &'static str, assign: fn(&mut Selection, Sensor)| -> bool {
             match overrides.get(key) {
-                Some(id) => match by_id(id) {
-                    Some(sensor)
-                        if sensor.valid
-                            && sensor.kind == "temperature"
-                            && valid_temperature(sensor.value) =>
-                    {
-                        assign(sel, sensor.clone());
-                        true
-                    }
-                    _ => {
-                        sel.errors.push(format!(
-                            "configured LHM sensor {key}={id:?} was not returned or is invalid"
+                Some(id) => {
+                    let mut matches = sensors.iter().filter(|sensor| sensor.id == *id);
+                    match (matches.next(), matches.next()) {
+                        (Some(sensor), None)
+                            if sensor.valid
+                                && sensor.kind == "temperature"
+                                && valid_temperature(sensor.value) =>
+                        {
+                            assign(sel, sensor.clone());
+                            true
+                        }
+                        _ => {
+                            sel.errors.push(format!(
+                            "configured LHM sensor {key}={id:?} was missing, ambiguous, or invalid"
                         ));
-                        true
+                            true
+                        }
                     }
-                },
+                }
                 None => false,
             }
         };
@@ -231,20 +337,23 @@ pub fn select(
     sel
 }
 
-/// Fetch + collect + select in one call.
-pub fn sample(
+pub fn sample_extended(
     url: &str,
     overrides: &std::collections::BTreeMap<String, String>,
+    selectors: &ExtendedSelectors,
     timeout: Duration,
-) -> Result<Selection, String> {
+) -> Result<(ExtendedSample, std::time::SystemTime), String> {
     let body = crate::http::get(url, timeout)?;
     let text = std::str::from_utf8(&body).map_err(|_| "LHM response is not UTF-8".to_string())?;
-    let doc = Json::parse(text).map_err(|e| format!("LHM JSON: {}", e))?;
+    let doc = Json::parse(text).map_err(|e| format!("LHM JSON: {e}"))?;
     let sensors = collect(&doc);
     if sensors.is_empty() {
         return Err("LHM returned no sensors".into());
     }
-    Ok(select(&sensors, overrides))
+    Ok((
+        select_extended(&sensors, overrides, selectors),
+        std::time::SystemTime::now(),
+    ))
 }
 
 #[cfg(test)]
@@ -362,6 +471,17 @@ mod tests {
             "/gpu-amd/0/temperature/9".to_string(),
         );
         assert_eq!(select(&gpu, &gpu_override).gpu_temp.unwrap().value, 51.0);
+
+        let duplicate = vec![
+            sensor("/amdcpu/0/temperature/9", "First", 42.0, true),
+            sensor("/amdcpu/0/temperature/9", "Second", 43.0, true),
+        ];
+        let selected = select(&duplicate, &overrides);
+        assert!(selected.cpu_temp.is_none());
+        assert!(selected
+            .errors
+            .iter()
+            .any(|error| error.contains("ambiguous")));
     }
 
     #[test]
@@ -377,5 +497,30 @@ mod tests {
         assert_eq!(sensors[0].hardware_type, "cpu");
         assert_eq!(sensors[0].kind, "temperature");
         assert!((sensors[0].value - 67.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn modern_recursive_shape_and_exact_extended_selectors_fail_closed() {
+        let doc = Json::parse(
+            r#"{"Children":[{"HardwareId":"board0","HardwareType":"Motherboard","Children":[
+                {"Children":[{"SensorId":"/board/vrm","Type":"Temperature","RawValue":61.25,"Text":"VRM"},
+                {"SensorId":"/board/power","Type":"Power","RawValue":315.5,"Text":"Total"}]}]}]}"#,
+        )
+        .unwrap();
+        let mut sensors = collect(&doc);
+        assert_eq!(sensors[0].hardware_id, "board0");
+        assert_eq!(sensors[0].kind, "temperature");
+        let selectors = ExtendedSelectors {
+            vrm_temp: "/board/vrm".into(),
+            total_power: "/board/power".into(),
+            ..Default::default()
+        };
+        let selected = select_extended(&sensors, &Default::default(), &selectors);
+        assert_eq!(selected.vrm_temp.unwrap().value, 61.25);
+        assert_eq!(selected.total_power.unwrap().value, 315.5);
+        sensors.push(sensors[0].clone());
+        let duplicate = select_extended(&sensors, &Default::default(), &selectors);
+        assert!(duplicate.vrm_temp.is_none());
+        assert!(!duplicate.errors.is_empty());
     }
 }

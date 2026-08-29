@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -43,6 +43,7 @@ impl Deadline {
 
 #[derive(Clone, Debug, Default)]
 pub struct Update {
+    pub generation: u64,
     pub ping: Metric,
     pub jitter: Metric,
     pub loss: Metric,
@@ -175,34 +176,74 @@ impl State {
 
 pub fn spawn(
     config: Arc<RwLock<Config>>,
+    generation: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
 ) -> (mpsc::Receiver<Update>, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("telemetry-network-quality".into())
-        .spawn(move || worker(config, shutdown, tx))
+        .spawn(move || worker(config, generation, shutdown, tx))
         .expect("network quality thread");
     (rx, thread)
 }
 
-fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Sender<Update>) {
+fn current_request(config: &RwLock<Config>, generation: &AtomicU64) -> (u64, Config) {
+    loop {
+        let before = generation.load(Ordering::SeqCst);
+        let config = config.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if before == generation.load(Ordering::SeqCst) {
+            return (before, config);
+        }
+    }
+}
+
+fn worker(
+    config: Arc<RwLock<Config>>,
+    generation: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
+    tx: mpsc::Sender<Update>,
+) {
     let mut state = State::default();
     let mut policy = None;
     let mut last_attempt = None;
     let mut disabled_published = false;
+    let mut current_generation = 0;
     while !shutdown.load(Ordering::Relaxed) {
-        let current = Policy::from(&*config.read().unwrap_or_else(|e| e.into_inner()));
+        let (request_generation, cfg) = current_request(&config, &generation);
+        if request_generation != current_generation {
+            current_generation = request_generation;
+            state.clear();
+            policy = None;
+            last_attempt = None;
+            disabled_published = false;
+            if tx
+                .send(Update {
+                    generation: request_generation,
+                    ..Default::default()
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+        let current = Policy::from(&cfg);
         if policy.as_ref().is_some_and(|old| old != &current) {
             state.clear();
             last_attempt = None;
-            if tx.send(state.update.clone()).is_err() {
+            let mut update = state.update.clone();
+            update.generation = request_generation;
+            if tx.send(update).is_err() {
                 return;
             }
         }
         policy = Some(current.clone());
         if !current.active() {
-            if !disabled_published && tx.send(state.clear()).is_err() {
-                return;
+            if !disabled_published {
+                let mut update = state.clear();
+                update.generation = request_generation;
+                if tx.send(update).is_err() {
+                    return;
+                }
             }
             disabled_published = true;
             std::thread::sleep(TICK);
@@ -219,20 +260,23 @@ fn worker(config: Arc<RwLock<Config>>, shutdown: Arc<AtomicBool>, tx: mpsc::Send
         if shutdown.load(Ordering::Acquire) {
             return;
         }
-        let latest = Policy::from(&*config.read().unwrap_or_else(|e| e.into_inner()));
-        if latest != current || !latest.active() {
+        let (latest_generation, latest_cfg) = current_request(&config, &generation);
+        let latest = Policy::from(&latest_cfg);
+        if latest_generation != request_generation || latest != current || !latest.active() {
+            current_generation = latest_generation;
             state.clear();
             policy = Some(latest);
             last_attempt = None;
-            if tx.send(state.update.clone()).is_err() {
+            let mut update = state.update.clone();
+            update.generation = latest_generation;
+            if tx.send(update).is_err() {
                 return;
             }
             continue;
         }
-        if tx
-            .send(state.apply(outcome, current.window, SystemTime::now()))
-            .is_err()
-        {
+        let mut update = state.apply(outcome, current.window, SystemTime::now());
+        update.generation = request_generation;
+        if tx.send(update).is_err() {
             return;
         }
     }

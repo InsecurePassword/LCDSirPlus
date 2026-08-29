@@ -8,7 +8,10 @@ use crate::backends::{Backend, BackendKind, BackendState, Message};
 use crate::config::Config;
 use crate::hardware_test::{self, TestConfig, Transport};
 use crate::logging::Level;
-use crate::model::{DiscordState, Metric, MetricKey, Reading, ReadingsSnapshot, Snapshot};
+use crate::model::{
+    BottleneckDetector, BottleneckInputs, BottleneckThresholds, DiscordState, Freshness, Metric,
+    MetricKey, Reading, ReadingsSnapshot, Snapshot,
+};
 use crate::providers::{ccd, clock, cpu, hang, memory};
 use crate::render::renderer::{OverlayOptions, Renderer, View};
 use crate::slots::Manager;
@@ -24,38 +27,36 @@ pub struct RunOptions {
 pub struct ValidateOutcome {
     pub ok: bool,
     pub message: String,
-    pub files: Vec<std::path::PathBuf>,
+    pub loaded: Option<crate::parser::LoadedConfig>,
 }
 
 /// Load + validate a configuration; used by `--validate-config` and startup.
 pub fn validate_config(path: &std::path::Path) -> ValidateOutcome {
     match crate::parser::load(path) {
-        Ok(loaded) => ValidateOutcome {
-            ok: true,
-            message: format!(
+        Ok(loaded) => {
+            let message = format!(
                 "configuration valid ({} file(s), {} bytes primary)",
                 loaded.files.len(),
                 std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
-            ),
-            files: loaded.files,
-        },
+            );
+            ValidateOutcome {
+                ok: true,
+                message,
+                loaded: Some(loaded),
+            }
+        }
         Err(e) => ValidateOutcome {
             ok: false,
             message: e.to_string(),
-            files: Vec::new(),
+            loaded: None,
         },
     }
 }
 
-fn default_config_path() -> std::path::PathBuf {
+pub fn default_config_path() -> std::path::PathBuf {
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let dir = exe.parent().unwrap_or(std::path::Path::new("."));
     dir.join("lcdsirplus.txt")
-}
-
-/// Public accessor for the CLI (`--validate-config` default resolution).
-pub fn default_config_path_pub() -> std::path::PathBuf {
-    default_config_path()
 }
 
 pub fn log_dir() -> std::path::PathBuf {
@@ -103,21 +104,20 @@ pub fn run_hardware_discover() -> i32 {
     }
 }
 
-/// Normal application run. Returns a process exit code.
-pub fn run(opts: RunOptions) -> i32 {
+/// Normal application run. Returns a process exit code or a startup failure.
+pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
     let config_path = opts.config_path.clone().unwrap_or_else(default_config_path);
     let outcome = validate_config(&config_path);
-    if !outcome.ok {
-        eprintln!("configuration error: {}", outcome.message);
-        return 2;
-    }
-    let mut cfg = crate::parser::load(&config_path).expect("checked").config;
+    let loaded = outcome
+        .loaded
+        .ok_or_else(|| (2, format!("configuration error: {}", outcome.message)))?;
+    let watched_files = loaded.files.clone();
+    let mut cfg = loaded.config;
     if opts.safe_mode {
         cfg.safe_mode = true;
     }
     if let Err(error) = init_logging(&cfg, opts.diagnostic_dir.as_deref()) {
-        eprintln!("logging initialization failed: {error}");
-        return 1;
+        return Err((1, format!("logging initialization failed: {error}")));
     }
     crate::log_info!("LCDSirPlus {} starting", env!("CARGO_PKG_VERSION"));
     crate::log_info!("configuration: {}", cfg.path);
@@ -126,13 +126,7 @@ pub fn run(opts: RunOptions) -> i32 {
     sync_startup_if_needed(&cfg, startup_executable.as_deref(), &mut startup_synced);
 
     // CCD topology (native detection; Process Lasso retired).
-    let topology = match (&cfg.ccd_source, &cfg.ccd_cache_processors) {
-        _ if cfg.ccd_source == "manual" && cfg.ccd_cache_processors.is_some() => ccd::from_lists(
-            cfg.ccd_cache_processors.as_deref().unwrap_or(&[]),
-            cfg.ccd_frequency_processors.as_deref().unwrap_or(&[]),
-        ),
-        _ => ccd::detect(),
-    };
+    let mut topology = resolve_ccd_topology(&cfg);
     crate::log_info!("CCD topology: {}", topology.detail);
 
     // Backend.
@@ -150,28 +144,34 @@ pub fn run(opts: RunOptions) -> i32 {
     let mut cpu_provider = cpu::CpuLoadProvider::new();
     let telemetry_runtime = crate::telemetry::spawn(&cfg);
     let discord_runtime = crate::providers::discord::spawn(&cfg);
-    let mut telemetry = crate::telemetry::Update::default();
+    let mut telemetry = crate::telemetry::Update {
+        generation: telemetry_runtime.generation(),
+        ..Default::default()
+    };
     let mut discord = DiscordState::default();
     let mut renderer = Renderer::new();
-    let slots = Manager::new(&cfg, [0; 4]);
-    let mut slot_indexes: [usize; 4] = [0; 4];
+    let mut slots = Manager::new(&cfg, [0; 4]);
     let mut hang_hold = hang::HoldState::default();
+    hang_hold.set_owner(proc_hang_owner(&slots));
     let mut alerts = crate::alerts::Manager::default();
+    let mut bottleneck = BottleneckDetector::default();
 
-    // Config watcher state: (mtime, len) of primary.
-    let mut watcher = ConfigWatcher::new(&config_path);
+    let mut watcher = ConfigWatcher::new(&watched_files);
 
     let mut last_telemetry = Instant::now() - cfg.telemetry_interval;
     let mut last_render = Instant::now() - cfg.render_interval;
     let mut snapshot = Snapshot::default();
     let mut running = true;
     let mut backend_state = BackendState::Discovering;
+    let process_epoch = Instant::now();
 
     while running {
         let now = Instant::now();
 
         while let Ok(update) = telemetry_runtime.updates.try_recv() {
-            telemetry = update;
+            if update.generation == telemetry_runtime.generation() {
+                telemetry = update;
+            }
         }
         while let Ok(update) = discord_runtime.updates.try_recv() {
             discord = update;
@@ -188,13 +188,27 @@ pub fn run(opts: RunOptions) -> i32 {
                             log_hang_audit(&audit);
                         }
                         let backend_changed = backend_config_changed(&cfg, &loaded.config);
+                        let topology_changed = ccd_config_changed(&cfg, &loaded.config);
+                        let files = loaded.files.clone();
                         cfg = loaded.config;
                         if opts.safe_mode {
                             cfg.safe_mode = true;
                         }
-                        telemetry_runtime.update_config(&cfg);
+                        if topology_changed {
+                            topology = resolve_ccd_topology(&cfg);
+                            crate::log_info!("CCD topology reloaded: {}", topology.detail);
+                        }
+                        let generation = telemetry_runtime.update_config(&cfg);
+                        invalidate_telemetry_publication(&mut telemetry, &mut snapshot, generation);
+                        alerts = crate::alerts::Manager::default();
+                        bottleneck = BottleneckDetector::default();
+                        renderer = Renderer::new();
                         discord_runtime.update_config(&cfg);
                         slots.apply(&cfg);
+                        if let Some(audit) = hang_hold.set_owner(proc_hang_owner(&slots)) {
+                            log_hang_audit(&audit);
+                        }
+                        watcher.replace(&files);
                         if backend_changed {
                             backend.reconfigure(
                                 crate::backends::resolve_kind(&cfg.logitech_backend),
@@ -230,17 +244,25 @@ pub fn run(opts: RunOptions) -> i32 {
                 &mut cpu_provider,
                 &telemetry,
                 &discord,
-                slot_indexes,
+                &mut bottleneck,
             );
         }
-        snapshot.hung = if cfg.safe_mode || !cfg.hang_enabled || !hang_available(&telemetry) {
+        let telemetry_generation = telemetry_runtime.generation();
+        let (published_hung, hang_provider_available) =
+            current_hang_publication(&telemetry, telemetry_generation);
+        snapshot.hung = if cfg.safe_mode || !cfg.hang_enabled || !hang_provider_available {
             Vec::new()
         } else {
-            telemetry.hung.clone()
+            published_hung.to_vec()
         };
+        if telemetry.generation != telemetry_generation {
+            snapshot.providers.remove("Hung window detector");
+        }
 
-        if let Some(audit) = hang_hold.reconcile(&cfg, &telemetry.hung, hang_available(&telemetry))
-        {
+        if let Some(audit) = hang_hold.set_owner(proc_hang_owner(&slots)) {
+            log_hang_audit(&audit);
+        }
+        if let Some(audit) = hang_hold.reconcile(&cfg, published_hung, hang_provider_available) {
             log_hang_audit(&audit);
         }
         alerts.evaluate(&mut snapshot, &cfg, now);
@@ -248,12 +270,7 @@ pub fn run(opts: RunOptions) -> i32 {
         if now.duration_since(last_render) >= cfg.render_interval {
             last_render = now;
             let view = View {
-                slot_modules: [
-                    slots.current(0),
-                    slots.current(1),
-                    slots.current(2),
-                    slots.current(3),
-                ],
+                slot_modules: effective_slot_modules(&slots, &snapshot),
                 hung_index: hang_hold.hung_index,
                 hung_detail: hang_hold.hung_detail,
                 hung_hold: hang_hold.progress(now, &cfg),
@@ -266,6 +283,13 @@ pub fn run(opts: RunOptions) -> i32 {
                     discord_max_speakers: cfg.discord_max_speakers.max(1) as usize,
                     discord_show_self: cfg.discord_show_self,
                     discord_show_channel: cfg.discord_show_channel,
+                    network_graph_ceiling_mbps: cfg.network_graph_ceiling_mbps,
+                    disk_graph_ceiling_mbps: cfg.disk_graph_ceiling_mbps,
+                    fps_graph_ceiling: cfg.fps_graph_ceiling,
+                    cpu_temp_max_c: cfg.cpu_temp_max_c,
+                    gpu_temp_max_c: cfg.gpu_temp_max_c,
+                    warning: cfg.warning,
+                    warning_phase: (process_epoch.elapsed().as_millis() / 100) % 2 == 1,
                 },
                 &view,
             );
@@ -305,20 +329,12 @@ pub fn run(opts: RunOptions) -> i32 {
                 },
                 Message::Buttons(events) => {
                     for event in events {
-                        let command = hang_hold.event(
-                            event,
-                            &cfg,
-                            &telemetry.hung,
-                            hang_available(&telemetry),
-                        );
-                        apply_hold_command(
-                            command,
-                            &slots,
-                            &mut slot_indexes,
-                            &cfg,
-                            &mut alerts,
-                            &mut snapshot,
-                        );
+                        let command =
+                            hang_hold.event(event, &cfg, published_hung, hang_provider_available);
+                        apply_hold_command(command, &mut slots, &cfg, &mut alerts, &mut snapshot);
+                        if let Some(audit) = hang_hold.set_owner(proc_hang_owner(&slots)) {
+                            log_hang_audit(&audit);
+                        }
                     }
                 }
             }
@@ -334,7 +350,9 @@ pub fn run(opts: RunOptions) -> i32 {
                     }
                     let delta: i64 = if backward { -1 } else { 1 };
                     slots.cycle(slot, delta);
-                    slot_indexes = slots.indexes();
+                    if let Some(audit) = hang_hold.set_owner(proc_hang_owner(&slots)) {
+                        log_hang_audit(&audit);
+                    }
                     crate::log_debug!("preview slot {} cycled", slot);
                 }
                 UiEvent::Exit => {
@@ -350,7 +368,44 @@ pub fn run(opts: RunOptions) -> i32 {
     crate::log_info!("shutting down");
     backend.shutdown();
     ui.shutdown();
-    0
+    Ok(0)
+}
+
+fn proc_hang_owner(slots: &Manager) -> Option<usize> {
+    (0..4).find(|&slot| slots.current(slot).eq_ignore_ascii_case("PROC_HANG"))
+}
+
+fn effective_slot_modules(slots: &Manager, snapshot: &Snapshot) -> [String; 4] {
+    std::array::from_fn(|slot| {
+        let selected = slots.current(slot);
+        let inactive = (selected.eq_ignore_ascii_case("PROC_HANG") && snapshot.hung.is_empty())
+            || (selected.eq_ignore_ascii_case("BOTTLENECK")
+                && snapshot.bottleneck.state == crate::model::BottleneckState::None
+                && snapshot.bottleneck.freshness == Freshness::Current);
+        if inactive {
+            slots
+                .next_except(slot, &["PROC_HANG", "BOTTLENECK"])
+                .unwrap_or_else(|| "CLEAR".into())
+        } else {
+            selected
+        }
+    })
+}
+
+fn resolve_ccd_topology(cfg: &Config) -> ccd::CcdTopology {
+    match (&cfg.ccd_source, &cfg.ccd_cache_processors) {
+        _ if cfg.ccd_source == "manual" && cfg.ccd_cache_processors.is_some() => ccd::from_lists(
+            cfg.ccd_cache_processors.as_deref().unwrap_or(&[]),
+            cfg.ccd_frequency_processors.as_deref().unwrap_or(&[]),
+        ),
+        _ => ccd::detect(),
+    }
+}
+
+fn ccd_config_changed(old: &Config, new: &Config) -> bool {
+    old.ccd_source != new.ccd_source
+        || old.ccd_cache_processors != new.ccd_cache_processors
+        || old.ccd_frequency_processors != new.ccd_frequency_processors
 }
 
 fn preview_for_backend(cfg: &Config, state: &BackendState) -> bool {
@@ -422,11 +477,11 @@ pub fn run_hardware_test(
 ) -> i32 {
     let config_path = config_path.unwrap_or_else(default_config_path);
     let outcome = validate_config(&config_path);
-    if !outcome.ok {
+    let Some(loaded) = outcome.loaded else {
         eprintln!("configuration error: {}", outcome.message);
         return 2;
-    }
-    let cfg = crate::parser::load(&config_path).expect("checked").config;
+    };
+    let cfg = loaded.config;
     if let Err(error) = init_logging(&cfg, diagnostic_dir.as_deref()) {
         eprintln!("logging initialization failed: {error}");
         return 1;
@@ -440,13 +495,14 @@ pub fn run_hardware_test(
     // Build the live dashboard frame for STEP 10.
     let mut cpu_provider = cpu::CpuLoadProvider::new();
     let topology = ccd::detect();
+    let mut bottleneck = BottleneckDetector::default();
     let snapshot = build_snapshot(
         &cfg,
         &topology,
         &mut cpu_provider,
         &crate::telemetry::Update::default(),
         &DiscordState::default(),
-        [0; 4],
+        &mut bottleneck,
     );
     let dashboard = crate::render::renderer::Renderer::new().render(
         &snapshot,
@@ -611,9 +667,10 @@ fn build_snapshot(
     cpu_provider: &mut cpu::CpuLoadProvider,
     telemetry: &crate::telemetry::Update,
     discord: &DiscordState,
-    _slot_indexes: [usize; 4],
+    bottleneck: &mut BottleneckDetector,
 ) -> Snapshot {
     let now = SystemTime::now();
+    let monotonic_now = Instant::now();
     let clock = clock::read();
     let per_lp = cpu_provider.update();
 
@@ -626,12 +683,9 @@ fn build_snapshot(
     } else {
         (false, cpu::aggregate(&per_lp, topology.cache_mask), 0.0)
     };
-    let total_load = if per_lp.is_empty() {
-        0.0
-    } else {
-        per_lp.iter().sum::<f64>() / per_lp.len() as f64
-    };
-    let mem = memory::memory_load_percent();
+    let total_load = (!per_lp.is_empty()).then(|| per_lp.iter().sum::<f64>() / per_lp.len() as f64);
+    let peak_load = per_lp.iter().copied().reduce(f64::max);
+    let mem = memory::sample();
 
     let mut snapshot = Snapshot {
         now: Some(now),
@@ -641,16 +695,37 @@ fn build_snapshot(
         time_text: clock.time,
         cpu_cache_load: Metric::valid(cache_load, now),
         cpu_freq_load: Metric::valid(freq_load, now),
-        headset: telemetry.headset.clone(),
-        controller: telemetry.controller.clone(),
-        discord: discord.clone(),
-        hung: telemetry.hung.clone(),
+        headset: if cfg.safe_mode {
+            Default::default()
+        } else {
+            telemetry.headset.clone()
+        },
+        controller: if cfg.safe_mode {
+            Default::default()
+        } else {
+            telemetry.controller.clone()
+        },
+        discord: if cfg.safe_mode {
+            DiscordState::default()
+        } else {
+            discord.clone()
+        },
+        hung: if cfg.safe_mode {
+            Vec::new()
+        } else {
+            telemetry.hung.clone()
+        },
+        system_battery: if cfg.safe_mode {
+            Default::default()
+        } else {
+            telemetry.system_battery
+        },
         ..Default::default()
     };
 
     // Canonical readings for the fixed bars.
     let mut readings = ReadingsSnapshot::default();
-    if total_load.is_finite() {
+    if let Some(total_load) = total_load.filter(|load| load.is_finite()) {
         readings.metrics.push(Reading::current_percent(
             MetricKey::CPUUtilization,
             total_load,
@@ -658,35 +733,101 @@ fn build_snapshot(
             now,
         ));
     }
-    if mem.is_finite() {
+    if let Some(peak_load) = peak_load.filter(|load| load.is_finite()) {
         readings.metrics.push(Reading::current_percent(
-            MetricKey::RAMUtilization,
-            mem,
-            "physical-memory",
+            MetricKey::CPUPeakUtilization,
+            peak_load,
+            "cpu-peak-logical-processor",
             now,
         ));
     }
-    readings
-        .metrics
-        .extend(telemetry.gpu_readings.iter().cloned());
+    readings.metrics.extend(memory_readings(mem));
+    if !cfg.safe_mode {
+        readings
+            .metrics
+            .extend(telemetry.gpu_readings.iter().cloned());
+        readings
+            .metrics
+            .extend(telemetry.extended_readings.iter().cloned());
+    }
     snapshot.readings = readings;
 
-    apply_telemetry(&mut snapshot, telemetry, now);
+    snapshot.bottleneck = bottleneck.update(
+        BottleneckThresholds {
+            cpu_percent: cfg.bottleneck_cpu_percent,
+            gpu_percent: cfg.bottleneck_gpu_percent,
+            memory_percent: cfg.bottleneck_memory_percent,
+            disk_mbps: cfg.bottleneck_disk_mbps,
+            sustain: cfg.bottleneck_sustain,
+        },
+        bottleneck_inputs(&snapshot.readings),
+        monotonic_now,
+    );
+
+    if !cfg.safe_mode {
+        apply_telemetry(&mut snapshot, telemetry, now);
+    }
 
     if cfg.safe_mode {
         snapshot.providers.insert("safe-mode".into(), true);
     }
-    for (name, ok) in &telemetry.providers {
-        snapshot.providers.insert(name.clone(), *ok);
+    if !cfg.safe_mode {
+        for (name, ok) in &telemetry.providers {
+            snapshot.providers.insert(name.clone(), *ok);
+        }
+        snapshot.providers.insert(
+            "Discord".into(),
+            snapshot.discord.connected && snapshot.discord.authenticated,
+        );
     }
-    snapshot.providers.insert(
-        "Discord".into(),
-        snapshot.discord.connected && snapshot.discord.authenticated,
-    );
-    if cfg.safe_mode || !cfg.hang_enabled || !hang_available(telemetry) {
+    if cfg.safe_mode || !cfg.hang_enabled || !hang_provider_available(telemetry) {
         snapshot.hung.clear();
     }
     snapshot
+}
+
+fn current_number(readings: &ReadingsSnapshot, key: MetricKey) -> Option<f64> {
+    readings.lookup(key, "").and_then(|reading| {
+        (reading.has_value && reading.freshness == Freshness::Current).then_some(reading.number)
+    })
+}
+
+fn bottleneck_inputs(readings: &ReadingsSnapshot) -> BottleneckInputs {
+    let disk = current_number(readings, MetricKey::DiskReadBytesPerSec)
+        .zip(current_number(readings, MetricKey::DiskWriteBytesPerSec));
+    BottleneckInputs {
+        cpu_peak_percent: current_number(readings, MetricKey::CPUPeakUtilization),
+        gpu_percent: current_number(readings, MetricKey::GPUUtilization),
+        ram_percent: current_number(readings, MetricKey::RAMUtilization),
+        vram_percent: current_number(readings, MetricKey::VRAMUtilization),
+        disk_mbps: disk.map(|(read, write)| (read + write) / 1_000_000.0),
+    }
+}
+
+fn memory_readings(sample: Result<memory::MemorySample, String>) -> Vec<Reading> {
+    let Ok(sample) = sample else {
+        return Vec::new();
+    };
+    vec![
+        Reading::current_percent(
+            MetricKey::RAMUtilization,
+            sample.percent,
+            "physical-memory",
+            sample.sampled_at,
+        ),
+        Reading::current_bytes(
+            MetricKey::RAMUsed,
+            sample.used_bytes,
+            "physical-memory",
+            sample.sampled_at,
+        ),
+        Reading::current_bytes(
+            MetricKey::RAMTotal,
+            sample.total_bytes,
+            "physical-memory",
+            sample.sampled_at,
+        ),
+    ]
 }
 
 fn apply_telemetry(snapshot: &mut Snapshot, telemetry: &crate::telemetry::Update, now: SystemTime) {
@@ -701,8 +842,8 @@ fn apply_telemetry(snapshot: &mut Snapshot, telemetry: &crate::telemetry::Update
     snapshot.network_in = Metric::default();
     snapshot.network_out = Metric::default();
     if let Some(net) = telemetry.net {
-        snapshot.network_in = Metric::valid(net.in_bps, now);
-        snapshot.network_out = Metric::valid(net.out_bps, now);
+        snapshot.network_in = Metric::valid(net.in_bps, net.sampled_at);
+        snapshot.network_out = Metric::valid(net.out_bps, net.sampled_at);
     }
 
     // Audio endpoint state.
@@ -710,17 +851,43 @@ fn apply_telemetry(snapshot: &mut Snapshot, telemetry: &crate::telemetry::Update
     snapshot.microphone_known = false;
     snapshot.microphone_muted = false;
     if let Some(audio) = &telemetry.audio {
-        snapshot.audio_volume = Metric::valid(audio.volume_percent, now);
+        snapshot.audio_volume = Metric::valid(
+            audio.volume_percent,
+            telemetry.audio_sampled_at.unwrap_or(now),
+        );
         snapshot.microphone_known = audio.mic_known;
         snapshot.microphone_muted = audio.mic_muted;
     }
 }
 
-fn hang_available(telemetry: &crate::telemetry::Update) -> bool {
+fn current_hang_publication(
+    telemetry: &crate::telemetry::Update,
+    generation: u64,
+) -> (&[crate::model::HungTarget], bool) {
+    if telemetry.generation != generation {
+        return (&[], false);
+    }
+    let available = hang_provider_available(telemetry);
+    (&telemetry.hung, available)
+}
+
+fn hang_provider_available(telemetry: &crate::telemetry::Update) -> bool {
     telemetry
         .providers
         .iter()
         .any(|(name, available)| name == "Hung window detector" && *available)
+}
+
+fn invalidate_telemetry_publication(
+    telemetry: &mut crate::telemetry::Update,
+    snapshot: &mut Snapshot,
+    generation: u64,
+) {
+    *telemetry = crate::telemetry::Update {
+        generation,
+        ..Default::default()
+    };
+    *snapshot = Snapshot::default();
 }
 
 fn log_hang_audit(audit: &hang::Audit) {
@@ -734,8 +901,7 @@ fn log_hang_audit(audit: &hang::Audit) {
 
 fn apply_hold_command(
     command: hang::HoldCommand,
-    slots: &Manager,
-    indexes: &mut [usize; 4],
+    slots: &mut Manager,
     cfg: &Config,
     alerts: &mut crate::alerts::Manager,
     snapshot: &mut Snapshot,
@@ -743,7 +909,6 @@ fn apply_hold_command(
     apply_hold_command_with(
         command,
         slots,
-        indexes,
         cfg,
         alerts,
         snapshot,
@@ -753,8 +918,7 @@ fn apply_hold_command(
 
 fn apply_hold_command_with<F>(
     command: hang::HoldCommand,
-    slots: &Manager,
-    indexes: &mut [usize; 4],
+    slots: &mut Manager,
     cfg: &Config,
     alerts: &mut crate::alerts::Manager,
     snapshot: &mut Snapshot,
@@ -770,7 +934,6 @@ fn apply_hold_command_with<F>(
                 return;
             }
             let module = slots.cycle(index, if backward { -1 } else { 1 });
-            *indexes = slots.indexes();
             crate::log_debug!("button {} -> slot module {}", index + 1, module);
         }
         hang::HoldCommand::Audit(audit) => log_hang_audit(&audit),
@@ -796,44 +959,77 @@ fn apply_hold_command_with<F>(
 }
 
 struct ConfigWatcher {
-    path: std::path::PathBuf,
-    last_mtime: Option<SystemTime>,
-    last_len: u64,
+    files: Vec<(std::path::PathBuf, Option<FileSignature>)>,
     pub last_check: Instant,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileSignature {
+    modified: Option<SystemTime>,
+    len: u64,
+    digest: String,
+}
+
 impl ConfigWatcher {
-    fn new(path: &std::path::Path) -> Self {
-        let (mtime, len) = stat(path);
+    fn new(paths: &[std::path::PathBuf]) -> Self {
         ConfigWatcher {
-            path: path.to_path_buf(),
-            last_mtime: mtime,
-            last_len: len,
+            files: paths
+                .iter()
+                .map(|path| (path.clone(), file_signature(path)))
+                .collect(),
             last_check: Instant::now(),
         }
     }
 
-    fn changed(&mut self) -> bool {
-        let (mtime, len) = stat(&self.path);
-        if mtime != self.last_mtime || len != self.last_len {
-            self.last_mtime = mtime;
-            self.last_len = len;
-            return true;
-        }
-        false
+    fn changed(&self) -> bool {
+        self.files
+            .iter()
+            .any(|(path, signature)| file_signature(path) != *signature)
+    }
+
+    fn replace(&mut self, paths: &[std::path::PathBuf]) {
+        self.files = paths
+            .iter()
+            .map(|path| (path.clone(), file_signature(path)))
+            .collect();
     }
 }
 
-fn stat(path: &std::path::Path) -> (Option<SystemTime>, u64) {
-    match std::fs::metadata(path) {
-        Ok(meta) => (meta.modified().ok(), meta.len()),
-        Err(_) => (None, 0),
-    }
+fn file_signature(path: &std::path::Path) -> Option<FileSignature> {
+    let bytes = std::fs::read(path).ok()?;
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileSignature {
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+        digest: crate::sha256::sha256_hex(&bytes),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_success_publishes_zero_and_bytes_while_failure_omits_all() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(7);
+        let readings = memory_readings(Ok(memory::MemorySample {
+            percent: 0.0,
+            used_bytes: 0,
+            total_bytes: 16,
+            sampled_at: at,
+        }));
+        assert_eq!(readings.len(), 3);
+        assert_eq!(readings[0].key, MetricKey::RAMUtilization);
+        assert_eq!(readings[0].number, 0.0);
+        assert_eq!(readings[1].key, MetricKey::RAMUsed);
+        assert_eq!(readings[1].bytes, 0);
+        assert_eq!(readings[2].key, MetricKey::RAMTotal);
+        assert_eq!(readings[2].bytes, 16);
+        assert!(readings
+            .iter()
+            .all(|reading| reading.sampled_at == Some(at)));
+        assert!(memory_readings(Err("unavailable".into())).is_empty());
+    }
 
     #[test]
     fn telemetry_projects_temperature_states_and_idle_network() {
@@ -854,12 +1050,44 @@ mod tests {
         assert_eq!(snapshot.ping_ms.value, 12.0);
         assert!(snapshot.packet_loss.valid);
         assert!(snapshot.network_in.valid && snapshot.network_out.valid);
+        assert_eq!(snapshot.network_in.updated, Some(SystemTime::UNIX_EPOCH));
 
         apply_telemetry(&mut snapshot, &crate::telemetry::Update::default(), now);
         assert!(!snapshot.cpu_temp.valid);
         assert!(!snapshot.gpu_temp.valid);
         assert!(!snapshot.network_in.valid);
         assert!(!snapshot.audio_volume.valid);
+    }
+
+    #[test]
+    fn bottleneck_inputs_require_native_core_data_and_use_peak_and_disk_sum() {
+        let at = SystemTime::UNIX_EPOCH;
+        let mut readings = ReadingsSnapshot {
+            metrics: vec![
+                Reading::current_percent(MetricKey::CPUPeakUtilization, 91.0, "cpu", at),
+                Reading::current_percent(MetricKey::RAMUtilization, 50.0, "ram", at),
+                Reading::current_number(
+                    MetricKey::DiskReadBytesPerSec,
+                    crate::model::ValueKind::ByteRate,
+                    300_000_000.0,
+                    "disk",
+                    at,
+                ),
+                Reading::current_number(
+                    MetricKey::DiskWriteBytesPerSec,
+                    crate::model::ValueKind::ByteRate,
+                    250_000_000.0,
+                    "disk",
+                    at,
+                ),
+            ],
+            ..Default::default()
+        };
+        let input = bottleneck_inputs(&readings);
+        assert_eq!(input.cpu_peak_percent, Some(91.0));
+        assert_eq!(input.disk_mbps, Some(550.0));
+        readings.metrics[2].freshness = Freshness::Stale;
+        assert_eq!(bottleneck_inputs(&readings).disk_mbps, None);
     }
 
     #[test]
@@ -906,6 +1134,160 @@ mod tests {
     }
 
     #[test]
+    fn ccd_policy_change_replaces_manual_topology() {
+        let old = Config::default();
+        let new = Config {
+            ccd_source: "manual".into(),
+            ccd_cache_processors: Some(vec![0, 1]),
+            ccd_frequency_processors: Some(vec![2, 3]),
+            ..Config::default()
+        };
+        assert!(ccd_config_changed(&old, &new));
+        let topology = resolve_ccd_topology(&new);
+        assert!(topology.dual);
+        assert_eq!(topology.cache_mask, 0b0011);
+        assert_eq!(topology.freq_mask, 0b1100);
+        let mut unrelated = new.clone();
+        unrelated.preview_scale = 2;
+        assert!(!ccd_config_changed(&new, &unrelated));
+    }
+
+    #[test]
+    fn validation_loads_once_and_retains_files_for_the_watcher() {
+        let dir = std::env::temp_dir().join(format!(
+            "lcdsirplus-validation-test-{}-{:?}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let primary = dir.join("main.txt");
+        let include = dir.join("local.txt");
+        std::fs::write(&primary, "include local.txt\n").unwrap();
+        std::fs::write(&include, "preview_scale 2\n").unwrap();
+
+        let before = crate::parser::test_load_calls();
+        let valid = validate_config(&primary);
+        assert_eq!(crate::parser::test_load_calls(), before + 1);
+        assert!(valid.ok);
+        assert_eq!(
+            valid.message,
+            "configuration valid (2 file(s), 18 bytes primary)"
+        );
+        let loaded = valid.loaded.unwrap();
+        assert_eq!(loaded.files.len(), 2);
+        let watcher = ConfigWatcher::new(&loaded.files);
+        assert!(!watcher.changed());
+
+        std::fs::write(&primary, "unknown_setting 1\n").unwrap();
+        let before = crate::parser::test_load_calls();
+        let invalid = validate_config(&primary);
+        assert_eq!(crate::parser::test_load_calls(), before + 1);
+        assert!(!invalid.ok && invalid.loaded.is_none());
+        assert!(invalid
+            .message
+            .ends_with(":1: unknown key \"unknown_setting\""));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_watcher_tracks_includes_and_retries_until_success_commit() {
+        let dir = std::env::temp_dir().join(format!(
+            "lcdsirplus-watcher-test-{}-{:?}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let primary = dir.join("main.txt");
+        let include = dir.join("local.txt");
+        std::fs::write(&primary, "include local.txt\n").unwrap();
+        std::fs::write(&include, "preview_scale 2\n").unwrap();
+        let loaded = crate::parser::load(&primary).unwrap();
+        let mut watcher = ConfigWatcher::new(&loaded.files);
+        assert!(!watcher.changed());
+
+        std::fs::write(&include, "preview_scale 3\n").unwrap();
+        assert!(watcher.changed(), "transitive include change is observed");
+        assert!(
+            watcher.changed(),
+            "failed reload does not commit the changed baseline"
+        );
+        let reloaded = crate::parser::load(&primary).unwrap();
+        watcher.replace(&reloaded.files);
+        assert!(!watcher.changed());
+
+        std::fs::remove_file(&include).unwrap();
+        assert!(watcher.changed(), "missing include triggers reload");
+        assert!(crate::parser::load(&primary).is_err());
+        assert!(watcher.changed(), "missing include keeps triggering retry");
+        std::fs::write(&include, "preview_scale 4\n").unwrap();
+        assert!(watcher.changed(), "replacement include remains pending");
+        let reloaded = crate::parser::load(&primary).unwrap();
+        watcher.replace(&reloaded.files);
+        assert!(!watcher.changed());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn safe_mode_snapshot_contains_only_native_cpu_and_ram_data() {
+        let at = SystemTime::UNIX_EPOCH;
+        let telemetry = crate::telemetry::Update {
+            headset: crate::model::HeadsetBattery {
+                present: true,
+                ..Default::default()
+            },
+            gpu_readings: vec![Reading::current_percent(
+                MetricKey::GPUUtilization,
+                99.0,
+                "gpu",
+                at,
+            )],
+            extended_readings: vec![Reading::current_number(
+                MetricKey::EstablishedConnections,
+                crate::model::ValueKind::Count,
+                5.0,
+                "tcp",
+                at,
+            )],
+            ..Default::default()
+        };
+        let cfg = Config {
+            safe_mode: true,
+            ccd_source: "manual".into(),
+            ccd_cache_processors: Some(vec![0]),
+            ..Config::default()
+        };
+        let mut cpu = cpu::CpuLoadProvider::new();
+        let mut bottleneck = BottleneckDetector::default();
+        let snapshot = build_snapshot(
+            &cfg,
+            &resolve_ccd_topology(&cfg),
+            &mut cpu,
+            &telemetry,
+            &DiscordState {
+                connected: true,
+                ..Default::default()
+            },
+            &mut bottleneck,
+        );
+        assert!(!snapshot.headset.present);
+        assert!(!snapshot.discord.connected);
+        assert!(snapshot.readings.metrics.iter().all(|reading| matches!(
+            reading.key,
+            MetricKey::CPUUtilization
+                | MetricKey::CPUPeakUtilization
+                | MetricKey::RAMUtilization
+                | MetricKey::RAMUsed
+                | MetricKey::RAMTotal
+        )));
+    }
+
+    #[test]
     fn safe_mode_never_attempts_startup_synchronization() {
         let cfg = Config {
             safe_mode: true,
@@ -925,8 +1307,7 @@ mod tests {
             safe_mode: true,
             ..Config::default()
         };
-        let slots = Manager::new(&cfg, [0; 4]);
-        let mut indexes = [0; 4];
+        let mut slots = Manager::new(&cfg, [0; 4]);
         let mut alerts = crate::alerts::Manager::default();
         let mut snapshot = Snapshot {
             gpu_temp: Metric::valid(91.0, SystemTime::UNIX_EPOCH),
@@ -940,8 +1321,7 @@ mod tests {
                 index: 0,
                 backward: false,
             },
-            &slots,
-            &mut indexes,
+            &mut slots,
             &cfg,
             &mut alerts,
             &mut snapshot,
@@ -957,8 +1337,7 @@ mod tests {
                 index: 3,
                 backward: false,
             },
-            &slots,
-            &mut indexes,
+            &mut slots,
             &cfg,
             &mut alerts,
             &mut snapshot,
@@ -978,8 +1357,7 @@ mod tests {
                 process_name: "game.exe".into(),
                 title: "Game".into(),
             }),
-            &slots,
-            &mut indexes,
+            &mut slots,
             &cfg,
             &mut alerts,
             &mut snapshot,
@@ -989,5 +1367,187 @@ mod tests {
             },
         );
         assert_eq!(kills.get(), 0);
+    }
+
+    #[test]
+    fn dynamic_modules_fall_through_without_changing_selection() {
+        let cfg = Config::default();
+        let slots = Manager::new(&cfg, [0; 4]);
+        let mut snapshot = Snapshot::default();
+        snapshot.bottleneck.state = crate::model::BottleneckState::None;
+        snapshot.bottleneck.freshness = Freshness::Current;
+        assert_eq!(slots.current(2), "PROC_HANG");
+        assert_eq!(effective_slot_modules(&slots, &snapshot)[2], "GPU_TEMP");
+        assert_eq!(slots.current(2), "PROC_HANG");
+
+        snapshot.hung.push(crate::model::HungTarget::default());
+        assert_eq!(effective_slot_modules(&slots, &snapshot)[2], "PROC_HANG");
+
+        let mut dynamic = cfg;
+        dynamic.slots[0] = vec!["BOTTLENECK".into(), "PROC_HANG".into()];
+        dynamic.slots[2] = vec!["GPU_TEMP".into()];
+        let slots = Manager::new(&dynamic, [0; 4]);
+        snapshot.hung.clear();
+        assert_eq!(effective_slot_modules(&slots, &snapshot)[0], "CLEAR");
+        assert_eq!(slots.current(0), "BOTTLENECK");
+    }
+
+    #[test]
+    fn stale_hang_generation_cannot_bind_during_reload_button_race() {
+        let cfg = Config::default();
+        let target = crate::model::HungTarget {
+            hwnd: 1,
+            pid: 2,
+            creation_time: 3,
+            image_path: r"C:\Games\game.exe".into(),
+            process_name: "game.exe".into(),
+            title: "Game".into(),
+        };
+        let stale = crate::telemetry::Update {
+            generation: 1,
+            hung: vec![target.clone()],
+            providers: vec![("Hung window detector".into(), true)],
+            ..Default::default()
+        };
+        let (targets, available) = current_hang_publication(&stale, 2);
+        assert!(targets.is_empty() && !available);
+
+        let started = Instant::now();
+        let mut hold = hang::HoldState::default();
+        hold.set_owner(Some(2));
+        hold.event(
+            crate::input::Event {
+                index: 2,
+                down: true,
+                backward: false,
+                canceled: false,
+                at: started,
+                source: "test",
+            },
+            &cfg,
+            targets,
+            available,
+        );
+        assert!(!matches!(
+            hold.event(
+                crate::input::Event {
+                    index: 2,
+                    down: false,
+                    backward: false,
+                    canceled: false,
+                    at: started + cfg.hang_hold,
+                    source: "test",
+                },
+                &cfg,
+                targets,
+                available,
+            ),
+            hang::HoldCommand::Terminate(_)
+        ));
+
+        let current = crate::telemetry::Update {
+            generation: 2,
+            hung: vec![target.clone()],
+            providers: vec![("Hung window detector".into(), true)],
+            ..Default::default()
+        };
+        let (targets, available) = current_hang_publication(&current, 2);
+        let mut hold = hang::HoldState::default();
+        hold.set_owner(Some(2));
+        hold.event(
+            crate::input::Event {
+                index: 2,
+                down: true,
+                backward: false,
+                canceled: false,
+                at: started,
+                source: "test",
+            },
+            &cfg,
+            targets,
+            available,
+        );
+        assert!(matches!(
+            hold.event(
+                crate::input::Event {
+                    index: 2,
+                    down: false,
+                    backward: false,
+                    canceled: false,
+                    at: started + cfg.hang_hold,
+                    source: "test",
+                },
+                &cfg,
+                targets,
+                available,
+            ),
+            hang::HoldCommand::Terminate(bound) if bound == target
+        ));
+    }
+
+    #[test]
+    fn selector_reload_immediately_invalidates_all_telemetry_publication() {
+        let mut telemetry = crate::telemetry::Update {
+            generation: 1,
+            cpu_temp: Metric::valid(67.0, SystemTime::UNIX_EPOCH),
+            gpu_temp: Metric::valid(74.0, SystemTime::UNIX_EPOCH),
+            hung: vec![crate::model::HungTarget::default()],
+            providers: vec![
+                ("Hung window detector".into(), true),
+                ("other".into(), true),
+            ],
+            ..Default::default()
+        };
+        let mut snapshot = Snapshot {
+            cpu_temp: Metric::valid(67.0, SystemTime::UNIX_EPOCH),
+            gpu_temp: Metric::valid(74.0, SystemTime::UNIX_EPOCH),
+            hung: vec![crate::model::HungTarget::default()],
+            providers: [
+                ("Hung window detector".into(), true),
+                ("other".into(), true),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        invalidate_telemetry_publication(&mut telemetry, &mut snapshot, 2);
+        assert_eq!(telemetry.generation, 2);
+        assert!(telemetry.hung.is_empty() && snapshot.hung.is_empty());
+        assert!(!telemetry.cpu_temp.valid && !snapshot.cpu_temp.valid);
+        assert!(!telemetry.gpu_temp.valid && !snapshot.gpu_temp.valid);
+        assert!(telemetry.providers.is_empty() && snapshot.providers.is_empty());
+    }
+
+    #[test]
+    fn safe_mode_reload_clears_old_provider_values_before_rebuild() {
+        let mut telemetry = crate::telemetry::Update {
+            generation: 1,
+            cpu_temp: Metric::valid(67.0, SystemTime::UNIX_EPOCH),
+            extended_readings: vec![Reading::current_number(
+                MetricKey::CPUPower,
+                crate::model::ValueKind::Watts,
+                100.0,
+                "old-hwinfo",
+                SystemTime::UNIX_EPOCH,
+            )],
+            providers: vec![("hwinfo".into(), true)],
+            ..Default::default()
+        };
+        let mut snapshot = Snapshot {
+            cpu_temp: telemetry.cpu_temp,
+            readings: ReadingsSnapshot {
+                metrics: telemetry.extended_readings.clone(),
+                ..Default::default()
+            },
+            providers: [("hwinfo".into(), true)].into_iter().collect(),
+            ..Default::default()
+        };
+        invalidate_telemetry_publication(&mut telemetry, &mut snapshot, 2);
+        assert_eq!(telemetry.generation, 2);
+        assert!(!snapshot.cpu_temp.valid);
+        assert!(snapshot.readings.metrics.is_empty());
+        assert!(snapshot.providers.is_empty());
+        assert!(telemetry.extended_readings.is_empty());
+        assert!(telemetry.providers.is_empty());
     }
 }

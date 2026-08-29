@@ -20,17 +20,42 @@ Set-StrictMode -Version 2.0
 
 $payload = @(
     'LCDSirPlus.exe',
+    'PresentMon.exe',
     'lcdsirplus.txt',
     'LICENSE',
     'README.md',
+    'modules.md',
     'RELEASE-NOTES.md',
     'SECURITY.md',
-    'docs/ARCHITECTURE.md',
     'docs/CONFIGURATION.md',
     'docs/HARDWARE-ACCEPTANCE.md',
-    'docs/PRODUCT-SPEC.md',
-    'docs/REFERENCE-LAYOUT.md'
+    'docs/INSTRUCTION-MANUAL.md',
+    'docs/LCDSirPlus-Instruction-Manual.pdf',
+    'licenses/PresentMon/LICENSE.txt',
+    'licenses/PresentMon/THIRD_PARTY.txt'
 )
+
+function Assert-PresentMonPayload {
+    param([string]$Root)
+    $files = @(
+        @('PresentMon.exe', [uint64]956768, '9bec3083069f58f911e6a512f4806db51a27bd096103087bc1d05ef54c80a191'),
+        @('licenses/PresentMon/LICENSE.txt', [uint64]1067, '4c949341b1893c8c6ad82f7fb4eedf622cd1fd9c22a9af8f19b2dac19d1947b6'),
+        @('licenses/PresentMon/THIRD_PARTY.txt', [uint64]6471, 'e039937f1a2fc2eb8f24a25b4229551a5a8056026d2da878507e20269eb56267')
+    )
+    foreach ($file in $files) {
+        $path = Join-Path $Root $file[0].Replace('/', '\')
+        $identity = Assert-RegularSingleLinkFile $path
+        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($identity.Size -ne $file[1] -or $hash -cne $file[2]) { throw "PresentMon payload identity mismatch: $($file[0])" }
+    }
+    $signature = Get-AuthenticodeSignature -FilePath (Join-Path $Root 'PresentMon.exe')
+    $certificate = $signature.SignerCertificate
+    $simpleName = if ($null -eq $certificate) { $null } else { $certificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) }
+    if ($signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or
+        $simpleName -cne 'Intel Corporation') {
+        throw "PresentMon Authenticode verification failed: $($signature.Status), $simpleName"
+    }
+}
 
 function Assert-ExpectedPackage {
     param([object[]]$Entries)
@@ -140,6 +165,7 @@ function Restore-RunState {
 $package = Assert-SafeLocalDirectory -Path $PackageRoot
 $entries = @(Read-VerifiedManifest -Root $package)
 Assert-ExpectedPackage $entries
+Assert-PresentMonPayload (Join-Path $package 'payload')
 Assert-SafeLeafName $ShortcutName
 if (-not $RunKey.StartsWith('HKCU:\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Run key must remain beneath HKCU' }
 
@@ -211,6 +237,7 @@ try {
     }
     Write-OwnershipManifest $stage
     [void]@(Read-VerifiedManifest -Root $stage -ManifestName 'INSTALL-MANIFEST.txt' -AllowedUndeclared @('lcdsirplus.txt'))
+    Assert-PresentMonPayload $stage
     if ($InjectFailure -eq 'AfterStage') { throw 'injected failure after stage' }
 
     if ([IO.Directory]::Exists($install)) {
@@ -226,6 +253,7 @@ try {
     $published = $true
     if ($InjectFailure -eq 'AfterPublish') { throw 'injected failure after publish' }
     [void]@(Read-VerifiedManifest -Root $install -ManifestName 'INSTALL-MANIFEST.txt' -AllowedUndeclared @('lcdsirplus.txt'))
+    Assert-PresentMonPayload $install
 
     if (-not $NoIntegration) {
         $shortcutWriteStarted = $true

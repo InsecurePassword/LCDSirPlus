@@ -1,28 +1,35 @@
 //! Read-only native GPU telemetry through the vendor-installed NVAPI/ADLX DLLs.
 
 #![cfg(windows)]
+#![allow(dead_code)]
 
 use std::ffi::{c_char, c_void};
 use std::mem::size_of;
+use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null_mut, NonNull};
 use std::time::SystemTime;
 
-use windows::core::{s, w, PCSTR};
+use windows::core::{s, w, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{FreeLibrary, HMODULE};
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::LibraryLoader::{
-    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
+use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 
 use crate::model::{Metric, MetricKey, Reading};
 
 const NVAPI_OK: i32 = 0;
 const NVAPI_MAX_PHYSICAL_GPUS: usize = 64;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Sample {
     pub backend: String,
     pub readings: Vec<Reading>,
     pub temperature: Metric,
+    /// Total board power only. Chip-only power is never published as board power.
+    pub power_w: Option<f64>,
+    pub sampled_at: SystemTime,
 }
 
 pub fn candidates(selector: &str) -> &'static [&'static str] {
@@ -168,12 +175,17 @@ fn valid_temperature(value: f64) -> bool {
     value.is_finite() && (-50.0..=200.0).contains(&value)
 }
 
+fn adlx_board_power(status: AdlxResult, value: f64) -> Option<f64> {
+    (status == 0 && value.is_finite() && value >= 0.0).then_some(value)
+}
+
 fn project(
     backend: &str,
     utilization: Option<f64>,
     temperature: Option<f64>,
     vram_used: Option<u64>,
     vram_total: Option<u64>,
+    power_w: Option<f64>,
     at: SystemTime,
 ) -> Sample {
     let hardware = format!("{backend}:gpu0");
@@ -215,6 +227,8 @@ fn project(
             .filter(|v| valid_temperature(*v))
             .map(|v| Metric::valid(v, at))
             .unwrap_or_default(),
+        power_w: power_w.filter(|value| value.is_finite() && *value >= 0.0),
+        sampled_at: at,
     }
 }
 
@@ -225,6 +239,7 @@ struct Nvapi {
     dynamic: NvDynamic,
     thermal: NvThermal,
     memory: NvMemory,
+    nvml: Option<Nvml>,
 }
 
 impl Nvapi {
@@ -256,6 +271,7 @@ impl Nvapi {
                     dynamic: nv_proc(query, 0x60de_d2ed, "GPU_GetDynamicPstatesInfoEx")?,
                     thermal: nv_proc(query, 0xe364_0a56, "GPU_GetThermalSettings")?,
                     memory: nv_proc(query, 0xc059_9498, "GPU_GetMemoryInfoEx")?,
+                    nvml: Nvml::open().ok(),
                 })
             })();
             if result.is_err() {
@@ -312,8 +328,12 @@ impl Nvapi {
             } else {
                 (None, None)
             };
-            let sample = project("nvapi", utilization, temperature, used, total, at);
-            if sample.readings.is_empty() && !sample.temperature.valid {
+            let power = self
+                .nvml
+                .as_mut()
+                .and_then(|nvml| nvml.power_w(self.handles.len()).ok());
+            let sample = project("nvapi", utilization, temperature, used, total, power, at);
+            if !has_telemetry(&sample) {
                 Err("NVAPI returned no supported telemetry metrics".into())
             } else {
                 Ok(sample)
@@ -476,8 +496,8 @@ struct AdlxMetricsVtable {
     vram_clock: usize,
     temperature: unsafe extern "system" fn(*mut AdlxMetrics, *mut f64) -> AdlxResult,
     hotspot: usize,
-    power: usize,
-    board_power: usize,
+    power: unsafe extern "system" fn(*mut AdlxMetrics, *mut f64) -> AdlxResult,
+    board_power: unsafe extern "system" fn(*mut AdlxMetrics, *mut f64) -> AdlxResult,
     fan: usize,
     vram: unsafe extern "system" fn(*mut AdlxMetrics, *mut i32) -> AdlxResult,
     voltage: usize,
@@ -565,6 +585,7 @@ impl Adlx {
             let mut usage = 0.0;
             let mut temperature = 0.0;
             let mut used_mb = 0i32;
+            let mut power = 0.0;
             let usage = (vtable.usage)(metrics.as_ptr(), &mut usage)
                 .eq(&0)
                 .then_some(usage);
@@ -576,6 +597,7 @@ impl Adlx {
                 .then_some(used_mb)
                 .filter(|v| *v >= 0)
                 .map(|v| v as u64 * 1024 * 1024);
+            let power = adlx_board_power((vtable.board_power)(metrics.as_ptr(), &mut power), power);
             release(metrics.as_ptr());
 
             let mut total_mb = 0u32;
@@ -583,12 +605,115 @@ impl Adlx {
                 ((*(*self.gpu.as_ptr()).vtable).total_vram)(self.gpu.as_ptr(), &mut total_mb)
                     .eq(&0)
                     .then_some(total_mb as u64 * 1024 * 1024);
-            let sample = project("adlx", usage, temperature, used, total, SystemTime::now());
-            if sample.readings.is_empty() && !sample.temperature.valid {
+            let sample = project(
+                "adlx",
+                usage,
+                temperature,
+                used,
+                total,
+                power,
+                SystemTime::now(),
+            );
+            if !has_telemetry(&sample) {
                 Err("ADLX returned no supported telemetry metrics".into())
             } else {
                 Ok(sample)
             }
+        }
+    }
+}
+
+type NvmlReturn = u32;
+type NvmlDevice = *mut c_void;
+type NvmlInit = unsafe extern "C" fn() -> NvmlReturn;
+type NvmlShutdown = unsafe extern "C" fn() -> NvmlReturn;
+type NvmlCount = unsafe extern "C" fn(*mut u32) -> NvmlReturn;
+type NvmlHandle = unsafe extern "C" fn(u32, *mut NvmlDevice) -> NvmlReturn;
+type NvmlPower = unsafe extern "C" fn(NvmlDevice, *mut u32) -> NvmlReturn;
+
+struct Nvml {
+    module: HMODULE,
+    shutdown: NvmlShutdown,
+    count: NvmlCount,
+    handle: NvmlHandle,
+    power: NvmlPower,
+}
+
+impl Nvml {
+    fn open() -> Result<Self, String> {
+        unsafe {
+            let module = load_nvml_module()?;
+            let result = (|| {
+                let init: NvmlInit = proc(module, s!("nvmlInit_v2"))?;
+                let shutdown: NvmlShutdown = proc(module, s!("nvmlShutdown"))?;
+                let count = proc(module, s!("nvmlDeviceGetCount_v2"))?;
+                let handle = proc(module, s!("nvmlDeviceGetHandleByIndex_v2"))?;
+                let power = proc(module, s!("nvmlDeviceGetPowerUsage"))?;
+                if init() != 0 {
+                    return Err("nvmlInit_v2 failed".into());
+                }
+                Ok(Self {
+                    module,
+                    shutdown,
+                    count,
+                    handle,
+                    power,
+                })
+            })();
+            if result.is_err() {
+                let _ = FreeLibrary(module);
+            }
+            result
+        }
+    }
+
+    fn power_w(&mut self, nvapi_count: usize) -> Result<f64, String> {
+        unsafe {
+            let mut count = 0;
+            if (self.count)(&mut count) != 0 || count != 1 || nvapi_count != 1 {
+                return Err("NVML/NVAPI PCI alignment unavailable for multiple GPUs".into());
+            }
+            let mut device = null_mut();
+            if (self.handle)(0, &mut device) != 0 || device.is_null() {
+                return Err("NVML device unavailable".into());
+            }
+            let mut milliwatts = 0;
+            if (self.power)(device, &mut milliwatts) != 0 {
+                return Err("NVML power usage unavailable".into());
+            }
+            Ok(milliwatts as f64 / 1000.0)
+        }
+    }
+}
+
+unsafe fn load_nvml_module() -> Result<HMODULE, String> {
+    if let Ok(module) = LoadLibraryExW(w!("nvml.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) {
+        return Ok(module);
+    }
+    let program_files = SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, None)
+        .map_err(|e| format!("resolve Program Files for legacy NVML: {e}"))?;
+    let root = program_files.to_string();
+    CoTaskMemFree(Some(program_files.0.cast()));
+    let path = std::path::PathBuf::from(
+        root.map_err(|e| format!("decode Program Files path for legacy NVML: {e}"))?,
+    )
+    .join("NVIDIA Corporation")
+    .join("NVSMI")
+    .join("nvml.dll");
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    LoadLibraryExW(
+        PCWSTR(wide.as_ptr()),
+        None,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+    )
+    .map_err(|e| format!("load trusted legacy NVML at {}: {e}", path.display()))
+}
+
+impl Drop for Nvml {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = (self.shutdown)();
+            let _ = FreeLibrary(self.module);
         }
     }
 }
@@ -615,6 +740,10 @@ fn adlx_status(code: AdlxResult, operation: &str) -> Result<(), String> {
     } else {
         Err(format!("{operation} failed ({code})"))
     }
+}
+
+fn has_telemetry(sample: &Sample) -> bool {
+    !sample.readings.is_empty() || sample.temperature.valid || sample.power_w.is_some()
 }
 
 #[cfg(test)]
@@ -656,6 +785,7 @@ mod tests {
             Some(70.0),
             Some(3),
             Some(4),
+            Some(250.0),
             SystemTime::UNIX_EPOCH,
         );
         assert_eq!(sample.readings.len(), 4);
@@ -674,12 +804,44 @@ mod tests {
             Some(500.0),
             Some(5),
             Some(4),
+            Some(f64::INFINITY),
             SystemTime::UNIX_EPOCH,
         );
         assert!(invalid.readings.iter().all(|r| {
             r.key != MetricKey::GPUUtilization && r.key != MetricKey::VRAMUtilization
         }));
         assert!(!invalid.temperature.valid);
+        assert!(invalid.power_w.is_none());
+    }
+
+    #[test]
+    fn adlx_power_only_sample_is_usable() {
+        let sample = project(
+            "adlx",
+            None,
+            None,
+            None,
+            None,
+            Some(200.0),
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(has_telemetry(&sample));
+        assert_eq!(adlx_board_power(0, 200.0), Some(200.0));
+        assert_eq!(adlx_board_power(1, 200.0), None);
+    }
+
+    #[test]
+    fn nvml_power_only_sample_is_usable() {
+        let sample = project(
+            "nvapi",
+            None,
+            None,
+            None,
+            None,
+            Some(175.5),
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(has_telemetry(&sample));
     }
 
     #[test]

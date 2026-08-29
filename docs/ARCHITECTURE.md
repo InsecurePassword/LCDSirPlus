@@ -12,7 +12,7 @@ src\
 ├── model.rs            canonical metric/reading/snapshot model
 ├── history.rs          ring buffer + frame statistics
 ├── render\
-│   ├── mod.rs          160x43 Frame (set/get/rect/hash/png)
+│   ├── mod.rs          160x43 Frame (set/get/rect/hash)
 │   ├── font.rs         3x5 bitmap font (glyph-exact Go port)
 │   └── renderer.rs     dashboard, slots, overlays, golden tests
 ├── backends\
@@ -25,10 +25,14 @@ src\
 │   ├── discord.rs      verified desktop RPC, voice tracker, OAuth + DPAPI
 │   ├── memory.rs       GlobalMemoryStatusEx
 │   ├── ccd.rs          L3/NUMA topology + CPUID cache-size labeling
-│   ├── gpu.rs          trusted NVAPI/ADLX loading + canonical GPU metrics
+│   ├── gpu.rs          trusted NVAPI/NVML/ADLX + canonical GPU metrics
+│   ├── hwinfo.rs       read-only exact-label HWiNFO shared-memory fallback
 │   ├── hang.rs         bounded WM_NULL probes + exact process identity tracker
-│   ├── lhm.rs          optional loopback temperatures-only fallback
+│   ├── lhm.rs          optional loopback temperature/exact-sensor fallback
 │   ├── presentmon.rs   owned console capture + CSV frame statistics
+│   ├── performance.rs  native PDH disk/page-read counters
+│   ├── connections.rs  native established IPv4/IPv6 TCP count
+│   ├── system_power.rs native AC/battery state
 │   └── network.rs      bounded optional ICMP/TCP quality probe
 ├── runtime.rs          named-mutex ownership + owned HKCU startup value
 ├── alerts.rs           configured alert episodes + acknowledgement
@@ -38,8 +42,7 @@ src\
 ├── ui.rs               preview window (GDI) + tray icon
 ├── slots.rs            four cycling slot windows
 ├── input.rs            button events + edge debounce
-├── sha256.rs           dependency-free SHA-256 (NIST-vector tested)
-└── png.rs              deterministic stored-deflate PNG writer
+└── sha256.rs           dependency-free SHA-256 (NIST-vector tested)
 ```
 
 ## Threading model
@@ -57,7 +60,7 @@ src\
 | telemetry-hang | visible-window probes and continuous-failure tracker | update channel |
 | telemetry-network-quality | optional bounded IP-literal ICMP/TCP probe | update channel |
 | lcdsirplus-discord | verified pipe, authentication, subscriptions, reconnect | snapshot channel |
-| telemetry-lhm/headset | bounded blocking HTTP/HID | event channel |
+| telemetry-lhm/hwinfo/headset | bounded blocking HTTP/shared-memory/HID | event channel |
 
 The backend thread is the only toucher of the device (mirrors the Go
 `LockOSThread` discipline). Frames are submitted only when changed; button
@@ -113,7 +116,8 @@ and removes shortcut/Run state only when it still targets the exact install.
 ## Data flow (one tick)
 
 ```text
-clock + CPU/memory + NVAPI/ADLX + optional LHM + PresentMon
+clock + CPU/memory/PDH/TCP/power + NVAPI/ADLX/NVML
+  + optional HWiNFO/LHM + owned bundled PresentMon
   → Snapshot { date/time, cpu_dual, cache/freq/total load, mem, readings }
   → Renderer::render(snapshot, overlay opts, view{slot modules})
   → Frame (160x43 bytes)
@@ -124,29 +128,38 @@ clock + CPU/memory + NVAPI/ADLX + optional LHM + PresentMon
 ```
 
 Backend button reports flow back: `parse_input` → `ButtonTracker.observe`
-(debounce) → app handles the matching action. Button 3 remains exclusive to a
-bound hung-target hold; button 4 acknowledges the highest active alert before
-cycling its slot. Render priority is hung hold, unacknowledged critical alert,
-Discord speaker overlay, then dashboard.
+(debounce) → app handles the matching action. A selected `PROC_HANG` token owns
+its slot's matching button and exact bound target; inactive `PROC_HANG` and
+current `BOTTLENECK NONE` dynamically render the next active token without
+changing selection. Button 4 acknowledges the highest active alert before
+cycling its slot. Render priority is hung hold, remaining unacknowledged alert
+overlays, Discord speaker overlay, then dashboard. Enabled CPU/GPU temperature
+warnings suppress their old full-screen temperature overlays and invert only
+the selected qualifying pane on alternating 100 ms phases.
 
 ## Determinism
 
 - The renderer is a pure function of (Snapshot, OverlayOptions, View) plus
-  graph history for FRAME_TIME/NET slots; golden hashes pin the fixed
+  exact trailing-30-second graph histories; golden hashes pin the fixed
   dashboard byte-for-byte against the Go 0.2.0 renderer.
-- SHA-256 and PNG encoders are dependency-free and deterministic; evidence
-  artifacts are byte-stable across machines.
+- SHA-256 is dependency-free and deterministic.
 
 ## Error handling
 
-- Config: file/line diagnostics; last valid config stays active; include
-  cycles, traversal, and oversize inputs rejected.
+- Config: token/parse diagnostics identify the source line; final range and
+  cross-field errors may use line 0 when no exact line is retained; last valid
+  config stays active; include cycles, traversal, and oversize inputs rejected.
 - Backend: every failure carries an exact reason string into
   `BackendState::Disconnected`; reconnect backoff doubles from
   `logitech_reconnect_ms` to `logitech_reconnect_max_ms`; device loss emits
   canceled button releases so no press is ever stuck.
 - Providers: absent data renders explicit `N/A`/`STALE` states — the fixed
   bars read only canonical readings, never legacy projections.
+- Telemetry source arbitration is native-first: documented Win32/vendor APIs,
+  then configured HWiNFO shared memory, then exact/automatic LHM loopback only
+  for values with no safe native source. No raw MSR, SMBus, EC, or Super-I/O
+  probing exists. Total power is never synthesized; CPU+GPU power is a separate
+  complete-current-components subtotal.
 - Network quality: disabled and safe-mode policies clear metrics and perform no
   I/O. One configured IP endpoint is probed per bounded interval; one absolute
   deadline covers ICMP, fallback, and TCP connect. Shutdown or policy changes
@@ -165,8 +178,9 @@ Discord speaker overlay, then dashboard.
   pumping messages, and detects only that child PID. An isolated cleanup owner
   waits for normal exit or terminates only that disposable child on exceptional
   return, then removes only its temporary tree.
-- Hung action: physical button 3 binds the exact currently selected confirmed
-  target at button-down. A single-source monotonic state machine cancels on
+- Hung action: the physical button matching the selected `PROC_HANG` slot binds
+  the exact currently selected confirmed target at button-down. A single-source
+  monotonic state machine cancels on
   release loss, recovery, selection/identity/provider/policy change, safe mode,
   disable, or reload. Reaching full progress never acts; only the matching
   release can enter the native boundary. That boundary repeats visible titled
@@ -180,16 +194,19 @@ Discord speaker overlay, then dashboard.
   terminate command while safe mode is active.
 - Vendor DLLs are loaded by name only from System32. GPU APIs are read-only,
   versioned, and bounded to vendor maximums. Automatically discovered
-  PresentMon is canonically contained beside LCDSirPlus; arguments are passed
-  without a shell, and only the child started by LCDSirPlus is terminated. Its
-  owner thread is joined during shutdown.
+  bundled signed PresentMon v2.5.1 is canonically contained beside LCDSirPlus;
+  arguments are passed without a shell, and only the child started for active
+  frame capture is terminated. Its owner thread is joined during shutdown.
 
 ## Security posture
 
-- Standard user; no elevation, services, drivers, listeners, or injection.
-- HID opens are read/write shared on the vendor collection only; no
-  unrelated interfaces are written (enumeration rejects non-matching
-  identities with recorded reasons).
+- Standard user; no services, drivers, listeners, or injection. PresentMon ETW
+  access can require Performance Log Users membership or elevation under local
+  policy, but LCDSirPlus installs neither and normally runs unelevated.
+- HID discovery/detail handles are read/write shared while attributes are
+  inspected. The final validated output handle uses `FILE_SHARE_MODE(0)` as an
+  exclusive LCore contention barrier; no unrelated interfaces are written
+  (enumeration rejects non-matching identities with recorded reasons).
 - Discord scans only `discord-ipc-0` through `-9` and accepts a server only
   after same-session/current-user checks plus canonical local executable,
   recognized Discord image, valid Authenticode, and `Discord Inc.` publisher

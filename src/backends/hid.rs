@@ -121,9 +121,7 @@ impl CandidateInfo {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // device_path retained for Phase 4 evidence records
 pub struct Rejection {
-    pub device_path: String,
     pub reason: String,
 }
 
@@ -171,7 +169,6 @@ pub fn discover() -> Discovery {
                             result.candidates.push(info);
                         } else {
                             result.rejections.push(Rejection {
-                                device_path,
                                 reason: format!(
                                     "identity mismatch vid={:04x} pid={:04x} usage={:04x}:{:04x} reports={}/{}",
                                     info.vid,
@@ -184,15 +181,9 @@ pub fn discover() -> Discovery {
                             });
                         }
                     }
-                    Err(reason) => result.rejections.push(Rejection {
-                        device_path,
-                        reason,
-                    }),
+                    Err(reason) => result.rejections.push(Rejection { reason }),
                 },
-                Err(reason) => result.rejections.push(Rejection {
-                    device_path: String::new(),
-                    reason,
-                }),
+                Err(reason) => result.rejections.push(Rejection { reason }),
             }
             if !result.candidates.is_empty() {
                 // Contract: accept exactly one candidate.

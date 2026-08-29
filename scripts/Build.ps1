@@ -18,6 +18,7 @@ if (-not ($output + '\').StartsWith($artifactsRoot.TrimEnd('\') + '\', [StringCo
 if (@(git status --porcelain).Count -ne 0) { throw 'release build requires a clean worktree' }
 $head = (git rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-f]{40}$') { throw 'cannot resolve release commit' }
+& (Join-Path $PSScriptRoot 'Acquire-PresentMon.ps1') -VerifyOnly
 
 function Copy-Allowlist {
     param([string]$SourceRoot, [string]$Destination, [string[]]$Paths)
@@ -107,6 +108,7 @@ try {
     $portableRoot = Join-Path $work $portableName
     $installerRoot = Join-Path $work $installerName
     $sourceRoot = Join-Path $work $sourceName
+    $verifiedBuild = Join-Path $work 'verified-build'
 
     try {
         Write-Host '== assemble explicit package trees ==' -ForegroundColor Cyan
@@ -116,14 +118,29 @@ try {
         [IO.Directory]::CreateDirectory($sourceRoot) | Out-Null
         Expand-Archive -LiteralPath $trackedZip -DestinationPath $sourceRoot
         Remove-Item -LiteralPath $trackedZip -Force
+        foreach ($license in @('LICENSE.txt', 'THIRD_PARTY.txt')) {
+            Copy-Item -LiteralPath (Join-Path $repo ('third_party\PresentMon\' + $license)) -Destination (Join-Path $sourceRoot ('third_party\PresentMon\' + $license)) -Force
+        }
+
+        [IO.Directory]::CreateDirectory($verifiedBuild) | Out-Null
+        & (Join-Path $sourceRoot 'scripts\Test-ReproducibleBuild.ps1') -SourceRoot $sourceRoot -OutputDir $verifiedBuild
+        if ($LASTEXITCODE -ne 0) { throw 'reproducible release build failed' }
+        Copy-Item -LiteralPath (Join-Path $verifiedBuild 'REPRODUCIBILITY.json') -Destination (Join-Path $output 'REPRODUCIBILITY.json')
 
         [IO.Directory]::CreateDirectory($portableRoot) | Out-Null
-        Copy-Item -LiteralPath (Join-Path $repo 'target\release\LCDSirPlus.exe') -Destination (Join-Path $portableRoot 'LCDSirPlus.exe')
+        Copy-Item -LiteralPath (Join-Path $verifiedBuild 'LCDSirPlus.exe') -Destination (Join-Path $portableRoot 'LCDSirPlus.exe')
+        Copy-Item -LiteralPath (Join-Path $verifiedBuild 'lcdsirplus.txt') -Destination (Join-Path $portableRoot 'lcdsirplus.txt')
+        Copy-Item -LiteralPath (Join-Path $repo 'third_party\PresentMon\PresentMon.exe') -Destination (Join-Path $portableRoot 'PresentMon.exe')
         Copy-Allowlist -SourceRoot $sourceRoot -Destination $portableRoot -Paths @(
-            'lcdsirplus.txt', 'LICENSE', 'README.md', 'RELEASE-NOTES.md', 'SECURITY.md',
-            'docs/ARCHITECTURE.md', 'docs/CONFIGURATION.md', 'docs/HARDWARE-ACCEPTANCE.md',
-            'docs/PRODUCT-SPEC.md', 'docs/REFERENCE-LAYOUT.md'
+            'LICENSE', 'README.md', 'modules.md', 'RELEASE-NOTES.md', 'SECURITY.md',
+            'docs/CONFIGURATION.md', 'docs/HARDWARE-ACCEPTANCE.md', 'docs/INSTRUCTION-MANUAL.md',
+            'docs/LCDSirPlus-Instruction-Manual.pdf'
         )
+        $presentMonLicenses = Join-Path $portableRoot 'licenses\PresentMon'
+        [IO.Directory]::CreateDirectory($presentMonLicenses) | Out-Null
+        foreach ($license in @('LICENSE.txt', 'THIRD_PARTY.txt')) {
+            Copy-Item -LiteralPath (Join-Path $repo ('third_party\PresentMon\' + $license)) -Destination (Join-Path $presentMonLicenses $license)
+        }
         Write-PackageManifest $portableRoot
 
         [IO.Directory]::CreateDirectory((Join-Path $installerRoot 'payload')) | Out-Null
