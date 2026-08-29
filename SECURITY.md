@@ -54,6 +54,7 @@ Allow time for triage and a corrected release before public disclosure.
 ## Local Safety
 
 The hung-window action can terminate an exact, repeatedly revalidated process
-only after a continuous physical-button hold and release. Use safe mode while
+automatically when a continuous physical-button hold reaches its configured
+threshold. Releasing afterward only resets the hold. Use safe mode while
 investigating. Test only with the disposable harness documented in
 `docs/HARDWARE-ACCEPTANCE.md`; never target unsaved work.

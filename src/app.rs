@@ -177,7 +177,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
             discord = update;
         }
 
-        // Reload before input so a same-loop release cannot use stale action policy.
+        // Reload before input so a same-loop hold cannot use stale action policy.
         if now.duration_since(watcher.last_check) >= cfg.config_refresh {
             watcher.last_check = now;
             if watcher.changed() {
@@ -361,6 +361,15 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                 }
             }
         }
+
+        if let Some(audit) = hang_hold.set_owner(proc_hang_owner(&slots)) {
+            log_hang_audit(&audit);
+        }
+        if let Some(audit) = hang_hold.reconcile(&cfg, published_hung, hang_provider_available) {
+            log_hang_audit(&audit);
+        }
+        let command = hang_hold.tick(now, &cfg, published_hung, hang_provider_available);
+        apply_hold_command(command, &mut slots, &cfg, &mut alerts, &mut snapshot);
 
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -1429,19 +1438,7 @@ mod tests {
             available,
         );
         assert!(!matches!(
-            hold.event(
-                crate::input::Event {
-                    index: 2,
-                    down: false,
-                    backward: false,
-                    canceled: false,
-                    at: started + cfg.hang_hold,
-                    source: "test",
-                },
-                &cfg,
-                targets,
-                available,
-            ),
+            hold.tick(started + cfg.hang_hold, &cfg, targets, available),
             hang::HoldCommand::Terminate(_)
         ));
 
@@ -1468,6 +1465,10 @@ mod tests {
             available,
         );
         assert!(matches!(
+            hold.tick(started + cfg.hang_hold, &cfg, targets, available),
+            hang::HoldCommand::Terminate(bound) if bound == target
+        ));
+        assert!(matches!(
             hold.event(
                 crate::input::Event {
                     index: 2,
@@ -1481,7 +1482,7 @@ mod tests {
                 targets,
                 available,
             ),
-            hang::HoldCommand::Terminate(bound) if bound == target
+            hang::HoldCommand::None
         ));
     }
 

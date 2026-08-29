@@ -180,10 +180,11 @@ the selected qualifying pane on alternating 100 ms phases.
   return, then removes only its temporary tree.
 - Hung action: the physical button matching the selected `PROC_HANG` slot binds
   the exact currently selected confirmed target at button-down. A single-source
-  monotonic state machine cancels on
-  release loss, recovery, selection/identity/provider/policy change, safe mode,
-  disable, or reload. Reaching full progress never acts; only the matching
-  release can enter the native boundary. That boundary repeats visible titled
+  monotonic state machine cancels on release loss, recovery,
+  selection/identity/provider/policy change, safe mode, disable, or reload.
+  Reaching full progress while still held enters the native boundary once;
+  release afterward only resets state. A loop delayed beyond the bounded maximum
+  refuses the hold as stale. The native boundary repeats visible titled
   top-level HWND/PID/creation/path/exclusion and `ERROR_TIMEOUT` checks, opens
   only `PROCESS_TERMINATE`, `PROCESS_SYNCHRONIZE`, and
   `PROCESS_QUERY_LIMITED_INFORMATION`, rechecks identity through that handle,

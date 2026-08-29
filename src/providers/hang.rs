@@ -89,6 +89,7 @@ struct Press {
     backward: bool,
     bound: Option<(usize, HungTarget, Policy)>,
     canceled: bool,
+    resolved: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -123,7 +124,7 @@ impl HoldState {
             let Some((_, target, _)) = &press.bound else {
                 continue;
             };
-            if !press.canceled && Some(index) != owner {
+            if !press.canceled && !press.resolved && Some(index) != owner {
                 press.canceled = true;
                 return Some(Audit {
                     target: target.clone(),
@@ -151,6 +152,7 @@ impl HoldState {
                 continue;
             };
             if !press.canceled
+                && !press.resolved
                 && (!provider_available
                     || !policy.active()
                     || &policy != bound_policy
@@ -170,7 +172,7 @@ impl HoldState {
     pub fn cancel_reload(&mut self) -> Option<Audit> {
         for press in self.presses.iter_mut().flatten() {
             if let Some((_, target, _)) = &press.bound {
-                if !press.canceled {
+                if !press.canceled && !press.resolved {
                     press.canceled = true;
                     return Some(Audit {
                         target: target.clone(),
@@ -186,7 +188,7 @@ impl HoldState {
         self.presses
             .iter()
             .flatten()
-            .find(|press| press.bound.is_some() && !press.canceled)
+            .find(|press| press.bound.is_some() && !press.canceled && !press.resolved)
             .map(|press| {
                 now.saturating_duration_since(press.started).as_secs_f64()
                     / cfg.hang_hold.as_secs_f64()
@@ -222,7 +224,7 @@ impl HoldState {
         }
         if event.down {
             if let Some(existing) = &self.presses[event.index] {
-                if existing.source != event.source || existing.canceled {
+                if existing.source != event.source || existing.canceled || existing.resolved {
                     return HoldCommand::None;
                 }
             }
@@ -244,6 +246,7 @@ impl HoldState {
                 backward: event.backward,
                 bound,
                 canceled: false,
+                resolved: false,
             });
             return HoldCommand::None;
         }
@@ -253,6 +256,9 @@ impl HoldState {
         };
         if press.source != event.source {
             self.presses[event.index] = Some(press);
+            return HoldCommand::None;
+        }
+        if press.resolved {
             return HoldCommand::None;
         }
         let Some((index, target, policy)) = press.bound else {
@@ -288,25 +294,67 @@ impl HoldState {
             });
         }
         let duration = event.at.saturating_duration_since(press.started);
+        if duration >= cfg.hang_hold {
+            return HoldCommand::None;
+        }
+        if self.hung_detail && targets.len() > 1 {
+            self.hung_index = (index + 1) % targets.len();
+            self.hung_detail = false;
+        } else {
+            self.hung_detail = !self.hung_detail;
+        }
+        HoldCommand::Audit(Audit {
+            target,
+            outcome: "canceled-early-release",
+        })
+    }
+
+    pub fn tick(
+        &mut self,
+        now: Instant,
+        cfg: &Config,
+        targets: &[HungTarget],
+        provider_available: bool,
+    ) -> HoldCommand {
+        let policy = Policy::from(cfg);
+        let owner = if self.owner_resolved {
+            self.owner
+        } else {
+            Some(cfg.hang_button.saturating_sub(1) as usize)
+        };
+        let Some((button, press)) = self.presses.iter_mut().enumerate().find(|(_, press)| {
+            press
+                .as_ref()
+                .is_some_and(|press| press.bound.is_some() && !press.canceled && !press.resolved)
+        }) else {
+            return HoldCommand::None;
+        };
+        let press = press.as_mut().unwrap();
+        let (index, target, bound_policy) = press.bound.as_ref().unwrap();
+        if !provider_available
+            || !policy.active()
+            || &policy != bound_policy
+            || owner != Some(button)
+            || targets.get(*index) != Some(target)
+        {
+            press.canceled = true;
+            return HoldCommand::Audit(Audit {
+                target: target.clone(),
+                outcome: "canceled-continuity",
+            });
+        }
+        let duration = now.saturating_duration_since(press.started);
+        if duration < cfg.hang_hold {
+            return HoldCommand::None;
+        }
+        press.resolved = true;
         if duration > maximum_press_duration(cfg.hang_hold) {
             return HoldCommand::Audit(Audit {
-                target,
-                outcome: "refused-stale-release",
+                target: target.clone(),
+                outcome: "refused-stale-hold",
             });
         }
-        if duration < cfg.hang_hold {
-            if self.hung_detail && targets.len() > 1 {
-                self.hung_index = (index + 1) % targets.len();
-                self.hung_detail = false;
-            } else {
-                self.hung_detail = !self.hung_detail;
-            }
-            return HoldCommand::Audit(Audit {
-                target,
-                outcome: "canceled-early-release",
-            });
-        }
-        HoldCommand::Terminate(target)
+        HoldCommand::Terminate(target.clone())
     }
 }
 
@@ -1602,21 +1650,14 @@ fn action_smoke(negative: bool) -> Result<u32, String> {
     {
         return Err("valid action hold canceled unexpectedly".into());
     }
-    let command = hold.event(
-        Event {
-            index: 2,
-            down: false,
-            backward: false,
-            canceled: false,
-            at: started + cfg.hang_hold,
-            source: "action-smoke",
-        },
+    let command = hold.tick(
+        started + cfg.hang_hold,
         &cfg,
         std::slice::from_ref(&target),
         true,
     );
     let HoldCommand::Terminate(bound) = command else {
-        return Err("valid release did not request termination".into());
+        return Err("qualified hold did not request termination".into());
     };
     let outcome = terminate_bound_target(&bound, &cfg);
     if outcome != ActionOutcome::Success {
@@ -1624,6 +1665,24 @@ fn action_smoke(negative: bool) -> Result<u32, String> {
             "owned child termination outcome={}",
             outcome.label()
         ));
+    }
+    if !matches!(
+        hold.event(
+            Event {
+                index: 2,
+                down: false,
+                backward: false,
+                canceled: false,
+                at: started + cfg.hang_hold,
+                source: "action-smoke",
+            },
+            &cfg,
+            std::slice::from_ref(&target),
+            true,
+        ),
+        HoldCommand::None
+    ) {
+        return Err("release after action was not inert".into());
     }
     wait_harness(&mut cleanup, Duration::from_secs(1))?;
     cleanup
@@ -1992,7 +2051,7 @@ mod tests {
     }
 
     #[test]
-    fn hold_requires_target_at_down_and_only_release_can_act() {
+    fn hold_requires_target_at_down_and_threshold_tick_acts_once() {
         let cfg = Config::default();
         let item = target(1, 10, 20, r"C:\Games\game.exe");
         let started = Instant::now();
@@ -2017,8 +2076,6 @@ mod tests {
             std::slice::from_ref(&item),
             true,
         );
-        assert_eq!(hold.progress(started + cfg.hang_hold, &cfg), 1.0);
-        assert!(hold.presses[2].is_some(), "100% must not trigger action");
         assert!(matches!(
             hold.event(
                 button(2, false, started + cfg.hang_hold, "hid"),
@@ -2026,7 +2083,72 @@ mod tests {
                 std::slice::from_ref(&item),
                 true
             ),
+            HoldCommand::None
+        ));
+
+        hold.event(
+            button(2, true, started, "hid"),
+            &cfg,
+            std::slice::from_ref(&item),
+            true,
+        );
+        assert_eq!(hold.progress(started + cfg.hang_hold, &cfg), 1.0);
+        assert!(matches!(
+            hold.tick(
+                started + cfg.hang_hold,
+                &cfg,
+                std::slice::from_ref(&item),
+                true
+            ),
             HoldCommand::Terminate(bound) if bound == item
+        ));
+        assert_eq!(hold.progress(started + cfg.hang_hold, &cfg), 0.0);
+        assert!(matches!(
+            hold.tick(
+                started + cfg.hang_hold + Duration::from_millis(1),
+                &cfg,
+                std::slice::from_ref(&item),
+                true
+            ),
+            HoldCommand::None
+        ));
+        assert!(matches!(
+            hold.event(
+                button(2, false, started + cfg.hang_hold, "hid"),
+                &cfg,
+                std::slice::from_ref(&item),
+                true
+            ),
+            HoldCommand::None
+        ));
+
+        let mut stale = HoldState::default();
+        stale.event(
+            button(2, true, started, "hid"),
+            &cfg,
+            std::slice::from_ref(&item),
+            true,
+        );
+        assert!(matches!(
+            stale.tick(
+                started + maximum_press_duration(cfg.hang_hold) + Duration::from_millis(1),
+                &cfg,
+                std::slice::from_ref(&item),
+                true
+            ),
+            HoldCommand::Audit(Audit {
+                outcome: "refused-stale-hold",
+                ..
+            })
+        ));
+        assert!(matches!(
+            stale.tick(
+                started + maximum_press_duration(cfg.hang_hold) + Duration::from_millis(2),
+                &cfg,
+                std::slice::from_ref(&item),
+                true
+            ),
+            HoldCommand::None
         ));
     }
 
@@ -2188,6 +2310,10 @@ mod tests {
             }
             assert!(hold.reconcile(&cfg, &targets, available).is_some());
             assert_eq!(hold.progress(started + base.hang_hold, &base), 0.0);
+            assert!(matches!(
+                hold.tick(started + base.hang_hold, &cfg, &targets, available),
+                HoldCommand::None
+            ));
         }
 
         let mut hold = HoldState::default();
@@ -2236,8 +2362,17 @@ mod tests {
                 .as_ref()
                 .is_some_and(|press| press.bound.is_some()));
             assert!(matches!(
-                hold.event(button(owner, false, started + cfg.hang_hold, "hid"), &cfg, std::slice::from_ref(&item), true),
+                hold.tick(started + cfg.hang_hold, &cfg, std::slice::from_ref(&item), true),
                 HoldCommand::Terminate(ref bound) if bound == &item
+            ));
+            assert!(matches!(
+                hold.event(
+                    button(owner, false, started + cfg.hang_hold, "hid"),
+                    &cfg,
+                    std::slice::from_ref(&item),
+                    true
+                ),
+                HoldCommand::None
             ));
         }
 

@@ -460,10 +460,11 @@ accepted but does not choose that binding. With no target, the next active token
 or `CLEAR` renders without changing selection. Button-down binds one exact
 displayed target. A short release toggles details, then advances to the next
 target when details are already shown; it does not terminate. A continuous hold
-of at least `hang_hold_ms` acts only on matching release after revalidation;
-full progress alone never acts. A release held beyond twice the configured hold,
-clamped to 3..15 seconds, is refused as stale. Recovery, target or selection
-change, device loss, provider failure, reload, or safe mode cancels the action.
+automatically requests termination at `hang_hold_ms` after revalidation; release
+afterward only resets and cannot act again. If the app loop resumes only after
+twice the configured hold, clamped to 3..15 seconds, the hold is refused as
+stale. Recovery, target or selection change, device loss, provider failure,
+reload, or safe mode cancels the action.
 Safe mode leaves ordinary short-release navigation available because no target
 is bound. Termination can lose unsaved work. Test only with the disposable
 harness in [HARDWARE-ACCEPTANCE.md](HARDWARE-ACCEPTANCE.md), never valuable work.
@@ -742,8 +743,8 @@ source, prerequisite, and fallback.
 | `SYSTEM_BATTERY` | AC/battery/charging state | Native Windows system power status | Shows AC/BAT/CHG/no-battery/unknown/stale states. |
 | `HARD_FAULTS` | Approximate page-read pressure as `n/s` | Native PDH `Page Reads/sec` | Titled `FAULTS`; not an exact hard-fault count. |
 | `BOTTLENECK` | CPU/GPU/MEM/DISK I/O/NONE heuristic | Native metrics, thresholds, sustain | `NONE` dynamically displays next token without changing selection. |
-| `PROC_HANG` | Selected hung window and guarded release action | Native detector and selected-slot physical button | Unique across slots; short release navigates, qualified release acts, and no target falls through. |
+| `PROC_HANG` | Selected hung window and guarded emergency hold action | Native detector and selected-slot physical button | Unique across slots; short release navigates, the hold threshold acts automatically, and no target falls through. |
 
 For exhaustive configuration key defaults and validation ranges, see
-[CONFIGURATION.md](CONFIGURATION.md). For physical release acceptance, see
+[CONFIGURATION.md](CONFIGURATION.md). For physical action acceptance, see
 [HARDWARE-ACCEPTANCE.md](HARDWARE-ACCEPTANCE.md).

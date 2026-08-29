@@ -54,4 +54,4 @@ NET_HEALTH - Displays network-probe ping, jitter, and packet loss together.
 SYSTEM_BATTERY - Displays system AC, battery, and charging state.
 HARD_FAULTS - Displays an approximation of page-read pressure per second.
 BOTTLENECK - Displays a sustained CPU, GPU, memory, disk, or none heuristic.
-PROC_HANG - Displays a detected hung window and provides a guarded release action.
+PROC_HANG - Displays a detected hung window and provides a guarded emergency hold action.

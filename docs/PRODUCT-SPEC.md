@@ -140,12 +140,14 @@ The guarded action binds the exact selected target only at physical button-down
 on the slot whose currently selected token is `PROC_HANG`; the legacy
 `hang_button` value does not choose the runtime button. `PROC_HANG` is globally
 unique, and no-target display fallback does not change its selection.
-The same input source must remain continuously held and release after the
-configured duration; full progress alone does nothing. Recovery, disappearance,
-identity or selection change, device loss, provider failure, safe mode, disable,
-or any hang-policy reload irreversibly cancels that press. The release boundary
-independently repeats native eligibility, timeout, exclusion, and process
-identity checks before using narrowly scoped terminate/query/synchronize rights.
+The same input source must remain continuously held. Reaching the configured
+duration requests termination automatically, and release afterward only resets
+the hold. Recovery, disappearance, identity or selection change, device loss,
+provider failure, safe mode, disable, or any hang-policy reload irreversibly
+cancels that press. The action boundary independently repeats native eligibility,
+timeout, exclusion, and process identity checks before using narrowly scoped
+terminate/query/synchronize rights. A loop delayed beyond the maximum press
+duration refuses the hold as stale instead of firing late.
 It never elevates or retries with broader access.
 
 ## Non-goals

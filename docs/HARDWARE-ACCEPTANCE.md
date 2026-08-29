@@ -62,11 +62,13 @@ requires a complete rerun.
   unsaved data.
 - Confirm a bound short release navigates target detail/selection without
   terminating; with no bound target it performs ordinary slot cycling. Confirm
-  target/identity/recovery/config/safe-mode/device changes cancel, only a
-  qualified continuous physical hold followed by release can terminate the
-  disposable child, and an overlong stale release is refused.
+  target/identity/recovery/provider/config/safe-mode/slot/device changes cancel,
+  a qualified continuous physical hold terminates the disposable child
+  automatically at `hang_hold_ms`, and release afterward only resets without a
+  second action. Confirm an app-loop resume after the maximum press duration is
+  refused as stale rather than firing a delayed action.
 - Record positive and negative harness results. Do not treat software unit tests
-  as physical-button authorization evidence.
+  as physical-button action evidence.
 
 ## Acceptance
 

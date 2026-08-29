@@ -572,7 +572,7 @@ configured slot lists.
 The token owns its runtime action binding: only while `PROC_HANG` is actually
 selected does that slot's matching physical button bind the exact displayed
 target on button-down. A continuous `hang_hold_ms` hold is required and full
-progress alone never acts; termination is considered only on matching release
+progress automatically requests termination while the button remains held,
 after identity, timeout, visibility, exclusion, and policy revalidation.
 Recovery, selection change, device loss, provider failure, reload, early
 release, or safe mode cancels. The legacy `hang_button` key remains accepted
@@ -950,7 +950,7 @@ portal redirect registration.
 |---|---|---|
 | `hang_enabled` | 1 | boolean; enable query-only hung-window detection |
 | `hang_button` | 3 | accepted legacy 1..4 value; runtime binding follows selected `PROC_HANG` slot |
-| `hang_hold_ms` | 2000 | 1000..10000; continuous selected-slot hold required before release can act |
+| `hang_hold_ms` | 2000 | 1000..10000; continuous selected-slot hold threshold for automatic action |
 | `hang_probe_interval_ms` | 2000 | 250..60000; detector probe cadence |
 | `hang_probe_timeout_ms` | 350 | 10..5000 and less than probe interval; bound one `WM_NULL` probe |
 | `hang_failures_required` | 3 | 2..10; consecutive timeouts required for a target |
@@ -960,12 +960,13 @@ portal redirect registration.
 `PROC_HANG` may occur only once across all slots. The selected token's physical
 slot button owns display/action binding; `hang_button` is compatibility-only.
 A short release while a target is bound toggles target detail, then advances to
-the next target when detail is already shown; it does not terminate. A release
-after at least `hang_hold_ms` terminates only after target and policy
-revalidation. A release held beyond the bounded maximum of twice the configured
-hold, clamped to 3..15 seconds, is refused as stale. Safe mode prevents target
-binding and termination but preserves ordinary short-release slot cycling and
-button 4 alert acknowledgement.
+the next target when detail is already shown; it does not terminate. Reaching
+`hang_hold_ms` while continuously held requests termination automatically after
+target and policy revalidation; release afterward only resets and cannot act
+again. If the app loop resumes only after the bounded maximum of twice the
+configured hold, clamped to 3..15 seconds, the hold is refused as stale. Safe
+mode prevents target binding and termination but preserves ordinary
+short-release slot cycling and button 4 alert acknowledgement.
 
 ## Alerts
 
