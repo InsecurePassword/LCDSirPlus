@@ -46,8 +46,9 @@ ccd_cache_processors    auto
 ccd_frequency_processors auto
 
 ##############################################################################
-# Logitech G13 backend. Auto uses the trusted SDK while LCore.exe owns the LCD
-# and direct HID only while LCore is absent. Explicit modes never fall back.
+# Logitech G13 backend. Auto uses the trusted SDK while LCore.exe owns the LCD;
+# direct HID also requires Logitech LampArray service to be stopped.
+# Explicit modes never fall back.
 #
 # logitech_backend       auto | sdk | hid | virtual
 

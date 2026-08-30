@@ -744,10 +744,11 @@ dashboard to the one-bar CPU layout automatically.
 | `logitech_invert` | 0 | boolean; invert output pixels |
 
 `auto` selects the trusted SDK while exact process name `LCore.exe` is present
-and direct HID while it is absent. Explicit `sdk` never falls back to HID;
-explicit `hid` waits while LCore owns the display. Ownership changes close the
-old transport before reevaluation. It never terminates Logitech software or
-blocks unrelated G HUB background components.
+and otherwise attempts direct HID. Direct HID refuses exact owners `LCore.exe`
+and `logi_lamparray_service.AMD64.exe`; the latter must be stopped when Logitech
+LampArray exclusively owns the G13. Explicit `sdk` never falls back to HID.
+Ownership changes close the old transport before reevaluation. LCDSirPlus never
+terminates Logitech software or blanket-blocks unrelated G HUB components.
 
 ## LibreHardwareMonitor (optional loopback fallback)
 

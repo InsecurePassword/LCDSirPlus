@@ -105,17 +105,18 @@ with or endorsers of LCDSirPlus.
 - Input uses report ID `0x01`; LCD buttons are byte 6 bits
   `0x02 << 0..3`.
 - Direct HID uses overlapped I/O, a one-second operation timeout, bounded
-  reconnect backoff, and blank-on-close. It refuses to open while exact process
-  name `LCore.exe` is running and does not blanket-block G HUB services.
+  reconnect backoff, and blank-on-close. It refuses exact owners `LCore.exe` and
+  `logi_lamparray_service.AMD64.exe` without blanket-blocking other G HUB
+  services.
 - `auto` uses the trusted Logitech LCD SDK while LCore is present and direct HID
   while it is absent. SDK loading is absolute-path-only from the running signed
   LCore installation after pinned-object Program Files, reparse/ACL/hard-link,
   AMD64 PE/export, cached-revocation, exact signer-certificate, product, and
   full-version validation. The loaded module identity must match the pinned DLL
   before any SDK call, and all SDK calls run on one bounded owner thread.
-- Direct HID takes a non-shared output handle, rechecks LCore after opening and
-  before every write, and polls ownership while idle. LCore detection closes HID
-  without a final blank.
+- Direct HID takes a non-shared output handle, rechecks competing owners after
+  opening and before every write, and polls ownership while idle. Owner
+  detection closes HID without a final blank.
 - Static frames are submitted only when changed. Hardware-test animation is
   capped at 10 updates per second while button polling remains independent.
 

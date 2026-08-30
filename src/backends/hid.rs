@@ -40,18 +40,26 @@ use super::g13::{
 
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_INTERFACES_VISITED: usize = 256;
-const COMPETING_OWNER: &str = "LCore.exe";
-const OWNER_MESSAGE: &str =
-    "Logitech Gaming Software (LCore.exe) owns the G13 LCD; exit Logitech Gaming Software to release the G13 LCD";
+const COMPETING_OWNERS: [(&str, &str); 2] = [
+    (
+        "LCore.exe",
+        "Logitech Gaming Software (LCore.exe) owns the G13 LCD; exit Logitech Gaming Software to release the G13 LCD",
+    ),
+    (
+        "logi_lamparray_service.AMD64.exe",
+        "Logitech LampArray service owns the G13 LCD; stop Logitech LampArray service to release the G13 LCD for direct HID",
+    ),
+];
 
 fn owner_gate(processes: Result<Vec<String>, String>) -> Result<(), String> {
     let processes = processes
         .map_err(|e| format!("cannot verify G13 LCD ownership ({e}); refusing direct HID"))?;
-    if processes
-        .iter()
-        .any(|name| name.eq_ignore_ascii_case(COMPETING_OWNER))
-    {
-        return Err(OWNER_MESSAGE.into());
+    if let Some((_, message)) = COMPETING_OWNERS.iter().find(|(owner, _)| {
+        processes
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(owner))
+    }) {
+        return Err((*message).into());
     }
     Ok(())
 }
@@ -543,6 +551,7 @@ mod tests {
     #[test]
     fn owner_name_matching_is_exact_and_case_insensitive() {
         assert!(owner_gate(Ok(vec!["lcore.EXE".into()])).is_err());
+        assert!(owner_gate(Ok(vec!["LOGI_LAMPARRAY_SERVICE.amd64.EXE".into()])).is_err());
         assert!(owner_gate(Ok(vec!["lcore-helper.exe".into(), "lghub.exe".into()])).is_ok());
     }
 
@@ -557,6 +566,8 @@ mod tests {
     fn owner_refusal_is_actionable_and_retry_can_recover() {
         let refused = owner_gate(Ok(vec!["LCore.exe".into()])).unwrap_err();
         assert!(refused.contains("exit Logitech Gaming Software"));
+        let refused = owner_gate(Ok(vec!["logi_lamparray_service.AMD64.exe".into()])).unwrap_err();
+        assert!(refused.contains("stop Logitech LampArray service"));
         assert!(owner_gate(Ok(Vec::new())).is_ok());
     }
 

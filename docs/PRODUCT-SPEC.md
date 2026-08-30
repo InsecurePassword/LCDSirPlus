@@ -58,11 +58,12 @@ Detection is native and automatic:
 ## G13 backend
 
 Modes are `auto`, `sdk`, `hid`, and `virtual`. `auto` uses only the trusted
-Logitech LCD SDK while LCore owns the display and direct HID only while LCore is
-absent. The SDK is loaded only from the canonical signed LCore installation and
-all calls are serialized on one bounded owner thread. Explicit modes retry
-their selected transport and never cross-fallback. This prevents simultaneous
-LGS/direct-HID writers without blocking unrelated G HUB processes.
+Logitech LCD SDK while LCore owns the display and otherwise attempts direct HID.
+Direct HID also refuses the exact Logitech LampArray process, which can
+exclusively claim the G13. The SDK is loaded only from the canonical signed
+LCore installation and all calls are serialized on one bounded owner thread.
+Explicit modes retry their selected transport and never cross-fallback. Exact
+owner checks do not blanket-block unrelated G HUB processes.
 
 ## Required telemetry sources
 

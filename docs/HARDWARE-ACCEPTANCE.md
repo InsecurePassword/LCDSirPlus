@@ -18,7 +18,9 @@ requires a complete rerun.
 ## Logitech G13
 
 - Exit Logitech Gaming Software normally and verify `LCore.exe` is no longer
-  running before direct-HID testing. Do not stop unrelated G HUB services.
+  running before direct-HID testing. If present, stop only Logitech LampArray
+  service, which can exclusively own the G13; do not stop unrelated G HUB
+  services.
 - Run `LCDSirPlus.exe --hardware-discover`; record the accepted VID/PID, usage,
   input/output report lengths, and rejection summary. Device paths are private
   and must not be published.

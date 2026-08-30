@@ -42,7 +42,7 @@ Optional features have separate dependencies:
 
 | Feature | Dependency |
 |---|---|
-| G13 through Logitech software | Installed, running Logitech Gaming Software (`LCore.exe`) with its trusted LCD SDK. `auto` uses direct HID when LCore is absent. |
+| G13 through Logitech software | Installed, running Logitech Gaming Software (`LCore.exe`) with its trusted LCD SDK. `auto` otherwise attempts direct HID, which also requires Logitech LampArray service to release the G13. |
 | GPU load, VRAM, temperature | NVIDIA or AMD display driver exposing NVAPI or ADLX. |
 | CPU temperature | Preferred: user-managed HWiNFO Sensors with Shared Memory Support and an exact configured label pair. Optional fallback: LibreHardwareMonitor with its loopback web server explicitly enabled by the user. |
 | FPS, frame time, game name, and sessions | Bundled official signed PresentMon v2.5.1 console, `PresentMon.exe`; plain Cargo output does not bundle it. |
@@ -138,9 +138,10 @@ Watch the physical LCD and press all four LCD buttons during hardware tests.
 Command success proves transport submission, not physical display quality.
 
 Normal `logitech_backend auto` selects the trusted Logitech SDK while exact
-process `LCore.exe` owns the G13, and direct HID only while LCore is absent.
-Explicit `sdk` and `hid` modes do not cross-fallback. LCDSirPlus never stops
-Logitech software for you.
+process `LCore.exe` owns the G13 and otherwise attempts direct HID. Direct HID
+also refuses Logitech LampArray when that service owns the device. Explicit
+`sdk` and `hid` modes do not cross-fallback. LCDSirPlus never stops Logitech
+software for you.
 
 ## Slots and buttons
 
@@ -526,11 +527,11 @@ leaves the previous valid configuration active.
 
 ### G13 is not detected
 
-Run `--hardware-discover`. For direct HID, exit Logitech Gaming Software
-normally and confirm `LCore.exe` is absent. For SDK mode, start the installed
-Logitech Gaming Software normally. Do not copy SDK DLLs or kill unrelated G HUB
-services. Use `--preview` or `logitech_backend virtual` to isolate rendering
-from hardware.
+Run `--hardware-discover`. For direct HID, exit Logitech Gaming Software,
+confirm `LCore.exe` is absent, and stop Logitech LampArray service if it owns the
+G13. For SDK mode, start the installed Logitech Gaming Software normally. Do not
+copy SDK DLLs or kill unrelated G HUB services. Use `--preview` or
+`logitech_backend virtual` to isolate rendering from hardware.
 
 ### Preview does not appear
 

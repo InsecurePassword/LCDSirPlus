@@ -2,7 +2,7 @@
 //! device I/O, and exposes a message surface to the application.
 //!
 //! Backend selection is ownership-driven: `auto` uses SDK while LCore owns
-//! the device and direct HID only while LCore is absent.
+//! the device and direct HID only while competing Logitech owners are absent.
 //! The worker suppresses unchanged frames and reconnects with bounded,
 //! capped backoff. Device loss emits canceled button releases.
 

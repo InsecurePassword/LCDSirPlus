@@ -67,12 +67,13 @@ The backend thread is the only toucher of the device (mirrors the Go
 edges are debounced in the backend thread and delivered as events. The UI
 producer atomically replaces one pending frame slot, so slow I/O and reconnect
 retain only the newest frame while shutdown uses a separate reliable signal.
-Before each physical open, a read-only ToolHelp snapshot arbitrates exact
-case-insensitive `LCore.exe` ownership. LCore present means SDK only; absent
-means HID only. If LCore appears during HID operation, writes stop and HID
-closes without a final blank. SDK calls own their buffers, time out after three
-seconds, and permanently open a process-wide physical circuit if a native owner
-does not return.
+Before each physical open, a read-only ToolHelp snapshot arbitrates exact,
+case-insensitive ownership. LCore present means SDK only; otherwise direct HID
+also refuses Logitech LampArray when that service owns the G13. If a competing
+owner appears during HID operation, writes stop and HID closes without a final
+blank. SDK calls own their buffers, time out after three seconds, and
+permanently open a process-wide physical circuit if a native owner does not
+return.
 
 SDK discovery, trust validation, loading, and initialization share that same
 three-second supervised owner operation. LCore, `LogitechLcd.dll`, and the DLL
