@@ -485,7 +485,7 @@ function Test-InstallerStatic {
         'licenses/PresentMon/THIRD_PARTY.txt'
     )
     Assert-ExpectedInventory @($sourceFiles | ForEach-Object { [pscustomobject]@{ Path = $_ } }) $expectedFiles 'setup source'
-    if (@([regex]::Matches($iss, '(?m)^Source: .*Flags: .*ignoreversion notimestamp$')).Count -ne $expectedFiles.Count) {
+    if (@([regex]::Matches($iss, '(?m)^Source: .*Flags: .*ignoreversion notimestamp\r?$')).Count -ne $expectedFiles.Count) {
         throw 'every setup payload file must disable source timestamps and restore on repair'
     }
     if ($iss.IndexOf('Source: "{#PayloadRoot}\SOURCE-COMMIT.txt"; DestDir: "{app}"; Attribs: readonly; Flags: overwritereadonly uninsremovereadonly ignoreversion notimestamp', [StringComparison]::Ordinal) -lt 0) {
