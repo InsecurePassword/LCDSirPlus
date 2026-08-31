@@ -1441,13 +1441,12 @@ fn detect_harness(pid: u32) -> Result<HungTarget, String> {
 }
 
 #[cfg(test)]
-fn detect_harness_with_shipped_policy(pid: u32) -> Result<HungTarget, String> {
-    let policy = Policy::from(&Config::default());
+fn detect_harness_with_policy(pid: u32, policy: &Policy) -> Result<HungTarget, String> {
     let started = Instant::now();
     let mut tracker = Tracker::default();
     let mut cadence = Cadence::default();
     while started.elapsed() < Duration::from_secs(15) {
-        if !cadence.poll_due(&policy, started.elapsed()) {
+        if !cadence.poll_due(policy, started.elapsed()) {
             std::thread::sleep(TICK);
             continue;
         }
@@ -1565,6 +1564,7 @@ fn action_smoke(negative: bool) -> Result<u32, String> {
     let pid = cleanup.child.as_ref().unwrap().id();
     let target = detect_harness(pid)?;
     let cfg = Config {
+        hang_enabled: true,
         hang_hold: Duration::from_secs(1),
         hang_probe_timeout: Duration::from_millis(100),
         ..Config::default()
@@ -1953,6 +1953,7 @@ mod tests {
             hang_probe_interval: Duration::from_secs(10),
             ..Config::default()
         };
+        cfg.hang_enabled = true;
         let mut policy = Policy::from(&cfg);
         assert!(cadence.poll_due(&policy, Duration::ZERO));
         assert!(!cadence.poll_due(&policy, Duration::from_secs(5)));
@@ -1972,7 +1973,10 @@ mod tests {
 
     #[test]
     fn changed_or_disabled_policy_discards_poll_and_resets_evidence() {
-        let cfg = Config::default();
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
         let started = Policy::from(&cfg);
         assert!(poll_policy_current(&started, &started));
 
@@ -2052,7 +2056,10 @@ mod tests {
 
     #[test]
     fn hold_requires_target_at_down_and_threshold_tick_acts_once() {
-        let cfg = Config::default();
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
         let item = target(1, 10, 20, r"C:\Games\game.exe");
         let started = Instant::now();
         let mut hold = HoldState::default();
@@ -2189,7 +2196,10 @@ mod tests {
 
     #[test]
     fn early_release_preserves_go_detail_and_duplicate_down_restarts() {
-        let cfg = Config::default();
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
         let items = vec![
             target(1, 10, 20, r"C:\Games\a.exe"),
             target(2, 11, 21, r"C:\Games\b.exe"),
@@ -2232,7 +2242,10 @@ mod tests {
 
     #[test]
     fn hold_owner_and_monotonic_cancellation_are_exact() {
-        let cfg = Config::default();
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
         let item = target(1, 10, 20, r"C:\Games\game.exe");
         let items = vec![item.clone()];
         let started = Instant::now();
@@ -2284,7 +2297,10 @@ mod tests {
 
     #[test]
     fn device_policy_provider_and_selection_changes_cancel_until_release() {
-        let base = Config::default();
+        let base = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
         let a = target(1, 10, 20, r"C:\Games\a.exe");
         let b = target(2, 11, 21, r"C:\Games\b.exe");
         let started = Instant::now();
@@ -2346,7 +2362,10 @@ mod tests {
 
     #[test]
     fn resolved_proc_hang_owner_binds_each_slot_and_movement_cancels() {
-        let cfg = Config::default();
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
         let item = target(1, 10, 20, r"C:\Games\game.exe");
         for owner in 0..4 {
             let started = Instant::now();
@@ -2466,7 +2485,10 @@ mod tests {
 
     #[test]
     fn action_adversarial_checks_prevent_termination() {
-        let cfg = Config::default();
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
         let expected = target(1, 10, 20, r"C:\Games\game.exe");
         let mut cases = Vec::new();
 
@@ -2561,7 +2583,10 @@ mod tests {
 
     #[test]
     fn action_calls_terminate_once_only_after_all_checks() {
-        let cfg = Config::default();
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
         let expected = target(1, 10, 20, r"C:\Games\game.exe");
         let mut api = FakeActionApi::valid(expected.clone());
         assert_eq!(
@@ -2585,6 +2610,21 @@ mod tests {
             ActionOutcome::WaitTimeout
         );
         assert_eq!(api.terminate_calls, 1);
+    }
+
+    #[test]
+    fn default_disabled_policy_never_polls_or_terminates() {
+        let cfg = Config::default();
+        assert!(!cfg.hang_enabled);
+        assert!(!Cadence::default().poll_due(&Policy::from(&cfg), Duration::ZERO));
+
+        let expected = target(1, 10, 20, r"C:\Games\game.exe");
+        let mut api = FakeActionApi::valid(expected.clone());
+        assert_eq!(
+            terminate_bound_target_with(&mut api, &expected, &cfg),
+            ActionOutcome::Refused
+        );
+        assert_eq!(api.terminate_calls, 0);
     }
 
     #[test]
@@ -2622,11 +2662,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "runs the pumping native timeout harness through the shipped unrestricted policy"]
-    fn disposable_harness_pumps_until_shipped_policy_confirms_timeouts() {
+    #[ignore = "runs the pumping native timeout harness through an explicitly enabled policy"]
+    fn disposable_harness_pumps_until_enabled_policy_confirms_timeouts() {
         let mut cleanup = spawn_harness(20).unwrap();
         let pid = cleanup.child.as_ref().unwrap().id();
-        detect_harness_with_shipped_policy(pid).unwrap();
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        detect_harness_with_policy(pid, &Policy::from(&cfg)).unwrap();
         assert!(matches!(
             cleanup.child.as_mut().unwrap().try_wait(),
             Ok(None)

@@ -2,7 +2,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$SourceRoot,
-    [Parameter(Mandatory = $true)][string]$OutputDir
+    [Parameter(Mandatory = $true)][string]$OutputDir,
+    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit
 )
 
 $ErrorActionPreference = 'Stop'
@@ -116,7 +117,6 @@ function Invoke-ReproducibleBuild {
     $flags.Add('-C')
     $flags.Add('link-arg=/Brepro')
 
-    $start = [DateTime]::UtcNow
     $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = $cargoPath
     $info.WorkingDirectory = $Root
@@ -161,9 +161,25 @@ function Invoke-ReproducibleBuild {
     }
     [ordered]@{
         label = $Label
-        duration_ms = [int64]([DateTime]::UtcNow - $start).TotalMilliseconds
         remap_destinations = @('/workspace', '/target', '/cargo', '/user', '/home', '/tmp')
     }
+}
+
+$expectedRustcVersion = '1.97.1'
+$expectedRustcCommit = '8bab26f4f68e0e26f0bb7960be334d5b520ea452'
+function Select-PinnedRustToolchain {
+    $rustup = Get-Command rustup -CommandType Application -ErrorAction SilentlyContinue
+    if ($null -eq $rustup) { throw 'Rust 1.97.1 is required. Install it with: rustup toolchain install 1.97.1-x86_64-pc-windows-msvc --profile minimal' }
+    $script:rustupPath = $rustup.Source
+    foreach ($line in @(& $script:rustupPath toolchain list)) {
+        $name = ($line -split '\s+')[0]
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        $verbose = (& $script:rustupPath run $name rustc --version --verbose | Out-String).Replace("`r", '')
+        if ($LASTEXITCODE -eq 0 -and $verbose -match "(?m)^release: $([regex]::Escape($expectedRustcVersion))$" -and
+            $verbose -match "(?m)^commit-hash: $expectedRustcCommit$" -and
+            $verbose -match '(?m)^host: x86_64-pc-windows-msvc$') { return $name }
+    }
+    throw 'Rust 1.97.1 (8bab26f4f68e0e26f0bb7960be334d5b520ea452) for x86_64-pc-windows-msvc is required. Install it with: rustup toolchain install 1.97.1-x86_64-pc-windows-msvc --profile minimal'
 }
 
 $source = Assert-LocalDirectory -Path $SourceRoot -Label 'SourceRoot'
@@ -171,8 +187,16 @@ $output = Assert-LocalDirectory -Path $OutputDir -Label 'OutputDir'
 if (Test-PathOverlap $source $output) { throw 'SourceRoot and OutputDir must not overlap' }
 if (@(Get-ChildItem -LiteralPath $output -Force).Count -ne 0) { throw 'OutputDir must be empty' }
 
-$cargoPath = (Get-Command cargo -CommandType Application).Source
-$rustcPath = (Get-Command rustc -CommandType Application).Source
+$rustupToolchainBefore = [Environment]::GetEnvironmentVariable('RUSTUP_TOOLCHAIN', 'Process')
+$selectedToolchain = Select-PinnedRustToolchain
+$env:RUSTUP_TOOLCHAIN = $selectedToolchain
+$cargoPath = (& $rustupPath which --toolchain $selectedToolchain cargo).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'cannot resolve cargo from the pinned installed toolchain' }
+$rustcPath = (& $rustupPath which --toolchain $selectedToolchain rustc).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'cannot resolve rustc from the pinned installed toolchain' }
+$rustcVerbose = (& $rustcPath --version --verbose | Out-String).Replace("`r", '')
+$rustcVersion = (& $rustcPath --version).Trim()
+$cargoVersion = (& $cargoPath --version).Trim()
 $cargoHome = if ($env:CARGO_HOME) { [IO.Path]::GetFullPath($env:CARGO_HOME) } else { Join-Path $env:USERPROFILE '.cargo' }
 $work = Join-Path ([IO.Path]::GetTempPath()) ('lcdsirplus-repro-' + [Guid]::NewGuid().ToString('N'))
 $detached = Join-Path $work 'detached-source'
@@ -237,10 +261,10 @@ try {
     [IO.File]::Copy($sourceExe, (Join-Path $output 'LCDSirPlus.exe'), $false)
     [IO.File]::Copy($sourceConfig, (Join-Path $output 'lcdsirplus.txt'), $false)
     $evidence = [ordered]@{
-        schema_version = 1
-        generated_utc = [DateTime]::UtcNow.ToString('o')
+        schema_version = 2
         source = [ordered]@{
-            root = $source
+            root = 'source-root'
+            commit = $SourceCommit
             file_count = $sourceManifest.Count
             manifest_sha256 = $sourceManifest.Sha256
             exclusions = @('.git/**', '.codex/**', 'artifacts/**', 'target/**', 'lcdsirplus.local.txt')
@@ -248,10 +272,15 @@ try {
             source_unchanged = $true
         }
         tools = [ordered]@{
-            cargo = [ordered]@{ path = $cargoPath; sha256 = (Get-FileHash $cargoPath -Algorithm SHA256).Hash.ToLowerInvariant(); version = (& $cargoPath --version).Trim() }
-            rustc = [ordered]@{ path = $rustcPath; sha256 = (Get-FileHash $rustcPath -Algorithm SHA256).Hash.ToLowerInvariant(); version = (& $rustcPath --version).Trim() }
+            cargo = [ordered]@{ label = 'pinned-toolchain/cargo'; sha256 = (Get-FileHash $cargoPath -Algorithm SHA256).Hash.ToLowerInvariant(); version = $cargoVersion }
+            rustc = [ordered]@{
+                label = 'pinned-toolchain/rustc'
+                sha256 = (Get-FileHash $rustcPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                version = $rustcVersion
+                commit = ([regex]::Match($rustcVerbose, '(?m)^commit-hash: ([0-9a-f]{40})$')).Groups[1].Value
+                host = 'x86_64-pc-windows-msvc'
+            }
             powershell = $PSVersionTable.PSVersion.ToString()
-            cargo_home = $cargoHome
             command = 'cargo build --release --locked --offline'
             controlled_environment = $true
             brepro = $true
@@ -283,6 +312,8 @@ try {
 }
 finally {
     if ([IO.Directory]::Exists($work)) { Remove-Item -LiteralPath $work -Recurse -Force }
+    if ($null -eq $rustupToolchainBefore) { Remove-Item Env:\RUSTUP_TOOLCHAIN -ErrorAction SilentlyContinue }
+    else { $env:RUSTUP_TOOLCHAIN = $rustupToolchainBefore }
 }
 
 Write-Host "Reproducible release build verified: $output" -ForegroundColor Green

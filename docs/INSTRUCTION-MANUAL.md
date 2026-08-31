@@ -1,5 +1,8 @@
 # LCDSirPlus 0.3.0 Instruction Manual
 
+**Draft / Unreleased:** 0.3.0 release acceptance is pending. Installer and
+portable-package procedures apply only if those artifacts are published.
+
 LCDSirPlus is a Windows 11 x64 dashboard for the Logitech G13 160x43
 monochrome LCD. It runs as a standard user, provides a virtual preview, and
 uses explicit `N/A`, stale, offline, or disabled states when optional telemetry
@@ -11,6 +14,7 @@ is unavailable.
 - [Install or run portable](#install-or-run-portable)
 - [First start](#first-start)
 - [Slots and buttons](#slots-and-buttons)
+- [Main displays](#main-displays)
 - [Configuration and preview](#configuration-and-preview)
 - [Providers](#providers)
 - [Network rates and quality](#network-rates-and-quality)
@@ -29,14 +33,17 @@ Required:
 - Windows 11 x64 and a standard, unelevated user account.
 - A Logitech G13 only for the physical LCD and buttons. The built-in virtual
   preview works without one.
-- `LCDSirPlus.exe` and `lcdsirplus.txt` in the same directory for the default
-  configuration location.
+- A writable configuration location: installed copies use
+  `%LOCALAPPDATA%\LCDSirPlus\Config\lcdsirplus.txt`; portable/development copies
+  use `lcdsirplus.txt` beside `LCDSirPlus.exe`.
 
-The main application is one native executable. Release packages also include
+The main application is one native executable. Published release packages are designed to include
 the official signed PresentMon v2.5.1 console for frame timing; LCDSirPlus does
 not install a runtime, service, driver, listener, browser extension, PresentMon
 MSI/service, or elevated component. LCDSirPlus packages are not code signed, so
-verify their SHA-256 checksums before use.
+verify their SHA-256 checksums before use. Package-level dependency notices are
+in `THIRD_PARTY_LICENSES.txt`; PresentMon's notices remain under
+`licenses/PresentMon/`.
 
 Optional features have separate dependencies:
 
@@ -55,40 +62,30 @@ Optional features have separate dependencies:
 
 ### Verify a release
 
-Place the checksum file beside the downloaded ZIPs and compare the published
-value with the local file:
+Place the checksum file beside the downloaded artifacts and compare the
+published values with the local files:
 
 ```powershell
 Get-Content .\LCDSirPlus-0.3.0-SHA256SUMS.txt
-Get-FileHash .\LCDSirPlus-0.3.0-*.zip -Algorithm SHA256
+Get-FileHash .\LCDSirPlus-0.3.0-* -Algorithm SHA256
 ```
 
 Each ZIP also contains a sorted `PACKAGE-MANIFEST.txt` listing every member's
-SHA-256 and byte size.
+SHA-256 and byte size. The setup EXE is covered by the outer checksum file.
 
 ### Installer package
 
-Extract the installer ZIP to a local fixed drive, open PowerShell in its root,
-and run:
-
-```powershell
-powershell.exe -NoProfile -File .\Install.ps1
-```
-
-The default destination is
-`%LOCALAPPDATA%\Programs\LCDSirPlus`. Installation is per-user, creates a
-current-user Start Menu shortcut, and does not request elevation. For persistent
-login startup, set `start_at_login 1` in the installed `lcdsirplus.txt`. The
-installer can create the initial current-user login entry:
-
-```powershell
-powershell.exe -NoProfile -File .\Install.ps1 -EnableLogin
-```
-
-`-EnableLogin` alone is temporary when configuration remains
-`start_at_login 0`: the application synchronizes its owned Run value to the
-configuration and removes it on startup. It never replaces or removes a foreign
-Run value with the same name.
+If published, run `LCDSirPlus-0.3.0-win-x64-setup.exe`. Current-user mode installs to
+`%LOCALAPPDATA%\Programs\LCDSirPlus`. The mode dialog can select an elevated
+all-users install to `%ProgramFiles%\LCDSirPlus`. Start Menu and per-user sign-in
+startup tasks are checked by default; the desktop shortcut is unchecked. The
+startup integration is an interactive, limited scheduled task, not an HKCU Run
+value or service. Its stable name includes the owning Windows account SID, so
+different accounts do not share one task identity.
+Setup installs a default configuration template. On first installed launch, the
+application validates and atomically seeds
+`%LOCALAPPDATA%\LCDSirPlus\Config\lcdsirplus.txt` only if that user file is
+absent; update and repair do not replace it.
 
 ### Portable package
 
@@ -166,10 +163,27 @@ before performing its normal slot action. When the guarded hung-window UI is
 active, its selected slot's physical button has special hold/release behavior
 described below.
 
-Every graph shows exactly the trailing 30 seconds. With `warning 1`, only the
-selected CPU/GPU temperature pane inverts in alternating 100 ms phases at its
-configured maximum; CPU/GPU temperature alert episodes do not use their old
-full-screen overlays. Other alert overlays remain available.
+Every graph shows exactly the trailing 30 seconds. Temperature and memory
+warnings are enabled independently. With temperature warnings enabled and
+`warning 1`, only the selected CPU/GPU temperature pane inverts in alternating
+100 ms phases at its configured maximum; CPU/GPU temperature alert episodes do
+not use full-screen overlays. With `warning 0`, those temperature overlays
+remain. Memory and headset alerts are unaffected by this presentation setting.
+
+## Main displays
+
+The compact date/time header and fixed four-button bottom row stay the same.
+Select one of three fixed built-in metric layouts:
+
+- `main_display 1` (default): original CPU/RAM and GPU/VRAM halves.
+- `main_display 2`: CPU/RAM, GPU/VRAM, and OUT/IN thirds.
+- `main_display 3`: original CPU/RAM on the left and NET IN/NET OUT on the
+  right.
+
+The value is an integer and only `1`, `2`, or `3` is valid. Saving a valid
+change applies it on hot reload. The OUT/IN bars show current throughput using
+`network_graph_ceiling_mbps`; with its default `1000` Mbps ceiling, 1 Gbps
+fills a bar. Layout 1 has no network bars.
 
 ## Configuration and preview
 
@@ -180,10 +194,12 @@ file and line. Final range and cross-field validation errors may report line `0`
 because no exact source line is retained for those checks. The last valid
 configuration remains active after any invalid edit.
 
-The default file is `lcdsirplus.txt` beside the executable. Cargo copies the
-canonical root configuration beside debug and release executables. An explicit
-`--config PATH` is supported for normal runtime, validation, hardware tests,
-and Discord authorization/credential removal, as detailed under Command line.
+Installed copies default to
+`%LOCALAPPDATA%\LCDSirPlus\Config\lcdsirplus.txt`; portable/development copies
+use the adjacent file. Cargo copies the canonical root configuration beside
+debug and release executables. An explicit `--config PATH` has precedence for
+normal runtime, validation, hardware tests, and Discord
+authorization/credential removal, as detailed under Command line.
 
 Validate before or after editing:
 
@@ -197,17 +213,36 @@ The complete key, default, and range reference is in
 
 | Key | Purpose |
 |---|---|
+| `main_display 1` | Select fixed built-in layout 1, 2, or 3; applies on valid hot reload. |
+| `temperature_warning_enabled 1` | Enable CPU/GPU temperature episodes and their selected presentation. |
+| `memory_warning_enabled 1` | Enable RAM/VRAM capacity episodes independently. |
+| `memory_warning 100` | RAM warning percentage, inclusive at `>=`; `0` is the compatibility disable value. |
+| `vmem_warning 100` | VRAM warning percentage, inclusive at `>=`; `0` is the compatibility disable value. |
+| `warning 1` | With temperature warnings enabled, flash selected panes and suppress temperature full-screen overlays; `0` retains overlays. |
 | `preview_mode auto` | Show preview when a physical HID/SDK backend is unavailable. `always` starts it visible; `never` starts it hidden. |
 | `preview_scale 4` | Preview scale, accepted range 1 through 10. |
 | `start_minimized 0` | Suppress automatic preview display when set to 1. |
-| `start_at_login 0` | Own the current user's exact LCDSirPlus Run value when set to 1. Safe mode never changes it. |
+| `start_at_login 0` | In portable mode, own the current user's exact LCDSirPlus Run value when set to 1. Installed startup is selected in setup instead. Safe mode never changes it. |
 | `logitech_backend auto` | Select trusted SDK with LCore, otherwise direct HID. `virtual` is preview-only. |
+| `hang_enabled 0` | Keep hung-window detection and destructive termination disabled until explicit opt-in and physical disposable-child qualification. |
 | `safe_mode 0` | Disable providers, Discord, probes, startup mutation, and the destructive hung action. |
 
 `preview_scale`, `log_level`, `log_max_bytes`, and `log_backups` are validated
 during hot reload but take effect only after restart. `date_format` and
-`time_format` are accepted but currently do not change the fixed display.
+`time_format` are accepted but currently do not change the shared header.
 `start_minimized` describes automatic-start preview behavior.
+
+The two warning category switches apply on valid hot reload. Disabling
+temperature warnings prevents CPU/GPU episodes and pane flashing without
+affecting memory or headset alerts. Disabling memory warnings prevents RAM/VRAM
+episodes without affecting temperature or headset alerts. Stale and unavailable
+readings never trigger. Use the category switch instead of zero thresholds for
+new configurations; installer updates preserve existing explicit thresholds
+and do not rewrite them. Existing episodes remain through unknown or stale
+readings. A first current valid recovery removes severity-2 warnings immediately
+and starts `critical_alert_linger_ms` only for severity-3 episodes. Disabling a
+warning category clears its episodes; disabling the headset provider clears its
+episode.
 
 An include file can hold machine-local overrides in source or portable use:
 
@@ -217,15 +252,14 @@ include lcdsirplus.local.txt
 
 Relative includes cannot use `..`, absolute paths, or environment expansion.
 Later included values override earlier files; duplicate keys in one file are
-rejected. Includes are portable/source-only in practice: installer update
-rejects undeclared files under the install root. Installed users should keep one
-primary `lcdsirplus.txt` rather than placing a local overlay beside it.
+rejected. Installed relative includes belong beside the user configuration
+under `%LOCALAPPDATA%\LCDSirPlus\Config`, which setup preserves.
 
 ## Providers
 
 ### Built-in Windows sources
 
-- Local date/time uses the fixed current Windows date/time layout.
+- Local date/time uses the shared fixed Windows date/time header layout.
 - CPU load uses native scheduler accounting and CCD topology detection.
 - RAM percentage uses `GlobalMemoryStatusEx`.
 - Network throughput uses native interface counters, excluding loopback and
@@ -287,14 +321,16 @@ lhm_url auto
 ```
 
 `auto` resolves to `http://127.0.0.1:8085/data.json`. If automatic temperature
-selection is wrong, set the stable CPU/GPU SensorId overrides documented in
-`CONFIGURATION.md`. The accepted `CPU_CACHE_TEMP` and
+selection is wrong, copy stable SensorIds from that live loopback `data.json`
+response, not from an LCDSirPlus diagnostics bundle, and set the overrides
+documented in `CONFIGURATION.md`. LHM is user-managed and not bundled; its
+absence is an acceptable unavailable state. The accepted `CPU_CACHE_TEMP` and
 `CPU_FREQ_TEMP` options are also currently unavailable because no runtime
 provider publishes the required per-domain temperatures.
 
 ### PresentMon
 
-Release packages bundle Intel's official signed PresentMon v2.5.1 console as
+Published release packages are designed to bundle Intel's official signed PresentMon v2.5.1 console as
 `PresentMon.exe`. Default `presentmon_path auto` uses that colocated file;
 plain Cargo output does not bundle it. Advanced users can select a valid console
 on a trusted fixed local drive explicitly. Default foreground
@@ -314,6 +350,11 @@ Elevation is troubleshooting, not a normal requirement. PresentMon is MIT
 licensed; its exact notices are in `licenses/PresentMon/LICENSE.txt` and
 `licenses/PresentMon/THIRD_PARTY.txt`, and upstream is
 [GameTechDev/PresentMon](https://github.com/GameTechDev/PresentMon).
+
+The provider is implemented, software-tested, pinned, and remains enabled by
+default because it is a required feature. Live capture against an actively
+presenting game is not yet release-qualified and is deferred while this PC's
+memory is occupied by the local LLM. Release remains pending that live gate.
 
 ### Headset, controller, and audio
 
@@ -355,8 +396,9 @@ Throughput and quality probing are independent:
 - `PING`, `JITTER`, and `PACKET_LOSS` require the optional active probe, which
   is off by default.
 
-All graph variants share `network_graph_ceiling_mbps`. Its default is `1000`
-and accepted range is `1..100000` Mbps. It clips only graph height and does not
+All network graph variants and the current OUT/IN bars in main displays 2 and 3
+share `network_graph_ceiling_mbps`. Its default is `1000` and accepted range is
+`1..100000` Mbps. At the default, 1 Gbps fills a bar. The ceiling does not
 change numeric readings. Example for a 2.5 Gbps link:
 
 ```text
@@ -382,7 +424,7 @@ no probe traffic.
 
 ## Discord setup
 
-Discord integration uses the verified local Discord Desktop named pipe for
+Discord integration uses the trust-checked local Discord Desktop named pipe for
 voice state and bounded HTTPS only for token exchange/refresh. It opens no
 browser, callback listener, or portal redirect.
 
@@ -392,6 +434,11 @@ application; it is not a secret. If the ID is missing, Discord is unconfigured
 and no IPC connection is attempted, so this is not a connection failure.
 LCDSirPlus reads voice state only: it publishes no Rich Presence and requires no
 image assets.
+
+The integration is implemented and software-tested, but its live voice/OAuth
+workflow is not yet release-qualified. Each user creates and registers their own
+Discord application, and tokens remain current-user DPAPI-protected local data.
+Release remains pending this gate unless it is explicitly deferred.
 
 1. Create a Discord developer application and add the account as an application
    tester if Discord requires it.
@@ -454,7 +501,13 @@ Discord access, network probes, hung-target binding/termination, and startup
 registration changes. Clock, native CPU load, native RAM percentage, preview,
 slot cycling, and alert acknowledgement remain harmless local functions.
 
-The hung-window detector can expose repeatedly unresponsive windows.
+The hung-window detector and destructive action are disabled by default. Set
+`hang_enabled 1` only to opt in. Until then, `PROC_HANG` remains in the shipped
+slot with the same button position and cannot bind or terminate a target. The
+provider reports disabled/unavailable while the existing no-target pane shows
+the next configured token without changing selection.
+
+When enabled, the detector can expose repeatedly unresponsive windows.
 `PROC_HANG` may occur only once across all slot lists. The token's selected slot
 owns the matching physical button at runtime; legacy `hang_button` remains
 accepted but does not choose that binding. With no target, the next active token
@@ -469,6 +522,8 @@ reload, or safe mode cancels the action.
 Safe mode leaves ordinary short-release navigation available because no target
 is bound. Termination can lose unsaved work. Test only with the disposable
 harness in [HARDWARE-ACCEPTANCE.md](HARDWARE-ACCEPTANCE.md), never valuable work.
+The action remains unqualified until that disposable-child physical-button gate
+passes; software tests do not qualify termination for release.
 
 `BOTTLENECK` uses sustained configurable CPU, GPU, memory, and disk heuristics.
 When its current result is `NONE`, it dynamically renders the next active token,
@@ -499,6 +554,10 @@ LCDSirPlus.exe [--config PATH] [COMMAND]
 `--config` applies to normal runtime, validation, hardware tests, Discord
 authorization, and Discord credential removal. Diagnostics deliberately ignores
 it; hardware discovery, HWiNFO listing, help, and version do not read it.
+An explicit path takes precedence. Without one, installed copies use
+`%LOCALAPPDATA%\LCDSirPlus\Config\lcdsirplus.txt`, while portable/development
+copies use adjacent `lcdsirplus.txt`; first installed launch seeds a missing user
+file from the installer template.
 `--diagnostic-dir` applies to normal runtime, hardware-test logs, and diagnostics
 output. `--preview` affects normal runtime. Diagnostics records the CLI safe-mode
 state but still starts no providers; other one-shot commands do not need safe
@@ -649,35 +708,28 @@ standard error.
 
 ## Update and uninstall
 
-To update, close LCDSirPlus, verify and extract the new installer ZIP, then run
-its `Install.ps1` again. The installer verifies every declared member, stages
-and publishes transactionally on the local volume, and preserves the installed
-`lcdsirplus.txt` byte-for-byte. It refuses to update while the installed
-executable is running, when any installer-owned file was modified, or when any
-undeclared file other than `lcdsirplus.txt` exists under the install root. Only
-`lcdsirplus.txt` receives update retention; installed users should not add local
-include files under that root.
+For a published update or repair, close LCDSirPlus, verify the new setup EXE, and run it in
+the same install mode. Rerunning setup restores installer-owned files. Windows
+Modify, where offered, runs the exact setup cached at
+`installer\LCDSirPlus-Setup.exe` with the registered `/CURRENTUSER` or
+`/ALLUSERS` scope. Setup refuses an opposite-scope registration, an old
+PowerShell install in the selected directory, or a foreign startup-task
+collision when owned by the same account; remove that account's old installation
+first. An all-users registration owned by another account may coexist with this
+account's current-user install. Setup checks the active account and does not
+enumerate offline user hives. Installed configuration remains at
+`%LOCALAPPDATA%\LCDSirPlus\Config\lcdsirplus.txt`; logs and credentials remain
+elsewhere under `%LOCALAPPDATA%\LCDSirPlus`.
 
-Uninstall from the installed directory:
-
-```powershell
-& "$env:LOCALAPPDATA\Programs\LCDSirPlus\Uninstall.ps1"
-```
-
-By default, uninstall removes only manifest-owned files, including bundled
-`PresentMon.exe` and its two notice files, plus integration entries
-that still point to the exact install. It aborts rather than deleting a modified
-owned file. It preserves `lcdsirplus.txt`, unknown install files, and
-`%LOCALAPPDATA%\LCDSirPlus` logs/credentials. To deliberately purge the canonical
-user-data directory as well:
-
-```powershell
-& "$env:LOCALAPPDATA\Programs\LCDSirPlus\Uninstall.ps1" `
-  -PurgeUserData -ConfirmPurge PURGE-LCDSIRPLUS-DATA
-```
-
-Close LCDSirPlus first. Purging user data removes logs and Discord credentials;
-revoke Discord authorization separately if needed.
+Uninstall from Windows **Installed apps**. The uninstaller removes application
+files, shortcuts, and the product-unique startup task. It preserves
+`%LOCALAPPDATA%\LCDSirPlus`. Task ownership and removal are checked before any
+application files are deleted; initialization only validates, while confirmed
+uninstall revalidates and deletes the task immediately before file removal. A
+cancel leaves the task intact, and a Task Scheduler failure leaves the
+installation available for retry. Delete user data manually only when its logs,
+configuration, and Discord credentials are no longer needed. Revoke Discord
+authorization separately if needed.
 
 For portable removal, first set `start_at_login 0`, start that exact portable
 executable once, and exit it so its owned Run value is removed. Then delete the
@@ -743,8 +795,8 @@ source, prerequisite, and fallback.
 | `NET_HEALTH` | Three rows: `P nMS`, `J nMS`, and `L n%` | Enabled probe and target/settings | All three readings required; blank scanlines separate rows. |
 | `SYSTEM_BATTERY` | AC/battery/charging state | Native Windows system power status | Shows AC/BAT/CHG/no-battery/unknown/stale states. |
 | `HARD_FAULTS` | Approximate page-read pressure as `n/s` | Native PDH `Page Reads/sec` | Titled `FAULTS`; not an exact hard-fault count. |
-| `BOTTLENECK` | CPU/GPU/MEM/DISK I/O/NONE heuristic | Native metrics, thresholds, sustain | `NONE` dynamically displays next token without changing selection. |
-| `PROC_HANG` | Selected hung window and guarded emergency hold action | Native detector and selected-slot physical button | Unique across slots; short release navigates, the hold threshold acts automatically, and no target falls through. |
+| `BOTTLENECK` | CPU/GPU/RAM/DISK I/O/NONE heuristic | Native metrics, thresholds, sustain | `NONE` dynamically displays next token without changing selection. |
+| `PROC_HANG` | Selected hung window and guarded emergency hold action | Native detector and selected-slot physical button; `hang_enabled 0` by default | Unique across slots; provider disabled/unavailable and no-target fall-through until opt-in, then short release navigates and the hold threshold acts automatically; physical disposable-child acceptance remains required. |
 
 For exhaustive configuration key defaults and validation ranges, see
 [CONFIGURATION.md](CONFIGURATION.md). For physical action acceptance, see

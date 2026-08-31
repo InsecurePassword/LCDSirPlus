@@ -1,0 +1,239 @@
+LCDSirPlus third-party dependency notices
+==========================================
+
+This file records the dependency closure selected for the Windows x64 MSVC
+release build reviewed for LCDSirPlus 0.3.0. Cargo registry checksums below
+are the checksums recorded in Cargo.lock. A checksum identifies a registry
+package; it is not a license-file checksum. This inventory is informational
+and is not legal advice.
+
+Runtime dependency closure (x86_64-pc-windows-msvc)
+---------------------------------------------------
+
+windows 0.58.0
+  Cargo checksum: dd04d41d93c4992d421894c18c8b43496aa748dd4c081bac0dc93eb0489272b6
+windows-core 0.58.0
+  Cargo checksum: 6ba6d44ec8c2591c134257ce647b7ea6b20335bf6379a27dac5f1641fcf59f99
+windows-implement 0.58.0
+  Cargo checksum: 2bbd5b46c938e506ecbce286b6628a02171d56153ba733b6c741fc627ec9579b
+windows-interface 0.58.0
+  Cargo checksum: 053c4c462dc91d3b1504c6fe5a726dd15e216ba718e84a0e46a88fbe5ded3515
+windows-result 0.2.0
+  Cargo checksum: 1d1043d8214f791817bab27572aaa8af63732e11bf84aa21a45a78d6c317ae0e
+windows-strings 0.1.0
+  Cargo checksum: 4cd9b125c486025df0eabcb585e62173c6c9eddcec5d117d3b6e8c30e2ee4d10
+windows-targets 0.52.6
+  Cargo checksum: 9b724f72796e036ab90c1021d4780d4d3d648aca59e491e6b98e725b84e99973
+windows_x86_64_msvc 0.52.6
+  Cargo checksum: 589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec
+proc-macro2 1.0.107
+  Cargo checksum: 985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9
+quote 1.0.47
+  Cargo checksum: 1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001
+syn 2.0.119
+  Cargo checksum: 872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297
+unicode-ident 1.0.24
+  Cargo checksum: e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75
+
+The windows, windows-core, windows-implement, windows-interface,
+windows-result, windows-strings, windows-targets, and
+windows_x86_64_msvc packages identify Microsoft as author and declare
+"MIT OR Apache-2.0". The MIT option is elected here.
+
+The proc-macro2, quote, and syn packages declare "MIT OR Apache-2.0".
+The MIT option is elected here. unicode-ident declares
+"(MIT OR Apache-2.0) AND Unicode-3.0"; the MIT option and the required
+Unicode-3.0 terms are reproduced below.
+
+Rust standard library provenance observed for the reviewed build
+---------------------------------------------------------------
+
+The reviewed build environment reported rustc 1.97.1
+(commit 8bab26f4f68e0e26f0bb7960be334d5b520ea452, 2026-07-14), host and
+target x86_64-pc-windows-msvc. Rust standard-library code may be statically
+linked into LCDSirPlus.exe and is not represented by a Cargo.lock package
+checksum. The installed toolchain's COPYRIGHT-library.html identifies The
+Rust Project Developers, states that the standard library is offered under
+Apache-2.0 OR MIT except where otherwise noted, and identifies its Unicode
+data under Unicode-3.0. The MIT option is elected here, and the Unicode-3.0
+terms are reproduced below.
+
+Common elected MIT notice
+-------------------------
+
+This text applies to the MIT elections above. Package authors and copyright
+holders retain their respective copyrights.
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+Unicode-3.0 notice
+------------------
+
+UNICODE LICENSE V3
+
+COPYRIGHT AND PERMISSION NOTICE
+
+unicode-ident 1.0.24 local notice:
+Copyright (c) 1991-2023 Unicode, Inc.
+
+Rust standard library 1.97.1 local notice:
+Copyright (c) 1991-2024 Unicode, Inc.
+
+NOTICE TO USER: Carefully read the following legal agreement. BY
+DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of data files and any associated documentation (the "Data Files") or
+software and any associated documentation (the "Software") to deal in the
+Data Files or Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, and/or sell
+copies of the Data Files or Software, and to permit persons to whom the
+Data Files or Software are furnished to do so, provided that either (a)
+this copyright and permission notice appear with all copies of the Data
+Files or Software, or (b) this copyright and permission notice appear in
+associated Documentation.
+
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+THIRD PARTY RIGHTS.
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+FILES OR SOFTWARE.
+
+Except as contained in this notice, the name of a copyright holder shall
+not be used in advertising or otherwise to promote the sale, use or other
+dealings in these Data Files or Software without prior written
+authorization of the copyright holder.
+
+The copyright symbol in the locally installed Unicode-3.0 notice is rendered
+as the ASCII sequence "(c)" above so this shipped notice remains ASCII.
+
+Build-only dependencies
+-----------------------
+
+The following packages are used by the resource build script. They are not
+members of the selected normal dependency closure above.
+
+winres 0.1.12
+  Vendored path dependency: third_party/winres
+  Cargo.lock has no registry source or registry checksum for this package.
+  License: MIT
+toml 0.5.11
+  Cargo checksum: f4f7f0dd8d50a853a531c426359045b1998f04219d88799810762cd4ad314234
+  License: MIT/Apache-2.0; MIT option elected.
+serde 1.0.229
+  Cargo checksum: 4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba
+  License: MIT OR Apache-2.0; MIT option elected.
+serde_core 1.0.229
+  Cargo checksum: 67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48
+  License: MIT OR Apache-2.0; MIT option elected.
+serde_derive 1.0.229
+  Cargo checksum: e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348
+  License: MIT OR Apache-2.0; MIT option elected.
+syn 3.0.4
+  Cargo checksum: e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f
+  License: MIT OR Apache-2.0; MIT option elected.
+
+The common elected MIT notice above applies to serde, serde_core,
+serde_derive, and syn 3.0.4.
+The distinct local winres and toml MIT notices follow.
+
+winres 0.1.12 MIT notice
+------------------------
+
+Copyright 2016 Max Resch
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+toml 0.5.11 MIT notice
+----------------------
+
+Copyright (c) 2014 Alex Crichton
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+Separately shipped PresentMon notices
+-------------------------------------
+
+The bundled PresentMon.exe is a separately acquired and verified release
+input, not a Cargo dependency. Its notices are shipped separately at:
+
+  licenses/PresentMon/LICENSE.txt
+  licenses/PresentMon/THIRD_PARTY.txt
+
+Those files, rather than this summary, are the notices for PresentMon and its
+third-party sources.

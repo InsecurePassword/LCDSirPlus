@@ -1,0 +1,28 @@
+{
+  "name": "Inno Setup",
+  "version": "6.7.3",
+  "tag": "is-6_7_3",
+  "installer": {
+    "file": "innosetup-6.7.3.exe",
+    "url": "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe",
+    "size": 10592232,
+    "sha256": "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732",
+    "authenticodeSimpleName": "Pyrsys B.V.",
+    "authenticodeSubject": "CN=Pyrsys B.V., O=Pyrsys B.V., S=Noord-Holland, C=NL",
+    "authenticodeThumbprint": "E0AB19C8D38CBF9C44709925122A7A02F8C70CB7"
+  },
+  "compiler": {
+    "file": "ISCC.exe",
+    "size": 1456272,
+    "sha256": "0a8757031b33777e4c9cbffee40f11a5062b36d25cbe144c1db73b6102b80ad7",
+    "banner": "Inno Setup 6 Command-Line Compiler"
+  },
+  "license": {
+    "file": "LICENSE.txt",
+    "size": 1491,
+    "sha256": "0c81595601bce47eeef8d865d5da7f9ca2c6a12235b7482b29f5ab23ed02ee5a",
+    "installedFile": "license.txt",
+    "installedSize": 1521,
+    "installedSha256": "2e5346868c2a18434489824e11d65c3031620f792fefc415d05f19cd441abf5c"
+  }
+}

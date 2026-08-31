@@ -8,13 +8,30 @@ and maintenance. End-user instructions belong in `README.md`, `modules.md`,
 
 LCDSirPlus is a Windows 11 x64 Rust application. `src/main.rs` owns command-line
 dispatch, `src/app.rs` wires configuration, telemetry, rendering, input, UI,
-and backends, and `src/render/renderer.rs` produces the fixed 160x43 frame.
+and backends, and `src/render/renderer.rs` produces the deterministic 160x43
+frame with three selectable fixed built-in layouts.
 Provider, backend, and package details are documented in
 `docs/ARCHITECTURE.md`.
 
-The build requires stable Rust with the MSVC target and the corresponding
-Microsoft C++ build tools. Direct Cargo dependencies are Microsoft's `windows`
-crate and the `winres` build dependency.
+The build requires Rust 1.97.1
+(`8bab26f4f68e0e26f0bb7960be334d5b520ea452`), host
+`x86_64-pc-windows-msvc`, minimal profile, plus the corresponding Microsoft C++
+build tools. This repository's `rust-toolchain.toml` selects the installed
+exact version and does not use a mutable channel alias. Before running any of
+the direct Cargo commands below, install this exact toolchain prerequisite:
+
+```powershell
+rustup toolchain install 1.97.1 --profile minimal `
+  --component clippy --component rustfmt `
+  --target x86_64-pc-windows-msvc
+```
+
+Build and test scripts select only that already-installed exact alias and verify
+its version, commit, host, components, and target. An explicit external
+`RUSTUP_TOOLCHAIN` override is accepted only when it passes the same provenance
+checks; scripts never silently fall back to `stable` or ask rustup to install or
+update a toolchain. Direct Cargo dependencies are Microsoft's `windows` crate
+and the `winres` build dependency.
 
 ## Build and quality gates
 
@@ -25,7 +42,7 @@ cargo build
 cargo build --release
 cargo fmt --check
 cargo clippy --all-targets
-cargo test --release
+cargo test --release --locked
 pwsh -NoProfile -File .\scripts\Test.ps1
 ```
 
@@ -36,6 +53,10 @@ executable, and exercises public smoke commands plus the virtual hardware test.
 
 `build.rs` copies the canonical root `lcdsirplus.txt` beside each Cargo debug or
 release executable; local overlay include files are deliberately not copied.
+Development and portable runs use that adjacent file unless `--config` is
+explicitly supplied. Installed runs instead default to
+`%LOCALAPPDATA%\LCDSirPlus\Config\lcdsirplus.txt`; the installed template seeds
+that file only when absent, and an explicit path always has precedence.
 
 The release binary uses `IMAGE_SUBSYSTEM_WINDOWS_GUI`. One-shot command modes
 attach to an existing parent console without allocating one, while tray/runtime
@@ -46,6 +67,16 @@ dialog smokes with guaranteed cleanup.
 
 ## Packaging
 
+Version 0.3.0 remains draft/unreleased. PresentMon is implemented,
+software-tested, pinned, and enabled by default as a required feature, but live
+game capture is not release-qualified and is deferred while this PC's memory is
+occupied by the local LLM. Discord is implemented and software-tested; users
+register their own applications and credentials remain current-user
+DPAPI-protected, but live voice/OAuth qualification is pending unless explicitly
+deferred. Guarded termination defaults off and remains unqualified until the
+disposable-child physical-button gate passes. These open gates prevent a release
+claim.
+
 ```powershell
 pwsh -NoProfile -File .\scripts\Build.ps1
 ```
@@ -53,16 +84,56 @@ pwsh -NoProfile -File .\scripts\Build.ps1
 Release packaging requires a clean worktree and an unchanged exact Git HEAD.
 The quality gate runs first. Source files are staged from `git archive HEAD`,
 not from the working directory. Explicit allowlists produce deterministic
-portable, installer, and source ZIPs with sorted hash/size manifests and an
-archive checksum file. Package lifecycle tests use clean extraction and verify
-install, update, rollback, ownership, and uninstall behavior.
+portable/source ZIPs and a versioned Inno Setup EXE with a sorted outer
+hash/size manifest. `REPRODUCIBILITY.json` records logical source/tool labels,
+tool versions/hashes, and the exact source commit without machine-specific
+paths; it is covered by the outer manifest, which never hashes itself. The setup
+is compiled twice and must be byte-identical. Portable, source, and setup
+payloads carry the same ASCII `SOURCE-COMMIT.txt`; portable/source manifests
+cover it, and setup installs it read-only. Final builds accept only the exact
+40-lowercase-hex HEAD. Manual non-release setup compilation must explicitly use
+`WORKTREE-` followed by a 64-lowercase-hex staged-manifest hash.
+Static package tests do not execute the installer.
 
-Portable and installer packages contain only public user documentation:
-`README.md`, `modules.md`, `LICENSE`, `RELEASE-NOTES.md`, `SECURITY.md`,
-`docs/CONFIGURATION.md`, `docs/HARDWARE-ACCEPTANCE.md`,
-`docs/INSTRUCTION-MANUAL.md`, and
-`docs/LCDSirPlus-Instruction-Manual.pdf`, plus the signed pinned
-`PresentMon.exe` and `licenses/PresentMon/LICENSE.txt`/`THIRD_PARTY.txt`.
+Real installer qualification is explicit and mutates Windows only when the
+confirmation switch is present:
+
+```powershell
+$setup = (Resolve-Path .\artifacts\release\LCDSirPlus-0.3.0-win-x64-setup.exe).Path
+$setupSha = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+$portable = (Resolve-Path .\artifacts\release\LCDSirPlus-0.3.0-win-x64-portable.zip).Path
+$sourceIdentity = (& tar.exe -xOf $portable `
+  LCDSirPlus-0.3.0-win-x64-portable/SOURCE-COMMIT.txt).Trim()
+pwsh -NoProfile -File .\scripts\Package-Test.ps1 -Mode CurrentUserLifecycle `
+  -SetupPath $setup -ExpectedSetupSha256 $setupSha `
+  -ExpectedSourceIdentity $sourceIdentity -ConfirmSystemMutation
+# Run from elevated PowerShell on a disposable VM:
+pwsh -NoProfile -File .\scripts\Package-Test.ps1 -Mode AllUsersQualification `
+  -SetupPath $setup -ExpectedSetupSha256 $setupSha `
+  -ExpectedSourceIdentity $sourceIdentity -ConfirmSystemMutation
+```
+
+These modes require no existing product registration, task, or shortcuts.
+Pre-existing `%LOCALAPPDATA%\LCDSirPlus` is supported: the harness records its
+exact file/directory metadata and verifies that the lifecycle preserves it.
+They exercise legacy/foreign-task refusal, default task selection,
+both same-user opposite-scope directions where elevation permits, install,
+tamper refusal, cached Modify repair, SID-specific task XML ownership, uninstall,
+user-data preservation, and best-effort cleanup. External qualification logs are
+retained for diagnosis. Standard-user over-the-shoulder UAC/original-user,
+second-account all-users coexistence, and interactive uninstall cancellation
+remain explicit disposable-VM gates when those sessions cannot be automated;
+the tests do not claim offline-HKU coverage. `Build.ps1` never invokes either
+mutation mode. Both lifecycle modes must use the exact same final setup file:
+the SHA-256 passed to each command and reported in both transcripts and retained
+`qualification-evidence.txt` files must match.
+
+Portable and installer payloads contain public user documentation, the signed
+pinned `PresentMon.exe`, and its `LICENSE.txt`/`THIRD_PARTY.txt` notices. The
+installer's exact document inventory is `README.md`, `modules.md`, `LICENSE`,
+`THIRD_PARTY_LICENSES.txt`, `docs/CONFIGURATION.md`,
+`docs/INSTRUCTION-MANUAL.md`, and the PDF manual; the portable ZIP additionally
+ships release, security, and hardware-acceptance documents.
 Architecture, product-specification, reference-layout, and development documents
 remain source-archive-only.
 
@@ -90,11 +161,34 @@ the same verification and does not download. Packaging copies the console and
 notices into portable/installer payloads, and package lifecycle tests verify
 identity, signature, installation, and removal.
 
+### Pinned Inno Setup acquisition
+
+```powershell
+pwsh -NoProfile -File .\scripts\Acquire-InnoSetup.ps1
+pwsh -NoProfile -File .\scripts\Acquire-InnoSetup.ps1 -VerifyOnly
+```
+
+This caches only the official tag `is-6_7_3` installer under the ignored
+`third_party/InnoSetup/cache/6.7.3` directory. It verifies the exact installer
+URL, byte size, SHA-256, and Authenticode certificate identity against
+`third_party/InnoSetup/manifest.json`. Release builds verify that cached
+installer, freshly extract the complete portable toolchain into a unique
+build-owned temporary directory, verify `ISCC.exe` SHA-256/banner and the
+installed license, and remove the extraction on success or failure. They never
+execute an extracted long-lived cache or acquire from the network. The source
+ZIP includes the `.iss`, manifest, license, and acquisition script, but no
+compiler binaries.
+
 PresentMon is MIT-licensed by Intel. HWiNFO is separately licensed under its
 vendor terms; LibreHardwareMonitor is MPL-2.0. ADLX and NVAPI/NVML are
 vendor-installed APIs used under vendor terms. None is a Rust dependency, and
 no sensor/GPU SDK is bundled. These projects and vendors are not affiliated
 with or endorsers of LCDSirPlus.
+
+`THIRD_PARTY_LICENSES.txt` inventories the selected Windows x64 MSVC Cargo
+dependency closure, its Cargo.lock checksums, the observed Rust standard-library
+provenance, and build-only dependencies. PresentMon retains its separately
+shipped upstream notices under `licenses/PresentMon/`.
 
 ## G13 backend proven contract
 
@@ -176,7 +270,7 @@ redistributed, and their licenses do not change LCDSirPlus's MIT license.
 
 - `docs/ARCHITECTURE.md`: subsystem layout, threading, data flow, boundaries.
 - `docs/PRODUCT-SPEC.md`: product behavior and operational requirements.
-- `docs/REFERENCE-LAYOUT.md`: fixed geometry and renderer golden hashes.
+- `docs/REFERENCE-LAYOUT.md`: shared and per-layout geometry plus renderer golden hashes.
 - `docs/HARDWARE-ACCEPTANCE.md`: physical G13 and live integration checks.
 - `docs/CONFIGURATION.md`: complete configuration schema and ranges.
 - `docs/INSTRUCTION-MANUAL.md`: detailed user procedures and troubleshooting.
@@ -191,9 +285,10 @@ documents for subsystem-specific checks.
 
 ## Deterministic artifacts
 
-The renderer's fixed dashboard is pinned to the hashes in
-`docs/REFERENCE-LAYOUT.md`. Intentional layout changes require updated goldens
-and visual review.
+The renderer's three built-in displays are pinned by implementation tests to
+the hashes in `docs/REFERENCE-LAYOUT.md`. These are not release-build or
+physical-acceptance evidence. Intentional shared or per-layout changes require
+updated goldens and visual review.
 
 The documentation gate verifies that `modules.md` contains exactly the 53
 canonical `src/config.rs` tokens in order and that the README and standalone

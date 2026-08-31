@@ -63,12 +63,6 @@ function Assert-SafeRelativePath {
     }
 }
 
-function Assert-SafeLeafName {
-    param([Parameter(Mandatory = $true)][string]$Name)
-    Assert-SafeRelativePath $Name
-    if ($Name.Contains('/')) { throw "name must contain exactly one path segment" }
-}
-
 function Get-RelativePackagePath {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -111,7 +105,8 @@ function Assert-RegularSingleLinkFile {
 function Assert-SafeLocalDirectory {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [switch]$Create
+        [switch]$Create,
+        [switch]$AllowMissing
     )
     $full = Get-NormalizedFullPath $Path
     if (-not [IO.Path]::IsPathRooted($full) -or $full.StartsWith('\\')) {
@@ -131,6 +126,7 @@ function Assert-SafeLocalDirectory {
         if ([string]::IsNullOrEmpty($part)) { continue }
         $current = Join-Path $current $part
         if (-not [IO.Directory]::Exists($current)) {
+            if ($AllowMissing) { break }
             if (-not $Create) { throw "directory does not exist" }
             [IO.Directory]::CreateDirectory($current) | Out-Null
         }
@@ -142,23 +138,90 @@ function Assert-SafeLocalDirectory {
     return $full
 }
 
-function Assert-NotDangerousInstallRoot {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    $full = Get-NormalizedFullPath $Path
-    $dangerous = @(
-        $env:LOCALAPPDATA,
-        $env:APPDATA,
-        $env:USERPROFILE,
-        $env:ProgramFiles,
-        ${env:ProgramFiles(x86)},
-        $env:SystemRoot,
-        [IO.Path]::GetTempPath(),
-        (Join-Path $env:LOCALAPPDATA 'Programs')
-    )
-    foreach ($candidate in $dangerous) {
-        if (-not [string]::IsNullOrWhiteSpace($candidate) -and $full.Equals((Get-NormalizedFullPath $candidate), [StringComparison]::OrdinalIgnoreCase)) {
-            throw "dangerous install root refused"
+function New-ReleaseOutputTransaction {
+    param([Parameter(Mandatory = $true)][string]$Output)
+    $outputFull = Get-NormalizedFullPath $Output
+    $parent = Assert-SafeLocalDirectory -Path (Split-Path $outputFull -Parent) -Create
+    $leaf = Split-Path $outputFull -Leaf
+    $stage = Join-Path $parent ('.' + $leaf + '.stage.' + [Guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($stage) | Out-Null
+        $stage = Assert-SafeLocalDirectory -Path $stage
+        if (-not (Get-NormalizedFullPath (Split-Path $stage -Parent)).Equals($parent, [StringComparison]::OrdinalIgnoreCase) -or
+            @(Get-ChildItem -LiteralPath $stage -Force).Count -ne 0) {
+            throw "release stage must be an empty sibling of output"
         }
+        $hadOutput = [IO.Directory]::Exists($outputFull)
+        if ($hadOutput) {
+            Assert-SafeLocalDirectory -Path $outputFull | Out-Null
+        }
+        elseif ([IO.File]::Exists($outputFull)) {
+            throw "release output must be a directory"
+        }
+        return [pscustomobject]@{ Output = $outputFull; Stage = $stage; Prior = $null; HadOutput = $hadOutput }
+    }
+    catch {
+        if ([IO.Directory]::Exists($stage)) { [IO.Directory]::Delete($stage, $true) }
+        throw
+    }
+}
+
+function Complete-ReleaseOutputTransaction {
+    param(
+        [Parameter(Mandatory = $true)][object]$Transaction,
+        [ValidateSet('None', 'BeforeMove', 'AfterMove')][string]$TestFailAt = 'None'
+    )
+    if ($TestFailAt -ne 'None' -and $env:LCDSIRPLUS_PACKAGE_TEST -cne '1') {
+        throw "release fault injection requires guarded package test mode"
+    }
+    $stage = Assert-SafeLocalDirectory -Path $Transaction.Stage
+    $output = Get-NormalizedFullPath $Transaction.Output
+    $parent = Assert-SafeLocalDirectory -Path (Split-Path $output -Parent)
+    if (-not (Get-NormalizedFullPath (Split-Path $stage -Parent)).Equals($parent, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "release stage must be a sibling of output"
+    }
+    $prior = $null
+    if ([bool]$Transaction.HadOutput) {
+        Assert-SafeLocalDirectory -Path $output | Out-Null
+        $prior = Join-Path $parent ('.' + (Split-Path $output -Leaf) + '.prior.' + [Guid]::NewGuid().ToString('N'))
+    }
+    elseif ([IO.Directory]::Exists($output) -or [IO.File]::Exists($output)) {
+        throw "release output appeared before promotion"
+    }
+
+    $movedPrior = $false
+    try {
+        if ($TestFailAt -eq 'BeforeMove') { throw "injected release failure before canonical move" }
+        if ($null -ne $prior) {
+            $Transaction.Prior = $prior
+            [IO.Directory]::Move($output, $prior)
+            $movedPrior = $true
+        }
+        if ($TestFailAt -eq 'AfterMove') { throw "injected release failure after canonical move" }
+        [IO.Directory]::Move($stage, $output)
+    }
+    catch {
+        $promotionFailure = $_
+        if ($movedPrior) {
+            try {
+                if ([IO.Directory]::Exists($output) -or [IO.File]::Exists($output)) { throw "canonical output path is occupied" }
+                [IO.Directory]::Move($prior, $output)
+                $Transaction.Prior = $null
+            }
+            catch {
+                throw "release promotion failed and prior restoration failed; recover by moving '$prior' to '$output'. Promotion: $promotionFailure Restoration: $_"
+            }
+        }
+        throw $promotionFailure
+    }
+
+    if ($null -ne $prior -and [IO.Directory]::Exists($prior)) {
+        try {
+            Assert-SafeTree $prior
+            Remove-Item -LiteralPath $prior -Recurse -Force
+            $Transaction.Prior = $null
+        }
+        catch { Write-Warning "Current release was promoted; prior-output cleanup residue retained at ${prior}: $_" }
     }
 }
 
@@ -252,11 +315,7 @@ function Assert-ArchiveMemberNames {
 }
 
 function Test-ExactProcessRunning {
-    param(
-        [Parameter(Mandatory = $true)][string]$ExecutablePath,
-        [switch]$SimulateRunning
-    )
-    if ($SimulateRunning) { return $true }
+    param([Parameter(Mandatory = $true)][string]$ExecutablePath)
     $expected = Get-NormalizedFullPath $ExecutablePath
     foreach ($process in [Diagnostics.Process]::GetProcesses()) {
         try {
@@ -267,21 +326,4 @@ function Test-ExactProcessRunning {
         finally { $process.Dispose() }
     }
     return $false
-}
-
-function Get-CommandTarget {
-    param([string]$Command)
-    if ([string]::IsNullOrWhiteSpace($Command)) { return $null }
-    if ($Command -match '^\s*"([^"]+)"(?:\s|$)') { return Get-NormalizedFullPath $Matches[1] }
-    if ($Command -match '^\s*([^\s]+)(?:\s|$)') { return Get-NormalizedFullPath $Matches[1] }
-    return $null
-}
-
-function Test-CommandTargets {
-    param([string]$Command, [Parameter(Mandatory = $true)][string]$ExecutablePath)
-    try {
-        $target = Get-CommandTarget $Command
-        return $null -ne $target -and $target.Equals((Get-NormalizedFullPath $ExecutablePath), [StringComparison]::OrdinalIgnoreCase)
-    }
-    catch { return $false }
 }

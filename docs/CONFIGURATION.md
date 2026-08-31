@@ -20,10 +20,15 @@ or `off`, case-insensitively. Unless a row says otherwise, one value is
 required; strings are limited to 4096 bytes and cannot contain control
 characters. An `auto` interval resolves to the numeric default shown.
 
-The default primary file is `lcdsirplus.txt` beside `LCDSirPlus.exe`. Normal
-runtime, validation, hardware tests, and Discord authorization/credential
-removal accept `--config PATH`; diagnostics intentionally ignores it. Cargo
-builds copy the canonical root file beside the debug or release executable.
+Installed copies default to
+`%LOCALAPPDATA%\LCDSirPlus\Config\lcdsirplus.txt`; portable and development
+copies default to `lcdsirplus.txt` beside `LCDSirPlus.exe`. An explicit
+`--config PATH` takes precedence for normal runtime, validation, hardware tests,
+and Discord authorization/credential removal. Diagnostics intentionally ignores
+it. The installer provides `lcdsirplus.default.txt`; on first installed launch,
+the application validates and atomically seeds a missing user configuration
+from that template without replacing an existing file. Cargo builds copy the
+canonical root file beside the debug or release executable.
 
 ## Core
 
@@ -31,7 +36,8 @@ builds copy the canonical root file beside the debug or release executable.
 |---|---|---|---|
 | `config_refresh_ms` | 1000 (`auto`) | 100..60000 | Check the primary/include graph for hot-reload changes. |
 | `telemetry_interval_ms` | 300 (`auto`) | 100..10000 | Poll fast native telemetry and build snapshots. |
-| `render_interval_ms` | 100 (`auto`) | 25..5000 | Render cadence; must be <=100 when `warning=1`. |
+| `render_interval_ms` | 100 (`auto`) | 25..5000 | Render cadence; must be <=100 when `warning=1` and `temperature_warning_enabled=1`. |
+| `main_display` | 1 | integer `1` \| `2` \| `3` | Select one of three fixed built-in main displays; applies on valid hot reload. |
 | `preview_mode` | `auto` | `auto` \| `always` \| `never` | Control preview visibility; `auto` treats connected HID and SDK transports as physical backends. |
 | `preview_scale` | 4 | 1..10 | Integer preview-window magnification. |
 | `start_minimized` | 0 | boolean | Suppress automatic preview display when the application starts automatically. |
@@ -47,10 +53,19 @@ suppresses automatic preview display. `start_at_login` owns only the current
 user's `LCDSirPlus` Run value and refuses to replace or remove a foreign value.
 Safe mode never changes startup registration.
 
-`start_at_login 1` is required for persistent automatic startup. Installer
-`-EnableLogin` creates the same owned Run value immediately, but the application
-synchronizes that value to configuration and removes it if `start_at_login`
-remains `0`. It never replaces or removes a foreign value with the same name.
+Set the main display with exact syntax such as `main_display 1`. Layout 1 is
+the original CPU/RAM and GPU/VRAM content, layout 2 is CPU/RAM, GPU/VRAM, and
+OUT/IN thirds, and layout 3 is the original CPU/RAM half paired with NET IN/NET
+OUT on the right. All retain the compact date/time header and fixed four-button
+row. Layouts 2 and 3 scale their current-throughput network bars with
+`network_graph_ceiling_mbps`;
+at its default `1000` Mbps, 1 Gbps is full scale.
+
+In portable mode, `start_at_login 1` owns the current user's exact LCDSirPlus
+Run value; `0` removes only that owned value. Installed mode does not touch HKCU
+Run. Its optional interactive, limited scheduled task is selected when setup is
+run and is independent of this setting. Its stable task name includes the owning
+Windows SID, allowing separate accounts' installer-owned tasks to coexist.
 
 The clock and fixed header currently use the default date and time formats shown
 above. `date_format` and `time_format` are accepted and reserved until runtime
@@ -343,7 +358,7 @@ web server.
 Shows whole-system CPU utilization from Windows scheduler accounting as
 0..100%, averaged across all logical processors over the latest telemetry
 sample interval. It is total CPU busy time, not the Cache/Frequency split used
-by the fixed dashboard. An empty or unusable Windows logical-processor sample
+by the built-in main displays. An empty or unusable Windows logical-processor sample
 is currently published and displayed as a valid `0%`; the reading is not
 retained as `STALE`.
 
@@ -549,12 +564,12 @@ does not add an unsupported approximation glyph. It has no external dependency.
 
 ### `BOTTLENECK`
 
-Shows a configurable heuristic: `CPU`, `GPU`, `MEM`, `DISK I/O`, or `NONE`.
-CPU uses peak logical-processor load, GPU uses native GPU load, MEM uses the
+Shows a configurable heuristic: `CPU`, `GPU`, `RAM`, `DISK I/O`, or `NONE`.
+CPU uses peak logical-processor load, GPU uses native GPU load, RAM uses the
 higher available RAM/VRAM percentage, and disk uses aggregate read+write MB/s.
 Candidates must meet their configured threshold continuously for
 `bottleneck_sustain_ms`; if several qualify, the largest threshold ratio wins
-with stable CPU/GPU/MEM/disk ordering on ties. CPU, RAM, and both disk readings
+with stable CPU/GPU/RAM/disk ordering on ties. CPU, RAM, and both disk readings
 are required for the heuristic; missing required input yields `N/A`.
 
 When the result is current `NONE`, the pane dynamically renders the next token
@@ -578,6 +593,12 @@ Recovery, selection change, device loss, provider failure, reload, early
 release, or safe mode cancels. The legacy `hang_button` key remains accepted
 for persisted configuration but does not choose the runtime button. Termination
 can lose unsaved work.
+With the default `hang_enabled 0`, the token and its button position remain
+unchanged. Its provider reports disabled/unavailable, the no-target pane renders
+the next configured token without changing selection, and it cannot bind or
+terminate a target.
+Termination requires explicit opt-in and remains unqualified until the
+disposable-child physical-button gate in `HARDWARE-ACCEPTANCE.md` passes.
 
 All six throughput options use Windows counters from all operational,
 non-loopback network interfaces, sampled about once per second. Rates are
@@ -613,13 +634,15 @@ Shows the current incoming SI bit rate and exactly the trailing 30 seconds in
 one-second bins. Graph height is clipped to the
 shared `network_graph_ceiling_mbps` setting (default 1000 Mbps, range
 1..100000); changing the ceiling does not change the numeric rate. `N/A` or
-`STALE` replaces the graph when the current reading is unusable.
+`STALE` replaces the graph when the current reading is unusable. Main-display
+network bars use the same scale.
 
 ### `NET_OUT_GRAPH`
 
 Shows the current outgoing SI bit rate and exactly the trailing 30 seconds in
 one-second bins. It uses the same
-`network_graph_ceiling_mbps` ceiling as every network graph. `N/A` or `STALE`
+`network_graph_ceiling_mbps` ceiling as every network graph and main-display
+network bar. `N/A` or `STALE`
 replaces the graph when the current reading is unusable.
 
 ### `NET_GRAPH`
@@ -678,7 +701,7 @@ Related settings and requirements are the same as `JITTER`.
 
 Shows the current Windows local time using the default `HH:mm:ss` format. It
 does not require a provider or external service and does not use `N/A` or
-`STALE`. The fixed dashboard header uses the default `yyyy-MM-dd dddd` date,
+`STALE`. The shared main-display header uses the default `yyyy-MM-dd dddd` date,
 falling back to `yyyy-MM-dd ddd` when needed to fit. The accepted `time_format`
 and `date_format` keys do not currently customize either display.
 
@@ -691,9 +714,10 @@ temperature, RAM percentage, VRAM percentage, and headset battery. Only current
 valid readings create alerts, so unavailable or stale telemetry does not create
 one. Physical button 4 acknowledges the highest active episode.
 
-Related settings: `cpu_temp_warning`, `cpu_temp_critical`,
-`gpu_temp_warning`, `gpu_temp_critical`, `memory_warning`, `vmem_warning`,
-`headset_warn_percent`, `headset_critical_percent`, and
+Related settings: `temperature_warning_enabled`, `memory_warning_enabled`,
+`cpu_temp_warning`, `cpu_temp_critical`, `gpu_temp_warning`,
+`gpu_temp_critical`, `memory_warning`, `vmem_warning`, `headset_warn_percent`,
+`headset_critical_percent`, and
 `critical_alert_linger_ms`. `CLEAR` is the normal idle state; this option does
 not show `N/A` or `STALE`.
 
@@ -778,7 +802,10 @@ not exist. LCDSirPlus never probes raw MSRs, SMBus, EC, or Super-I/O registers.
 | `pump_max_rpm` | 0 | 0..30000; 0 disables RPM-derived percentage |
 
 The user must explicitly run LibreHardwareMonitor and enable its web server.
-LCDSirPlus does not enable or manage it. Only loopback HTTP is accepted. Exact
+LCDSirPlus does not bundle, start, enable, or manage LHM; its absence and the
+resulting unavailable readings are acceptable. Only loopback HTTP is accepted.
+Copy exact SensorIds from the user's live loopback `data.json` response (normally
+`http://127.0.0.1:8085/data.json`), not from an LCDSirPlus diagnostics bundle. Exact
 extended SensorIds fail closed when missing, ambiguous, wrong-type, or outside
 their expected ranges; no LHM load, VRAM, RAM, disk, or network values are
 published.
@@ -826,7 +853,7 @@ and drivers are external platform components, not Rust dependencies.
 | `presentmon_exclude` | `dwm.exe explorer.exe applicationframehost.exe textinputhost.exe searchhost.exe lcdsirplus.exe lcdsirplus.console.exe` | zero to 256 foreground names excluded from capture |
 | `stutter_threshold_ms` | 33.34 | 1..1000; frame-time threshold for session stutter count |
 
-Release packages bundle the official signed PresentMon v2.5.1 console as
+Published release packages are designed to bundle the official signed PresentMon v2.5.1 console as
 `PresentMon.exe`. LCDSirPlus launches and owns it only while an enabled target
 frame capture is active, passes arguments without a shell, and stops only its
 own child on target/config change or shutdown. PresentMon supplies frame/FPS
@@ -840,6 +867,12 @@ path, interval, window, or stutter threshold starts a new capture/session. If
 capture cannot start, add the user to Windows' **Performance Log Users** group
 and sign out/in, or test an elevated launch if local ETW policy requires it.
 Elevation is troubleshooting, not a normal LCDSirPlus requirement.
+
+The provider is implemented, software-tested, pinned, and enabled by default as
+a required feature. Live capture against an actively presenting game is not yet
+release-qualified and is deferred while this PC's memory is occupied by the
+local LLM. Release remains pending that gate; the default is not disabled to
+bypass it.
 
 PresentMon is MIT-licensed by Intel and is not affiliated with LCDSirPlus. Its
 exact notices ship as `licenses/PresentMon/LICENSE.txt` and
@@ -879,18 +912,19 @@ standard-library DNS resolution cannot be canceled with the required shutdown bo
 
 `NET_IN`, `NET_OUT`, and `NET_BOTH` show current decimal SI bit rates. The graph
 variants show exactly the trailing 30 seconds in one-second bins.
-`network_graph_ceiling_mbps`
-defaults to 1000 and accepts 1..100000 Mbps; it clips graph height only and is
-hot-reloaded without changing numeric readings.
+`network_graph_ceiling_mbps` defaults to 1000 and accepts 1..100000 Mbps. It is
+hot-reloaded and scales every network graph plus the current OUT/IN bars in main
+displays 2 and 3. A current 1 Gbps direction fills a bar at the default 1000
+Mbps ceiling. The setting does not change numeric rate readings.
 
 ## Graph, warning, and bottleneck settings
 
 | Key | Default | Range / behavior |
 |---|---|---|
-| `network_graph_ceiling_mbps` | 1000 | 1..100000; network graph scale only |
+| `network_graph_ceiling_mbps` | 1000 | 1..100000; all network graphs and main-display network bars |
 | `disk_graph_ceiling_mbps` | 1000 | 1..100000; disk graph scale only |
 | `fps_graph_ceiling` | 240 | 1..1000; FPS graph scale only |
-| `warning` | 1 | boolean; enable selected temperature-pane inversion |
+| `warning` | 1 | compatibility boolean; with temperature warnings enabled, select pane flashing (`1`) or full-screen overlays (`0`) |
 | `cpu_temp_max_c` | 90 | 1..150; CPU graph ceiling and pane-warning threshold |
 | `gpu_temp_max_c` | 90 | 1..150; GPU graph ceiling and pane-warning threshold |
 | `bottleneck_cpu_percent` | 90 | 1..100; CPU heuristic threshold |
@@ -901,17 +935,20 @@ hot-reloaded without changing numeric readings.
 
 All graph modules render exactly the trailing 30 seconds in one-second bins.
 Load graphs use 100%; temperature, disk, network, and FPS graphs use the fixed
-ceilings above. `FRAME_TIME` alone scales to its observed min/max within the
-same 30-second window. Ceilings never clip numeric text.
+ceilings above. Main displays 2 and 3 also use the network ceiling for their
+current OUT/IN bars. `FRAME_TIME` alone scales to its observed min/max within
+the same 30-second window. Ceilings never clip numeric text.
 
-With `warning 1`, a currently selected `CPU_TEMP`, `CPU_TEMP_GRAPH`,
-`CPU_CACHE_TEMP`, `CPU_FREQ_TEMP`, `GPU_TEMP`, `GPU_TEMP_GRAPH`, or `THERMALS`
-pane inverts on alternating 100 ms phases at or above its shared graph/warning
-threshold. This requires `render_interval_ms <= 100`; validation rejects a
-slower interval. Only that slot pane inverts. This replaces the old full-screen
-CPU/GPU temperature overlays. The separate `cpu_temp_warning/critical`,
-`gpu_temp_warning/critical`, memory/VRAM, headset, `ALERTS`, acknowledgement,
-and non-temperature full-screen alert behavior remain available.
+With `temperature_warning_enabled 1` and `warning 1`, a currently selected
+`CPU_TEMP`, `CPU_TEMP_GRAPH`, `CPU_CACHE_TEMP`, `CPU_FREQ_TEMP`, `GPU_TEMP`,
+`GPU_TEMP_GRAPH`, or `THERMALS` pane inverts on alternating 100 ms phases at or
+above its shared graph/warning threshold. This requires
+`render_interval_ms <= 100`; validation rejects a slower interval. Only that
+slot pane inverts. This replaces the old full-screen CPU/GPU temperature
+overlays. With `temperature_warning_enabled 1` and `warning 0`, temperature
+episodes instead use full-screen overlays. The `warning` key does not enable or
+disable temperature episodes; use `temperature_warning_enabled` for that.
+Memory/VRAM and headset behavior is independent.
 
 ## Discord
 
@@ -934,6 +971,11 @@ fixed-local IPC server must pass process, session, executable, Authenticode, and
 Discord publisher checks. LCDSirPlus displays voice state only; it does not
 publish Rich Presence and needs no image assets.
 
+Each user creates and registers their own Discord application. The integration
+is implemented and software-tested, but the live voice/OAuth workflow remains
+unqualified; release remains pending that gate unless it is explicitly
+deferred. Tokens stay in current-user DPAPI-protected local storage.
+
 No token or client secret belongs in this file. Use `--discord-authorize` once
 while each Discord Account Switcher account is active. Its v2 access/refresh
 record is stored under the immutable Discord user ID and current-Windows-user
@@ -949,7 +991,7 @@ portal redirect registration.
 
 | Key | Default | Range / behavior |
 |---|---|---|
-| `hang_enabled` | 1 | boolean; enable query-only hung-window detection |
+| `hang_enabled` | 0 | boolean; explicit opt-in for hung-window detection and destructive action |
 | `hang_button` | 3 | accepted legacy 1..4 value; runtime binding follows selected `PROC_HANG` slot |
 | `hang_hold_ms` | 2000 | 1000..10000; continuous selected-slot hold threshold for automatic action |
 | `hang_probe_interval_ms` | 2000 | 250..60000; detector probe cadence |
@@ -968,27 +1010,47 @@ again. If the app loop resumes only after the bounded maximum of twice the
 configured hold, clamped to 3..15 seconds, the hold is refused as stale. Safe
 mode prevents target binding and termination but preserves ordinary
 short-release slot cycling and button 4 alert acknowledgement.
+The shipped slot/button remains unchanged while disabled; the provider reports
+disabled/unavailable and the no-target pane falls through. Enabling this
+destructive action does not qualify it for
+release: the disposable-child physical-button gate must still pass.
 
 ## Alerts
 
 | Key | Default | Range / values | Purpose / dependency |
 |---|---|---|---|
+| `temperature_warning_enabled` | 1 | boolean | Enable CPU/GPU temperature episodes and their selected presentation. |
+| `memory_warning_enabled` | 1 | boolean | Enable RAM/VRAM capacity episodes. |
 | `cpu_temp_warning` | 85 | 0..150 | CPU warning-episode threshold; must be <= `cpu_temp_critical`. |
 | `cpu_temp_critical` | 95 | 0..150 | CPU critical-episode threshold; must be >= `cpu_temp_warning`. |
 | `gpu_temp_warning` | 83 | 0..150 | GPU warning-episode threshold; must be <= `gpu_temp_critical`. |
 | `gpu_temp_critical` | 90 | 0..150 | GPU critical-episode threshold; must be >= `gpu_temp_warning`. |
-| `memory_warning` | 90 | 0..100 | Physical-memory warning-episode percentage. |
-| `vmem_warning` | 95 | 0..100 | VRAM warning-episode percentage. |
-| `critical_alert_linger_ms` | 3000 | 0..60000 | Retain a cleared critical overlay for this duration. |
+| `memory_warning` | 100 | 0..100 | Physical-memory warning-episode percentage; `0` is the compatibility disable value. |
+| `vmem_warning` | 100 | 0..100 | VRAM warning-episode percentage; `0` is the compatibility disable value. |
+| `critical_alert_linger_ms` | 3000 | 0..60000 | Retain only a recovered severity-3 episode for this duration, starting at its first current valid recovery reading. |
 
 These alert-episode thresholds are separate from `cpu_temp_max_c` and
-`gpu_temp_max_c` pane warnings. Only current valid readings create episodes.
+`gpu_temp_max_c` pane warnings. Category switches and thresholds apply on valid
+hot reload. RAM and VRAM trigger inclusively at `>=`; prefer
+`memory_warning_enabled 0` over setting both thresholds to `0`. Existing
+explicit threshold values in installed configurations are preserved and are
+not rewritten on update. Only current valid readings create episodes, so stale
+and unavailable values cannot trigger them. An existing episode is retained
+through unknown or stale readings because those readings do not prove recovery.
+The first current valid recovered reading removes severity-2 warnings
+immediately and starts `critical_alert_linger_ms` only for severity-3 episodes.
+Disabling the applicable temperature/memory category clears its episodes;
+disabling the headset provider (or entering safe mode) clears headset episodes.
 Alerts are ordered by severity, first observation, then stable identity;
 physical button 4 or preview slot 4 acknowledges the highest unacknowledged
-episode before its normal slot action. A cleared episode rearms if it later recurs. With
-`warning 1`, CPU/GPU temperature episodes remain visible in `ALERTS` but their
-full-screen overlays are suppressed in favor of pane inversion; other alert
-overlays remain.
+episode before its normal slot action. A cleared episode rearms if it later
+recurs. Disabling temperature warnings creates no CPU/GPU temperature episodes
+or pane flashing; disabling memory warnings creates no RAM/VRAM episodes.
+Neither switch affects headset alerts. With temperature warnings enabled,
+`warning 1` keeps CPU/GPU episodes visible in `ALERTS` but suppresses their
+full-screen overlays in favor of pane inversion; `warning 0` retains the
+full-screen temperature overlays. Acknowledgement and the critical-linger rules
+above are independent of this presentation choice.
 
 ## Logging
 
@@ -1037,7 +1099,7 @@ Example: `include lcdsirplus.local.txt`.
 Relative to the including file; no `..`, no absolute paths, no environment
 syntax; cycles rejected; later files override earlier values.
 
-Includes are practical for source and portable layouts. Installer update allows
-only the declared installed inventory plus `lcdsirplus.txt`, so an undeclared
-include file under the install root causes update refusal. Installed users
-should keep one primary `lcdsirplus.txt`.
+Includes are practical for source and portable layouts. Installed configurations
+and their relative include files belong under
+`%LOCALAPPDATA%\LCDSirPlus\Config`; setup repair and uninstall preserve that
+user-owned directory.

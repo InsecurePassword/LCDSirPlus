@@ -53,12 +53,6 @@ pub fn validate_config(path: &std::path::Path) -> ValidateOutcome {
     }
 }
 
-pub fn default_config_path() -> std::path::PathBuf {
-    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let dir = exe.parent().unwrap_or(std::path::Path::new("."));
-    dir.join("lcdsirplus.txt")
-}
-
 pub fn log_dir() -> std::path::PathBuf {
     std::env::var("LOCALAPPDATA")
         .map(|base| std::path::PathBuf::from(base).join("LCDSirPlus"))
@@ -106,7 +100,9 @@ pub fn run_hardware_discover() -> i32 {
 
 /// Normal application run. Returns a process exit code or a startup failure.
 pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
-    let config_path = opts.config_path.clone().unwrap_or_else(default_config_path);
+    let resolved = crate::runtime::resolve_config(opts.config_path.clone())
+        .map_err(|error| (2, format!("configuration resolution failed: {error}")))?;
+    let config_path = resolved.path;
     let outcome = validate_config(&config_path);
     let loaded = outcome
         .loaded
@@ -123,7 +119,12 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
     crate::log_info!("configuration: {}", cfg.path);
     let startup_executable = crate::runtime::canonical_executable().ok();
     let mut startup_synced = None;
-    sync_startup_if_needed(&cfg, startup_executable.as_deref(), &mut startup_synced);
+    sync_startup_if_needed(
+        &cfg,
+        resolved.installed,
+        startup_executable.as_deref(),
+        &mut startup_synced,
+    );
 
     // CCD topology (native detection; Process Lasso retired).
     let mut topology = resolve_ccd_topology(&cfg);
@@ -194,13 +195,13 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                         if opts.safe_mode {
                             cfg.safe_mode = true;
                         }
+                        alerts.clear_disabled_categories(&cfg);
                         if topology_changed {
                             topology = resolve_ccd_topology(&cfg);
                             crate::log_info!("CCD topology reloaded: {}", topology.detail);
                         }
                         let generation = telemetry_runtime.update_config(&cfg);
                         invalidate_telemetry_publication(&mut telemetry, &mut snapshot, generation);
-                        alerts = crate::alerts::Manager::default();
                         bottleneck = BottleneckDetector::default();
                         renderer = Renderer::new();
                         discord_runtime.update_config(&cfg);
@@ -218,6 +219,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                         }
                         sync_startup_if_needed(
                             &cfg,
+                            resolved.installed,
                             startup_executable.as_deref(),
                             &mut startup_synced,
                         );
@@ -279,6 +281,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
             let frame = renderer.render(
                 &snapshot,
                 OverlayOptions {
+                    main_display: cfg.main_display,
                     discord_linger: cfg.discord_linger,
                     discord_max_speakers: cfg.discord_max_speakers.max(1) as usize,
                     discord_show_self: cfg.discord_show_self,
@@ -288,7 +291,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                     fps_graph_ceiling: cfg.fps_graph_ceiling,
                     cpu_temp_max_c: cfg.cpu_temp_max_c,
                     gpu_temp_max_c: cfg.gpu_temp_max_c,
-                    warning: cfg.warning,
+                    warning: temperature_pane_warning(&cfg),
                     warning_phase: (process_epoch.elapsed().as_millis() / 100) % 2 == 1,
                 },
                 &view,
@@ -430,6 +433,10 @@ fn preview_for_backend(cfg: &Config, state: &BackendState) -> bool {
     }
 }
 
+fn temperature_pane_warning(cfg: &Config) -> bool {
+    cfg.temperature_warning_enabled && cfg.warning
+}
+
 fn backend_config_changed(old: &Config, new: &Config) -> bool {
     old.logitech_backend != new.logitech_backend
         || old.logitech_reconnect != new.logitech_reconnect
@@ -454,10 +461,29 @@ fn apply_preview_policy(ui: &Ui, cfg: &Config, state: &BackendState) {
 
 fn sync_startup_if_needed(
     cfg: &Config,
+    installed: bool,
     executable: Option<&std::path::Path>,
     synced: &mut Option<bool>,
 ) {
-    if cfg.safe_mode || *synced == Some(cfg.start_at_login) {
+    sync_startup_if_needed_with(
+        cfg,
+        installed,
+        executable,
+        synced,
+        crate::runtime::sync_startup,
+    );
+}
+
+fn sync_startup_if_needed_with<F>(
+    cfg: &Config,
+    installed: bool,
+    executable: Option<&std::path::Path>,
+    synced: &mut Option<bool>,
+    sync: F,
+) where
+    F: FnOnce(bool, &std::path::Path) -> Result<(), String>,
+{
+    if installed || cfg.safe_mode || *synced == Some(cfg.start_at_login) {
         return;
     }
     let Some(executable) = executable else {
@@ -466,7 +492,7 @@ fn sync_startup_if_needed(
         );
         return;
     };
-    match crate::runtime::sync_startup(cfg.start_at_login, executable) {
+    match sync(cfg.start_at_login, executable) {
         Ok(()) => *synced = Some(cfg.start_at_login),
         Err(error) => crate::log_warn!(
             "start-at-login synchronization failed enabled={}: {}",
@@ -484,7 +510,13 @@ pub fn run_hardware_test(
     duration: Duration,
     diagnostic_dir: Option<std::path::PathBuf>,
 ) -> i32 {
-    let config_path = config_path.unwrap_or_else(default_config_path);
+    let config_path = match crate::runtime::resolve_config(config_path) {
+        Ok(resolved) => resolved.path,
+        Err(error) => {
+            eprintln!("configuration resolution failed: {error}");
+            return 2;
+        }
+    };
     let outcome = validate_config(&config_path);
     let Some(loaded) = outcome.loaded else {
         eprintln!("configuration error: {}", outcome.message);
@@ -515,7 +547,14 @@ pub fn run_hardware_test(
     );
     let dashboard = crate::render::renderer::Renderer::new().render(
         &snapshot,
-        OverlayOptions::default(),
+        OverlayOptions {
+            main_display: cfg.main_display,
+            network_graph_ceiling_mbps: cfg.network_graph_ceiling_mbps,
+            cpu_temp_max_c: cfg.cpu_temp_max_c,
+            gpu_temp_max_c: cfg.gpu_temp_max_c,
+            warning: temperature_pane_warning(&cfg),
+            ..Default::default()
+        },
         &View {
             slot_modules: [
                 "PROVIDER_STATUS".into(),
@@ -1133,6 +1172,17 @@ mod tests {
     }
 
     #[test]
+    fn temperature_pane_warning_requires_both_legacy_and_category_switches() {
+        let mut cfg = Config::default();
+        assert!(temperature_pane_warning(&cfg));
+        cfg.warning = false;
+        assert!(!temperature_pane_warning(&cfg));
+        cfg.warning = true;
+        cfg.temperature_warning_enabled = false;
+        assert!(!temperature_pane_warning(&cfg));
+    }
+
+    #[test]
     fn only_backend_settings_trigger_backend_reload() {
         let old = Config::default();
         let mut new = old.clone();
@@ -1304,8 +1354,42 @@ mod tests {
             ..Config::default()
         };
         let mut synced = None;
-        sync_startup_if_needed(&cfg, None, &mut synced);
+        sync_startup_if_needed(&cfg, false, None, &mut synced);
         assert_eq!(synced, None);
+    }
+
+    #[test]
+    fn installed_mode_suppresses_startup_while_portable_mode_keeps_syncing() {
+        use std::cell::Cell;
+
+        let cfg = Config {
+            start_at_login: true,
+            ..Config::default()
+        };
+        let executable = std::path::Path::new(r"C:\LCDSirPlus\LCDSirPlus.exe");
+        let calls = Cell::new(0);
+        let mut synced = None;
+        sync_startup_if_needed_with(&cfg, true, Some(executable), &mut synced, |_, _| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert_eq!(calls.get(), 0);
+        assert_eq!(synced, None);
+
+        sync_startup_if_needed_with(
+            &cfg,
+            false,
+            Some(executable),
+            &mut synced,
+            |enabled, path| {
+                calls.set(calls.get() + 1);
+                assert!(enabled);
+                assert_eq!(path, executable);
+                Ok(())
+            },
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(synced, Some(true));
     }
 
     #[test]
@@ -1403,7 +1487,10 @@ mod tests {
 
     #[test]
     fn stale_hang_generation_cannot_bind_during_reload_button_race() {
-        let cfg = Config::default();
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
         let target = crate::model::HungTarget {
             hwnd: 1,
             pid: 2,
@@ -1517,6 +1604,38 @@ mod tests {
         assert!(!telemetry.cpu_temp.valid && !snapshot.cpu_temp.valid);
         assert!(!telemetry.gpu_temp.valid && !snapshot.gpu_temp.valid);
         assert!(telemetry.providers.is_empty() && snapshot.providers.is_empty());
+    }
+
+    #[test]
+    fn reload_invalidation_preserves_acknowledged_alert_until_fresh_recovery() {
+        let cfg = Config {
+            critical_alert_linger: Duration::ZERO,
+            telemetry_interval: Duration::from_secs(60),
+            ..Config::default()
+        };
+        let now = Instant::now();
+        let mut alerts = crate::alerts::Manager::default();
+        let mut snapshot = Snapshot {
+            gpu_temp: Metric::valid(91.0, SystemTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        alerts.evaluate(&mut snapshot, &cfg, now);
+        assert!(alerts.acknowledge_highest(&mut snapshot));
+
+        let mut telemetry = crate::telemetry::Update::default();
+        alerts.clear_disabled_categories(&cfg);
+        invalidate_telemetry_publication(&mut telemetry, &mut snapshot, 1);
+        alerts.evaluate(&mut snapshot, &cfg, now + cfg.telemetry_interval);
+        assert_eq!(snapshot.alerts.len(), 1);
+        assert!(snapshot.alerts[0].acknowledged);
+
+        snapshot.gpu_temp = Metric::valid(40.0, SystemTime::UNIX_EPOCH);
+        alerts.evaluate(
+            &mut snapshot,
+            &cfg,
+            now + cfg.telemetry_interval + Duration::from_secs(1),
+        );
+        assert!(snapshot.alerts.is_empty());
     }
 
     #[test]

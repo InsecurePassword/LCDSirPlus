@@ -3,6 +3,7 @@
 /Installer/
 /.codex/
 /third_party/PresentMon/PresentMon.exe
+/third_party/InnoSetup/cache/
 
 *.log
 *.pdb

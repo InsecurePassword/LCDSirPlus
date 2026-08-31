@@ -5,7 +5,6 @@
 //! byte values that never round-trip through float64, and legacy percentage
 //! projections for the fixed bars.
 #![allow(dead_code)]
-//! projections for the fixed bars.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -346,7 +345,7 @@ impl BottleneckState {
             Self::None => Some("NONE"),
             Self::Cpu => Some("CPU"),
             Self::Gpu => Some("GPU"),
-            Self::Mem => Some("MEM"),
+            Self::Mem => Some("RAM"),
             Self::DiskIo => Some("DISK I/O"),
         }
     }
@@ -506,6 +505,20 @@ pub fn format_duration(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bottleneck_state_tokens_are_stable_display_text() {
+        for (state, token) in [
+            (BottleneckState::Unavailable, None),
+            (BottleneckState::None, Some("NONE")),
+            (BottleneckState::Cpu, Some("CPU")),
+            (BottleneckState::Gpu, Some("GPU")),
+            (BottleneckState::Mem, Some("RAM")),
+            (BottleneckState::DiskIo, Some("DISK I/O")),
+        ] {
+            assert_eq!(state.token(), token);
+        }
+    }
 
     #[test]
     fn lookup_empty_hardware_selects_first_in_order() {

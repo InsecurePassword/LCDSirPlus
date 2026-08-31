@@ -41,6 +41,8 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const RETRY_DELAY: Duration = Duration::from_secs(10);
 const HELP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HELP_BYTES: usize = 512 * 1024;
+const MAX_STDERR_BYTES: usize = 16 * 1024;
+const MAX_DIAGNOSTIC_CHARS: usize = 1024;
 const PRESENTMON_SHA256: &str = "9bec3083069f58f911e6a512f4806db51a27bd096103087bc1d05ef54c80a191";
 const PRESENTMON_SIZE: u64 = 956_768;
 const PRESENTMON_SIGNER: &str = "Intel Corporation";
@@ -66,6 +68,7 @@ pub struct Update {
     pub generation: u64,
     pub game: GameStats,
     pub available: bool,
+    pub error: bool,
     pub detail: String,
 }
 
@@ -108,13 +111,21 @@ impl Parser {
             if !fields.iter().any(|v| v.eq_ignore_ascii_case("ProcessID")) {
                 return Ok(None);
             }
-            self.header = Some(
-                fields
-                    .iter()
-                    .enumerate()
-                    .map(|(i, h)| (h.trim().to_ascii_lowercase(), i))
-                    .collect(),
-            );
+            let header: HashMap<_, _> = fields
+                .iter()
+                .enumerate()
+                .map(|(i, h)| (h.trim().to_ascii_lowercase(), i))
+                .collect();
+            if !["FrameTime", "MsBetweenPresents", "MsBetweenDisplayChange"]
+                .iter()
+                .any(|name| header.contains_key(&name.to_ascii_lowercase()))
+            {
+                return Err(
+                    "CSV header has no frame-time column (expected FrameTime for --v2_metrics)"
+                        .into(),
+                );
+            }
+            self.header = Some(header);
             return Ok(None);
         }
         let get = |names: &[&str]| -> &str {
@@ -212,7 +223,7 @@ impl Stats {
         self.session_start.get_or_insert(frame.at);
         self.frames.push_back((frame.observed_at, frame.frame_ms));
         if frame.frame_ms >= self.threshold {
-            self.stutters += 1;
+            self.stutters = self.stutters.saturating_add(1);
         }
         Ok(())
     }
@@ -300,14 +311,14 @@ fn run(
     while !shutdown.load(Ordering::Relaxed) {
         let (request_generation, cfg) = current_request(&config, &generation);
         if request_generation != current_generation {
-            capture.stop();
+            let _ = capture.stop();
             capture = Capture::default();
             current_generation = request_generation;
         }
         capture.reconcile(&cfg, request_generation, &tx);
         std::thread::sleep(Duration::from_millis(50));
     }
-    capture.stop();
+    let _ = capture.stop();
 }
 
 #[derive(Default)]
@@ -316,6 +327,8 @@ struct Capture {
     lines: Option<mpsc::Receiver<String>>,
     line_overflow: Option<Arc<AtomicBool>>,
     reader: Option<std::thread::JoinHandle<()>>,
+    stderr: Option<Arc<std::sync::Mutex<BoundedDiagnostic>>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
     target: ProcessInfo,
     key: String,
     parser: Parser,
@@ -331,7 +344,7 @@ struct Capture {
 impl Capture {
     fn reconcile(&mut self, cfg: &Config, generation: u64, tx: &mpsc::Sender<Update>) {
         if cfg.safe_mode || !cfg.presentmon_enabled || cfg.presentmon_target_mode == "disabled" {
-            self.stop();
+            let _ = self.stop();
             self.unavailable(tx, generation, "disabled".into());
             return;
         }
@@ -350,7 +363,7 @@ impl Capture {
                             self.unavailable(tx, generation, "PresentMon restart cooldown".into());
                             return;
                         }
-                        self.stop();
+                        let _ = self.stop();
                         match resolve_executable(&cfg.presentmon_path).and_then(|executable| {
                             self.start(&executable, target.clone(), cfg, key)
                         }) {
@@ -375,15 +388,24 @@ impl Capture {
                             }
                             Err(e) => {
                                 self.schedule_retry(now);
-                                self.unavailable(tx, generation, e);
+                                self.failure(tx, generation, e);
                                 return;
                             }
                         }
                     }
                 }
-                Ok(_) | Err(_) => {
-                    self.stop();
+                Ok(_) => {
+                    let _ = self.stop();
                     self.unavailable(tx, generation, "waiting for target process".into());
+                    return;
+                }
+                Err(error) => {
+                    let _ = self.stop();
+                    self.failure(
+                        tx,
+                        generation,
+                        format!("PresentMon target selection failed: {error}"),
+                    );
                     return;
                 }
             }
@@ -392,18 +414,29 @@ impl Capture {
         if let Some(child) = &mut self.child {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    self.stop();
+                    let target = self.target.name.clone();
+                    let stderr = self.stop();
                     self.schedule_retry(now);
-                    self.unavailable(tx, generation, format!("PresentMon exited ({status})"));
+                    self.failure(
+                        tx,
+                        generation,
+                        with_diagnostic(
+                            format!(
+                                "PresentMon exited ({status}) while capturing {}; the target may have exited",
+                                target
+                            ),
+                            stderr,
+                        ),
+                    );
                     return;
                 }
                 Err(e) => {
-                    self.stop();
+                    let stderr = self.stop();
                     self.schedule_retry(now);
-                    self.unavailable(
+                    self.failure(
                         tx,
                         generation,
-                        format!("PresentMon process status failed: {e}"),
+                        with_diagnostic(format!("PresentMon process status failed: {e}"), stderr),
                     );
                     return;
                 }
@@ -415,19 +448,22 @@ impl Capture {
             .as_ref()
             .is_some_and(|overflow| overflow.swap(false, Ordering::AcqRel))
         {
-            self.stop();
+            let stderr = self.stop();
             self.schedule_retry(now);
-            self.unavailable(
+            self.failure(
                 tx,
                 generation,
-                "PresentMon output overflowed; statistics reset".into(),
+                with_diagnostic(
+                    "PresentMon output overflowed; statistics reset".into(),
+                    stderr,
+                ),
             );
             return;
         }
         if let Err(error) = self.drain(cfg, generation, tx, now) {
-            self.stop();
+            let stderr = self.stop();
             self.schedule_retry(now);
-            self.unavailable(tx, generation, error);
+            self.failure(tx, generation, with_diagnostic(error, stderr));
             return;
         }
         if self.last_frame.is_none()
@@ -436,13 +472,17 @@ impl Capture {
                 .map(|started| now.duration_since(started) > STARTUP_TIMEOUT)
                 .unwrap_or(false)
         {
-            self.stop();
+            let reason = if self.parser.header.is_some() {
+                format!(
+                    "PresentMon produced a CSV header but no matching frames for {} in 45 seconds",
+                    self.target.name
+                )
+            } else {
+                "PresentMon produced no CSV header in 45 seconds".into()
+            };
+            let stderr = self.stop();
             self.schedule_retry(now);
-            self.unavailable(
-                tx,
-                generation,
-                "PresentMon produced no frames for 45 seconds".into(),
-            );
+            self.failure(tx, generation, with_diagnostic(reason, stderr));
             return;
         }
         if let (Some(last), Some(stats)) = (self.last_frame, self.stats.as_ref()) {
@@ -504,13 +544,18 @@ impl Capture {
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("start PresentMon {}: {e}", executable.path.display()))?;
         let Some(stdout) = child.stdout.take() else {
             let _ = child.kill();
             let _ = child.wait();
             return Err("PresentMon stdout pipe unavailable".into());
+        };
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("PresentMon stderr pipe unavailable".into());
         };
         let (line_tx, line_rx) = mpsc::sync_channel(LINE_QUEUE_CAPACITY);
         let overflow = Arc::new(AtomicBool::new(false));
@@ -526,10 +571,27 @@ impl Capture {
                 return Err(format!("start PresentMon output reader: {error}"));
             }
         };
+        let diagnostic = Arc::new(std::sync::Mutex::new(BoundedDiagnostic::default()));
+        let diagnostic_output = Arc::clone(&diagnostic);
+        let stderr_reader = match std::thread::Builder::new()
+            .name("presentmon-stderr".into())
+            .spawn(move || read_diagnostic(stderr, diagnostic_output))
+        {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(line_rx);
+                let _ = reader.join();
+                return Err(format!("start PresentMon stderr reader: {error}"));
+            }
+        };
         self.child = Some(child);
         self.lines = Some(line_rx);
         self.line_overflow = Some(overflow);
         self.reader = Some(reader);
+        self.stderr = Some(diagnostic);
+        self.stderr_reader = Some(stderr_reader);
         self.target = target;
         self.key = key;
         self.parser = Parser::default();
@@ -599,6 +661,7 @@ impl Capture {
             let _ = tx.send(Update {
                 generation,
                 available: game.active,
+                error: false,
                 detail: self.target.name.clone(),
                 game,
             });
@@ -606,7 +669,7 @@ impl Capture {
         Ok(())
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> String {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -616,19 +679,46 @@ impl Capture {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+        let diagnostic = self
+            .stderr
+            .take()
+            .map(|output| {
+                let output = output.lock().unwrap_or_else(|e| e.into_inner());
+                diagnostic_text(&output)
+            })
+            .unwrap_or_default();
         self.target = ProcessInfo::default();
         self.key.clear();
         self.stats = None;
         self.last_frame = None;
         self.last_publish = None;
         self.started_at = None;
+        diagnostic
     }
 
     fn unavailable(&mut self, tx: &mpsc::Sender<Update>, generation: u64, detail: String) {
+        self.set_unavailable(tx, generation, detail, false);
+    }
+
+    fn failure(&mut self, tx: &mpsc::Sender<Update>, generation: u64, detail: String) {
+        self.set_unavailable(tx, generation, detail, true);
+    }
+
+    fn set_unavailable(
+        &mut self,
+        tx: &mpsc::Sender<Update>,
+        generation: u64,
+        detail: String,
+        error: bool,
+    ) {
         if self.last_unavailable != detail {
             self.last_unavailable = detail.clone();
             let _ = tx.send(Update {
                 generation,
+                error,
                 detail,
                 ..Default::default()
             });
@@ -671,6 +761,53 @@ fn stale_projection(
         metric.stale = metric.valid;
     }
     Some((game, "capture stale: no frames for 5 seconds".into()))
+}
+
+#[derive(Default)]
+struct BoundedDiagnostic {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn read_diagnostic(mut reader: impl Read, output: Arc<std::sync::Mutex<BoundedDiagnostic>>) {
+    let mut buffer = [0u8; 1024];
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => return,
+            Ok(count) => count,
+        };
+        let mut output = output.lock().unwrap_or_else(|e| e.into_inner());
+        let remaining = MAX_STDERR_BYTES.saturating_sub(output.bytes.len());
+        output
+            .bytes
+            .extend_from_slice(&buffer[..count.min(remaining)]);
+        output.truncated |= count > remaining;
+    }
+}
+
+fn diagnostic_text(output: &BoundedDiagnostic) -> String {
+    let mut text = String::from_utf8_lossy(&output.bytes).into_owned();
+    for variable in ["USERPROFILE", "TEMP", "TMP"] {
+        if let Ok(value) = std::env::var(variable) {
+            if !value.is_empty() {
+                text = text.replace(&value, &format!("%{variable}%"));
+            }
+        }
+    }
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut text: String = normalized.chars().take(MAX_DIAGNOSTIC_CHARS).collect();
+    if output.truncated || normalized.chars().count() > MAX_DIAGNOSTIC_CHARS {
+        text.push_str(" [truncated]");
+    }
+    text
+}
+
+fn with_diagnostic(reason: String, diagnostic: String) -> String {
+    if diagnostic.is_empty() {
+        reason
+    } else {
+        format!("{reason}; stderr: {diagnostic}")
+    }
 }
 
 fn read_output(mut reader: impl BufRead, tx: mpsc::SyncSender<String>, dropped: Arc<AtomicBool>) {
@@ -739,7 +876,7 @@ fn send_line(tx: &mpsc::SyncSender<String>, dropped: &AtomicBool, line: String) 
 
 impl Drop for Capture {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 }
 
@@ -1324,13 +1461,47 @@ mod tests {
             .is_none());
 
         let mut displayed_only = Parser::default();
-        displayed_only
-            .parse_line("Application,ProcessID,DisplayedTime", at)
-            .unwrap();
         assert!(displayed_only
-            .parse_line("game.exe,42,18.0", at)
-            .unwrap()
-            .is_none());
+            .parse_line("Application,ProcessID,DisplayedTime", at)
+            .unwrap_err()
+            .contains("expected FrameTime for --v2_metrics"));
+    }
+
+    #[test]
+    fn child_stderr_capture_is_bounded_sanitized_and_preserves_exit_context() {
+        let mut child = Command::new("cmd.exe")
+            .args([
+                "/D",
+                "/C",
+                "echo failed to start trace session access denied 1>&2 & exit /B 5",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let output = Arc::new(std::sync::Mutex::new(BoundedDiagnostic::default()));
+        let reader_output = Arc::clone(&output);
+        let reader = std::thread::spawn(move || read_diagnostic(stderr, reader_output));
+        let status = child.wait().unwrap();
+        reader.join().unwrap();
+        let detail = with_diagnostic(
+            format!("PresentMon exited ({status})"),
+            diagnostic_text(&output.lock().unwrap()),
+        );
+        assert_eq!(status.code(), Some(5));
+        assert!(detail.contains("access denied"));
+
+        let output = Arc::new(std::sync::Mutex::new(BoundedDiagnostic::default()));
+        read_diagnostic(
+            std::io::Cursor::new(vec![b'x'; MAX_STDERR_BYTES + 1]),
+            Arc::clone(&output),
+        );
+        let output = output.lock().unwrap();
+        assert_eq!(output.bytes.len(), MAX_STDERR_BYTES);
+        assert!(output.truncated);
+        assert!(diagnostic_text(&output).ends_with("[truncated]"));
     }
 
     #[test]
@@ -1359,6 +1530,28 @@ mod tests {
         assert!((game.one_percent.value - 10.0).abs() < 1e-9);
         assert!((game.point_one_low.value - 10.0).abs() < 1e-9);
         assert_eq!(game.session_start, Some(SystemTime::UNIX_EPOCH));
+    }
+
+    #[test]
+    fn stutters_saturate_and_new_stats_reset_the_session() {
+        let observed = Instant::now();
+        let first_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let frame = Frame {
+            at: first_at,
+            observed_at: observed,
+            frame_ms: 30.0,
+            ..Default::default()
+        };
+        let mut stats = Stats::new(30.0, Duration::from_secs(5));
+        stats.stutters = i32::MAX - 1;
+        stats.add(&frame).unwrap();
+        stats.add(&frame).unwrap();
+        assert_eq!(stats.stutters, i32::MAX);
+        assert_eq!(stats.session_start, Some(first_at));
+
+        let reset = Stats::new(30.0, Duration::from_secs(5));
+        assert_eq!(reset.stutters, 0);
+        assert_eq!(reset.session_start, None);
     }
 
     #[test]

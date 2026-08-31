@@ -102,6 +102,7 @@ pub struct Config {
     pub config_refresh: Duration,
     pub telemetry_interval: Duration,
     pub render_interval: Duration,
+    pub main_display: i32,
     pub preview_mode: String,
     pub preview_scale: i32,
     pub start_minimized: bool,
@@ -182,6 +183,8 @@ pub struct Config {
     pub fps_graph_ceiling: f64,
 
     pub warning: bool,
+    pub memory_warning_enabled: bool,
+    pub temperature_warning_enabled: bool,
     pub cpu_temp_max_c: f64,
     pub gpu_temp_max_c: f64,
 
@@ -233,6 +236,7 @@ impl Default for Config {
             config_refresh: Duration::from_secs(1),
             telemetry_interval: Duration::from_millis(300),
             render_interval: Duration::from_millis(100),
+            main_display: 1,
             preview_mode: "auto".into(),
             preview_scale: 4,
             start_minimized: false,
@@ -313,6 +317,8 @@ impl Default for Config {
             disk_graph_ceiling_mbps: 1000.0,
             fps_graph_ceiling: 240.0,
             warning: true,
+            memory_warning_enabled: true,
+            temperature_warning_enabled: true,
             cpu_temp_max_c: 90.0,
             gpu_temp_max_c: 90.0,
             bottleneck_cpu_percent: 90.0,
@@ -329,7 +335,7 @@ impl Default for Config {
             discord_max_speakers: 2,
             discord_show_self: false,
             discord_show_channel: false,
-            hang_enabled: true,
+            hang_enabled: false,
             hang_button: 3,
             hang_hold: Duration::from_secs(2),
             hang_probe_interval: Duration::from_secs(2),
@@ -356,8 +362,8 @@ impl Default for Config {
             cpu_temp_critical: 95.0,
             gpu_temp_warning: 83.0,
             gpu_temp_critical: 90.0,
-            memory_warning: 90.0,
-            vmem_warning: 95.0,
+            memory_warning: 100.0,
+            vmem_warning: 100.0,
             critical_alert_linger: Duration::from_secs(3),
             log_level: "info".into(),
             log_max_bytes: 2 * 1024 * 1024,
@@ -414,9 +420,14 @@ pub fn validate(c: &Config) -> Result<(), String> {
         25,
         5000,
     )?;
-    if c.warning && c.render_interval > Duration::from_millis(100) {
-        return Err("render_interval_ms must be <=100 when warning=1".into());
+    if c.warning && c.temperature_warning_enabled && c.render_interval > Duration::from_millis(100)
+    {
+        return Err(
+            "render_interval_ms must be <=100 when warning=1 and temperature_warning_enabled=1"
+                .into(),
+        );
     }
+    check_range_i32("main_display", c.main_display, 1, 3)?;
     if !matches!(c.preview_mode.as_str(), "auto" | "always" | "never") {
         return Err("preview_mode must be auto, always, or never".into());
     }
@@ -857,7 +868,14 @@ mod tests {
 
     #[test]
     fn default_is_valid() {
-        assert!(validate(&Config::default()).is_ok());
+        let cfg = Config::default();
+        assert_eq!(cfg.main_display, 1);
+        assert!(cfg.memory_warning_enabled);
+        assert!(cfg.temperature_warning_enabled);
+        assert!(!cfg.hang_enabled);
+        assert_eq!(cfg.memory_warning, 100.0);
+        assert_eq!(cfg.vmem_warning, 100.0);
+        assert!(validate(&cfg).is_ok());
     }
 
     #[test]
@@ -915,13 +933,30 @@ mod tests {
     }
 
     #[test]
-    fn default_slots_match_shipped_portable_config() {
+    fn defaults_match_shipped_portable_config() {
         let shipped = crate::parser::parse_standalone(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/lcdsirplus.txt"
         )))
         .expect("canonical shipped configuration must parse");
-        assert_eq!(Config::default().slots, shipped.slots);
+        let defaults = Config::default();
+        assert_eq!(defaults.slots, shipped.slots);
+        assert_eq!(
+            (
+                defaults.memory_warning_enabled,
+                defaults.temperature_warning_enabled,
+                defaults.hang_enabled,
+                defaults.memory_warning,
+                defaults.vmem_warning,
+            ),
+            (
+                shipped.memory_warning_enabled,
+                shipped.temperature_warning_enabled,
+                shipped.hang_enabled,
+                shipped.memory_warning,
+                shipped.vmem_warning,
+            )
+        );
     }
 
     #[test]
@@ -960,6 +995,7 @@ mod tests {
     #[test]
     fn proc_hang_is_globally_unique_and_legacy_button_is_accepted() {
         let mut cfg = Config {
+            hang_enabled: true,
             hang_button: 1,
             ..Config::default()
         };
@@ -985,6 +1021,19 @@ mod tests {
         assert!(validate(&Config {
             warning: false,
             render_interval: Duration::from_secs(5),
+            ..Config::default()
+        })
+        .is_ok());
+        assert!(validate(&Config {
+            warning: true,
+            temperature_warning_enabled: false,
+            render_interval: Duration::from_secs(5),
+            ..Config::default()
+        })
+        .is_ok());
+        assert!(validate(&Config {
+            memory_warning: 0.0,
+            vmem_warning: 0.0,
             ..Config::default()
         })
         .is_ok());
@@ -1024,6 +1073,13 @@ mod tests {
         for url in [
             "https://127.0.0.1:8085/data.json",
             "http://example.com@127.0.0.1:8085/data.json",
+            "http://::1/data.json",
+            "http://127.0.0.1:/data.json",
+            "http://127.0.0.1:80:90/data.json",
+            "http://[::1]:/data.json",
+            "http://127.0.0.1:8085/data json",
+            "http://127.0.0.1:8085/data.json\r\nX-Injected: yes",
+            "http://127.0.0.1:8085/data.json#fragment",
         ] {
             let c = Config {
                 lhm_url: url.into(),

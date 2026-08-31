@@ -347,6 +347,7 @@ impl ParseContext {
                 cfg.telemetry_interval = ms_auto(v, Duration::from_millis(300))?
             }
             "render_interval_ms" => cfg.render_interval = ms_auto(v, Duration::from_millis(100))?,
+            "main_display" => cfg.main_display = checked_i32(key, intv(v)?)?,
             "preview_mode" => cfg.preview_mode = lower_one(v)?,
             "preview_scale" => cfg.preview_scale = checked_i32(key, intv(v)?)?,
             "start_minimized" => cfg.start_minimized = boolv(v)?,
@@ -455,6 +456,7 @@ impl ParseContext {
             "disk_graph_ceiling_mbps" => cfg.disk_graph_ceiling_mbps = floatv(v)?,
             "fps_graph_ceiling" => cfg.fps_graph_ceiling = floatv(v)?,
             "warning" => cfg.warning = boolv(v)?,
+            "temperature_warning_enabled" => cfg.temperature_warning_enabled = boolv(v)?,
             "cpu_temp_max_c" => cfg.cpu_temp_max_c = floatv(v)?,
             "gpu_temp_max_c" => cfg.gpu_temp_max_c = floatv(v)?,
             "bottleneck_cpu_percent" => cfg.bottleneck_cpu_percent = floatv(v)?,
@@ -483,6 +485,7 @@ impl ParseContext {
             "cpu_temp_critical" => cfg.cpu_temp_critical = floatv(v)?,
             "gpu_temp_warning" => cfg.gpu_temp_warning = floatv(v)?,
             "gpu_temp_critical" => cfg.gpu_temp_critical = floatv(v)?,
+            "memory_warning_enabled" => cfg.memory_warning_enabled = boolv(v)?,
             "memory_warning" => cfg.memory_warning = floatv(v)?,
             "vmem_warning" => cfg.vmem_warning = floatv(v)?,
             "critical_alert_linger_ms" => cfg.critical_alert_linger = msv(v)?,
@@ -712,6 +715,47 @@ mod tests {
         assert_eq!(cfg.render_interval, Duration::from_millis(100));
         assert!(parse_standalone(b"warning 1\nrender_interval_ms 101\n").is_err());
         assert!(parse_standalone(b"warning 0\nrender_interval_ms 5000\n").is_ok());
+        assert!(parse_standalone(
+            b"warning 1\ntemperature_warning_enabled 0\nrender_interval_ms 5000\n"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn parses_independent_warning_categories_and_legacy_thresholds() {
+        let cfg = parse_standalone(
+            b"warning 0\ntemperature_warning_enabled off\nmemory_warning_enabled yes\nmemory_warning 0\nvmem_warning 75\n",
+        )
+        .unwrap();
+        assert!(!cfg.warning);
+        assert!(!cfg.temperature_warning_enabled);
+        assert!(cfg.memory_warning_enabled);
+        assert_eq!(cfg.memory_warning, 0.0);
+        assert_eq!(cfg.vmem_warning, 75.0);
+
+        for key in ["temperature_warning_enabled", "memory_warning_enabled"] {
+            let error = parse_standalone(format!("{key} maybe\n").as_bytes()).unwrap_err();
+            assert_eq!(error.line, 1);
+            assert!(error.message.contains(key));
+        }
+    }
+
+    #[test]
+    fn main_display_accepts_only_current_integer_layouts() {
+        for value in 1..=3 {
+            assert_eq!(
+                parse_standalone(format!("main_display {value}\n").as_bytes())
+                    .unwrap()
+                    .main_display,
+                value
+            );
+        }
+        for value in ["0", "4", "1.5", "9223372036854775808"] {
+            assert!(
+                parse_standalone(format!("main_display {value}\n").as_bytes()).is_err(),
+                "accepted {value}"
+            );
+        }
     }
 
     #[test]
@@ -772,6 +816,7 @@ mod tests {
     fn integer_fields_reject_lossy_i32_conversion() {
         for key in [
             "preview_scale",
+            "main_display",
             "headset_warn_percent",
             "headset_critical_percent",
             "controller_index",

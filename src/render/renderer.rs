@@ -1,7 +1,7 @@
-//! Fixed 160x43 dashboard renderer, ported pixel-for-pixel from the original
-//! Go implementation. The golden framebuffer hashes below are release invariants;
-//! any change to them is a fixed-layout change requiring explicit review.
-#![allow(clippy::too_many_arguments)] // drawing signatures mirror the Go renderer 1:1
+//! Fixed 160x43 dashboard renderer. Layout 1 preserves legacy Go behavior;
+//! additional layouts and helpers are Rust-specific. Golden framebuffer hashes
+//! are release invariants requiring explicit review when changed.
+#![allow(clippy::too_many_arguments)] // Direct drawing signatures cover legacy and Rust layouts.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
@@ -17,6 +17,7 @@ use crate::model::{
 /// Overlay knobs the renderer reads from configuration.
 #[derive(Clone, Copy, Debug)]
 pub struct OverlayOptions {
+    pub main_display: i32,
     pub discord_linger: Duration,
     pub discord_max_speakers: usize,
     pub discord_show_self: bool,
@@ -33,6 +34,7 @@ pub struct OverlayOptions {
 impl Default for OverlayOptions {
     fn default() -> Self {
         OverlayOptions {
+            main_display: 1,
             discord_linger: Duration::from_millis(700),
             discord_max_speakers: 2,
             discord_show_self: false,
@@ -170,47 +172,53 @@ impl Renderer {
             date = s.date_short_text.clone();
         }
         let date = fit_text(&date, WIDTH as i32 - text_width(&s.time_text, 1) - 3, 1);
-        f.text(1, 1, &date, true);
-        f.text_right(158, 1, &s.time_text, true);
-        f.h_line(0, 159, 7, true);
-        f.v_line(79, 8, 24, true);
+        f.text(1, 0, &date, true);
+        f.text_right(158, 0, &s.time_text, true);
+        f.h_line(0, 159, 6, true);
         f.h_line(0, 159, 25, true);
         for x in [39, 79, 119] {
             f.v_line(x, 26, 42, true);
         }
-        if s.cpu_dual {
-            self.cpu_split(f, 1, 9, s.cpu_cache_load, s.cpu_freq_load);
-        } else {
-            // Single-CCD: one full-height bar, MEM-style.
-            self.metric_bar(f, 1, 9, "CPU", &s.cpu_cache_load, 75, 7);
+        match opts.main_display {
+            2 => self.main_display_2(f, s, opts.network_graph_ceiling_mbps),
+            3 => self.main_display_3(f, s, opts.network_graph_ceiling_mbps),
+            _ => {
+                f.v_line(79, 7, 24, true);
+                if s.cpu_dual {
+                    self.cpu_split(f, 1, 8, s.cpu_cache_load, s.cpu_freq_load, 77);
+                } else {
+                    // Single-CCD: one standard-height CPU bar.
+                    self.metric_bar(f, 1, 8, "CPU", &s.cpu_cache_load, 75, 7);
+                }
+                self.metric_bar(
+                    f,
+                    1,
+                    17,
+                    "RAM",
+                    &canonical_percent_metric(&s.readings, MetricKey::RAMUtilization, ""),
+                    75,
+                    7,
+                );
+                self.metric_bar(
+                    f,
+                    81,
+                    8,
+                    "GPU ",
+                    &canonical_percent_metric(&s.readings, MetricKey::GPUUtilization, ""),
+                    77,
+                    7,
+                );
+                self.metric_bar(
+                    f,
+                    81,
+                    17,
+                    "VRAM",
+                    &canonical_percent_metric(&s.readings, MetricKey::VRAMUtilization, ""),
+                    77,
+                    7,
+                );
+            }
         }
-        self.metric_bar(
-            f,
-            1,
-            18,
-            "MEM",
-            &canonical_percent_metric(&s.readings, MetricKey::RAMUtilization, ""),
-            75,
-            7,
-        );
-        self.metric_bar(
-            f,
-            81,
-            9,
-            "GPU",
-            &canonical_percent_metric(&s.readings, MetricKey::GPUUtilization, ""),
-            77,
-            7,
-        );
-        self.metric_bar(
-            f,
-            81,
-            18,
-            "VRAM",
-            &canonical_percent_metric(&s.readings, MetricKey::VRAMUtilization, ""),
-            77,
-            7,
-        );
         for i in 0..4usize {
             self.slot(f, i, &v.slot_modules[i], s, opts, v);
             if opts.warning
@@ -223,24 +231,99 @@ impl Renderer {
         }
     }
 
-    fn cpu_split(&mut self, f: &mut Frame, x: i32, y: i32, cache: Metric, freq: Metric) {
-        f.text(x, y + 2, "CPU", true);
-        self.small_bar(f, x + 15, y, "C", cache, 62);
-        self.small_bar(f, x + 15, y + 4, "F", freq, 62);
+    fn main_display_2(&mut self, f: &mut Frame, s: &Snapshot, ceiling_mbps: f64) {
+        f.v_line(52, 7, 24, true);
+        f.v_line(105, 7, 24, true);
+        if s.cpu_dual {
+            self.cpu_split(f, 1, 8, s.cpu_cache_load, s.cpu_freq_load, 51);
+        } else {
+            self.metric_bar(f, 1, 8, "CPU", &s.cpu_cache_load, 51, 7);
+        }
+        self.metric_bar(
+            f,
+            1,
+            17,
+            "RAM",
+            &canonical_percent_metric(&s.readings, MetricKey::RAMUtilization, ""),
+            51,
+            7,
+        );
+        self.metric_bar(
+            f,
+            54,
+            8,
+            "GPU ",
+            &canonical_percent_metric(&s.readings, MetricKey::GPUUtilization, ""),
+            51,
+            7,
+        );
+        self.metric_bar(
+            f,
+            54,
+            17,
+            "VRAM",
+            &canonical_percent_metric(&s.readings, MetricKey::VRAMUtilization, ""),
+            51,
+            7,
+        );
+        self.network_bar(f, 107, 9, 8, "OUT", s.network_out, 157, 7, ceiling_mbps);
+        self.network_bar(f, 107, 18, 17, "IN ", s.network_in, 157, 7, ceiling_mbps);
     }
 
-    fn small_bar(&mut self, f: &mut Frame, x: i32, y: i32, label: &str, m: Metric, w: i32) {
-        f.text(x, y, label, true);
-        let bx = x + 4;
-        let bw = w - 4;
-        f.rect(bx, y, bw, 3, true);
+    fn main_display_3(&mut self, f: &mut Frame, s: &Snapshot, ceiling_mbps: f64) {
+        f.v_line(79, 7, 24, true);
+        if s.cpu_dual {
+            self.cpu_split(f, 1, 8, s.cpu_cache_load, s.cpu_freq_load, 77);
+        } else {
+            self.metric_bar(f, 1, 8, "CPU", &s.cpu_cache_load, 75, 7);
+        }
+        self.metric_bar(
+            f,
+            1,
+            17,
+            "RAM",
+            &canonical_percent_metric(&s.readings, MetricKey::RAMUtilization, ""),
+            75,
+            7,
+        );
+        self.network_bar(f, 81, 9, 8, "NET IN ", s.network_in, 157, 7, ceiling_mbps);
+        self.network_bar(
+            f,
+            81,
+            18,
+            17,
+            "NET OUT",
+            s.network_out,
+            157,
+            7,
+            ceiling_mbps,
+        );
+    }
+
+    fn cpu_split(
+        &mut self,
+        f: &mut Frame,
+        x: i32,
+        y: i32,
+        cache: Metric,
+        freq: Metric,
+        right: i32,
+    ) {
+        f.text(x, y + 2, "CPU", true);
+        let bx = x + text_width("CPU", 1) + 2;
+        self.small_bar(f, bx, y, cache, right - bx + 1);
+        self.small_bar(f, bx, y + 4, freq, right - bx + 1);
+    }
+
+    fn small_bar(&mut self, f: &mut Frame, x: i32, y: i32, m: Metric, w: i32) {
+        f.rect(x, y, w, 3, true);
         let p = metric_percent(&m);
         if p < 0 {
-            self.metric_placeholder(f, bx + 1, y + 1, bw - 2, 1, m.valid && m.stale);
+            self.metric_placeholder(f, x + 1, y + 1, w - 2, 1, m.valid && m.stale);
             return;
         }
-        let fill = (bw - 2) * p / 100;
-        f.fill_rect(bx + 1, y + 1, fill, 1, true);
+        let fill = (w - 2) * p / 100;
+        f.fill_rect(x + 1, y + 1, fill, 1, true);
     }
 
     fn metric_bar(
@@ -265,6 +348,38 @@ impl Renderer {
         }
         let fill = (bw - 2) * p / 100;
         f.fill_rect(bx + 1, y + 1, fill, h - 2, true);
+    }
+
+    fn network_bar(
+        &mut self,
+        f: &mut Frame,
+        x: i32,
+        label_y: i32,
+        bar_y: i32,
+        label: &str,
+        m: Metric,
+        right: i32,
+        height: i32,
+        ceiling_mbps: f64,
+    ) {
+        f.text(x, label_y, label, true);
+        let bx = x + text_width(label, 1) + 2;
+        let bw = right - bx + 1;
+        f.rect(bx, bar_y, bw, height, true);
+        let state = metric_state(m);
+        if state != DisplayState::Current {
+            self.metric_placeholder(
+                f,
+                bx + 1,
+                bar_y + 1,
+                bw - 2,
+                height - 2,
+                state == DisplayState::Stale,
+            );
+        } else {
+            let fill = network_graph_height(m.value, ceiling_mbps, bw - 2);
+            f.fill_rect(bx + 1, bar_y + 1, fill, height - 2, true);
+        }
     }
 
     fn metric_placeholder(
@@ -603,7 +718,7 @@ impl Renderer {
             other => {
                 debug_assert!(
                     !crate::config::valid_module(other),
-                    "registered module {other} used generic fallback"
+                    "registered module {other} reached the unknown-module fallback"
                 );
                 self.text_slot(f, left, width, other, "N/A")
             }
@@ -1950,10 +2065,14 @@ mod tests {
     use crate::model::{Alert, ControllerBattery, GameStats, Reading};
     use std::time::{Duration, SystemTime};
 
-    const GOLDEN_NORMAL: &str = "e44f9a1646d9e091fd1482dc5147f0cd9e639f0dd6b7fbb93edcf5d10da2757b";
+    const GOLDEN_NORMAL: &str = "a2f36db6c54c09adcd459756677a6fc348f181d01e0810a9c7e4d9c3c998c20c";
     const GOLDEN_UNAVAILABLE: &str =
-        "0561081d2f5ee1930177a40d7f4425ac32d84a53bde0aaf92e49f8e616033576";
-    const GOLDEN_STALE: &str = "bd3e659e30ecb742c0a97aa331c74388608053a6a534496fd8cbfc635fb14cd0";
+        "387f5269dded63f8c38cd965b55f02fbb1e2552e89c90e5353c34ec3e1058aa9";
+    const GOLDEN_STALE: &str = "f7bc46cc0f4763084dabf1445a2240e08ec892ed2c3c49991e9428296d69bdb8";
+    const GOLDEN_LAYOUT_2: &str =
+        "c6bf7ef1e919ef47dfc7ed13ef9a9f937253e47a449fe8558f00adf98a881701";
+    const GOLDEN_LAYOUT_3: &str =
+        "ef1dbde8de40632b213b7c149789a716165719b0ab4f40ab80aa508930b6ff8b";
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
@@ -2242,13 +2361,25 @@ mod tests {
         Renderer::new().render(s, OverlayOptions::default(), &golden_view())
     }
 
+    fn render_main_display(s: &Snapshot, main_display: i32, ceiling_mbps: f64) -> Frame {
+        Renderer::new().render(
+            s,
+            OverlayOptions {
+                main_display,
+                network_graph_ceiling_mbps: ceiling_mbps,
+                ..Default::default()
+            },
+            &golden_view(),
+        )
+    }
+
     #[test]
     fn render_is_deterministic_and_matches_golden() {
         let s = sample_snapshot();
         let a = render_dashboard(&s);
         let b = render_dashboard(&s);
         assert!(a.equal(&b), "frames differ");
-        assert_eq!(a.hash_hex(), GOLDEN_NORMAL, "fixed dashboard changed");
+        assert_eq!(a.hash_hex(), GOLDEN_NORMAL, "layout 1 dashboard changed");
     }
 
     #[test]
@@ -2286,6 +2417,220 @@ mod tests {
     }
 
     #[test]
+    fn selectable_layouts_are_deterministic_and_keep_shared_regions_exact() {
+        let mut snapshot = sample_snapshot();
+        let now = snapshot.now.unwrap();
+        snapshot.network_in = Metric::valid(62_500_000.0, now);
+        snapshot.network_out = Metric::valid(125_000_000.0, now);
+
+        let classic = render_dashboard(&snapshot);
+        let layout_2 = render_main_display(&snapshot, 2, 1000.0);
+        let layout_3 = render_main_display(&snapshot, 3, 1000.0);
+        assert_eq!(layout_2.hash_hex(), GOLDEN_LAYOUT_2);
+        assert_eq!(layout_3.hash_hex(), GOLDEN_LAYOUT_3);
+        assert!(layout_2.equal(&render_main_display(&snapshot, 2, 1000.0)));
+        assert!(layout_3.equal(&render_main_display(&snapshot, 3, 1000.0)));
+
+        for frame in [&layout_2, &layout_3] {
+            for y in (0..=6).chain(25..=42) {
+                for x in 0..160 {
+                    assert_eq!(frame.get(x, y), classic.get(x, y), "shared pixel ({x},{y})");
+                }
+            }
+        }
+        for (frame, dividers) in [
+            (&classic, &[79][..]),
+            (&layout_2, &[52, 105][..]),
+            (&layout_3, &[79][..]),
+        ] {
+            assert!(frame.get(1, 0), "header text must start at y=0");
+            assert!((0..160).all(|x| !frame.get(x, 5)), "row 5 must be blank");
+            assert!(
+                (0..160).all(|x| frame.get(x, 6)),
+                "header separator must be y=6"
+            );
+            assert!(
+                (0..160).all(|x| frame.get(x, 25)),
+                "bottom separator must be solid"
+            );
+            assert!(dividers.iter().all(|&x| frame.get(x, 7)));
+        }
+        assert!((7..=24).all(|y| layout_2.get(52, y) && layout_2.get(105, y)));
+        assert!((7..=24).all(|y| layout_3.get(79, y)));
+        for (frame, left, right) in [(&classic, 98, 157), (&layout_2, 71, 104)] {
+            for y in [8, 14, 17, 23] {
+                assert!((left..=right).all(|x| frame.get(x, y)));
+            }
+            assert!((left..=right).all(|x| !frame.get(x, 16)));
+        }
+        for (frame, right) in [(&classic, 77), (&layout_2, 51), (&layout_3, 77)] {
+            assert!((14..=right).all(|x| frame.get(x, 8) && frame.get(x, 10)));
+            assert!((14..=right).all(|x| frame.get(x, 12) && frame.get(x, 14)));
+            assert!((8..=10).all(|y| frame.get(14, y) && frame.get(right, y)));
+            assert!((12..=14).all(|y| frame.get(14, y) && frame.get(right, y)));
+            assert!(!frame.get(16, 11), "former C glyph cell must be blank");
+            assert!(
+                !frame.get(16, 15) && !frame.get(16, 16),
+                "former F glyph cells must be blank"
+            );
+        }
+
+        snapshot.cpu_dual = false;
+        let single_2 = render_main_display(&snapshot, 2, 1000.0);
+        assert!((14..=51).all(|x| single_2.get(x, 8)));
+        assert!((8..=14).all(|y| single_2.get(51, y) && !single_2.get(53, y)));
+        assert!(!single_2.equal(&layout_2));
+
+        let single_3 = render_main_display(&snapshot, 3, 1000.0);
+        let layout_1_single = render_main_display(&snapshot, 1, 1000.0);
+        for y in 7..=24 {
+            for x in 0..=79 {
+                assert_eq!(
+                    single_3.get(x, y),
+                    layout_1_single.get(x, y),
+                    "left pane ({x},{y})"
+                );
+            }
+        }
+        assert!(!single_3.equal(&layout_3));
+        assert!(
+            render_main_display(&snapshot, 4, 1000.0).equal(&layout_1_single),
+            "unknown layouts fall back to layout 1"
+        );
+    }
+
+    #[test]
+    fn standard_lower_fills_and_placeholders_stop_before_row_24() {
+        let current = sample_snapshot();
+        let mut unavailable = current.clone();
+        unavailable.readings.metrics.clear();
+        let mut stale = current.clone();
+        for reading in &mut stale.readings.metrics {
+            reading.freshness = Freshness::Stale;
+        }
+        stale.network_in = Metric::valid(1.0, stale.now.unwrap());
+        stale.network_in.stale = true;
+        stale.network_out = stale.network_in;
+
+        for snapshot in [&current, &unavailable, &stale] {
+            for (main_display, dividers) in [(1, &[79][..]), (2, &[52, 105][..]), (3, &[79][..])] {
+                let frame = render_main_display(snapshot, main_display, 1000.0);
+                for x in 0..160 {
+                    assert_eq!(
+                        frame.get(x, 24),
+                        dividers.contains(&x),
+                        "layout {main_display} row 24 x={x}"
+                    );
+                    assert!(frame.get(x, 25), "layout {main_display} row 25 x={x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_layouts_use_ram_label_and_explicit_state_patterns() {
+        let mut expected_label = Frame::new();
+        expected_label.text(1, 18, "RAM", true);
+        for main_display in 1..=3 {
+            let current = render_main_display(&sample_snapshot(), main_display, 1000.0);
+            for y in 18..=22 {
+                for x in 1..=11 {
+                    assert_eq!(
+                        current.get(x, y),
+                        expected_label.get(x, y),
+                        "layout {main_display} RAM pixel ({x},{y})"
+                    );
+                }
+            }
+        }
+        let current = render_main_display(&sample_snapshot(), 2, 1000.0);
+        for y in [8, 14, 17, 23] {
+            assert!((120..=157).all(|x| current.get(x, y)));
+        }
+
+        let mut states = sample_snapshot();
+        states
+            .readings
+            .metrics
+            .iter_mut()
+            .find(|reading| reading.key == MetricKey::RAMUtilization)
+            .unwrap()
+            .freshness = Freshness::Stale;
+        states.network_out = Metric::valid(1.0, states.now.unwrap());
+        states.network_out.stale = true;
+        states.network_in = Metric::invalid();
+        let frame = render_main_display(&states, 2, 1000.0);
+
+        for (x, expected) in [(15, true), (16, true), (17, false), (18, false)] {
+            assert_eq!(frame.get(x, 18), expected, "RAM stale stripe x={x}");
+        }
+        assert!(frame.get(121, 9) && frame.get(122, 9) && !frame.get(123, 9));
+        assert!(frame.get(121, 18) && !frame.get(122, 18));
+        assert!(!frame.get(121, 19) && frame.get(122, 19));
+    }
+
+    #[test]
+    fn network_bars_follow_configured_ceiling_in_both_network_layouts() {
+        let now = at(50);
+        let snapshot = Snapshot {
+            network_in: Metric::valid(6_250_000.0, now),
+            network_out: Metric::valid(12_500_000.0, now),
+            ..Default::default()
+        };
+
+        let thirds = render_main_display(&snapshot, 2, 100.0);
+        assert!((120..=157).all(|x| thirds.get(x, 8) && thirds.get(x, 14)));
+        assert!((120..=157).all(|x| thirds.get(x, 17) && thirds.get(x, 23)));
+        assert!((121..=156).all(|x| (9..=13).all(|y| thirds.get(x, y))));
+        assert!((121..=138).all(|x| (18..=22).all(|y| thirds.get(x, y))));
+        assert!((139..=156).all(|x| (18..=22).all(|y| !thirds.get(x, y))));
+
+        let network = render_main_display(&snapshot, 3, 100.0);
+        assert!((110..=157).all(|x| network.get(x, 8) && network.get(x, 14)));
+        assert!((110..=157).all(|x| network.get(x, 17) && network.get(x, 23)));
+        assert!((111..=133).all(|x| (9..=13).all(|y| network.get(x, y))));
+        assert!((134..=156).all(|x| (9..=13).all(|y| !network.get(x, y))));
+        assert!((111..=156).all(|x| (18..=22).all(|y| network.get(x, y))));
+    }
+
+    #[test]
+    fn final_layout_3_matches_layout_1_left_and_ignores_gpu_readings() {
+        let snapshot = sample_snapshot();
+        let classic = render_main_display(&snapshot, 1, 1000.0);
+        let current = render_main_display(&snapshot, 3, 1000.0);
+        assert!((7..=24).all(|y| current.get(79, y)));
+        for y in 7..=24 {
+            for x in 0..=79 {
+                assert_eq!(current.get(x, y), classic.get(x, y), "left pane ({x},{y})");
+            }
+        }
+        for y in [8, 14, 17, 23] {
+            assert!((110..=157).all(|x| current.get(x, y)));
+        }
+
+        let mut gpu_changed = snapshot.clone();
+        gpu_changed.readings.metrics.retain(|reading| {
+            !matches!(
+                reading.key,
+                MetricKey::GPUUtilization
+                    | MetricKey::VRAMUtilization
+                    | MetricKey::VRAMUsed
+                    | MetricKey::VRAMTotal
+            )
+        });
+        assert!(current.equal(&render_main_display(&gpu_changed, 3, 1000.0)));
+
+        let mut states = snapshot;
+        states.network_in = Metric::valid(1.0, states.now.unwrap());
+        states.network_in.stale = true;
+        states.network_out = Metric::invalid();
+        let frame = render_main_display(&states, 3, 1000.0);
+        assert!(frame.get(111, 9) && frame.get(112, 9) && !frame.get(113, 9));
+        assert!(frame.get(111, 18) && !frame.get(112, 18));
+        assert!(!frame.get(111, 19) && frame.get(112, 19));
+    }
+
+    #[test]
     fn attached_target_snapshot_matches() {
         let snapshot = Snapshot {
             cpu_dual: true,
@@ -2304,11 +2649,12 @@ mod tests {
             ..Default::default()
         };
 
+        let hash = Renderer::new()
+            .render(&snapshot, OverlayOptions::default(), &view)
+            .hash_hex();
         assert_eq!(
-            Renderer::new()
-                .render(&snapshot, OverlayOptions::default(), &view)
-                .hash_hex(),
-            "533efdda88f150095ea19e44c5d203a0480d3f314d0dd9d36e3885bec5422e52"
+            hash,
+            "375a955ea619691e07c49c69e111e3c0831ba3fb338da116c0007c360684e76d"
         );
     }
 
@@ -2332,12 +2678,12 @@ mod tests {
                 },
             ),
         ];
-        let label_width = text_width("MEM", 1);
+        let label_width = text_width("RAM", 1);
         for (name, metric) in cases {
             // Full bar
             let mut r = Renderer::new();
             let mut f = Frame::new();
-            r.metric_bar(&mut f, 1, 18, "MEM", &metric, 75, 7);
+            r.metric_bar(&mut f, 1, 18, "RAM", &metric, 75, 7);
             let bx = 1 + label_width + 2;
             let p = metric_percent(&metric);
             let want_filled = if p >= 0 {
@@ -2362,7 +2708,7 @@ mod tests {
             // Small bar
             let mut r = Renderer::new();
             let mut f = Frame::new();
-            r.small_bar(&mut f, 16, 9, "C", metric, 62);
+            r.small_bar(&mut f, 20, 9, metric, 58);
             let want_filled = if p >= 0 { 56 * p / 100 } else { 0 };
             match name {
                 "unavailable" => {
@@ -2414,8 +2760,8 @@ mod tests {
     fn fixed_dashboard_uses_vram_label_only() {
         let current = render_dashboard(&sample_snapshot());
         let mut previous = current.clone();
-        previous.fill_rect(81, 19, text_width("VRAM", 1), 5, false);
-        previous.text(81, 19, "VMEM", true);
+        previous.fill_rect(81, 18, text_width("VRAM", 1), 5, false);
+        previous.text(81, 18, "VMEM", true);
 
         let changed: Vec<_> = current
             .pixels
@@ -2429,14 +2775,14 @@ mod tests {
         assert!(
             changed
                 .iter()
-                .all(|&(x, y)| (86..=91).contains(&x) && (19..=23).contains(&y)),
+                .all(|&(x, y)| (86..=91).contains(&x) && (18..=22).contains(&y)),
             "label diff escaped audited bounds: {changed:?}"
         );
     }
 
     #[test]
-    fn fixed_bars_ignore_noncanonical_sources() {
-        // The fixed MEM/GPU/VRAM bars read only the canonical readings; a
+    fn layout_one_bars_ignore_noncanonical_sources() {
+        // Layout 1 RAM/GPU/VRAM bars read only the canonical readings; a
         // change to unrelated snapshot fields (temps feed slots, not bars)
         // must leave the bar regions pixel-identical.
         let s = sample_snapshot();
@@ -2445,20 +2791,20 @@ mod tests {
         changed.cpu_temp = Metric::valid(99.0, s.now.unwrap());
         changed.gpu_temp = Metric::valid(99.0, s.now.unwrap());
         let after = render_dashboard(&changed);
-        // MEM bar region: x=14..75, y=18..24. GPU bar region: x=95..157, y=9..15.
-        for y in 18..25 {
+        // RAM bar region: x=14..75, y=17..23. GPU bar region: x=98..157, y=8..14.
+        for y in 17..24 {
             for x in 14..76 {
                 assert_eq!(
                     base.get(x, y),
                     after.get(x, y),
-                    "MEM bar pixel ({},{})",
+                    "RAM bar pixel ({},{})",
                     x,
                     y
                 );
             }
         }
-        for y in 9..16 {
-            for x in 95..158 {
+        for y in 8..15 {
+            for x in 98..158 {
                 assert_eq!(
                     base.get(x, y),
                     after.get(x, y),
@@ -2884,13 +3230,16 @@ mod tests {
         let dual = render_dashboard(&sample_snapshot());
         let single = render_dashboard(&s);
         assert!(!single.equal(&dual));
-        // Single mode draws the "CPU" label at y=10 (dual draws it at y=11):
-        // the C glyph's row-1 pixel lands at (1,11) only in single mode.
-        assert!(single.get(1, 11), "CPU label at single-mode position");
-        assert!(!dual.get(1, 11), "dual mode has different label geometry");
-        // Single mode: full-height bar border at x=15, rows 9..15.
-        assert!(single.get(15, 12), "full-height CPU bar left border");
-        assert!(!dual.get(15, 12), "dual micro-bars start at x=20");
+        // Single mode draws the "CPU" label at y=9 (dual draws it at y=10):
+        // the C glyph's row-1 pixel lands at (1,10) only in single mode.
+        assert!(single.get(1, 10), "CPU label at single-mode position");
+        assert!(!dual.get(1, 10), "dual mode has different label geometry");
+        // Single mode remains continuous where dual mode has its center gap.
+        assert!(single.get(15, 11), "full-height CPU bar left border");
+        assert!(
+            !dual.get(15, 11),
+            "dual compact bars retain their center gap"
+        );
         // Deterministic.
         assert_eq!(single.hash_hex(), render_dashboard(&s).hash_hex());
     }
@@ -3376,6 +3725,28 @@ mod tests {
             &view,
         );
         assert!(stale.equal(&stale_base));
+
+        snapshot.cpu_temp.stale = false;
+        let category_disabled = Renderer::new().render(
+            &snapshot,
+            OverlayOptions {
+                warning: false,
+                warning_phase: true,
+                cpu_temp_max_c: 90.0,
+                ..Default::default()
+            },
+            &view,
+        );
+        let disabled_base = Renderer::new().render(
+            &snapshot,
+            OverlayOptions {
+                warning: false,
+                cpu_temp_max_c: 90.0,
+                ..Default::default()
+            },
+            &view,
+        );
+        assert!(category_disabled.equal(&disabled_base));
     }
 
     #[test]
@@ -3447,6 +3818,25 @@ mod tests {
         );
         assert_eq!(graph_height(200.0, 100.0, 7), 7);
         assert_eq!(graph_height(-1.0, 100.0, 7), 0);
+    }
+
+    #[test]
+    fn bottleneck_text_maps_every_state_and_stale_precedence() {
+        let mut snapshot = Snapshot::default();
+        snapshot.bottleneck.freshness = Freshness::Current;
+        for (state, expected) in [
+            (crate::model::BottleneckState::Unavailable, "N/A"),
+            (crate::model::BottleneckState::None, "NONE"),
+            (crate::model::BottleneckState::Cpu, "CPU"),
+            (crate::model::BottleneckState::Gpu, "GPU"),
+            (crate::model::BottleneckState::Mem, "RAM"),
+            (crate::model::BottleneckState::DiskIo, "DISK I/O"),
+        ] {
+            snapshot.bottleneck.state = state;
+            assert_eq!(bottleneck_text(&snapshot), expected);
+        }
+        snapshot.bottleneck.freshness = Freshness::Stale;
+        assert_eq!(bottleneck_text(&snapshot), "STALE");
     }
 
     #[test]

@@ -530,7 +530,11 @@ impl Worker {
         self.update.game = update.game;
         self.set_provider("presentmon", update.available);
         if !update.available && !update.detail.is_empty() {
-            crate::log_debug!("PresentMon unavailable: {}", update.detail);
+            if update.error {
+                crate::log_warn!("PresentMon unavailable: {}", update.detail);
+            } else {
+                crate::log_debug!("PresentMon unavailable: {}", update.detail);
+            }
         }
     }
 

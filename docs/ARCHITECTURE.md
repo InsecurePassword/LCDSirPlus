@@ -14,7 +14,7 @@ src\
 ├── render\
 │   ├── mod.rs          160x43 Frame (set/get/rect/hash)
 │   ├── font.rs         3x5 bitmap font (glyph-exact Go port)
-│   └── renderer.rs     dashboard, slots, overlays, golden tests
+│   └── renderer.rs     three built-in displays, slots, overlays, golden tests
 ├── backends\
 │   ├── mod.rs          worker thread: selection, reconnect, suppression
 │   ├── g13.rs          pure G13 report contract (pack/parse) + tests
@@ -22,7 +22,7 @@ src\
 ├── providers\
 │   ├── clock.rs        Win32 NLS date/time formatting
 │   ├── cpu.rs          NtQuerySystemInformation per-LP deltas
-│   ├── discord.rs      verified desktop RPC, voice tracker, OAuth + DPAPI
+│   ├── discord.rs      trust-checked desktop RPC, voice tracker, OAuth + DPAPI
 │   ├── memory.rs       GlobalMemoryStatusEx
 │   ├── ccd.rs          L3/NUMA topology + CPUID cache-size labeling
 │   ├── gpu.rs          trusted NVAPI/NVML/ADLX + canonical GPU metrics
@@ -97,22 +97,52 @@ contention barrier during the bounded observation interval.
 Normal runtime and direct-HID hardware tests acquire the per-session
 `Local\\LCDSirPlus.Runtime` mutex before opening a backend/device. Read-only CLI
 commands and virtual tests do not acquire it. The RAII owner closes the handle
-on return. Startup registration uses a transaction and mutates only an exact
-owned current-user Run value.
+on return. Portable startup registration uses a transaction and mutates only an
+exact owned current-user Run value; installed mode suppresses that path and uses
+the installer's per-user scheduled task.
+
+Configuration resolution gives an explicit `--config` path first precedence.
+Without it, portable/development layouts use adjacent `lcdsirplus.txt`, while an
+installed layout uses `%LOCALAPPDATA%\LCDSirPlus\Config\lcdsirplus.txt`. If that
+installed user file is absent, the runtime validates the installer-owned
+`lcdsirplus.default.txt` and atomically seeds the user file once without
+overwriting a concurrently created or existing file.
 
 ## Packaging boundary
 
 `scripts/Build.ps1` accepts only a clean exact Git HEAD, runs the full quality
 gate, stages explicit member allowlists, and emits deterministic portable,
-installer, and source ZIPs. Every archive has one root and a sorted hash/size
-manifest; `LCDSirPlus-0.3.0-SHA256SUMS.txt` covers all three ZIPs. The source tree is populated
-from `git archive HEAD`, not the working directory.
+source ZIPs and a versioned Inno Setup EXE. Every ZIP has one root and a sorted
+hash/size manifest; `LCDSirPlus-0.3.0-SHA256SUMS.txt` covers both ZIPs and the
+setup EXE. The source tree is populated from `git archive HEAD`, not the working
+directory.
 
-`Install.ps1` and `Uninstall.ps1` share `Package.Common.ps1` for member, path,
-fixed-volume, reparse, hard-link, hash, and process checks. Install uses a
-same-parent stage/backup swap and preserves the live config on update. Uninstall
-uses the installed ownership manifest, preserves undeclared files/config/data,
-and removes shortcut/Run state only when it still targets the exact install.
+The Inno installer uses auto Program Files constants for current-user/all-users
+mode, standard uninstall registration, Restart Manager, and a per-original-user
+interactive/limited ONLOGON task with a stable SID-specific name and
+version-independent description. The same SID's opposite-scope registration and
+legacy-install collisions are rejected before file copy; another SID's all-users
+registration may coexist with a current-user install, without offline-HKU
+enumeration claims. Standard registration supplies scope and install location;
+task create/update/delete authenticates the protected installer owner file plus
+exact source, description, action, working-directory, trigger, principal,
+logon-type, and run-level fields. Create/update is atomic: the exact prior XML is
+restored after registration or post-verification failure, and a failed first
+install removes only its newly created verified task. The exact setup cache and
+owner file are prepared transactionally before the task commit. Uninstall initialization
+only validates; `usUninstall` immediately revalidates/deletes before files, so
+cancel leaves the task intact and deletion failure aborts file removal. The exact
+running setup is cached under the install root and registered as the same-scope
+Modify path. Repair and uninstall leave `%LOCALAPPDATA%\LCDSirPlus` user data
+untouched.
+
+PresentMon support is implemented, software-tested, pinned, and enabled by
+default as a required feature, but live game capture is not release-qualified.
+That gate is deferred while this PC's memory is occupied by the local LLM, so
+release remains pending. Discord RPC/OAuth is implemented and software-tested;
+each user supplies their own registered application and current-user
+DPAPI-protected tokens. Its live voice/OAuth gate is pending unless explicitly
+deferred.
 
 ## Data flow (one tick)
 
@@ -120,7 +150,7 @@ and removes shortcut/Run state only when it still targets the exact install.
 clock + CPU/memory/PDH/TCP/power + NVAPI/ADLX/NVML
   + optional HWiNFO/LHM + owned bundled PresentMon
   → Snapshot { date/time, cpu_dual, cache/freq/total load, mem, readings }
-  → Renderer::render(snapshot, overlay opts, view{slot modules})
+  → Renderer::render(snapshot, overlay opts{main display, scales}, view{slot modules})
   → Frame (160x43 bytes)
   ├── backend.submit → transform (orientation/invert)
   │     ├── HID pack_report → WriteFile 992 bytes
@@ -134,15 +164,25 @@ its slot's matching button and exact bound target; inactive `PROC_HANG` and
 current `BOTTLENECK NONE` dynamically render the next active token without
 changing selection. Button 4 acknowledges the highest active alert before
 cycling its slot. Render priority is hung hold, remaining unacknowledged alert
-overlays, Discord speaker overlay, then dashboard. Enabled CPU/GPU temperature
-warnings suppress their old full-screen temperature overlays and invert only
-the selected qualifying pane on alternating 100 ms phases.
+overlays, Discord speaker overlay, then dashboard. Hot-reloaded
+`temperature_warning_enabled` and `memory_warning_enabled`, both default true,
+gate CPU/GPU and RAM/VRAM episodes independently before alert state is updated.
+Stale or unavailable readings cannot create either category and retain any
+existing episode until a current valid recovery arrives. That first recovery
+removes severity-2 warnings immediately and starts configured linger only for
+severity-3 episodes. Disabling a warning category clears its episodes, and
+disabling the headset provider clears its episode. With the
+temperature category enabled, compatibility `warning` presentation suppresses
+full-screen temperature overlays and inverts only the selected qualifying pane
+on alternating 100 ms phases when true; when false, temperature overlays remain.
+Acknowledgement remains shared alert-state behavior.
 
 ## Determinism
 
 - The renderer is a pure function of (Snapshot, OverlayOptions, View) plus
-  exact trailing-30-second graph histories; golden hashes pin the fixed
-  dashboard byte-for-byte against the Go 0.2.0 renderer.
+  exact trailing-30-second graph histories. `main_display` selects one of three
+  fixed built-in metric regions while all retain the shared header and button
+  row; golden hashes pin all three byte-for-byte.
 - SHA-256 is dependency-free and deterministic.
 
 ## Error handling
@@ -154,13 +194,16 @@ the selected qualifying pane on alternating 100 ms phases.
   `BackendState::Disconnected`; reconnect backoff doubles from
   `logitech_reconnect_ms` to `logitech_reconnect_max_ms`; device loss emits
   canceled button releases so no press is ever stuck.
-- Providers: absent data renders explicit `N/A`/`STALE` states — the fixed
+- Providers: absent data renders explicit `N/A`/`STALE` states; built-in display
   bars read only canonical readings, never legacy projections.
 - Telemetry source arbitration is native-first: documented Win32/vendor APIs,
   then configured HWiNFO shared memory, then exact/automatic LHM loopback only
   for values with no safe native source. No raw MSR, SMBus, EC, or Super-I/O
   probing exists. Total power is never synthesized; CPU+GPU power is a separate
-  complete-current-components subtotal.
+  complete-current-components subtotal. LibreHardwareMonitor remains
+  user-managed and unbundled; absence is an acceptable unavailable state, and
+  exact SensorIds come from its loopback `data.json` response rather than
+  diagnostics.
 - Network quality: disabled and safe-mode policies clear metrics and perform no
   I/O. One configured IP endpoint is probed per bounded interval; one absolute
   deadline covers ICMP, fallback, and TCP connect. Shutdown or policy changes
@@ -193,7 +236,11 @@ the selected qualifying pane on alternating 100 ms phases.
   sanitized basename, and a fixed outcome label.
   Safe mode creates only unbound button presses, so releases retain normal slot
   behavior; the app and native action boundaries independently refuse any
-  terminate command while safe mode is active.
+  terminate command while safe mode is active. `hang_enabled` defaults false;
+  the shipped slot/button remains present, the provider reports
+  disabled/unavailable, and the no-target pane falls through until explicit
+  opt-in. Termination remains unqualified until disposable-child
+  physical-button acceptance passes.
 - Vendor DLLs are loaded by name only from System32. GPU APIs are read-only,
   versioned, and bounded to vendor maximums. Automatically discovered
   bundled signed PresentMon v2.5.1 is canonically contained beside LCDSirPlus;

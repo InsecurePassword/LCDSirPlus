@@ -61,6 +61,43 @@ function Stop-TestProcess {
     [void]$Process.WaitForExit(10000)
 }
 
+$expectedRustcVersion = '1.97.1'
+$expectedRustcCommit = '8bab26f4f68e0e26f0bb7960be334d5b520ea452'
+function Select-PinnedRustToolchain {
+    $rustup = Get-Command rustup -CommandType Application -ErrorAction SilentlyContinue
+    $install = 'rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt --target x86_64-pc-windows-msvc'
+    if ($null -eq $rustup) { throw "Rust 1.97.1 is required. Install it with: $install" }
+    $name = [Environment]::GetEnvironmentVariable('RUSTUP_TOOLCHAIN', 'Process')
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        $name = '1.97.1-x86_64-pc-windows-msvc'
+        $installed = @(& $rustup.Source toolchain list | ForEach-Object { ($_ -split '\s+')[0] })
+        if ($name -cnotin $installed) { throw "The exact Rust 1.97.1 toolchain alias is not installed. Install it with: $install" }
+    }
+    $verbose = (& $rustup.Source run $name rustc --version --verbose | Out-String).Replace("`r", '')
+    $components = @(& $rustup.Source component list --toolchain $name --installed)
+    $targets = @(& $rustup.Source target list --toolchain $name --installed)
+    if ($LASTEXITCODE -ne 0 -or $verbose -notmatch "(?m)^release: $([regex]::Escape($expectedRustcVersion))$" -or
+        $verbose -notmatch "(?m)^commit-hash: $expectedRustcCommit$" -or
+        $verbose -notmatch '(?m)^host: x86_64-pc-windows-msvc$' -or
+        @($components | Where-Object { $_ -match '^clippy-' }).Count -ne 1 -or
+        @($components | Where-Object { $_ -match '^rustfmt-' }).Count -ne 1 -or
+        @($targets | Where-Object { $_ -ceq 'x86_64-pc-windows-msvc' }).Count -ne 1) {
+        throw "Selected Rust toolchain '$name' is not the pinned 1.97.1 provenance with required components and target. Install it with: $install"
+    }
+    return $name
+}
+
+$toolchain = [IO.File]::ReadAllText((Join-Path $repo 'rust-toolchain.toml'), [Text.Encoding]::UTF8).Replace("`r`n", "`n")
+if ($toolchain -cne "[toolchain]`nchannel = `"1.97.1`"`nprofile = `"minimal`"`ncomponents = [`"clippy`", `"rustfmt`"]`ntargets = [`"x86_64-pc-windows-msvc`"]`n") {
+    throw 'rust-toolchain.toml does not pin the exact Rust version, minimal profile, components, and Windows MSVC target'
+}
+$env:RUSTUP_TOOLCHAIN = Select-PinnedRustToolchain
+$noticeText = [IO.File]::ReadAllText((Join-Path $repo 'THIRD_PARTY_LICENSES.txt'), [Text.Encoding]::UTF8)
+if ($noticeText.IndexOf('rustc 1.97.1', [StringComparison]::Ordinal) -lt 0 -or
+    $noticeText.IndexOf($expectedRustcCommit, [StringComparison]::Ordinal) -lt 0) {
+    throw 'third-party notices do not identify the pinned rustc version and commit'
+}
+
 Write-Host '== PowerShell syntax ==' -ForegroundColor Cyan
 $parse = '$tokens=$null; $errors=$null; [Management.Automation.Language.Parser]::ParseFile($env:LCDSIRPLUS_PARSE_FILE,[ref]$tokens,[ref]$errors) | Out-Null; if ($errors.Count -ne 0) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }'
 $allScripts = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1' -File | ForEach-Object { $_.Name } | Sort-Object)
@@ -69,7 +106,7 @@ foreach ($script in $allScripts) {
     & (Get-Command pwsh).Source -NoProfile -Command $parse
     if ($LASTEXITCODE -ne 0) { throw "pwsh syntax failed: $script" }
 }
-foreach ($script in @('Install.ps1', 'Package.Common.ps1', 'Uninstall.ps1')) {
+foreach ($script in @('Acquire-InnoSetup.ps1')) {
     $env:LCDSIRPLUS_PARSE_FILE = Join-Path $PSScriptRoot $script
     & (Get-Command powershell.exe).Source -NoProfile -Command $parse
     if ($LASTEXITCODE -ne 0) { throw "Windows PowerShell 5.1 syntax failed: $script" }
@@ -129,7 +166,7 @@ $warnings = @($clippyOutput | Where-Object { $_ -match 'warning:' })
 if ($warnings.Count -gt 0) { throw "clippy emitted $($warnings.Count) warnings; zero-warning policy violated" }
 
 Write-Host '== cargo test ==' -ForegroundColor Cyan
-cargo test --release
+cargo test --release --locked
 if ($LASTEXITCODE -ne 0) { throw 'cargo test failed' }
 
 if ($ReleaseOnly) { return }

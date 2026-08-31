@@ -353,7 +353,13 @@ fn main() {
     }
 
     if cli.validate {
-        let path = cli.config.clone().unwrap_or_else(app::default_config_path);
+        let path = match runtime::resolve_config(cli.config.clone()) {
+            Ok(resolved) => resolved.path,
+            Err(error) => {
+                eprintln!("INVALID: configuration resolution failed: {error}");
+                std::process::exit(2);
+            }
+        };
         match app::validate_config(&path) {
             outcome if outcome.ok => {
                 println!("OK: {}", outcome.message);
@@ -372,7 +378,13 @@ fn main() {
     }
 
     if cli.discord_clear_token {
-        let path = cli.config.clone().unwrap_or_else(app::default_config_path);
+        let path = match runtime::resolve_config(cli.config.clone()) {
+            Ok(resolved) => resolved.path,
+            Err(error) => {
+                eprintln!("configuration resolution failed: {error}");
+                std::process::exit(2);
+            }
+        };
         if let Err(error) = parser::load(&path) {
             eprintln!("configuration error: {}", error);
             std::process::exit(2);
@@ -388,7 +400,13 @@ fn main() {
     }
 
     if cli.discord_authorize {
-        let path = cli.config.clone().unwrap_or_else(app::default_config_path);
+        let path = match runtime::resolve_config(cli.config.clone()) {
+            Ok(resolved) => resolved.path,
+            Err(error) => {
+                eprintln!("configuration resolution failed: {error}");
+                std::process::exit(2);
+            }
+        };
         let cfg = match parser::load(&path) {
             Ok(loaded) => loaded.config,
             Err(error) => {

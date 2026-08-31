@@ -2,8 +2,8 @@
 # LCDSirPlus 0.3.0 configuration (Rust port)
 #
 # Blank lines and lines beginning with # are ignored. Each setting is a key
-# followed by whitespace-separated values. The physical 160x43 layout is
-# fixed; these settings select data sources, thresholds, and the ordered
+# followed by whitespace-separated values. The physical 160x43 framebuffer is
+# fixed; these settings select its layout, data sources, thresholds, and ordered
 # module list for each LCD button. Saving a valid file hot-reloads it. Parse or
 # token errors identify the source line; final range or cross-field errors can
 # report line 0. Invalid changes are rejected; the prior valid config stays active.
@@ -14,6 +14,8 @@
 config_refresh_ms       1000
 telemetry_interval_ms   auto          # 300
 render_interval_ms      auto          # 100
+# Main dashboard: 1 classic CPU/GPU, 2 thirds, 3 CPU/RAM + network.
+main_display            1             # 1 | 2 | 3
 preview_mode            auto          # auto | always | never
 preview_scale           4
 start_minimized         0
@@ -65,13 +67,14 @@ logitech_invert         0
 # Native Win32/vendor APIs are used first. HWiNFO, then exact/automatic LHM,
 # covers only readings with no safe native source. LCDSirPlus never probes raw
 # MSRs, SMBus, EC, or Super-I/O. LHM is user-managed: explicitly start it and
-# safely enable its loopback web server (normally port 8085).
+# safely enable its loopback web server (normally port 8085). It is not bundled;
+# absence and unavailable LHM readings are acceptable.
 
 lhm_mode                auto          # auto | on | off
 lhm_url                 auto          # http://127.0.0.1:8085/data.json
 lhm_interval_ms         auto          # 300
 lhm_stale_ms            auto          # 3000
-# Optional stable SensorId overrides from a diagnostic bundle:
+# Optional stable SensorId overrides copied from LHM's loopback data.json:
 # lhm_cpu_temp_sensor    /amdcpu/0/temperature/2
 # lhm_gpu_temp_sensor    /lpc/it8720f/temperature/2
 # lhm_vrm_temp_sensor
@@ -153,9 +156,11 @@ network_graph_ceiling_mbps 1000
 disk_graph_ceiling_mbps 1000
 fps_graph_ceiling       240
 
-# Selected CPU/GPU temperature panes invert every 100 ms at the max threshold.
-# warning=1 requires render_interval_ms <=100. Other alert types remain.
+# Legacy warning controls temperature pane presentation. The category switch
+# independently disables temperature alerts and flashing. When both are 1,
+# render_interval_ms must be <=100.
 warning                 1
+temperature_warning_enabled 1
 cpu_temp_max_c          90
 gpu_temp_max_c          90
 bottleneck_cpu_percent  90
@@ -183,11 +188,15 @@ discord_show_self       0
 discord_show_channel    0
 
 ##############################################################################
-# Hung-window detector and guarded action. PROC_HANG may occur only once; while
-# selected, its slot's physical button owns the binding. No target dynamically
-# shows the next token without changing selection. Safe mode cannot terminate.
+# Hung-window detector and destructive guarded action. It is opt-in and remains
+# unqualified until the disposable-child physical-button acceptance gate passes.
+# PROC_HANG stays selected in its slot; its provider reports disabled/unavailable
+# and the existing no-target fallback renders the next token until enabled.
+# While selected, its slot's physical button owns the binding. No target
+# dynamically shows the next token without changing selection. Safe mode cannot
+# terminate.
 
-hang_enabled            1
+hang_enabled            0
 hang_button             3             # Legacy accepted; selected PROC_HANG slot owns runtime button.
 hang_hold_ms            2000
 hang_probe_interval_ms  2000
@@ -196,13 +205,17 @@ hang_failures_required  3
 hang_minimum_ms         6000
 hang_ignore LCDSirPlus.exe explorer.exe dwm.exe winlogon.exe csrss.exe services.exe lsass.exe smss.exe fontdrvhost.exe sihost.exe taskhostw.exe
 
-# Alert thresholds — Phase 2/4.
+# Alert categories and thresholds. Memory capacity defaults to alert only at 100%.
+memory_warning_enabled  1
 cpu_temp_warning        85
 cpu_temp_critical       95
 gpu_temp_warning        83
 gpu_temp_critical       90
-memory_warning          90
-vmem_warning            95
+memory_warning          100
+vmem_warning            100
+# Severity-2 recovery removes immediately. Severity-3 linger starts on the first
+# current valid recovery; unknown/stale retains an episode. Disabling its
+# category or the headset provider clears the corresponding episode.
 critical_alert_linger_ms 3000
 
 ##############################################################################
