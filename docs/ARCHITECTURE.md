@@ -266,9 +266,11 @@ Acknowledgement remains shared alert-state behavior.
   raw payloads, and OAuth response bodies are never included. Token HTTPS
   responses are bounded to 1 MiB and credentials to 64 KiB.
 - Discord credentials are v2, keyed by immutable Discord user ID, and
-  current-Windows-user DPAPI protected at rest. Optional client secrets enter
-  through the authorization environment variable and remain encrypted with the
-  account record for refresh.
+  current-Windows-user DPAPI protected at rest. The generic OAuth exchange
+  requires a client secret before any authorization IPC; it enters only through
+  the temporary authorization environment variable and remains encrypted with
+  the account record for refresh. Social SDK Public Client authorization is not
+  implemented.
 - Authorization is local RPC plus outbound WinHTTP token exchange. Both the RPC
   request and authorization-code exchange omit `redirect_uri`; there is no
   callback listener, browser launch, bot/Gateway connection, or user token.

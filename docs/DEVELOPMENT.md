@@ -71,11 +71,12 @@ Version 0.3.0 remains draft/unreleased. PresentMon is implemented,
 software-tested, pinned, and enabled by default as a required feature, but live
 game capture is not release-qualified and is deferred while this PC's memory is
 occupied by the local LLM. Discord is implemented and software-tested; users
-register their own applications and credentials remain current-user
-DPAPI-protected, but live voice/OAuth qualification is pending unless explicitly
-deferred. Guarded termination defaults off and remains unqualified until the
-disposable-child physical-button gate passes. These open gates prevent a release
-claim.
+register their own applications, provide the generic OAuth client secret only
+through the temporary authorization environment variable, and keep credentials
+current-user DPAPI-protected, but live voice/OAuth qualification is pending
+unless explicitly deferred. Guarded termination defaults off and remains
+unqualified until the disposable-child physical-button gate passes. These open
+gates prevent a release claim.
 
 ```powershell
 pwsh -NoProfile -File .\scripts\Build.ps1

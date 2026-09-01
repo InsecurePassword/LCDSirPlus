@@ -159,10 +159,12 @@ Get-AuthenticodeSignature -FilePath $pm |
 
 ## Discord
 
-- Use a dedicated developer application/test account. No portal redirect is
-  required. Never record the client secret or DPAPI token bytes.
-- Authorize with Discord Desktop running; confirm no listener/browser is opened
-  and clear the client-secret environment variable. Switch to a second dedicated
+- Use a dedicated developer application/test account and its OAuth client
+  secret. No portal redirect is required. Never record the client secret or
+  DPAPI token bytes; use the manual's masked temporary environment procedure.
+- Authorize with Discord Desktop running; confirm a missing/blank secret fails
+  before IPC, no listener/browser is opened, and the client-secret environment
+  variable is cleared immediately. Switch to a second dedicated
   test account, authorize it once, and confirm switching either direction uses
   only that account's voice session without another authorization.
 - Join a voice channel with another participant. Confirm channel label,

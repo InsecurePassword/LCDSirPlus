@@ -94,7 +94,9 @@ owner checks do not blanket-block unrelated G HUB processes.
   families: optional battery, connection, and model-dependent charging state.
 - Discord local RPC: implemented and software-tested active-speaker overlay with RPC OAuth and
   active-account-bound, per-Discord-user DPAPI credential storage; authorization
-  uses no redirect URI or callback listener.
+  uses no redirect URI or callback listener. Each user's application supplies a
+  temporarily exposed client secret for the generic OAuth exchange; Social SDK
+  Public Client authorization is not implemented.
 
 PresentMon is implemented, software-tested, pinned, and remains enabled by
 default because it is a required feature. Live capture against an actively

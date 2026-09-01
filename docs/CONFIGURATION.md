@@ -976,14 +976,19 @@ is implemented and software-tested, but the live voice/OAuth workflow remains
 unqualified; release remains pending that gate unless it is explicitly
 deferred. Tokens stay in current-user DPAPI-protected local storage.
 
-No token or client secret belongs in this file. Use `--discord-authorize` once
-while each Discord Account Switcher account is active. Its v2 access/refresh
-record is stored under the immutable Discord user ID and current-Windows-user
-DPAPI protected in `%LOCALAPPDATA%\LCDSirPlus`. A confidential-client secret,
-when required, is accepted only from `LCDSIRPLUS_DISCORD_CLIENT_SECRET` during
-authorization and retained inside that encrypted record for refresh; remove the
-environment variable afterward. Use `--discord-clear-token` to remove all exact
-LCDSirPlus Discord credential records, including the old global record.
+No token or client secret belongs in this file. LCDSirPlus uses Discord's
+generic OAuth token endpoint, so `--discord-authorize` requires the application's
+client secret in `LCDSIRPLUS_DISCORD_CLIENT_SECRET`. Public Client mode does not
+make this implemented flow secretless; Discord's no-secret flow is specific to
+Social SDK `GetToken`, which LCDSirPlus does not implement. Supply the secret
+only through a masked prompt for authorization, clear the environment variable
+immediately, and never put it in source, configuration, arguments, logs, or
+chat. Authorize once while each Discord Account Switcher account is active. Its
+v2 access/refresh record is stored under the immutable Discord user ID and
+current-Windows-user DPAPI protected in `%LOCALAPPDATA%\LCDSirPlus`; the secret
+is retained inside that encrypted record for refresh. Use
+`--discord-clear-token` to remove all exact LCDSirPlus Discord credential
+records, including the old global record.
 RPC authorization opens no listener, uses no redirect URI, and requires no
 portal redirect registration.
 

@@ -2332,16 +2332,13 @@ fn authorize_args(client_id: &str) -> String {
     )
 }
 
-fn authorization_code_body(client_id: &str, code: &str, client_secret: Option<&str>) -> String {
-    let mut fields = vec![
+fn authorization_code_body(client_id: &str, code: &str, client_secret: &str) -> String {
+    form_encode(&[
         ("client_id", client_id),
         ("grant_type", "authorization_code"),
         ("code", code),
-    ];
-    if let Some(client_secret) = client_secret {
-        fields.push(("client_secret", client_secret));
-    }
-    form_encode(&fields)
+        ("client_secret", client_secret),
+    ])
 }
 
 fn authorization_code(payload: &Payload, nonce: &str) -> Result<String, String> {
@@ -2361,7 +2358,9 @@ pub fn authorize(config: &Config, client_secret: &str) -> Result<(), String> {
     if config.discord_client_id.trim().is_empty() {
         return Err("discord_client_id is not configured".into());
     }
-    let client_secret = normalized_client_secret(client_secret);
+    let client_secret = normalized_client_secret(client_secret).ok_or(
+        "LCDSIRPLUS_DISCORD_CLIENT_SECRET must be exposed temporarily only for Discord authorization and cleared immediately afterward",
+    )?;
     let deadline = Instant::now() + Duration::from_secs(120);
     let (mut file, _) = open_pipe()?;
     let (ready_id, code) = authorize_rpc(&mut file, config, deadline)?;
@@ -2374,7 +2373,7 @@ pub fn authorize(config: &Config, client_secret: &str) -> Result<(), String> {
     let record = TokenRecord::from_response(
         &ready_id,
         &config.discord_client_id,
-        client_secret,
+        Some(client_secret),
         response,
         unix_now(),
     )?;
@@ -2969,7 +2968,7 @@ mod tests {
         );
         assert!(!args.contains("redirect_uri"));
 
-        let secret = normalized_client_secret("  secret+x  ");
+        let secret = normalized_client_secret("  secret+x  ").unwrap();
         let body = authorization_code_body("123456", " *~%é", secret);
         assert_eq!(
             body,
@@ -2977,28 +2976,36 @@ mod tests {
         );
         assert!(!body.contains("redirect_uri"));
 
-        let empty_secret = normalized_client_secret(" \t ");
-        assert_eq!(
-            authorization_code_body("123456", "code", empty_secret),
-            "client_id=123456&grant_type=authorization_code&code=code"
-        );
         let response = TokenResponse {
             access_token: "access".into(),
             scope: "identify rpc rpc.voice.read".into(),
             ..Default::default()
         };
         let record =
-            TokenRecord::from_response("111", "123456", secret, response.clone(), 1).unwrap();
+            TokenRecord::from_response("111", "123456", Some(secret), response.clone(), 1).unwrap();
         assert_eq!(record.client_secret, "secret+x");
         assert_eq!(TokenRecord::decode(&record.encode()).unwrap(), record);
 
-        let empty_record =
-            TokenRecord::from_response("111", "123456", empty_secret, response, 1).unwrap();
+        let empty_record = TokenRecord::from_response("111", "123456", None, response, 1).unwrap();
         assert!(empty_record.client_secret.is_empty());
         assert!(TokenRecord::decode(&empty_record.encode())
             .unwrap()
             .client_secret
             .is_empty());
+    }
+
+    #[test]
+    fn authorization_requires_secret_before_discord_io() {
+        let config = Config {
+            discord_client_id: "123456".into(),
+            ..Config::default()
+        };
+        for secret in ["", " \t\r\n "] {
+            assert_eq!(
+                authorize(&config, secret).unwrap_err(),
+                "LCDSIRPLUS_DISCORD_CLIENT_SECRET must be exposed temporarily only for Discord authorization and cleared immediately afterward"
+            );
+        }
     }
 
     #[test]

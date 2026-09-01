@@ -46,12 +46,15 @@ serials, arbitrary listings, and device paths. Review a bundle before sharing.
 ## Secrets
 
 Each user must create and register their own Discord application. Never put
-Discord client secrets or tokens in configuration, command arguments,
-issues, diagnostics, logs, screenshots, or package fixtures. If Discord requires
-a client secret, expose it only through `LCDSIRPLUS_DISCORD_CLIENT_SECRET` for
-authorization and remove the environment variable immediately afterward. The
-secret is retained only inside that account's DPAPI-protected v2 credential so
-refresh can use it. Credentials stay in current-user DPAPI-protected local files
+Discord client secrets or tokens in source, configuration, command arguments,
+issues, chat, diagnostics, logs, screenshots, or package fixtures. The generic
+OAuth exchange used by LCDSirPlus requires the client secret; Public Client
+no-secret authorization is Social SDK-specific and is not implemented. Enter
+the secret through a masked prompt, expose it only through
+`LCDSIRPLUS_DISCORD_CLIENT_SECRET` for authorization, and remove the environment
+variable immediately afterward. The secret is retained only inside that
+account's DPAPI-protected v2 credential so refresh can use it. Credentials stay
+in current-user DPAPI-protected local files
 under `%LOCALAPPDATA%\LCDSirPlus`; installed configuration is separately stored
 at `%LOCALAPPDATA%\LCDSirPlus\Config\lcdsirplus.txt`, while portable/development
 configuration is adjacent to the executable. Explicit `--config` takes

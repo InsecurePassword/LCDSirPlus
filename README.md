@@ -227,27 +227,32 @@ and causes no IPC attempt. LCDSirPlus reads voice state only; it publishes no
 Rich Presence and needs no image assets. Discord Desktop must run under the same
 Windows user/session and pass the signed fixed-local IPC checks.
 
-1. Create an application in the Developer Portal and add your Discord account
-   as a tester if required.
+1. Create your own application in the Developer Portal, obtain its OAuth client
+   secret, and add your Discord account as a tester if required.
 2. Copy the application's client ID into `discord_client_id` in
    `lcdsirplus.txt`.
 3. Start Discord Desktop and sign in to the account you want to authorize.
-4. Run `LCDSirPlus.exe --discord-authorize` and approve the prompt in Discord.
-
-If Discord requires the application's client secret for authorization, expose
-it only for that command and remove it immediately afterward:
+4. In PowerShell, enter the secret through a masked prompt, authorize, and
+   approve the prompt in Discord:
 
 ```powershell
-$env:LCDSIRPLUS_DISCORD_CLIENT_SECRET = '<secret>'
-.\LCDSirPlus.exe --discord-authorize
-Remove-Item Env:\LCDSIRPLUS_DISCORD_CLIENT_SECRET
+try {
+    $env:LCDSIRPLUS_DISCORD_CLIENT_SECRET = Read-Host 'Discord client secret' -MaskInput
+    .\LCDSirPlus.exe --discord-authorize
+} finally {
+    Remove-Item Env:\LCDSIRPLUS_DISCORD_CLIENT_SECRET -ErrorAction SilentlyContinue
+}
 ```
 
-Never place the secret in `lcdsirplus.txt` or a command argument. Repeat the
-authorization while each Discord Account Switcher account is active. When a
-secret is required, LCDSirPlus retains it only inside the protected local
-credential so token refresh can continue; the environment variable remains
-temporary and should still be removed immediately.
+LCDSirPlus uses Discord's generic OAuth token endpoint, which requires the
+client secret for authorization. Enabling **Public Client** does not remove that
+requirement: Discord's no-secret flow is specific to Social SDK `GetToken`,
+which LCDSirPlus does not implement. Never put the secret in source,
+`lcdsirplus.txt`, command arguments, logs, screenshots, issues, or chat. Repeat
+authorization while each Discord Account Switcher account is active. LCDSirPlus
+retains the secret only inside the DPAPI-protected local credential so refresh
+can continue; the environment variable is only for authorization and must be
+cleared immediately.
 
 To remove LCDSirPlus's local Discord credentials, run
 `LCDSirPlus.exe --discord-clear-token`. To end access remotely, also revoke the

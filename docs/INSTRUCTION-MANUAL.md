@@ -440,8 +440,8 @@ workflow is not yet release-qualified. Each user creates and registers their own
 Discord application, and tokens remain current-user DPAPI-protected local data.
 Release remains pending this gate unless it is explicitly deferred.
 
-1. Create a Discord developer application and add the account as an application
-   tester if Discord requires it.
+1. Create your own Discord developer application, obtain its OAuth client
+   secret, and add the account as an application tester if Discord requires it.
 2. Put the numeric application ID in configuration:
 
    ```text
@@ -450,25 +450,28 @@ Release remains pending this gate unless it is explicitly deferred.
    ```
 
 3. Start Discord Desktop and activate the account to authorize.
-4. Run authorization:
+4. In PowerShell, enter the client secret through a masked prompt and run
+   authorization. The `finally` block clears the temporary environment value
+   even if authorization fails:
 
    ```powershell
-   .\LCDSirPlus.exe --discord-authorize
+   try {
+       $env:LCDSIRPLUS_DISCORD_CLIENT_SECRET = Read-Host 'Discord client secret' -MaskInput
+       .\LCDSirPlus.exe --discord-authorize
+   } finally {
+       Remove-Item Env:\LCDSIRPLUS_DISCORD_CLIENT_SECRET -ErrorAction SilentlyContinue
+   }
    ```
 
-5. If the application is a confidential client, expose its secret only for the
-   authorization command, then remove it:
-
-   ```powershell
-   $env:LCDSIRPLUS_DISCORD_CLIENT_SECRET = '<secret>'
-   .\LCDSirPlus.exe --discord-authorize
-   Remove-Item Env:\LCDSIRPLUS_DISCORD_CLIENT_SECRET -ErrorAction SilentlyContinue
-   ```
-
-Never place a secret or token in configuration or command arguments. Each
-Discord Account Switcher account must be active and authorized once. Credentials
-are encrypted for the current Windows user with DPAPI and stored under that
-Discord user ID in `%LOCALAPPDATA%\LCDSirPlus`.
+LCDSirPlus exchanges the RPC authorization code through Discord's generic OAuth
+token endpoint, which requires the client secret. Enabling **Public Client**
+does not make this implemented flow secretless; Discord's no-secret flow is
+specific to Social SDK `GetToken`, which LCDSirPlus does not implement. Never
+put a secret or token in source, configuration, command arguments, logs,
+screenshots, issues, or chat. Each Discord Account Switcher account must be
+active and authorized once. Credentials, including the secret retained for
+refresh, are encrypted for the current Windows user with DPAPI and stored under
+that Discord user ID in `%LOCALAPPDATA%\LCDSirPlus`.
 
 Discord Desktop must continue running as the same Windows user and in the same
 interactive session. LCDSirPlus accepts only a named-pipe server whose process,
@@ -655,10 +658,11 @@ needs at least two successful samples. Safe mode always disables probing.
 An empty `discord_client_id` is an unconfigured state, not a failed connection;
 LCDSirPlus does not attempt IPC until a numeric ID is supplied. Otherwise,
 confirm Discord Desktop is running in the same user/session, the numeric ID is
-correct, the current account was authorized, required tester access exists, the
-account is in a voice channel, and someone allowed by `discord_show_self` is
-speaking. Reauthorize after revocation or client-ID changes. Never share token
-files.
+correct, authorization was run with the temporary
+`LCDSIRPLUS_DISCORD_CLIENT_SECRET`, the current account was authorized, required
+tester access exists, the account is in a voice channel, and someone allowed by
+`discord_show_self` is speaking. Reauthorize after revocation or client-ID
+changes. Never share token files.
 
 ### Application says it is already running
 
