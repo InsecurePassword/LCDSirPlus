@@ -16,7 +16,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_MORE_DATA, ERROR_SUCCESS, ERROR_WMI_INSTANCE_NOT_FOUND, HANDLE, MAX_PATH,
+};
+use windows::Win32::System::Com::CoCreateGuid;
+use windows::Win32::System::Diagnostics::Etw::{
+    ControlTraceW, CONTROLTRACE_HANDLE, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_PROPERTIES,
+};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
@@ -39,23 +45,12 @@ const MAX_LINES_PER_TICK: usize = 128;
 const MAX_WINDOW_FRAMES: usize = 600_000 + MAX_LINES_PER_TICK;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const RETRY_DELAY: Duration = Duration::from_secs(10);
-const HELP_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_HELP_BYTES: usize = 512 * 1024;
+const STOP_TIMEOUT_MS: u32 = 2_000;
 const MAX_STDERR_BYTES: usize = 16 * 1024;
 const MAX_DIAGNOSTIC_CHARS: usize = 1024;
 const PRESENTMON_SHA256: &str = "9bec3083069f58f911e6a512f4806db51a27bd096103087bc1d05ef54c80a191";
 const PRESENTMON_SIZE: u64 = 956_768;
 const PRESENTMON_SIGNER: &str = "Intel Corporation";
-const REQUIRED_FLAGS: [&str; 8] = [
-    "--process_id",
-    "--output_stdout",
-    "--no_console_stats",
-    "--terminate_on_proc_exit",
-    "--session_name",
-    "--stop_existing_session",
-    "--v2_metrics",
-    "--exclude_dropped",
-];
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProcessInfo {
@@ -300,6 +295,85 @@ fn current_request(config: &RwLock<Config>, generation: &AtomicU64) -> (u64, Con
     }
 }
 
+fn confirm_start_request(
+    config: &RwLock<Config>,
+    live_generation: &AtomicU64,
+    shutdown: &AtomicBool,
+    expected_config: &Config,
+    expected_generation: u64,
+    expected_target: &ProcessInfo,
+    expected_key: &str,
+) -> Result<(), String> {
+    let (generation, config) = current_request(config, live_generation);
+    let target = select_target(&config)
+        .map_err(|error| format!("PresentMon final target selection failed: {error}"))?;
+    if shutdown.load(Ordering::Acquire)
+        || generation != expected_generation
+        || live_generation.load(Ordering::SeqCst) != expected_generation
+        || config != *expected_config
+        || target.pid != expected_target.pid
+        || capture_key(&config, &target) != expected_key
+    {
+        return Err("PresentMon request changed or shutdown began before capture start".into());
+    }
+    Ok(())
+}
+
+fn wait_bounded(
+    timeout: Duration,
+    mut exited: impl FnMut() -> Result<bool, String>,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if exited()? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "exit was not confirmed within {} ms",
+                timeout.as_millis()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_child_bounded(child: &mut Child, timeout: Duration) -> Result<(), String> {
+    wait_bounded(timeout, || {
+        child
+            .try_wait()
+            .map(|status| status.is_some())
+            .map_err(|error| format!("query child status: {error}"))
+    })
+}
+
+fn stop_child_bounded(child: &mut Child, timeout: Duration) -> Result<(), String> {
+    if child.try_wait().is_ok_and(|status| status.is_some()) {
+        return Ok(());
+    }
+    if let Err(kill) = child.kill() {
+        return match child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(format!("kill child: {kill}; child is still running")),
+            Err(wait) => Err(format!("kill child: {kill}; confirm exit: {wait}")),
+        };
+    }
+    wait_child_bounded(child, timeout).map_err(|error| format!("after kill: {error}"))
+}
+
+fn join_thread_bounded<T>(
+    thread: std::thread::JoinHandle<T>,
+    deadline: Instant,
+) -> Result<T, &'static str> {
+    while !thread.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !thread.is_finished() {
+        return Err("reader timed out and was detached");
+    }
+    thread.join().map_err(|_| "reader panicked")
+}
+
 fn run(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
@@ -311,19 +385,49 @@ fn run(
     while !shutdown.load(Ordering::Relaxed) {
         let (request_generation, cfg) = current_request(&config, &generation);
         if request_generation != current_generation {
-            let _ = capture.stop();
+            if capture.stop_and_report_cleanup(&tx, request_generation, Instant::now()) {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             capture = Capture::default();
             current_generation = request_generation;
         }
-        capture.reconcile(&cfg, request_generation, &tx);
+        capture.reconcile(&cfg, request_generation, &tx, &|target, key| {
+            confirm_start_request(
+                &config,
+                &generation,
+                &shutdown,
+                &cfg,
+                request_generation,
+                target,
+                key,
+            )
+        });
         std::thread::sleep(Duration::from_millis(50));
     }
-    let _ = capture.stop();
+    let mut stderr = String::new();
+    for _ in 0..3 {
+        let current = capture.stop();
+        if !current.is_empty() {
+            stderr = current;
+        }
+        if !capture.teardown_pending() {
+            break;
+        }
+    }
+    if capture.teardown_pending() || !capture.stop_diagnostic.is_empty() {
+        capture.failure(
+            &tx,
+            generation.load(Ordering::SeqCst),
+            with_diagnostic("PresentMon final shutdown incomplete".into(), stderr),
+        );
+    }
 }
 
 #[derive(Default)]
 struct Capture {
     child: Option<Child>,
+    owned_session: Option<String>,
     lines: Option<mpsc::Receiver<String>>,
     line_overflow: Option<Arc<AtomicBool>>,
     reader: Option<std::thread::JoinHandle<()>>,
@@ -339,16 +443,25 @@ struct Capture {
     last_unavailable: String,
     started_at: Option<Instant>,
     retry_after: Option<Instant>,
+    stop_diagnostic: String,
 }
 
 impl Capture {
-    fn reconcile(&mut self, cfg: &Config, generation: u64, tx: &mpsc::Sender<Update>) {
+    fn reconcile(
+        &mut self,
+        cfg: &Config,
+        generation: u64,
+        tx: &mpsc::Sender<Update>,
+        confirm_start: &dyn Fn(&ProcessInfo, &str) -> Result<(), String>,
+    ) {
+        let now = Instant::now();
         if cfg.safe_mode || !cfg.presentmon_enabled || cfg.presentmon_target_mode == "disabled" {
-            let _ = self.stop();
+            if self.stop_and_report_cleanup(tx, generation, now) {
+                return;
+            }
             self.unavailable(tx, generation, "disabled".into());
             return;
         }
-        let now = Instant::now();
         let should_select = self
             .last_target_poll
             .map(|last| now.duration_since(last) >= TARGET_POLL)
@@ -363,9 +476,11 @@ impl Capture {
                             self.unavailable(tx, generation, "PresentMon restart cooldown".into());
                             return;
                         }
-                        let _ = self.stop();
+                        if self.stop_and_report_cleanup(tx, generation, now) {
+                            return;
+                        }
                         match resolve_executable(&cfg.presentmon_path).and_then(|executable| {
-                            self.start(&executable, target.clone(), cfg, key)
+                            self.start(&executable, target.clone(), cfg, key, confirm_start)
                         }) {
                             Ok(()) => {
                                 self.last_unavailable.clear();
@@ -395,7 +510,9 @@ impl Capture {
                     }
                 }
                 Ok(_) => {
-                    let _ = self.stop();
+                    if self.stop_and_report_cleanup(tx, generation, now) {
+                        return;
+                    }
                     self.unavailable(tx, generation, "waiting for target process".into());
                     return;
                 }
@@ -515,47 +632,52 @@ impl Capture {
         target: ProcessInfo,
         cfg: &Config,
         key: String,
+        confirm_start: &dyn Fn(&ProcessInfo, &str) -> Result<(), String>,
     ) -> Result<(), String> {
+        if self.teardown_pending() {
+            return Err("PresentMon teardown is still pending; refusing a new capture".into());
+        }
         let current = pin_executable(&executable.path)?;
         if current.identity != executable.identity {
             return Err("PresentMon path identity changed after validation".into());
         }
+        // Command cannot launch an existing file handle. Holding both file identities and every
+        // parent without delete sharing narrows the remaining same-user path race to CreateProcess.
+        let session_name = new_session_name(target.pid)?;
+        let args = presentmon_args(target.pid, &session_name);
         let _held_through_spawn = (
             &executable.file,
             &executable.parents,
             &current.file,
             &current.parents,
         );
-        // Command cannot launch an existing file handle. Holding both file identities and every
-        // parent without delete sharing narrows the remaining same-user path race to CreateProcess.
-        let mut child = Command::new(&executable.path)
-            .args([
-                "--process_id",
-                &target.pid.to_string(),
-                "--output_stdout",
-                "--no_console_stats",
-                "--terminate_on_proc_exit",
-                "--session_name",
-                &format!("LCDSirPlus-{}", target.pid),
-                "--stop_existing_session",
-                "--v2_metrics",
-                "--exclude_dropped",
-            ])
+        let mut command = Command::new(&executable.path);
+        command
+            .args(args)
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("start PresentMon {}: {e}", executable.path.display()))?;
-        let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("PresentMon stdout pipe unavailable".into());
+            .stderr(Stdio::piped());
+        confirm_start(&target, &key)?;
+        let child = command.spawn();
+        let child = match child {
+            Ok(child) => {
+                self.owned_session = Some(session_name);
+                child
+            }
+            Err(error) => {
+                return Err(format!(
+                    "start PresentMon {}: {error}",
+                    executable.path.display()
+                ));
+            }
         };
-        let Some(stderr) = child.stderr.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("PresentMon stderr pipe unavailable".into());
+        self.child = Some(child);
+        let Some(stdout) = self.child.as_mut().and_then(|child| child.stdout.take()) else {
+            return Err(self.stop_error("PresentMon stdout pipe unavailable".into()));
+        };
+        let Some(stderr) = self.child.as_mut().and_then(|child| child.stderr.take()) else {
+            return Err(self.stop_error("PresentMon stderr pipe unavailable".into()));
         };
         let (line_tx, line_rx) = mpsc::sync_channel(LINE_QUEUE_CAPACITY);
         let overflow = Arc::new(AtomicBool::new(false));
@@ -566,11 +688,12 @@ impl Capture {
         {
             Ok(reader) => reader,
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("start PresentMon output reader: {error}"));
+                return Err(self.stop_error(format!("start PresentMon output reader: {error}")));
             }
         };
+        self.lines = Some(line_rx);
+        self.line_overflow = Some(overflow);
+        self.reader = Some(reader);
         let diagnostic = Arc::new(std::sync::Mutex::new(BoundedDiagnostic::default()));
         let diagnostic_output = Arc::clone(&diagnostic);
         let stderr_reader = match std::thread::Builder::new()
@@ -579,17 +702,9 @@ impl Capture {
         {
             Ok(reader) => reader,
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                drop(line_rx);
-                let _ = reader.join();
-                return Err(format!("start PresentMon stderr reader: {error}"));
+                return Err(self.stop_error(format!("start PresentMon stderr reader: {error}")));
             }
         };
-        self.child = Some(child);
-        self.lines = Some(line_rx);
-        self.line_overflow = Some(overflow);
-        self.reader = Some(reader);
         self.stderr = Some(diagnostic);
         self.stderr_reader = Some(stderr_reader);
         self.target = target;
@@ -616,7 +731,10 @@ impl Capture {
         for _ in 0..MAX_LINES_PER_TICK {
             let line = match lines.try_recv() {
                 Ok(line) => line,
-                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err("PresentMon output reader disconnected".into());
+                }
             };
             let mut frame = match self.parser.parse_line(&line, SystemTime::now()) {
                 Ok(Some(frame)) => frame,
@@ -645,7 +763,7 @@ impl Capture {
         {
             return Err("PresentMon output overflowed; statistics reset".into());
         }
-        if self.last_frame.is_some()
+        if self.last_frame > self.last_publish
             && self
                 .last_publish
                 .map(|last| now.duration_since(last) >= cfg.presentmon_interval)
@@ -670,33 +788,97 @@ impl Capture {
     }
 
     fn stop(&mut self) -> String {
+        self.stop_with(
+            |child| stop_child_bounded(child, Duration::from_millis(STOP_TIMEOUT_MS.into())),
+            stop_etw_session,
+        )
+    }
+
+    fn stop_with(
+        &mut self,
+        stop_child: impl FnOnce(&mut Child) -> Result<(), String>,
+        cleanup: impl FnOnce(&str) -> Result<(), String>,
+    ) -> String {
+        let mut shutdown = Vec::new();
+        self.stop_diagnostic.clear();
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Err(error) = stop_child(&mut child) {
+                self.stop_diagnostic = format!("teardown: {error}");
+                self.child = Some(child);
+                return String::new();
+            }
         }
         self.lines = None;
         self.line_overflow = None;
+        let deadline = Instant::now() + Duration::from_millis(STOP_TIMEOUT_MS.into());
         if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+            if let Err(error) = join_thread_bounded(reader, deadline) {
+                shutdown.push(format!("output {error}"));
+            }
         }
-        if let Some(reader) = self.stderr_reader.take() {
-            let _ = reader.join();
+        let stderr_finished = self.stderr_reader.take().is_none_or(|reader| {
+            join_thread_bounded(reader, deadline)
+                .map_err(|error| shutdown.push(format!("stderr {error}")))
+                .is_ok()
+        });
+        let stderr = take_diagnostic(self.stderr.take(), stderr_finished);
+        if !shutdown.is_empty() {
+            self.stop_diagnostic = format!("shutdown: {}", shutdown.join("; "));
         }
-        let diagnostic = self
-            .stderr
-            .take()
-            .map(|output| {
-                let output = output.lock().unwrap_or_else(|e| e.into_inner());
-                diagnostic_text(&output)
-            })
-            .unwrap_or_default();
+        let cleanup_error = self
+            .owned_session
+            .as_deref()
+            .and_then(|session| cleanup(session).err());
+        if let Some(error) = cleanup_error {
+            if !self.stop_diagnostic.is_empty() {
+                self.stop_diagnostic.push_str("; ");
+            }
+            self.stop_diagnostic
+                .push_str(&format!("ETW cleanup: {error}"));
+        } else {
+            self.owned_session = None;
+        }
         self.target = ProcessInfo::default();
         self.key.clear();
         self.stats = None;
         self.last_frame = None;
         self.last_publish = None;
         self.started_at = None;
-        diagnostic
+        stderr
+    }
+
+    fn teardown_pending(&self) -> bool {
+        self.child.is_some() || self.owned_session.is_some()
+    }
+
+    fn stop_error(&mut self, reason: String) -> String {
+        let stderr = self.stop();
+        with_diagnostic(reason, stderr)
+    }
+
+    fn stop_and_report_cleanup(
+        &mut self,
+        tx: &mpsc::Sender<Update>,
+        generation: u64,
+        now: Instant,
+    ) -> bool {
+        if self.teardown_pending() && retry_pending(self.retry_after, now) {
+            self.unavailable(tx, generation, "PresentMon cleanup retry cooldown".into());
+            return true;
+        }
+        let stderr = self.stop();
+        let failed = self.teardown_pending();
+        if !self.stop_diagnostic.is_empty() {
+            self.failure(
+                tx,
+                generation,
+                with_diagnostic("PresentMon shutdown incomplete".into(), stderr),
+            );
+        }
+        if failed {
+            self.schedule_retry(now);
+        }
+        failed
     }
 
     fn unavailable(&mut self, tx: &mpsc::Sender<Update>, generation: u64, detail: String) {
@@ -704,6 +886,11 @@ impl Capture {
     }
 
     fn failure(&mut self, tx: &mpsc::Sender<Update>, generation: u64, detail: String) {
+        let detail = if self.stop_diagnostic.is_empty() {
+            detail
+        } else {
+            format!("{detail}; {}", self.stop_diagnostic)
+        };
         self.set_unavailable(tx, generation, detail, true);
     }
 
@@ -800,6 +987,18 @@ fn diagnostic_text(output: &BoundedDiagnostic) -> String {
         text.push_str(" [truncated]");
     }
     text
+}
+
+fn take_diagnostic(
+    output: Option<Arc<std::sync::Mutex<BoundedDiagnostic>>>,
+    reader_finished: bool,
+) -> String {
+    if !reader_finished {
+        return String::new();
+    }
+    output
+        .map(|output| diagnostic_text(&output.lock().unwrap_or_else(|error| error.into_inner())))
+        .unwrap_or_default()
 }
 
 fn with_diagnostic(reason: String, diagnostic: String) -> String {
@@ -905,11 +1104,63 @@ struct PinnedExecutable {
     identity: FileIdentity,
 }
 
+fn new_session_name(pid: u32) -> Result<String, String> {
+    let guid =
+        unsafe { CoCreateGuid() }.map_err(|error| format!("create ETW session ID: {error}"))?;
+    Ok(format!("LCDSirPlus-{pid}-{:032x}", guid.to_u128()))
+}
+
+fn presentmon_args(pid: u32, session_name: &str) -> [OsString; 9] {
+    [
+        "--process_id".into(),
+        pid.to_string().into(),
+        "--output_stdout".into(),
+        "--no_console_stats".into(),
+        "--terminate_on_proc_exit".into(),
+        "--session_name".into(),
+        session_name.into(),
+        "--v2_metrics".into(),
+        "--exclude_dropped".into(),
+    ]
+}
+
+fn trace_stop_succeeded(status: u32) -> bool {
+    [
+        ERROR_SUCCESS.0,
+        ERROR_MORE_DATA.0,
+        ERROR_WMI_INSTANCE_NOT_FOUND.0,
+    ]
+    .contains(&status)
+}
+
+fn stop_etw_session(session_name: &str) -> Result<(), String> {
+    let wide: Vec<u16> = session_name.encode_utf16().chain(Some(0)).collect();
+    let mut block = [0u64; 600];
+    let status = unsafe {
+        let properties = block.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
+        (*properties).Wnode.BufferSize = std::mem::size_of_val(&block) as u32;
+        (*properties).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+        (*properties).LogFileNameOffset = (*properties).LoggerNameOffset + 2048;
+        ControlTraceW(
+            CONTROLTRACE_HANDLE::default(),
+            windows::core::PCWSTR(wide.as_ptr()),
+            properties,
+            EVENT_TRACE_CONTROL_STOP,
+        )
+    };
+    if trace_stop_succeeded(status.0) {
+        Ok(())
+    } else {
+        Err(format!(
+            "stop exact session {session_name}: Win32 {}",
+            status.0
+        ))
+    }
+}
+
 fn resolve_executable(setting: &str) -> Result<PinnedExecutable, String> {
     if !setting.trim().is_empty() && !setting.eq_ignore_ascii_case("auto") {
-        let executable = validate_executable(Path::new(setting), false)?;
-        verify_help(&executable)?;
-        return Ok(executable);
+        return validate_executable(Path::new(setting));
     }
 
     let current = std::env::current_exe()
@@ -930,14 +1181,14 @@ fn validate_auto_executable(path: &Path, root: &Path) -> Result<PinnedExecutable
         .canonicalize()
         .map_err(|e| format!("PresentMon trusted root {}: {e}", root.display()))?;
     require_fixed_local_drive(&root)?;
-    let executable = validate_executable(path, true)?;
+    let executable = validate_executable(path)?;
     if !executable.path.starts_with(&root) {
         return Err("PresentMon candidate escapes its trusted root".into());
     }
     Ok(executable)
 }
 
-fn validate_executable(path: &Path, automatic: bool) -> Result<PinnedExecutable, String> {
+fn validate_executable(path: &Path) -> Result<PinnedExecutable, String> {
     let canonical = path
         .canonicalize()
         .map_err(|e| format!("PresentMon path {}: {e}", path.display()))?;
@@ -954,11 +1205,10 @@ fn validate_executable(path: &Path, automatic: bool) -> Result<PinnedExecutable,
     }
     let pinned = pin_canonical_executable(canonical)?;
     verify_authenticode(&pinned.file, &pinned.path)?;
-    if automatic
-        && (pinned.identity.size != PRESENTMON_SIZE
-            || held_sha256(&pinned.file, pinned.identity.size)? != PRESENTMON_SHA256)
+    if pinned.identity.size != PRESENTMON_SIZE
+        || held_sha256(&pinned.file, pinned.identity.size)? != PRESENTMON_SHA256
     {
-        return Err("bundled PresentMon does not match the pinned v2.5.1 artifact".into());
+        return Err("PresentMon does not match the pinned v2.5.1 artifact".into());
     }
     Ok(pinned)
 }
@@ -1232,71 +1482,6 @@ fn verify_authenticode(file: &File, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_help(executable: &PinnedExecutable) -> Result<(), String> {
-    let mut child = Command::new(&executable.path)
-        .arg("--help")
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("run PresentMon --help: {e}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("PresentMon help stdout unavailable")?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or("PresentMon help stderr unavailable")?;
-    let read = |mut pipe: Box<dyn Read + Send>| {
-        std::thread::spawn(move || {
-            let mut output = Vec::new();
-            pipe.by_ref()
-                .take((MAX_HELP_BYTES + 1) as u64)
-                .read_to_end(&mut output)
-                .map(|_| output)
-        })
-    };
-    let stdout_thread = read(Box::new(stdout));
-    let stderr_thread = read(Box::new(stderr));
-    let deadline = Instant::now() + HELP_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                return Err("PresentMon --help timed out after 10 seconds".into());
-            }
-            Err(e) => return Err(format!("wait for PresentMon --help: {e}")),
-        }
-    }
-    let stdout = stdout_thread
-        .join()
-        .map_err(|_| "PresentMon help reader failed")?
-        .map_err(|e| format!("read PresentMon help: {e}"))?;
-    let stderr = stderr_thread
-        .join()
-        .map_err(|_| "PresentMon help reader failed")?
-        .map_err(|e| format!("read PresentMon help: {e}"))?;
-    if stdout.len() > MAX_HELP_BYTES || stderr.len() > MAX_HELP_BYTES {
-        return Err("PresentMon --help output exceeds 512 KiB".into());
-    }
-    let output = String::from_utf8_lossy(&stdout).into_owned() + &String::from_utf8_lossy(&stderr);
-    for flag in REQUIRED_FLAGS {
-        if !output.contains(flag) {
-            return Err(format!(
-                "PresentMon --help does not advertise required flag {flag}"
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
@@ -1505,6 +1690,23 @@ mod tests {
     }
 
     #[test]
+    fn session_names_are_unique_and_presentmon_args_are_exact() {
+        let first = new_session_name(4242).unwrap();
+        assert_ne!(first, new_session_name(4242).unwrap());
+        #[rustfmt::skip]
+        assert!(first.starts_with("LCDSirPlus-4242-") && first.len() == 48 && first[16..].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        #[rustfmt::skip]
+        assert_eq!(
+            presentmon_args(4242, &first),
+            ["--process_id", "4242", "--output_stdout", "--no_console_stats", "--terminate_on_proc_exit", "--session_name", &first, "--v2_metrics", "--exclude_dropped"].map(OsString::from)
+        );
+        assert!(trace_stop_succeeded(ERROR_MORE_DATA.0));
+        assert!(!trace_stop_succeeded(5));
+        stop_etw_session(&first).unwrap();
+        stop_etw_session(&first).unwrap();
+    }
+
+    #[test]
     fn stats_compute_lows_stutters_session_and_window() {
         let observed = Instant::now();
         let mut stats = Stats::new(30.0, Duration::from_secs(5));
@@ -1647,6 +1849,29 @@ mod tests {
     }
 
     #[test]
+    fn drain_reports_disconnection_after_prior_frames() {
+        let (line_tx, line_rx) = mpsc::sync_channel(2);
+        line_tx
+            .send("Application,ProcessID,FrameTime".into())
+            .unwrap();
+        line_tx.send("game.exe,42,16.0".into()).unwrap();
+        drop(line_tx);
+        let mut capture = Capture::default();
+        capture.lines = Some(line_rx);
+        capture.target = ProcessInfo {
+            pid: 42,
+            name: "game.exe".into(),
+        };
+        capture.stats = Some(Stats::new(30.0, Duration::from_secs(60)));
+        let (updates, _rx) = mpsc::channel();
+        let error = capture
+            .drain(&Config::default(), 1, &updates, Instant::now())
+            .unwrap_err();
+        assert!(capture.last_frame.is_some());
+        assert!(error.contains("output reader disconnected"));
+    }
+
+    #[test]
     fn output_reader_exits_when_shutdown_drops_its_mailbox() {
         let (tx, rx) = mpsc::sync_channel(1);
         drop(rx);
@@ -1691,6 +1916,56 @@ mod tests {
         )
         .unwrap();
         assert!(!expired.active && !expired.fps.valid);
+    }
+
+    #[test]
+    fn stale_and_expired_updates_are_not_republished_as_active_until_a_new_frame() {
+        let cfg = Config::default();
+        let (line_tx, line_rx) = mpsc::sync_channel(4);
+        line_tx
+            .send("Application,ProcessID,FrameTime".into())
+            .unwrap();
+        line_tx.send("game.exe,42,16.0".into()).unwrap();
+        let (updates, rx) = mpsc::channel();
+        let mut capture = Capture::default();
+        capture.lines = Some(line_rx);
+        capture.target = ProcessInfo {
+            pid: 42,
+            name: "game.exe".into(),
+        };
+        capture.stats = Some(Stats::new(30.0, cfg.presentmon_window));
+        capture.drain(&cfg, 1, &updates, Instant::now()).unwrap();
+        assert!(rx.recv().unwrap().available);
+
+        let stale_at = Instant::now() - Duration::from_secs(6);
+        capture.last_frame = Some(stale_at);
+        capture.last_publish = Some(stale_at);
+        capture.last_target_poll = Some(Instant::now());
+        capture.reconcile(&cfg, 1, &updates, &|_, _| unreachable!());
+        let stale = rx.recv().unwrap();
+        assert!(stale.detail.contains("capture stale") && stale.game.fps.stale);
+        capture.last_publish = Some(stale_at);
+        capture.last_target_poll = Some(Instant::now());
+        capture.reconcile(&cfg, 1, &updates, &|_, _| unreachable!());
+        assert!(rx.try_recv().is_err());
+
+        let expired_at = Instant::now() - Duration::from_secs(11);
+        capture.last_frame = Some(expired_at);
+        capture.last_publish = Some(expired_at);
+        capture.last_target_poll = Some(Instant::now());
+        capture.reconcile(&cfg, 1, &updates, &|_, _| unreachable!());
+        let expired = rx.recv().unwrap();
+        assert!(expired.detail.contains("stale data expired") && !expired.game.active);
+        capture.last_publish = Some(expired_at);
+        capture.last_target_poll = Some(Instant::now());
+        capture.reconcile(&cfg, 1, &updates, &|_, _| unreachable!());
+        assert!(rx.try_recv().is_err());
+
+        line_tx.send("game.exe,42,16.0".into()).unwrap();
+        capture.last_target_poll = Some(Instant::now());
+        capture.reconcile(&cfg, 1, &updates, &|_, _| unreachable!());
+        assert!(rx.recv().unwrap().available);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -1776,6 +2051,114 @@ mod tests {
     }
 
     #[test]
+    fn failed_cleanup_is_retained_and_gates_retry() {
+        let mut capture = Capture::default();
+        capture.owned_session = Some("LCDSirPlus-42-owned".into());
+        capture.stop_with(|_| Ok(()), |_| Err("injected failure".into()));
+        #[rustfmt::skip]
+        assert_eq!(capture.owned_session.as_deref(), Some("LCDSirPlus-42-owned"));
+        capture.schedule_retry(Instant::now());
+        assert!(retry_pending(capture.retry_after, Instant::now()));
+        #[rustfmt::skip]
+        capture.stop_with(|_| Ok(()), |name| { assert_eq!(name, "LCDSirPlus-42-owned"); Ok(()) });
+    }
+
+    #[test]
+    fn unconfirmed_child_retains_capture_and_gates_new_start() {
+        #[rustfmt::skip]
+        let child = Command::new(std::env::current_exe().unwrap()).arg("--list").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let executable = pin_executable(&std::env::current_exe().unwrap()).unwrap();
+        let mut capture = Capture::default();
+        capture.child = Some(child);
+        capture.owned_session = Some("LCDSirPlus-42-owned".into());
+        capture.reader = Some(std::thread::spawn(|| {}));
+        capture.target = ProcessInfo {
+            pid: 42,
+            name: "game.exe".into(),
+        };
+        capture.stop_with(
+            |_| Err("forced kill/wait timeout".into()),
+            |_| panic!("ETW cleanup must wait for confirmed child exit"),
+        );
+        assert!(capture.child.is_some() && capture.reader.is_some());
+        assert_eq!(
+            capture.owned_session.as_deref(),
+            Some("LCDSirPlus-42-owned")
+        );
+        assert_eq!(capture.target.pid, 42);
+        assert!(capture.stop_diagnostic.contains("forced kill/wait timeout"));
+        let error = capture
+            .start(
+                &executable,
+                ProcessInfo {
+                    pid: 7,
+                    name: "next.exe".into(),
+                },
+                &Config::default(),
+                "next".into(),
+                &|_, _| panic!("start validation must follow teardown gating"),
+            )
+            .unwrap_err();
+        assert!(error.contains("teardown is still pending"));
+    }
+
+    #[test]
+    fn start_refuses_a_changed_final_request_before_spawn() {
+        let executable = pin_executable(&std::env::current_exe().unwrap()).unwrap();
+        let target = ProcessInfo {
+            pid: 42,
+            name: "game.exe".into(),
+        };
+        let checked = std::cell::Cell::new(false);
+        let error = Capture::default()
+            .start(
+                &executable,
+                target,
+                &Config::default(),
+                "expected".into(),
+                &|_, _| {
+                    checked.set(true);
+                    Err("forced final request change".into())
+                },
+            )
+            .unwrap_err();
+        assert!(checked.get());
+        assert!(error.contains("forced final request change"));
+    }
+
+    #[test]
+    fn detached_reader_skips_diagnostic_lock_and_bounded_helpers_timeout() {
+        let diagnostic = Arc::new(std::sync::Mutex::new(BoundedDiagnostic::default()));
+        let guard = diagnostic.lock().unwrap();
+        let reader = std::thread::spawn(|| std::thread::sleep(Duration::from_millis(50)));
+        assert_eq!(
+            join_thread_bounded(reader, Instant::now()),
+            Err("reader timed out and was detached")
+        );
+        let started = Instant::now();
+        assert!(take_diagnostic(Some(Arc::clone(&diagnostic)), false).is_empty());
+        assert!(started.elapsed() < Duration::from_millis(20));
+        assert!(wait_bounded(Duration::ZERO, || Ok(false))
+            .unwrap_err()
+            .contains("exit was not confirmed"));
+        drop(guard);
+    }
+
+    #[test]
+    fn capture_boundedly_stops_child_and_readers_before_cleanup() {
+        #[rustfmt::skip]
+        let child = Command::new(std::env::current_exe().unwrap()).arg("--list").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let mut capture = Capture::default();
+        capture.child = Some(child);
+        let delay = Duration::from_millis(20);
+        capture.reader = Some(std::thread::spawn(move || std::thread::sleep(delay)));
+        capture.owned_session = Some("LCDSirPlus-77-owned".into());
+        let started = Instant::now();
+        #[rustfmt::skip]
+        capture.stop_with(|child| stop_child_bounded(child, Duration::from_millis(STOP_TIMEOUT_MS.into())), |name| { assert!((Duration::from_millis(20)..=Duration::from_millis(STOP_TIMEOUT_MS.into())).contains(&started.elapsed())); assert_eq!(name, "LCDSirPlus-77-owned"); Ok(()) });
+    }
+
+    #[test]
     fn pinned_executable_denies_writers_until_release() {
         let temp =
             std::env::temp_dir().join(format!("lcdsirplus-presentmon-pin-{}", std::process::id()));
@@ -1796,8 +2179,7 @@ mod tests {
             return;
         }
         validate_auto_executable(&executable, &root).unwrap();
-        let custom = validate_executable(&executable, false).unwrap();
-        verify_help(&custom).unwrap();
+        validate_executable(&executable).unwrap();
 
         let temp = std::env::temp_dir().join(format!(
             "lcdsirplus-presentmon-tamper-{}",
@@ -1809,7 +2191,7 @@ mod tests {
         let mut bytes = std::fs::read(&tampered).unwrap();
         bytes[0] ^= 1;
         std::fs::write(&tampered, bytes).unwrap();
-        assert!(validate_executable(&tampered, true).is_err());
+        assert!(validate_executable(&tampered).is_err());
         std::fs::remove_dir_all(temp).unwrap();
     }
 
