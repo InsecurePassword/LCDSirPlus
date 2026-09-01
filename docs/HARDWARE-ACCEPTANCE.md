@@ -121,19 +121,37 @@ Get-AuthenticodeSignature -FilePath $pm |
   acceptance configuration with `presentmon_enabled 1`, `presentmon_path auto`,
   `log_level debug`, and a new evidence directory selected with
   `--diagnostic-dir`.
-- Test `process_name` first. Set `presentmon_target_mode process_name` and
-  `presentmon_process_name` to the exact executable filename of a known
-  presenting game, start that game, then run the final packaged
+- Test default `presenting` mode first with one exact-path high-confidence game
+  in a valid NVIDIA App local catalog plus Chrome or OpenCode presenting at a
+  higher frame rate, then run the final packaged
   `LCDSirPlus.exe --config <acceptance-config> --diagnostic-dir <evidence-dir>`.
   Record the LCD/preview and the single child `PresentMon.exe` PID. Cycle through
   `FPS_CURRENT`, `FPS_1LOW`, `FPS_01LOW`, `FRAME_TIME`, `SESSION_TIME`,
   `SESSION_SUMMARY`, and `GAME_NAME`; confirm plausible FPS/lows/frame time,
-  advancing session time, accumulated stutter count, and the exact selected game.
-- Then set `presentmon_target_mode foreground`, clear
-  `presentmon_process_name`, and repeat after focusing the game. Alt-Tab between
-  two presenting processes and an excluded shell process. Confirm target/game
-  changes start a new session, excluded/no-target state does not capture the
-  shell, and no more than one LCDSirPlus-owned PresentMon child exists.
+  advancing session time, accumulated stutter count, and autonomous selection of
+  the catalog-qualified game without a configured name. Confirm Chrome/OpenCode
+  is never selected, then Alt-Tab to excluded shell/noise and confirm the active
+  game remains sticky. Stop it beyond expiry and confirm the provider waits
+  unavailable rather than publishing desktop metrics, statistics/session reset,
+  and the same single LCDSirPlus-owned PresentMon child remains. Separately make
+  the catalog unavailable without modifying it and confirm the R4 generic
+  workload fallback still selects deterministically.
+- With `presentmon_deferred 1`, stop the game and verify every configured
+  PresentMon panel falls through to the next eligible token while button cycling
+  and the stored selection remain unchanged; verify an all-deferred slot shows
+  `CLEAR`. Repeat with `presentmon_deferred 0` and confirm `N/A`, `STALE`,
+  `00:00`, `IDLE`, and game-name `N/A` appear as appropriate.
+- Repeat autonomous capture with `presentmon_persist 1` and a valid catalog.
+  Confirm a sustained non-game presenter can be selected through generic R4
+  inference, then confirm exclusions, PID/image identity, switching hysteresis,
+  stale expiry, config reset, and one-child ownership still hold. Restore the
+  default `presentmon_persist 0` and confirm the valid catalog rejects it again.
+- Then test both targeted expert overrides. Set `presentmon_target_mode
+  process_name` with the exact game executable, then set
+  `presentmon_target_mode foreground`, clear `presentmon_process_name`, and
+  repeat after focusing the game. Confirm each target change starts a new child
+  and session, excluded/no-target state does not capture the shell, and no more
+  than one LCDSirPlus-owned PresentMon child exists.
 - Stop rendering without exiting for at least five seconds and confirm metrics
   become `STALE`; continue beyond ten seconds and confirm they expire. Resume
   and confirm recovery. Change target and PresentMon settings while capturing,

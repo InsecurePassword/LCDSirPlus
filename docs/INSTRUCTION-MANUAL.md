@@ -333,16 +333,45 @@ provider publishes the required per-domain temperatures.
 Published release packages are designed to bundle Intel's official signed PresentMon v2.5.1 console as
 `PresentMon.exe`. Default `presentmon_path auto` uses that colocated file;
 plain Cargo output does not bundle it. Advanced users can select a valid console
-on a trusted fixed local drive explicitly. Default foreground
-targeting follows the current foreground process. Process-name mode requires
-`presentmon_process_name`.
+on a trusted fixed local drive explicitly. Default `presenting` mode observes
+local application/PID frame streams and automatically selects a current
+presenter. `foreground` and `process_name` remain expert targeted overrides;
+process-name mode requires `presentmon_process_name`.
 
-LCDSirPlus launches and owns PresentMon only while an enabled target frame
-capture is active and stops its own child on target/config change or shutdown.
-It provides FPS, low FPS, frame time, game name, session duration, and stutter
-count only; it does not provide CPU/GPU hardware telemetry. No PresentMon
-service, MSI, GUI, or API/SDK is bundled or installed. Data becomes stale after
-five seconds without frames and expires after another five.
+LCDSirPlus launches and owns PresentMon only while capture is enabled and stops
+its own child/session on config change or shutdown. In `presenting` mode one
+targetless child remains running across presenter changes; local exclusions and
+an optional current-user NVIDIA App local catalog select the game. A valid
+catalog requires an exact full executable path and all high-confidence game
+flags, so Chrome, OpenCode, basename-only matches, and unsupported games are not
+selected. If the fixed catalog is absent, inaccessible, unsafe, malformed, or
+schema-incompatible, bounded PresentMon graphics/CPU workload with
+foreground/activity fallback and switch hysteresis is used instead. NVIDIA App
+is not required. LCDSirPlus never writes or displays the catalog, logs its raw
+inventory, invokes NVIDIA/DRS, reads Xbox catalogs, or performs catalog network
+access. Statistics
+reset on every PID, creation-time, or executable-image change. It provides FPS, low FPS, frame time, game name, session
+duration, and stutter count only; it does not provide CPU/GPU hardware
+telemetry. No PresentMon service, MSI, GUI, or API/SDK is bundled or installed.
+Data becomes stale after five seconds without frames and expires after another
+five before another active presenter can be selected.
+
+`presentmon_deferred 1` is the default display policy. If a selected PresentMon
+panel has no current usable data, rendering temporarily scans forward through
+that slot's configured tokens without changing its saved selection or button
+position. It skips unavailable PresentMon panels and never falls back to
+`PROC_HANG` or `BOTTLENECK`; if nothing qualifies it shows `CLEAR`. Set
+`presentmon_deferred 0` to keep the selected panel visible with its normal
+inactive text: `N/A`/`STALE` for metrics, `00:00` for session time, `IDLE` for
+session summary, and `N/A` for game name.
+
+`presentmon_persist 0` keeps the catalog game gate. Opt-in
+`presentmon_persist 1` affects only autonomous `presenting` and allows generic
+non-game presenters through the same bounded workload, foreground, identity,
+exclusion, hysteresis, stale, and expiry rules. A desktop application's name and
+FPS can therefore appear on the display. Persistence does not pin a target,
+retain stale statistics, guarantee DWM attribution, or override disabled/safe
+mode. Targeted modes are unchanged, and catalog contents remain private.
 
 If capture cannot start, add the user to Windows' **Performance Log Users**
 group and sign out/in, or test elevation if local ETW policy requires it.
@@ -640,12 +669,16 @@ server, and kept `lhm_url` on loopback. LCDSirPlus cannot turn that server on.
 ### PresentMon capture remains N/A
 
 Confirm `PresentMon.exe` remains beside `LCDSirPlus.exe`,
-`presentmon_enabled 1`, targeting is not disabled, and the foreground/explicit
-process is actively presenting frames. Do not install the PresentMon service or
-MSI for LCDSirPlus. If logs show ETW/capture access failure, add the user to
+`presentmon_enabled 1`, targeting is not disabled, and a local presenter (or the
+foreground/explicit override) is actively presenting frames. Check
+`presentmon_exclude` if an expected application is not selected. Do not install
+the PresentMon service or MSI for LCDSirPlus. If logs show ETW/capture access failure, add the user to
 **Performance Log Users** and sign out/in; elevation can be tested only to
 diagnose restrictive local policy. PresentMon supplies no hardware telemetry,
 so it cannot fix CPU/GPU temperature or load-source failures.
+With default `presentmon_deferred 1`, also check the next configured slot token:
+an unavailable PresentMon panel may be deferred rather than visibly showing
+`N/A`. Temporarily set it to `0` when diagnosing the panel itself.
 
 ### Ping/jitter/loss remain unavailable
 
@@ -690,15 +723,16 @@ Diagnostics mode ignores `--config`, starts no hardware/providers/probes/
 Discord/actions, and writes a store-only ZIP capped at 1 MiB. It contains only
 `privacy.txt`, `report.txt`, and `manifest.txt`. It excludes raw logs and
 configuration, credentials, Discord content and identifiers, process/window
-details, user paths, network targets, environment and registry values, serials,
-and device paths. Review any bundle before sharing. Raw logs and configuration
+details, NVIDIA App catalog contents, user paths, network targets, environment
+and registry values, serials, and device paths. Review any bundle before sharing. Raw logs and configuration
 may still contain operational detail and should not be posted without private
 review.
 
 LCDSirPlus is local-first. Normal optional outbound traffic is limited to a
 configured network probe and Discord token exchange/refresh. LHM is restricted
 to loopback. HWiNFO access is read-only shared memory, and PresentMon uses local
-ETW/captured frame output. No LCDSirPlus feature opens an inbound listener.
+ETW/captured frame output. The optional NVIDIA App catalog hint is local and
+read-only with no network request. No LCDSirPlus feature opens an inbound listener.
 
 Normal launch is a GUI/tray process with no console. One-shot commands attach
 output to a parent console or redirected handles. Interactive PowerShell does

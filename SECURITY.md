@@ -19,10 +19,35 @@ user-managed and not bundled; its absence is an acceptable unavailable state.
 
 Planned release packages bundle the official Intel-signed PresentMon v2.5.1
 console and exact `licenses/PresentMon/LICENSE.txt`/`THIRD_PARTY.txt` notices. LCDSirPlus validates
-the automatic artifact, starts it without a shell only for active frame capture,
-and terminates only its owned child. It installs no PresentMon service, MSI,
-GUI, or API. Local ETW policy can require Performance Log Users membership or
-elevation for capture; neither is granted by LCDSirPlus.
+the automatic artifact and starts it without a shell only while frame capture is
+enabled. Default mode receives targetless local application/PID frame timing and
+rejects invalid, excluded, and LCDSirPlus identities before retaining bounded
+candidate activity and selected-only statistics. Candidates are bound to PID,
+creation time, and executable image through cached original-process handles;
+failed identity queries are rejected. Selection uses bounded PresentMon
+frame-level graphics/CPU workload. Autonomous mode optionally reads only
+`%LOCALAPPDATA%\NVIDIA Corporation\NVIDIA App\NvBackend\ApplicationStorage.json`
+as a same-user, untrusted selection hint. Reads are capped at 1 MiB, 4096
+application records, and 64 detected paths per record. Malformed or ambiguous
+application records are skipped, but at least one fully typed record is required;
+malformed roots, unsupported record-only inputs, and unsafe or changing files are
+unavailable. A valid catalog admits only an exact
+full-process-image path with all required high-confidence flags and rejects all
+other presenters. The cache retains only normalized qualified paths, is cleared
+with the provider, and logs only state transitions with a fixed reason code or
+bounded qualified-path count, never raw catalog paths, records, names, or
+timestamps. LCDSirPlus never writes or scans NVIDIA data, invokes NVIDIA/NVAPI
+DRS, accesses Xbox catalogs, uses network catalog services, or treats this hint
+as an authorization boundary. Generic workload/activity inference is used only
+when the catalog is unavailable. It terminates only its owned
+child and exact ETW session and installs no PresentMon service, MSI, GUI, or API.
+Opt-in `presentmon_persist` treats the catalog as unavailable only for autonomous
+candidate selection. It broadens eligible local presenters, so a desktop
+application's executable name and FPS may appear on the LCD/preview and in
+existing PresentMon status detail, but it does not weaken process identity,
+exclusions, queue/bounds, stale expiry, cleanup, or catalog privacy controls.
+Local ETW policy can require Performance Log Users membership or elevation for
+capture; neither is granted by LCDSirPlus.
 
 Published LCDSirPlus packages will not be code-signed even though the bundled PresentMon
 binary is. Verify `LCDSirPlus-0.3.0-SHA256SUMS.txt` and the package's sorted

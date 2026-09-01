@@ -147,7 +147,7 @@ slot_3  THERMALS PACKET_LOSS MIC_STATUS SESSION_SUMMARY PROVIDER_STATUS
 ```
 
 Common provider settings include `gpu_provider`, `presentmon_target_mode`,
-`lhm_mode`, `network_probe_enabled`, `network_probe_target`,
+`presentmon_deferred`, `presentmon_persist`, `lhm_mode`, `network_probe_enabled`, `network_probe_target`,
 `discord_client_id`, and `preview_mode`.
 
 Warning categories are independently hot-reloaded:
@@ -173,17 +173,30 @@ See the [Configuration Reference](docs/CONFIGURATION.md) or
 [Instruction Manual](docs/INSTRUCTION-MANUAL.md) for advanced settings and
 button actions.
 
-Unavailable or stale data is shown explicitly rather than replaced by another
-metric. Release packages are designed to bundle the signed official PresentMon
+Unavailable or stale data is normally shown explicitly. By default,
+`presentmon_deferred 1` temporarily renders the next eligible configured slot
+token instead of an unavailable PresentMon panel without changing the stored
+selection; set it to `0` to retain the panel's existing inactive text. Release
+packages are designed to bundle the signed official PresentMon
 v2.5.1 console for frame/FPS timing; other optional programs and hardware,
 including user-managed LibreHardwareMonitor, are not bundled. LHM being absent
 is an acceptable unavailable state, and exact SensorIds come from its loopback
 `data.json` response, not diagnostics.
 
 PresentMon support is implemented, software-tested, and pinned, and remains
-enabled by default as a required feature. Live capture against an actively
-presenting game is not yet release-qualified and is deferred while this PC's
-memory is occupied by the local LLM; release remains pending that gate.
+enabled by default as a required feature. Default `presenting` mode observes
+local frame streams and optionally reads the current user's fixed NVIDIA App
+`ApplicationStorage.json` catalog. When that private catalog is valid, only an
+exact full-path record with all high-confidence game flags can be selected; when
+it is unavailable or invalid, bounded PresentMon workload inference remains the
+fallback. NVIDIA App is not required, and LCDSirPlus never writes the catalog,
+logs its inventory, invokes NVIDIA, uses DRS, or performs catalog network access.
+`presentmon_persist 0` keeps that gate. Opt-in `presentmon_persist 1` ignores the
+gate only for autonomous selection and allows generic desktop presenters through
+the same bounded workload, identity, exclusion, expiry, and hysteresis rules.
+Live capture against an
+actively presenting game is not yet release-qualified and is deferred while
+this PC's memory is occupied by the local LLM; release remains pending that gate.
 
 ## Display options
 

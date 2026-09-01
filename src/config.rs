@@ -156,6 +156,8 @@ pub struct Config {
     pub presentmon_interval: Duration,
     pub presentmon_window: Duration,
     pub presentmon_target_mode: String,
+    pub presentmon_deferred: bool,
+    pub presentmon_persist: bool,
     pub presentmon_process_name: String,
     pub presentmon_exclude: Vec<String>,
     pub stutter_threshold_ms: f64,
@@ -282,7 +284,9 @@ impl Default for Config {
             presentmon_path: "auto".into(),
             presentmon_interval: Duration::from_secs(1),
             presentmon_window: Duration::from_secs(60),
-            presentmon_target_mode: "foreground".into(),
+            presentmon_target_mode: "presenting".into(),
+            presentmon_deferred: true,
+            presentmon_persist: false,
             presentmon_process_name: String::new(),
             presentmon_exclude: [
                 "dwm.exe",
@@ -542,9 +546,12 @@ pub fn validate(c: &Config) -> Result<(), String> {
     }
     if !matches!(
         c.presentmon_target_mode.as_str(),
-        "foreground" | "process_name" | "disabled"
+        "presenting" | "foreground" | "process_name" | "disabled"
     ) {
-        return Err("presentmon_target_mode must be foreground, process_name, or disabled".into());
+        return Err(
+            "presentmon_target_mode must be presenting, foreground, process_name, or disabled"
+                .into(),
+        );
     }
     if c.presentmon_target_mode == "process_name" && c.presentmon_process_name.is_empty() {
         return Err("presentmon_process_name is required in process_name mode".into());
@@ -873,9 +880,34 @@ mod tests {
         assert!(cfg.memory_warning_enabled);
         assert!(cfg.temperature_warning_enabled);
         assert!(!cfg.hang_enabled);
+        assert_eq!(cfg.presentmon_target_mode, "presenting");
+        assert!(cfg.presentmon_deferred);
+        assert!(!cfg.presentmon_persist);
         assert_eq!(cfg.memory_warning, 100.0);
         assert_eq!(cfg.vmem_warning, 100.0);
         assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn presentmon_modes_preserve_targeted_overrides() {
+        for mode in ["presenting", "foreground", "disabled"] {
+            assert!(validate(&Config {
+                presentmon_target_mode: mode.into(),
+                ..Config::default()
+            })
+            .is_ok());
+        }
+        assert!(validate(&Config {
+            presentmon_target_mode: "process_name".into(),
+            presentmon_process_name: "game.exe".into(),
+            ..Config::default()
+        })
+        .is_ok());
+        assert!(validate(&Config {
+            presentmon_target_mode: "process_name".into(),
+            ..Config::default()
+        })
+        .is_err());
     }
 
     #[test]
@@ -941,6 +973,18 @@ mod tests {
         .expect("canonical shipped configuration must parse");
         let defaults = Config::default();
         assert_eq!(defaults.slots, shipped.slots);
+        assert_eq!(
+            (
+                &defaults.presentmon_target_mode,
+                defaults.presentmon_deferred,
+                defaults.presentmon_persist,
+            ),
+            (
+                &shipped.presentmon_target_mode,
+                shipped.presentmon_deferred,
+                shipped.presentmon_persist,
+            )
+        );
         assert_eq!(
             (
                 defaults.memory_warning_enabled,

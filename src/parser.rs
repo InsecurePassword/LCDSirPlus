@@ -425,6 +425,8 @@ impl ParseContext {
                 cfg.presentmon_window = ms_auto(v, Duration::from_secs(60))?;
             }
             "presentmon_target_mode" => cfg.presentmon_target_mode = lower_one(v)?,
+            "presentmon_deferred" => cfg.presentmon_deferred = boolv(v)?,
+            "presentmon_persist" => cfg.presentmon_persist = boolv(v)?,
             "presentmon_process_name" => cfg.presentmon_process_name = one(v)?,
             "presentmon_exclude" => cfg.presentmon_exclude = v.to_vec(),
             "stutter_threshold_ms" => cfg.stutter_threshold_ms = floatv(v)?,
@@ -707,6 +709,18 @@ mod tests {
                 .unwrap();
         assert_eq!(cfg.telemetry_interval, Duration::from_millis(300));
         assert_eq!(cfg.render_interval, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn presentmon_pane_modes_use_standard_boolean_grammar() {
+        let cfg = parse_standalone(b"presentmon_deferred 0\npresentmon_persist yes\n").unwrap();
+        assert!(!cfg.presentmon_deferred);
+        assert!(cfg.presentmon_persist);
+        for key in ["presentmon_deferred", "presentmon_persist"] {
+            let error = parse_standalone(format!("{key} maybe\n").as_bytes()).unwrap_err();
+            assert_eq!(error.line, 1);
+            assert!(error.message.contains("must be 0/1 or true/false"));
+        }
     }
 
     #[test]

@@ -272,7 +272,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
         if now.duration_since(last_render) >= cfg.render_interval {
             last_render = now;
             let view = View {
-                slot_modules: effective_slot_modules(&slots, &snapshot),
+                slot_modules: effective_slot_modules(&slots, &snapshot, &cfg),
                 hung_index: hang_hold.hung_index,
                 hung_detail: hang_hold.hung_detail,
                 hung_hold: hang_hold.progress(now, &cfg),
@@ -387,19 +387,55 @@ fn proc_hang_owner(slots: &Manager) -> Option<usize> {
     (0..4).find(|&slot| slots.current(slot).eq_ignore_ascii_case("PROC_HANG"))
 }
 
-fn effective_slot_modules(slots: &Manager, snapshot: &Snapshot) -> [String; 4] {
+fn effective_slot_modules(slots: &Manager, snapshot: &Snapshot, cfg: &Config) -> [String; 4] {
+    let provider_current = !cfg.safe_mode
+        && cfg.presentmon_enabled
+        && cfg.presentmon_target_mode != "disabled"
+        && snapshot.providers.get("presentmon") == Some(&true);
+    let metric_current = |metric: crate::model::Metric| {
+        provider_current && metric.valid && !metric.stale && metric.value.is_finite()
+    };
+    let presentmon_available = |module: &str| match module.to_ascii_uppercase().as_str() {
+        "FPS_CURRENT" | "FPS_GRAPH" => Some(metric_current(snapshot.game.fps)),
+        "FPS_1LOW" => Some(metric_current(snapshot.game.one_percent)),
+        "FPS_01LOW" => Some(metric_current(snapshot.game.point_one_low)),
+        "FRAME_TIME" => Some(metric_current(snapshot.game.frame_time_ms)),
+        "SESSION_TIME" | "SESSION_SUMMARY" => {
+            Some(provider_current && snapshot.game.active && snapshot.game.session_start.is_some())
+        }
+        "GAME_NAME" => Some(
+            provider_current
+                && snapshot.game.active
+                && snapshot.game.session_start.is_some()
+                && !snapshot.game.game_name.is_empty(),
+        ),
+        _ => None,
+    };
     std::array::from_fn(|slot| {
         let selected = slots.current(slot);
-        let inactive = (selected.eq_ignore_ascii_case("PROC_HANG") && snapshot.hung.is_empty())
+        let inactive_dynamic = (selected.eq_ignore_ascii_case("PROC_HANG")
+            && snapshot.hung.is_empty())
             || (selected.eq_ignore_ascii_case("BOTTLENECK")
                 && snapshot.bottleneck.state == crate::model::BottleneckState::None
                 && snapshot.bottleneck.freshness == Freshness::Current);
-        if inactive {
-            slots
-                .next_except(slot, &["PROC_HANG", "BOTTLENECK"])
-                .unwrap_or_else(|| "CLEAR".into())
-        } else {
-            selected
+        let inactive_presentmon = cfg.presentmon_deferred
+            && presentmon_available(&selected).is_some_and(|available| !available);
+        if !inactive_dynamic && !inactive_presentmon {
+            return selected;
+        }
+
+        let mut excluded = vec!["PROC_HANG".to_string(), "BOTTLENECK".to_string(), selected];
+        loop {
+            let excluded_refs: Vec<_> = excluded.iter().map(String::as_str).collect();
+            let Some(candidate) = slots.next_except(slot, &excluded_refs) else {
+                return "CLEAR".into();
+            };
+            if !cfg.presentmon_deferred
+                || presentmon_available(&candidate).is_none_or(|available| available)
+            {
+                return candidate;
+            }
+            excluded.push(candidate);
         }
     })
 }
@@ -1470,19 +1506,164 @@ mod tests {
         snapshot.bottleneck.state = crate::model::BottleneckState::None;
         snapshot.bottleneck.freshness = Freshness::Current;
         assert_eq!(slots.current(2), "PROC_HANG");
-        assert_eq!(effective_slot_modules(&slots, &snapshot)[2], "GPU_TEMP");
+        assert_eq!(
+            effective_slot_modules(&slots, &snapshot, &cfg)[2],
+            "GPU_TEMP"
+        );
         assert_eq!(slots.current(2), "PROC_HANG");
 
         snapshot.hung.push(crate::model::HungTarget::default());
-        assert_eq!(effective_slot_modules(&slots, &snapshot)[2], "PROC_HANG");
+        assert_eq!(
+            effective_slot_modules(&slots, &snapshot, &cfg)[2],
+            "PROC_HANG"
+        );
 
         let mut dynamic = cfg;
         dynamic.slots[0] = vec!["BOTTLENECK".into(), "PROC_HANG".into()];
         dynamic.slots[2] = vec!["GPU_TEMP".into()];
         let slots = Manager::new(&dynamic, [0; 4]);
         snapshot.hung.clear();
-        assert_eq!(effective_slot_modules(&slots, &snapshot)[0], "CLEAR");
+        assert_eq!(
+            effective_slot_modules(&slots, &snapshot, &dynamic)[0],
+            "CLEAR"
+        );
         assert_eq!(slots.current(0), "BOTTLENECK");
+    }
+
+    #[test]
+    fn presentmon_deferred_resolves_without_changing_stored_selection() {
+        let mut cfg = Config::default();
+        cfg.slots[0] = ["PROC_HANG", "FPS_CURRENT", "GPU_TEMP"]
+            .map(str::to_string)
+            .to_vec();
+        let mut slots = Manager::new(&cfg, [0; 4]);
+        let mut snapshot = Snapshot::default();
+        snapshot.providers.insert("presentmon".into(), true);
+        snapshot.game.active = true;
+        snapshot.game.fps = crate::model::Metric::valid(60.0, SystemTime::now());
+
+        snapshot.hung.push(crate::model::HungTarget::default());
+        assert_eq!(
+            effective_slot_modules(&slots, &snapshot, &cfg)[0],
+            "PROC_HANG"
+        );
+        snapshot.hung.clear();
+        assert_eq!(
+            effective_slot_modules(&slots, &snapshot, &cfg)[0],
+            "FPS_CURRENT"
+        );
+        snapshot.game = Default::default();
+        assert_eq!(
+            effective_slot_modules(&slots, &snapshot, &cfg)[0],
+            "GPU_TEMP"
+        );
+        assert_eq!(slots.current(0), "PROC_HANG");
+
+        assert_eq!(slots.cycle(0, 1), "FPS_CURRENT");
+        assert_eq!(
+            effective_slot_modules(&slots, &snapshot, &cfg)[0],
+            "GPU_TEMP"
+        );
+        assert_eq!(slots.current(0), "FPS_CURRENT");
+
+        cfg.presentmon_deferred = false;
+        assert_eq!(
+            effective_slot_modules(&slots, &snapshot, &cfg)[0],
+            "FPS_CURRENT"
+        );
+    }
+
+    #[test]
+    fn presentmon_deferred_checks_every_panel_and_skips_dynamic_fallbacks() {
+        let modules = [
+            "FPS_CURRENT",
+            "FPS_1LOW",
+            "FPS_01LOW",
+            "FRAME_TIME",
+            "FPS_GRAPH",
+            "SESSION_TIME",
+            "SESSION_SUMMARY",
+            "GAME_NAME",
+        ];
+        let mut current = Snapshot::default();
+        current.providers.insert("presentmon".into(), true);
+        current.game.active = true;
+        current.game.session_start = Some(SystemTime::now());
+        current.game.game_name = "Game".into();
+        current.game.fps = crate::model::Metric::valid(60.0, SystemTime::now());
+        current.game.one_percent = crate::model::Metric::valid(50.0, SystemTime::now());
+        current.game.point_one_low = crate::model::Metric::valid(40.0, SystemTime::now());
+        current.game.frame_time_ms = crate::model::Metric::valid(16.0, SystemTime::now());
+
+        for module in modules {
+            let mut cfg = Config::default();
+            cfg.slots[0] = [module, "GPU_TEMP"].map(str::to_string).to_vec();
+            let slots = Manager::new(&cfg, [0; 4]);
+            assert_eq!(effective_slot_modules(&slots, &current, &cfg)[0], module);
+
+            let mut unavailable = current.clone();
+            match module {
+                "FPS_CURRENT" | "FPS_GRAPH" => unavailable.game.fps.stale = true,
+                "FPS_1LOW" => unavailable.game.one_percent.valid = false,
+                "FPS_01LOW" => unavailable.game.point_one_low.value = f64::NAN,
+                "FRAME_TIME" => unavailable.game.frame_time_ms.value = f64::INFINITY,
+                "SESSION_TIME" | "SESSION_SUMMARY" => unavailable.game.session_start = None,
+                "GAME_NAME" => unavailable.game.game_name.clear(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                effective_slot_modules(&slots, &unavailable, &cfg)[0],
+                "GPU_TEMP",
+                "{module}"
+            );
+
+            unavailable = current.clone();
+            unavailable.providers.remove("presentmon");
+            assert_eq!(
+                effective_slot_modules(&slots, &unavailable, &cfg)[0],
+                "GPU_TEMP",
+                "absent {module}"
+            );
+        }
+
+        let mut cfg = Config::default();
+        cfg.slots[0] = ["FPS_CURRENT", "PROC_HANG", "BOTTLENECK", "GPU_TEMP"]
+            .map(str::to_string)
+            .to_vec();
+        let slots = Manager::new(&cfg, [0; 4]);
+        let mut unavailable = Snapshot::default();
+        unavailable.bottleneck.freshness = Freshness::Current;
+        assert_eq!(
+            effective_slot_modules(&slots, &unavailable, &cfg)[0],
+            "GPU_TEMP"
+        );
+
+        cfg.slots[0].pop();
+        let slots = Manager::new(&cfg, [0; 4]);
+        assert_eq!(
+            effective_slot_modules(&slots, &unavailable, &cfg)[0],
+            "CLEAR"
+        );
+
+        cfg.slots[0] = ["FPS_CURRENT", "GPU_TEMP"].map(str::to_string).to_vec();
+        let slots = Manager::new(&cfg, [0; 4]);
+        cfg.presentmon_enabled = false;
+        assert_eq!(
+            effective_slot_modules(&slots, &current, &cfg)[0],
+            "GPU_TEMP"
+        );
+        cfg.presentmon_enabled = true;
+        cfg.safe_mode = true;
+        assert_eq!(
+            effective_slot_modules(&slots, &current, &cfg)[0],
+            "GPU_TEMP"
+        );
+        cfg.safe_mode = false;
+        cfg.presentmon_target_mode = "disabled".into();
+        assert_eq!(
+            effective_slot_modules(&slots, &current, &cfg)[0],
+            "GPU_TEMP"
+        );
     }
 
     #[test]

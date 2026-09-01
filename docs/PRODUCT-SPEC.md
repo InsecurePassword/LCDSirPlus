@@ -89,7 +89,8 @@ owner checks do not blanket-block unrelated G HUB processes.
   LibreHardwareMonitor loopback JSON are optional fallbacks only where no safe
   native source exists.
 - Official signed bundled PresentMon v2.5.1 console: FPS/frame timing only;
-  launched and owned only during active capture, with no service/MSI/API.
+  default targetless local observation automatically selects one active
+  PID/application while capture is enabled, with no service/MSI/API.
 - Explicitly profiled SteelSeries Arctis/GameBuds wireless USB receiver
   families: optional battery, connection, and model-dependent charging state.
 - Discord local RPC: implemented and software-tested active-speaker overlay with RPC OAuth and
@@ -99,7 +100,22 @@ owner checks do not blanket-block unrelated G HUB processes.
   Public Client authorization is not implemented.
 
 PresentMon is implemented, software-tested, pinned, and remains enabled by
-default because it is a required feature. Live capture against an actively
+default in autonomous `presenting` mode because it is a required feature. The
+selector ranks bounded sustained PresentMon graphics/CPU frame workload, uses
+foreground/recent activity for seeding and fallback, applies switch hysteresis,
+and resets full statistics on PID, creation-time, or executable-image changes.
+In autonomous mode, a valid bounded read-only NVIDIA App private local catalog
+gates candidates to exact full-path records carrying every required
+high-confidence game flag. Generic inference is retained only when that catalog
+is unavailable or invalid. NVIDIA App is optional; no NVIDIA process/API, DRS,
+Xbox catalog, network lookup, vendor write, or raw inventory logging is used.
+Unsupported catalog games can therefore be false negatives while a valid
+catalog is active. `presentmon_deferred` defaults on and performs render-only
+cyclic fallback for unavailable PresentMon panels without changing stored slot
+selection. `presentmon_persist` defaults off; its opt-in autonomous mode treats
+the catalog as unavailable only for the existing generic selector, permitting
+non-game presenters while preserving exclusions, identity binding, workload
+hysteresis, expiry, cleanup, and privacy bounds. Live capture against an actively
 presenting game is not yet release-qualified and is deferred while this PC's
 memory is occupied by the local LLM; release remains pending that gate. Discord
 is also implemented and software-tested, but live voice/OAuth qualification is
@@ -182,6 +198,8 @@ Preview mode `auto` hides the preview when either HID or SDK is connected as a
 physical backend, `always` starts visible unless minimized, and `never` starts
 hidden. Backend reconnect state changes reuse the existing preview window
 rather than creating another UI owner and do not override a manual tray toggle.
+The preview uses Win32 no-activate creation/showing so startup cannot take focus;
+mouse slot clicks and tray/manual visibility remain available.
 
 ## Hung-window detector
 

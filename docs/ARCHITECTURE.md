@@ -244,8 +244,27 @@ Acknowledgement remains shared alert-state behavior.
 - Vendor DLLs are loaded by name only from System32. GPU APIs are read-only,
   versioned, and bounded to vendor maximums. Automatically discovered
   bundled signed PresentMon v2.5.1 is canonically contained beside LCDSirPlus;
-  arguments are passed without a shell, and only the child started for active
-  frame capture is terminated. Its owner thread is joined during shutdown.
+  default mode uses one targetless child and bounded one-second PresentMon
+  graphics/CPU workload buckets with foreground/recent-activity fallback and
+  switch hysteresis. Autonomous selection first applies an optional bounded,
+  read-only NVIDIA App private local catalog gate: a valid catalog retains only
+  normalized exact full paths carrying all required high-confidence flags;
+  malformed or ambiguous records are skipped, at least one fully typed record is
+  required, and unavailable/unsupported input retains generic inference. The
+  cache holds no raw JSON or descriptive inventory,
+  refreshes no faster than every five seconds, retries one metadata race, logs
+  only fixed-code/count state transitions, and clears with provider state. No NVIDIA process,
+  API/DRS, Xbox source, network, or vendor write is involved. Full statistics
+  belong only to the selected PID, creation time, and executable image.
+  `presentmon_persist` defaults off; when enabled only in autonomous mode, the
+  same admission, purge, and ranking pipeline receives an unavailable catalog
+  view and therefore reuses generic R4 inference without bypassing identity,
+  exclusion, bounds, expiry, or lifecycle controls. At render time the shared
+  slot resolver can defer unavailable PresentMon panels cyclically without
+  mutating the slot manager's stored selection. Presenter changes reset
+  statistics without restarting the child. Arguments are passed without a shell,
+  and only the child/session started for active frame capture is terminated. Its
+  owner thread is joined during shutdown.
 
 ## Security posture
 

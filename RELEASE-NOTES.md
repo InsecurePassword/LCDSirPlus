@@ -36,9 +36,11 @@ per-user packaging.
 - Pinned and software-tested Intel's official signed PresentMon v2.5.1 console
   and its MIT/third-party notices for release packaging. Package-level Rust and
   Windows dependency notices are in
-  `THIRD_PARTY_LICENSES.txt`. LCDSirPlus owns PresentMon only during active
-  frame capture; uninstall removes it. No PresentMon service, MSI, GUI, or API
-  is installed.
+  `THIRD_PARTY_LICENSES.txt`. Default targetless capture autonomously selects a
+  strong sustained local presenter from bounded PresentMon graphics/CPU workload
+  with foreground/activity fallback, without a game-name list or vendor API.
+  Targeted expert overrides remain available. LCDSirPlus owns PresentMon only during active frame capture;
+  uninstall removes it. No PresentMon service, MSI, GUI, or API is installed.
 - Implemented and software-tested Discord Desktop IPC with bounded OAuth,
   DPAPI-local credential storage, cancellation, and redacted errors. Each user
   creates and registers their own Discord application.
@@ -63,9 +65,19 @@ per-user packaging.
   acceptance is pending. Release remains pending this gate unless it is
   explicitly deferred; tokens remain current-user DPAPI-protected local data.
 - PresentMon remains enabled by default because it is a required product
-  feature. Live capture against an actively presenting game is not yet
+  feature. Autonomous mode optionally gates selection through the current
+  user's bounded, read-only NVIDIA App local catalog using exact full-path and
+  high-confidence flags; unavailable/invalid catalogs retain generic workload
+  fallback. NVIDIA App is not required, and no catalog inventory is logged or
+  written. Live capture against an actively presenting game is not yet
   release-qualified and is deferred because this PC's memory is occupied by the
   local LLM. Release remains pending that live gate.
+- PresentMon panels now default to render-only deferred fallback
+  (`presentmon_deferred 1`) without changing button selection; disabling it keeps
+  existing `N/A`/`STALE`/`00:00`/`IDLE` text. Optional
+  `presentmon_persist 1` allows generic presenters only in autonomous mode while
+  retaining identity, exclusions, workload hysteresis, expiry, cleanup, and
+  catalog privacy controls; it defaults to `0`.
 - Guarded hung-window detection and termination are opt-in (`hang_enabled 0` by
   default). `PROC_HANG` remains selected in the shipped slot while its provider
   reports disabled/unavailable and its no-target pane falls through until

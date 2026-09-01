@@ -112,13 +112,18 @@ gpu_provider            auto          # auto | nvapi | adlx | off
 
 ##############################################################################
 # Official signed PresentMon v2.5.1 console bundled for frame/FPS timing only.
-# LCDSirPlus owns it only during active capture; no service/MSI/API is installed.
+# Default presenting mode uses a valid optional NVIDIA App local catalog as an
+# exact-path game gate; generic workload fallback applies only when unavailable.
+# NVIDIA App is not required, and its catalog is never written or logged.
+# LCDSirPlus owns one child only while capture is enabled.
 
 presentmon_enabled      1
 presentmon_path         auto
 presentmon_interval_ms  auto          # 1000
 presentmon_window_ms    auto          # 60000
-presentmon_target_mode  foreground    # foreground | process_name | disabled
+presentmon_target_mode  presenting    # presenting | foreground | process_name | disabled
+presentmon_deferred     1             # skip unavailable PresentMon panels without changing selection
+presentmon_persist      0             # presenting only: 1 allows generic non-game presenters
 presentmon_process_name ""
 # presentmon_exclude dwm.exe explorer.exe applicationframehost.exe textinputhost.exe searchhost.exe lcdsirplus.exe lcdsirplus.console.exe
 stutter_threshold_ms    33.34

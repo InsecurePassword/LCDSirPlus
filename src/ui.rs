@@ -25,10 +25,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DispatchMessageW, GetCursorPos, GetMessageW, LoadCursorW, LoadIconW, PostMessageW,
     PostQuitMessage, RegisterClassW, SetForegroundWindow, ShowWindow, TrackPopupMenu,
-    TranslateMessage, CW_USEDEFAULT, HICON, HMENU, IDC_ARROW, IDI_APPLICATION, MENU_ITEM_FLAGS,
-    MSG, SW_HIDE, SW_SHOW, TRACK_POPUP_MENU_FLAGS, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_LBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WNDCLASSW,
-    WS_OVERLAPPEDWINDOW,
+    TranslateMessage, CW_USEDEFAULT, HICON, HMENU, IDC_ARROW, IDI_APPLICATION, MA_NOACTIVATE,
+    MENU_ITEM_FLAGS, MSG, SW_HIDE, SW_SHOWNOACTIVATE, TRACK_POPUP_MENU_FLAGS, WINDOW_EX_STYLE,
+    WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_LBUTTONDOWN,
+    WM_MOUSEACTIVATE, WM_PAINT, WM_RBUTTONDOWN, WNDCLASSW, WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW,
 };
 
 pub const FRAME_W: u32 = crate::model::WIDTH as u32;
@@ -40,6 +40,22 @@ const ID_MENU_EXIT: usize = 1002;
 
 fn preview_size(scale: i32) -> (i32, i32) {
     (FRAME_W as i32 * scale, FRAME_H as i32 * scale)
+}
+
+fn preview_ex_style() -> WINDOW_EX_STYLE {
+    WS_EX_NOACTIVATE
+}
+
+fn preview_show_command(visible: bool) -> windows::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD {
+    if visible {
+        SW_SHOWNOACTIVATE
+    } else {
+        SW_HIDE
+    }
+}
+
+fn preview_mouse_activation(msg: u32) -> Option<LRESULT> {
+    (msg == WM_MOUSEACTIVATE).then_some(LRESULT(MA_NOACTIVATE as isize))
 }
 
 unsafe fn load_app_icon(hinstance: HINSTANCE) -> HICON {
@@ -151,7 +167,7 @@ impl Ui {
         unsafe {
             let hwnd = UI.hwnd.load(Ordering::Relaxed);
             if hwnd != 0 {
-                let _ = ShowWindow(HWND(hwnd as _), if visible { SW_SHOW } else { SW_HIDE });
+                let _ = ShowWindow(HWND(hwnd as _), preview_show_command(visible));
             }
         }
     }
@@ -214,7 +230,7 @@ fn ui_main(frame_rx: std::sync::mpsc::Receiver<Vec<u8>>) {
         let height = client_h + (rect.bottom - rect.top);
         let window_name: Vec<u16> = "LCDSirPlus Preview\0".encode_utf16().collect();
         let Ok(hwnd) = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            preview_ex_style(),
             PCWSTR::from_raw(class_name.as_ptr()),
             PCWSTR::from_raw(window_name.as_ptr()),
             WS_OVERLAPPEDWINDOW,
@@ -234,7 +250,7 @@ fn ui_main(frame_rx: std::sync::mpsc::Receiver<Vec<u8>>) {
         add_tray_icon(hwnd, icon);
 
         let visible = UI.preview_visible.load(Ordering::Relaxed);
-        let _ = ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
+        let _ = ShowWindow(hwnd, preview_show_command(visible));
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -246,6 +262,9 @@ fn ui_main(frame_rx: std::sync::mpsc::Receiver<Vec<u8>>) {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if let Some(result) = preview_mouse_activation(msg) {
+        return result;
+    }
     match msg {
         WM_CREATE => LRESULT(0),
         WM_APP_FRAME => {
@@ -317,7 +336,7 @@ unsafe fn toggle_preview(hwnd: HWND) {
     let visible = !UI.preview_visible.load(Ordering::Relaxed);
     UI.manual_visibility.store(true, Ordering::Relaxed);
     UI.preview_visible.store(visible, Ordering::Relaxed);
-    let _ = ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
+    let _ = ShowWindow(hwnd, preview_show_command(visible));
 }
 
 unsafe fn wide(s: &str) -> Vec<u16> {
@@ -416,5 +435,17 @@ mod tests {
             let module = GetModuleHandleW(None).unwrap();
             assert!(!load_app_icon(HINSTANCE::from(module)).0.is_null());
         }
+    }
+
+    #[test]
+    fn preview_uses_no_activate_window_behavior() {
+        assert_ne!(preview_ex_style().0 & WS_EX_NOACTIVATE.0, 0);
+        assert_eq!(preview_show_command(true), SW_SHOWNOACTIVATE);
+        assert_eq!(
+            preview_mouse_activation(WM_MOUSEACTIVATE),
+            Some(LRESULT(MA_NOACTIVATE as isize))
+        );
+        assert_eq!(preview_mouse_activation(WM_LBUTTONDOWN), None);
+        assert_eq!(preview_mouse_activation(WM_RBUTTONDOWN), None);
     }
 }

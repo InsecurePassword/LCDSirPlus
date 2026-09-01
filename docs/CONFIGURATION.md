@@ -229,10 +229,11 @@ frame. Higher is better. `N/A` means there is no active captured frame stream;
 after a further five seconds.
 
 Related settings: `presentmon_enabled`, `presentmon_path`,
-`presentmon_interval_ms`, `presentmon_target_mode`, `presentmon_process_name`,
-and `presentmon_exclude`. Release packages include the official signed
-PresentMon v2.5.1 console as `PresentMon.exe`; a selected process must be
-actively presenting.
+`presentmon_interval_ms`, `presentmon_target_mode`, `presentmon_deferred`,
+`presentmon_persist`, `presentmon_process_name`, and `presentmon_exclude`. Release packages include the official signed
+PresentMon v2.5.1 console as `PresentMon.exe`. Default `presenting` mode selects
+the strongest sustained recent local presenter from measured graphics/CPU frame
+workload, with foreground/activity fallback; a selected process must keep presenting.
 
 ### `FPS_1LOW`
 
@@ -272,10 +273,12 @@ Related settings and requirements are the same as `FPS_CURRENT`.
 Shows elapsed time for the active PresentMon game/capture session (`mm:ss`, or
 `h:mm` after one hour). A session starts when capture starts for a selected
 target and frame accumulation begins with the first accepted frame. It resets
-when the target process or capture identity changes, PresentMon restarts, or a
-capture-affecting setting such as path, interval, window, or stutter threshold
-starts a new capture. With no active session it shows `00:00`; it does not use
-`N/A` or `STALE` text.
+when the selected process identity (PID, creation time, and executable image)
+or capture identity changes, PresentMon
+restarts, or a capture-affecting setting such as path, interval, window, or
+stutter threshold starts a new capture. Presenter changes in `presenting` mode
+reset the session without restarting its targetless PresentMon child. With no
+active session it shows `00:00`; it does not use `N/A` or `STALE` text.
 
 Related settings and requirements are the PresentMon settings listed for
 `FPS_CURRENT`, including `presentmon_window_ms` and `stutter_threshold_ms`.
@@ -848,22 +851,55 @@ and drivers are external platform components, not Rust dependencies.
 | `presentmon_path` | `auto` | bundled colocated `PresentMon.exe`, or explicit fixed-local-drive console path; select console |
 | `presentmon_interval_ms` | 1000 (`auto`) | 100..10000; capture/report interval |
 | `presentmon_window_ms` | 60000 (`auto`) | 5000..600000; rolling low-FPS window |
-| `presentmon_target_mode` | `foreground` | `foreground` \| `process_name` \| `disabled`; target policy |
+| `presentmon_target_mode` | `presenting` | `presenting` uses an optional valid NVIDIA App local catalog as an exact-path game gate and otherwise falls back to sustained PresentMon workload; `foreground` \| `process_name` are unchanged targeted overrides; `disabled` turns capture off |
+| `presentmon_deferred` | 1 | boolean; skip unavailable PresentMon slot panels cyclically at render time without changing the stored selection |
+| `presentmon_persist` | 0 | boolean; in `presenting` only, ignore the catalog game gate and allow generic presenters through the existing autonomous selector |
 | `presentmon_process_name` | empty | one process name; required in `process_name` mode |
-| `presentmon_exclude` | `dwm.exe explorer.exe applicationframehost.exe textinputhost.exe searchhost.exe lcdsirplus.exe lcdsirplus.console.exe` | zero to 256 foreground names excluded from capture |
+| `presentmon_exclude` | `dwm.exe explorer.exe applicationframehost.exe textinputhost.exe searchhost.exe lcdsirplus.exe lcdsirplus.console.exe` | zero to 256 application names rejected from automatic or targeted selection |
 | `stutter_threshold_ms` | 33.34 | 1..1000; frame-time threshold for session stutter count |
 
 Published release packages are designed to bundle the official signed PresentMon v2.5.1 console as
-`PresentMon.exe`. LCDSirPlus launches and owns it only while an enabled target
-frame capture is active, passes arguments without a shell, and stops only its
-own child on target/config change or shutdown. PresentMon supplies frame/FPS
-timing only; it is not a source of CPU/GPU hardware telemetry. No PresentMon
-service, MSI, GUI, or API/SDK is bundled or installed. Uninstall removes the
-owned console.
+`PresentMon.exe`. In default `presenting` mode LCDSirPlus launches one targetless
+child and locally observes application/PID frame rows. It rejects invalid,
+excluded, and LCDSirPlus identities. It also optionally reads only the current
+user's fixed NVIDIA App `ApplicationStorage.json`. A valid catalog admits an
+exact normalized full-process-image path only when the record is non-creative,
+OPS-supported, fingerprint-detected, and not manually added; every other
+presenter is rejected. If the file is absent, inaccessible, unsafe, changing,
+malformed, over its bounds, or schema-incompatible, bounded one-second
+PresentMon workload/foreground/activity inference remains available. NVIDIA App
+is not required. LCDSirPlus does not scan, invoke, or write NVIDIA data, use DRS
+or Xbox catalogs, access a catalog network service, or log raw inventory.
+Candidate identity is bound to PID, process creation time, and executable image
+through one cached original-process handle. Only the selected
+presenter receives full rolling statistics; changing presenter resets those
+statistics without restarting PresentMon.
+With `presentmon_deferred 1`, unavailable `FPS_CURRENT`, `FPS_1LOW`,
+`FPS_01LOW`, `FRAME_TIME`, `FPS_GRAPH`, `SESSION_TIME`, `SESSION_SUMMARY`, and
+`GAME_NAME` panels fall through cyclically to the first eligible configured
+token. Fallback never chooses `PROC_HANG` or `BOTTLENECK`, and all-unavailable
+lists render `CLEAR`. The selected slot token and button-cycle position do not
+change. With `presentmon_deferred 0`, those panels remain selected and retain
+their renderer text: numeric/graph panels show `N/A` or `STALE`, session time
+shows `00:00`, session summary shows `IDLE`, and game name shows `N/A`.
+
+`presentmon_persist 0` preserves the valid-catalog game gate. Opt-in
+`presentmon_persist 1` applies only to autonomous `presenting`: catalog-qualified
+paths are still loaded privately, but admission, purge, and ranking use the
+existing generic workload/foreground/activity path as though the catalog were
+unavailable. This can select desktop applications and display their executable
+name and FPS. It does not bypass exclusions or identity checks, retain stale
+statistics, pin a target, guarantee DWM attribution, or keep capture enabled.
+`foreground` and `process_name` retain targeted capture. Arguments are passed
+without a shell, and only the owned child/session is stopped on config change or
+shutdown. PresentMon supplies frame/FPS timing and per-frame busy durations for
+selection only; it is not a source of CPU/GPU hardware telemetry. No PresentMon service, MSI, GUI, or API/SDK is
+bundled or installed. Uninstall removes the owned console.
 
 Frame metrics become stale after five seconds without output and expire after
-another five. Low-FPS metrics use `presentmon_window_ms`; changing target,
-path, interval, window, or stutter threshold starts a new capture/session. If
+another five. After expiry, `presenting` mode can select another active
+candidate. Low-FPS metrics use `presentmon_window_ms`; changing a targeted-mode
+target, path, interval, window, or stutter threshold starts a new capture. If
 capture cannot start, add the user to Windows' **Performance Log Users** group
 and sign out/in, or test an elevated launch if local ETW policy requires it.
 Elevation is troubleshooting, not a normal LCDSirPlus requirement.
