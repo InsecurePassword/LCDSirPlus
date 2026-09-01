@@ -38,11 +38,14 @@ use crate::model::{GameStats, Metric};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const STALE_AFTER: Duration = Duration::from_secs(5);
 const TARGET_POLL: Duration = Duration::from_secs(1);
-const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
-const LINE_QUEUE_CAPACITY: usize = 256;
-const MAX_LINES_PER_TICK: usize = 128;
-// 600 seconds at 1000 FPS, including both boundaries and one grouped drain batch.
-const MAX_WINDOW_FRAMES: usize = 600_000 + MAX_LINES_PER_TICK;
+const MAX_LINE_BYTES: usize = 64 * 1024;
+const LINE_QUEUE_CAPACITY: usize = 2048;
+const MAX_LINES_PER_TICK: usize = 512;
+// At most 128 MiB of CSV payload can wait in the bounded channel, below the prior 512 MiB bound.
+const _: () = assert!(LINE_QUEUE_CAPACITY * MAX_LINE_BYTES == 128 * 1024 * 1024);
+// 600 seconds at 1000 FPS plus the full queued backlog draining at one observed timestamp.
+const MAX_WINDOW_FRAMES: usize = 600 * 1_000 + LINE_QUEUE_CAPACITY;
+const _: () = assert!(MAX_WINDOW_FRAMES == 602_048);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const RETRY_DELAY: Duration = Duration::from_secs(10);
 const STOP_TIMEOUT_MS: u32 = 2_000;
@@ -96,7 +99,7 @@ struct Parser {
 impl Parser {
     fn parse_line(&mut self, line: &str, at: SystemTime) -> Result<Option<Frame>, String> {
         if line.len() > MAX_LINE_BYTES {
-            return Err("PresentMon CSV line exceeds 2 MiB".into());
+            return Err("PresentMon CSV line exceeds 64 KiB".into());
         }
         let fields = csv_fields(line)?;
         if fields.is_empty() {
@@ -1789,6 +1792,46 @@ mod tests {
         read_output(std::io::Cursor::new(input), tx, Arc::clone(&dropped));
         assert_eq!(rx.into_iter().collect::<Vec<_>>(), vec!["valid"]);
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn output_reader_queues_and_drains_a_stalled_presentmon_burst() {
+        const BURST_FRAMES: usize = 1_200;
+        let header = "Application,ProcessID,FrameTime,MsBetweenPresents,DisplayedTime,GPUTime,GPUBusy,GPUWait\n";
+        let row = "Palworld-Win64-Shipping.exe,4242,16.667,16.667,16.667,4.100,3.900,0.200\n";
+        let input = format!("{header}{}", row.repeat(BURST_FRAMES));
+        let (line_tx, line_rx) = mpsc::sync_channel(LINE_QUEUE_CAPACITY);
+        let keep_connected = line_tx.clone();
+        let overflow = Arc::new(AtomicBool::new(false));
+
+        // Read the whole burst before consuming to model a short consumer stall.
+        read_output(
+            std::io::Cursor::new(input.into_bytes()),
+            line_tx,
+            Arc::clone(&overflow),
+        );
+        assert!(!overflow.load(Ordering::Acquire));
+
+        let mut capture = Capture::default();
+        capture.lines = Some(line_rx);
+        capture.line_overflow = Some(overflow);
+        capture.target = ProcessInfo {
+            pid: 4242,
+            name: "Palworld-Win64-Shipping.exe".into(),
+        };
+        capture.stats = Some(Stats::new(30.0, Duration::from_secs(600)));
+        let (updates, _rx) = mpsc::channel();
+        for _ in 0..(BURST_FRAMES + 1).div_ceil(MAX_LINES_PER_TICK) {
+            capture
+                .drain(&Config::default(), 1, &updates, Instant::now())
+                .unwrap();
+        }
+        assert_eq!(capture.stats.as_ref().unwrap().frames.len(), BURST_FRAMES);
+        assert!(matches!(
+            capture.lines.as_ref().unwrap().try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(keep_connected);
     }
 
     #[test]
