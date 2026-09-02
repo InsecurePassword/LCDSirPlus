@@ -144,7 +144,7 @@ finally {
 
 Write-Host '== product identity ==' -ForegroundColor Cyan
 $retiredPattern = 'lcd' + '([-_ ]?)' + 'for' + 'ge2?'
-$trackedNames = @(git ls-files --cached --others --exclude-standard | Where-Object {
+$trackedNames = @(git ls-files --cached --others --exclude-standard -- . ':(exclude)docs/OldDocs.7z' | Where-Object {
         $_ -cne 'docs/OldDocs.7z' -and (Test-Path -LiteralPath $_)
     })
 if ($LASTEXITCODE -ne 0 -or @($trackedNames | Where-Object { $_ -match $retiredPattern }).Count -ne 0) { throw 'tracked filename contains the retired product identity' }
@@ -157,17 +157,26 @@ $configSource = [IO.File]::ReadAllText((Join-Path $repo 'src\config.rs'))
 $moduleBlock = [regex]::Match($configSource, 'pub const MODULES:\s*&\[&str\]\s*=\s*&\[(.*?)\];', [Text.RegularExpressions.RegexOptions]::Singleline)
 if (-not $moduleBlock.Success) { throw 'canonical module registry not found' }
 $canonicalModules = @([regex]::Matches($moduleBlock.Groups[1].Value, '"([A-Z][A-Z0-9_]*)"') | ForEach-Object { $_.Groups[1].Value })
-$moduleLines = @([IO.File]::ReadAllLines((Join-Path $repo 'modules.md')) | Where-Object { $_ -match '^([A-Z][A-Z0-9_]*) - .+$' })
-$documentedModules = @($moduleLines | ForEach-Object { [regex]::Match($_, '^([A-Z][A-Z0-9_]*) - ').Groups[1].Value })
-if ($canonicalModules.Count -ne 53 -or $documentedModules.Count -ne 53) { throw 'module reference must contain exactly 53 canonical entries' }
+$modules = [IO.File]::ReadAllText((Join-Path $repo 'modules.md'))
+$manual = [IO.File]::ReadAllText((Join-Path $repo 'docs\INSTRUCTION-MANUAL.md'))
+$tableHeaderPattern = '(?m)^\| Option \| Description \|\r?$'
+$tableRowPattern = '(?m)^(\| `([A-Z][A-Z0-9_]*)` \| .+ \|)\r?$'
+if ([regex]::Matches($modules, $tableHeaderPattern).Count -ne 1 -or
+    [regex]::Matches($manual, $tableHeaderPattern).Count -ne 1) {
+    throw 'modules and instruction manual must each contain exactly one button option table'
+}
+$moduleRows = @([regex]::Matches($modules, $tableRowPattern) | ForEach-Object { $_.Groups[1].Value })
+$manualRows = @([regex]::Matches($manual, $tableRowPattern) | ForEach-Object { $_.Groups[1].Value })
+$documentedModules = @([regex]::Matches($modules, $tableRowPattern) | ForEach-Object { $_.Groups[2].Value })
+if ($canonicalModules.Count -ne 53 -or $moduleRows.Count -ne 53 -or $manualRows.Count -ne 53) {
+    throw "button option inventory mismatch: source=$($canonicalModules.Count), modules=$($moduleRows.Count), manual=$($manualRows.Count)"
+}
 for ($index = 0; $index -lt $canonicalModules.Count; $index++) {
     if ($canonicalModules[$index] -cne $documentedModules[$index]) { throw "module reference order mismatch at index $index" }
+    if ($moduleRows[$index] -cne $manualRows[$index]) { throw "button option table row mismatch at index $index" }
 }
 $readme = [IO.File]::ReadAllText((Join-Path $repo 'README.md'))
-$manual = [IO.File]::ReadAllText((Join-Path $repo 'docs\INSTRUCTION-MANUAL.md'))
 if ($readme -notmatch '\]\(modules\.md\)' -or $manual -notmatch '\]\(\.\./modules\.md\)') { throw 'quick-reference links are missing' }
-$duplicatedManualModules = @($canonicalModules | Where-Object { $manual -match "(?m)^\| ``$([regex]::Escape($_))`` \|" })
-if ($duplicatedManualModules.Count -ne 0) { throw "instruction manual duplicates canonical module descriptions: $($duplicatedManualModules -join ',')" }
 $parserSource = [IO.File]::ReadAllText((Join-Path $repo 'src\parser.rs'))
 $applyBlock = [regex]::Match($parserSource, 'fn apply\(.*?match key \{(.*?)other =>', [Text.RegularExpressions.RegexOptions]::Singleline)
 if (-not $applyBlock.Success) { throw 'configuration parser key registry not found' }

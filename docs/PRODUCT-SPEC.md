@@ -34,9 +34,10 @@ save. Network bars in layouts 2 and 3 show current throughput and use
 domains use Cache and Frequency bars. Manual CCD topology requires both
 processor lists to be automatic or both to be explicit, disjoint `0..63` lists.
 
-The button registry contains exactly 53 values in `src/config.rs` order;
-[modules.md](../modules.md) is their sole description reference. Graphs cover
-the trailing 30 seconds. There is no layout editor or plug-in system.
+The button registry contains exactly 53 values in `src/config.rs` order. Their
+descriptions appear in the canonical [modules.md](../modules.md) quick reference
+and are mirrored exactly in the instruction manual/PDF. Graphs cover the trailing
+30 seconds. There is no layout editor or plug-in system.
 
 ## Button behavior
 

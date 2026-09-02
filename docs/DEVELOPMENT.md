@@ -161,10 +161,10 @@ manual checks where automation cannot reproduce them.
 
 ## Update documentation
 
-`modules.md` is the sole 53-value description reference. It must contain exactly
-the `src/config.rs` values in code order using `TOKEN - description` lines;
-other documents link to it instead of maintaining duplicate descriptions.
-`scripts/Test.ps1` checks the inventory, order, and required links.
+`modules.md` is the canonical quick reference for all 53 values. Its table must
+contain exactly the `src/config.rs` values in code order and be mirrored exactly
+in the instruction manual/PDF. `scripts/Test.ps1` checks both inventories,
+source order, row parity, and required links.
 
 After any Markdown manual change, regenerate the PDF before packaging:
 
