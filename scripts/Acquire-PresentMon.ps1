@@ -1,3 +1,17 @@
+<#
+.SYNOPSIS
+Acquires or verifies the pinned PresentMon distribution.
+
+.DESCRIPTION
+Validates the tracked manifest, then downloads and verifies PresentMon v2.5.1 and its licenses by default. The default run writes the binary and license artifacts under third_party/PresentMon; verification creates no artifacts.
+
+.PARAMETER VerifyOnly
+Verifies the existing binary, signature, required command-line flags, and licenses without downloading files.
+
+.EXAMPLE
+PS> .\scripts\Acquire-PresentMon.ps1
+Downloads and verifies the pinned PresentMon binary and licenses when needed.
+#>
 #Requires -Version 5.1
 [CmdletBinding()]
 param([switch]$VerifyOnly)

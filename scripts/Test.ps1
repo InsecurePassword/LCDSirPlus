@@ -1,4 +1,17 @@
-# LCDSirPlus 0.3.0 build and test script (PowerShell 7+)
+<#
+.SYNOPSIS
+Runs the repository build, test, documentation, and smoke-test gates.
+
+.DESCRIPTION
+Checks PowerShell, Rust, documentation, and product behavior with the pinned toolchain. Commands update Rust build outputs under target/; temporary fixtures are removed. The default run also creates the release executable and configuration in target/release and runs Windows CLI and GUI smoke tests, but not physical hardware acceptance.
+
+.PARAMETER ReleaseOnly
+Stops after formatting, lint, and release-mode test gates, skipping the final application build and Windows CLI and GUI smoke tests.
+
+.EXAMPLE
+PS> .\scripts\Test.ps1
+Runs all automated repository gates and smoke tests.
+#>
 #Requires -Version 7
 
 [CmdletBinding()]
@@ -131,7 +144,9 @@ finally {
 
 Write-Host '== product identity ==' -ForegroundColor Cyan
 $retiredPattern = 'lcd' + '([-_ ]?)' + 'for' + 'ge2?'
-$trackedNames = @(git ls-files --cached --others --exclude-standard | Where-Object { Test-Path -LiteralPath $_ })
+$trackedNames = @(git ls-files --cached --others --exclude-standard | Where-Object {
+        $_ -cne 'docs/OldDocs.7z' -and (Test-Path -LiteralPath $_)
+    })
 if ($LASTEXITCODE -ne 0 -or @($trackedNames | Where-Object { $_ -match $retiredPattern }).Count -ne 0) { throw 'tracked filename contains the retired product identity' }
 foreach ($name in $trackedNames) {
     if ([IO.File]::ReadAllText((Join-Path $repo $name)).ToLowerInvariant() -match $retiredPattern) { throw "tracked content contains the retired product identity: $name" }
@@ -151,8 +166,101 @@ for ($index = 0; $index -lt $canonicalModules.Count; $index++) {
 $readme = [IO.File]::ReadAllText((Join-Path $repo 'README.md'))
 $manual = [IO.File]::ReadAllText((Join-Path $repo 'docs\INSTRUCTION-MANUAL.md'))
 if ($readme -notmatch '\]\(modules\.md\)' -or $manual -notmatch '\]\(\.\./modules\.md\)') { throw 'quick-reference links are missing' }
-foreach ($module in $canonicalModules) {
-    if (@([regex]::Matches($manual, "(?m)^\| ``$([regex]::Escape($module))`` \|")).Count -ne 1) { throw "instruction manual entry mismatch: $module" }
+$duplicatedManualModules = @($canonicalModules | Where-Object { $manual -match "(?m)^\| ``$([regex]::Escape($_))`` \|" })
+if ($duplicatedManualModules.Count -ne 0) { throw "instruction manual duplicates canonical module descriptions: $($duplicatedManualModules -join ',')" }
+$parserSource = [IO.File]::ReadAllText((Join-Path $repo 'src\parser.rs'))
+$applyBlock = [regex]::Match($parserSource, 'fn apply\(.*?match key \{(.*?)other =>', [Text.RegularExpressions.RegexOptions]::Singleline)
+if (-not $applyBlock.Success) { throw 'configuration parser key registry not found' }
+$acceptedConfigKeys = @('include') + @([regex]::Matches($applyBlock.Groups[1].Value, '"([a-z][a-z0-9_]*)"\s*(?:\||=>)') | ForEach-Object { $_.Groups[1].Value })
+$configuration = [IO.File]::ReadAllText((Join-Path $repo 'docs\CONFIGURATION.md'))
+$documentedConfigKeys = @([regex]::Matches($configuration, '(?m)^\| `([a-z][a-z0-9_]*)` \|') | ForEach-Object { $_.Groups[1].Value })
+$missingConfigKeys = @($acceptedConfigKeys | Where-Object { $_ -cnotin $documentedConfigKeys })
+$extraConfigKeys = @($documentedConfigKeys | Where-Object { $_ -cnotin $acceptedConfigKeys })
+if ($acceptedConfigKeys.Count -ne $documentedConfigKeys.Count -or $missingConfigKeys.Count -ne 0 -or $extraConfigKeys.Count -ne 0) {
+    throw "configuration reference key mismatch: parser=$($acceptedConfigKeys.Count), docs=$($documentedConfigKeys.Count), missing=$($missingConfigKeys -join ','), extra=$($extraConfigKeys -join ',')"
+}
+foreach ($key in $acceptedConfigKeys) {
+    if (@($documentedConfigKeys | Where-Object { $_ -ceq $key }).Count -ne 1) { throw "configuration reference entry mismatch: $key" }
+}
+$compatibilityConfigKeys = @('date_format', 'time_format', 'headset_estimate_hours', 'discord_redirect_uri', 'hang_button')
+$compatibilitySection = [regex]::Match($configuration, '(?ms)^## Advanced compatibility-only settings\s+(.*?)(?=^## |\z)')
+if (-not $compatibilitySection.Success) { throw 'advanced compatibility-only configuration section is missing' }
+$documentedCompatibilityKeys = @([regex]::Matches($compatibilitySection.Groups[1].Value, '(?m)^\| `([a-z][a-z0-9_]*)` \|') | ForEach-Object { $_.Groups[1].Value })
+if ($documentedCompatibilityKeys.Count -ne $compatibilityConfigKeys.Count) { throw 'advanced compatibility-only configuration section contains an active or missing key' }
+foreach ($key in $compatibilityConfigKeys) {
+    if (@([regex]::Matches($compatibilitySection.Groups[1].Value, "(?m)^\| ``$key`` \|")).Count -ne 1) { throw "compatibility-only configuration key is not isolated: $key" }
+}
+$template = [IO.File]::ReadAllText($config)
+$templateKeys = @([regex]::Matches($template, '(?m)^([a-z][a-z0-9_]*)\s+') | ForEach-Object { $_.Groups[1].Value })
+foreach ($key in $compatibilityConfigKeys) {
+    if ($key -cin $templateKeys) { throw "compatibility-only key appears in default template: $key" }
+}
+if (@($templateKeys | Where-Object { $_ -cnotin $acceptedConfigKeys }).Count -ne 0 -or
+    @($templateKeys | Group-Object | Where-Object Count -ne 1).Count -ne 0) {
+    throw 'default template contains an unknown or duplicate active key'
+}
+$omittedSensorConfigKeys = @(
+    'lhm_cpu_temp_sensor', 'lhm_gpu_temp_sensor', 'lhm_vrm_temp_sensor', 'lhm_chipset_temp_sensor',
+    'lhm_motherboard_temp_sensor', 'lhm_cpu_fan_control_sensor', 'lhm_cpu_fan_rpm_sensor',
+    'lhm_pump_control_sensor', 'lhm_pump_rpm_sensor', 'lhm_total_power_sensor', 'lhm_cpu_power_sensor',
+    'lhm_gpu_power_sensor', 'hwinfo_cpu_temp_sensor', 'hwinfo_cpu_temp_reading',
+    'hwinfo_total_power_sensor', 'hwinfo_total_power_reading', 'hwinfo_cpu_power_sensor',
+    'hwinfo_cpu_power_reading', 'hwinfo_gpu_power_sensor', 'hwinfo_gpu_power_reading'
+)
+$expectedTemplateKeys = @($acceptedConfigKeys | Where-Object {
+        $_ -cne 'include' -and $_ -cnotin $compatibilityConfigKeys -and $_ -cnotin $omittedSensorConfigKeys
+    })
+if ($templateKeys.Count -ne $expectedTemplateKeys.Count -or
+    @($expectedTemplateKeys | Where-Object { $_ -cnotin $templateKeys }).Count -ne 0) {
+    throw 'default template does not contain every shipped active default key'
+}
+foreach ($line in @(
+    'safe_mode               0',
+    'ccd_source              auto',
+    'ccd_cache_processors    auto',
+    'ccd_frequency_processors auto',
+    'presentmon_enabled      1',
+    'presentmon_target_mode  presenting',
+    'presentmon_deferred     1',
+    'presentmon_persist      0',
+    'presentmon_process_name ""',
+    'presentmon_exclude      dwm.exe explorer.exe applicationframehost.exe textinputhost.exe searchhost.exe lcdsirplus.exe lcdsirplus.console.exe'
+)) {
+    if (-not $template.Contains($line, [StringComparison]::Ordinal)) { throw "default template active default mismatch: $line" }
+}
+$publicDocuments = @(
+    'README.md', 'modules.md', 'RELEASE-NOTES.md', 'SECURITY.md',
+    'docs\CONFIGURATION.md', 'docs\INSTRUCTION-MANUAL.md'
+)
+foreach ($document in $publicDocuments) {
+    if ([IO.File]::ReadAllText((Join-Path $repo $document)).Contains('HARDWARE-ACCEPTANCE.md', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "public document links the source-only hardware acceptance ledger: $document"
+    }
+}
+foreach ($script in @('scripts\Build.ps1', 'scripts\Package-Test.ps1')) {
+    $scriptText = [IO.File]::ReadAllText((Join-Path $repo $script)).Replace('\', '/')
+    if ($scriptText.Contains('docs/HARDWARE-ACCEPTANCE.md', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "portable inventory includes the source-only hardware acceptance ledger: $script"
+    }
+}
+$buildInventory = [IO.File]::ReadAllText((Join-Path $repo 'scripts\Build.ps1'))
+$installerInventory = [IO.File]::ReadAllText((Join-Path $repo 'packaging\LCDSirPlus.iss'))
+$packageInventory = [IO.File]::ReadAllText((Join-Path $repo 'scripts\Package-Test.ps1'))
+foreach ($document in @('RELEASE-NOTES.md', 'SECURITY.md')) {
+    if (@([regex]::Matches($buildInventory, "'$([regex]::Escape($document))'")).Count -ne 2 -or
+        @([regex]::Matches($installerInventory, "(?m)^Source: .*\\$([regex]::Escape($document))`"; DestDir:")).Count -ne 1 -or
+        @([regex]::Matches($packageInventory, "'$([regex]::Escape($document))'")).Count -lt 2) {
+        throw "installed document inventory is not synchronized: $document"
+    }
+}
+foreach ($shortcut in @(
+    'Name: "{autoprograms}\LCDSirPlus\Instruction Manual"; Filename: "{app}\docs\LCDSirPlus-Instruction-Manual.pdf"; Tasks: startmenu',
+    'Name: "{autoprograms}\LCDSirPlus\Security"; Filename: "{app}\SECURITY.md"; Tasks: startmenu'
+)) {
+    if ($installerInventory.IndexOf($shortcut, [StringComparison]::Ordinal) -lt 0 -or
+        $packageInventory.IndexOf("'$shortcut'", [StringComparison]::Ordinal) -lt 0) {
+        throw "installed document shortcut is not synchronized: $shortcut"
+    }
 }
 
 Write-Host '== cargo fmt check ==' -ForegroundColor Cyan

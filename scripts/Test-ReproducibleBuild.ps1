@@ -1,3 +1,23 @@
+<#
+.SYNOPSIS
+Verifies that two isolated release builds are byte-identical.
+
+.DESCRIPTION
+Copies the source to a temporary detached tree and performs two offline builds with the pinned Rust toolchain. SourceRoot must remain unchanged. On success, creates LCDSirPlus.exe, lcdsirplus.txt, and REPRODUCIBILITY.json in the existing empty OutputDir; temporary build trees are removed.
+
+.PARAMETER SourceRoot
+Existing local, non-reparse source directory to build.
+
+.PARAMETER OutputDir
+Existing empty local, non-reparse directory that does not overlap SourceRoot.
+
+.PARAMETER SourceCommit
+40-character lowercase commit recorded in the reproducibility evidence.
+
+.EXAMPLE
+PS> $out = Join-Path $env:TEMP ('lcdsirplus-repro-' + [guid]::NewGuid()); New-Item -ItemType Directory $out | Out-Null; .\scripts\Test-ReproducibleBuild.ps1 -SourceRoot . -OutputDir $out -SourceCommit (git rev-parse HEAD)
+Builds the repository twice and writes the verified outputs to a new temporary directory.
+#>
 #Requires -Version 7.0
 [CmdletBinding()]
 param(

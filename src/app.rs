@@ -81,11 +81,7 @@ pub fn run_hardware_discover() -> i32 {
         println!("G13 candidate: NONE");
     } else {
         for c in &discovery.candidates {
-            println!(
-                "G13 candidate: vid={:04x} pid={:04x} usage={:04x}:{:04x} reports={}/{}",
-                c.vid, c.pid, c.usage_page, c.usage, c.input_report_length, c.output_report_length
-            );
-            println!("  path: {}", c.device_path);
+            println!("{}", hardware_candidate_summary(c));
         }
     }
     for r in &discovery.rejections {
@@ -96,6 +92,13 @@ pub fn run_hardware_discover() -> i32 {
     } else {
         0
     }
+}
+
+fn hardware_candidate_summary(c: &crate::backends::hid::CandidateInfo) -> String {
+    format!(
+        "G13 candidate: vid={:04x} pid={:04x} usage={:04x}:{:04x} reports={}/{}",
+        c.vid, c.pid, c.usage_page, c.usage, c.input_report_length, c.output_report_length
+    )
 }
 
 /// Normal application run. Returns a process exit code or a startup failure.
@@ -607,7 +610,9 @@ pub fn run_hardware_test(
             Ok(Some(_)) => BackendKind::Sdk,
             Ok(None) => BackendKind::Hid,
             Err(error) => {
-                eprintln!("hardware test ownership discovery failed: {error}");
+                eprintln!(
+                    "hardware test SDK selection failed while checking running LCore.exe: {error}"
+                );
                 return 3;
             }
         }
@@ -625,7 +630,9 @@ pub fn run_hardware_test(
                     return 3;
                 }
                 Err(error) => {
-                    eprintln!("hardware test ownership discovery failed: {error}");
+                    eprintln!(
+                        "hardware test SDK selection failed while checking running LCore.exe: {error}"
+                    );
                     return 3;
                 }
             };
@@ -1092,6 +1099,25 @@ fn file_signature(path: &std::path::Path) -> Option<FileSignature> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hardware_discovery_summary_omits_raw_device_path() {
+        let candidate = crate::backends::hid::CandidateInfo {
+            device_path: r"\\?\hid#vid_046d&pid_c21c#private-instance".into(),
+            vid: 0x046d,
+            pid: 0xc21c,
+            usage_page: 0xff00,
+            usage: 0x0001,
+            input_report_length: 9,
+            output_report_length: 992,
+        };
+        let summary = hardware_candidate_summary(&candidate);
+        assert_eq!(
+            summary,
+            "G13 candidate: vid=046d pid=c21c usage=ff00:0001 reports=9/992"
+        );
+        assert!(!summary.contains(&candidate.device_path));
+    }
 
     #[test]
     fn memory_success_publishes_zero_and_bytes_while_failure_omits_all() {

@@ -1,3 +1,23 @@
+<#
+.SYNOPSIS
+Acquires or verifies the pinned Inno Setup compiler installer.
+
+.DESCRIPTION
+Validates the tracked manifest and license, then downloads and verifies Inno Setup 6.7.3 by default. The default run creates the installer cache under third_party/InnoSetup; verification creates no artifacts, while extraction creates a new portable compiler directory.
+
+.PARAMETER VerifyOnly
+Verifies the existing installer cache without downloading or creating artifacts.
+
+.PARAMETER ExtractVerified
+Verifies the cached installer and extracts a portable compiler to OutputDir. Cannot be combined with VerifyOnly.
+
+.PARAMETER OutputDir
+New extraction directory used with ExtractVerified. Relative paths are resolved from the repository root, and the directory must not already exist.
+
+.EXAMPLE
+PS> .\scripts\Acquire-InnoSetup.ps1
+Downloads the pinned installer into its repository cache when it is not already present and verified.
+#>
 #Requires -Version 5.1
 [CmdletBinding()]
 param(

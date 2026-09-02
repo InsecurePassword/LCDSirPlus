@@ -146,7 +146,7 @@ pub fn lcore() -> Result<Option<LCore>, String> {
         }
         let _ = CloseHandle(snapshot);
         if found.len() > 1 {
-            return Err("multiple LCore.exe processes make LCD ownership ambiguous".into());
+            return Err("multiple running LCore.exe processes make SDK selection ambiguous".into());
         }
         let Some(pid) = found.first().copied() else {
             return Ok(None);

@@ -95,6 +95,8 @@ Source: "{#PayloadRoot}\lcdsirplus.layout"; DestDir: "{app}"; Flags: ignoreversi
 Source: "{#PayloadRoot}\SOURCE-COMMIT.txt"; DestDir: "{app}"; Attribs: readonly; Flags: overwritereadonly uninsremovereadonly ignoreversion notimestamp
 Source: "{#PayloadRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion notimestamp
 Source: "{#PayloadRoot}\modules.md"; DestDir: "{app}"; Flags: ignoreversion notimestamp
+Source: "{#PayloadRoot}\RELEASE-NOTES.md"; DestDir: "{app}"; Flags: ignoreversion notimestamp
+Source: "{#PayloadRoot}\SECURITY.md"; DestDir: "{app}"; Flags: ignoreversion notimestamp
 Source: "{#PayloadRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion notimestamp
 Source: "{#PayloadRoot}\THIRD_PARTY_LICENSES.txt"; DestDir: "{app}"; Flags: ignoreversion notimestamp
 Source: "{#PayloadRoot}\docs\CONFIGURATION.md"; DestDir: "{app}\docs"; Flags: ignoreversion notimestamp
@@ -105,6 +107,8 @@ Source: "{#PayloadRoot}\licenses\PresentMon\THIRD_PARTY.txt"; DestDir: "{app}\li
 
 [Icons]
 Name: "{autoprograms}\LCDSirPlus\LCDSirPlus"; Filename: "{app}\LCDSirPlus.exe"; WorkingDir: "{app}"; Tasks: startmenu
+Name: "{autoprograms}\LCDSirPlus\Instruction Manual"; Filename: "{app}\docs\LCDSirPlus-Instruction-Manual.pdf"; Tasks: startmenu
+Name: "{autoprograms}\LCDSirPlus\Security"; Filename: "{app}\SECURITY.md"; Tasks: startmenu
 Name: "{autoprograms}\LCDSirPlus\Uninstall LCDSirPlus"; Filename: "{uninstallexe}"; Tasks: startmenu
 Name: "{autodesktop}\LCDSirPlus"; Filename: "{app}\LCDSirPlus.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
@@ -526,7 +530,7 @@ begin
   DeleteFile(SidPath);
   DeleteFile(NamePath);
   if not SaveStringToFile(ScriptPath, TaskScript, False) then begin
-    Failure := 'could not prepare the Task Scheduler ownership helper';
+    Failure := 'could not prepare the Windows Task Scheduler check';
     Result := False;
     Exit;
   end;
@@ -547,78 +551,78 @@ begin
       ewWaitUntilTerminated, ResultCode);
   DeleteFile(ScriptPath);
   if not Result then
-    Failure := 'could not launch the Task Scheduler ownership helper'
+    Failure := 'could not start the Windows Task Scheduler check'
   else if ResultCode = 20 then begin
-    Failure := 'the existing startup task could not be queried';
+    Failure := 'Windows could not read the existing LCDSirPlus startup task';
     Result := False;
   end
   else if ResultCode = 21 then begin
-    Failure := 'the startup task name is occupied by an unverified task; it was not changed';
+    Failure := 'a different task is using the LCDSirPlus startup task name; that task was not changed';
     Result := False;
   end
   else if ResultCode = 22 then begin
-    Failure := 'Task Scheduler refused the requested owned-task change';
+    Failure := 'Windows refused to update the verified LCDSirPlus startup task';
     Result := False;
   end
   else if ResultCode = 23 then begin
-    Failure := 'the startup task could not be verified after the requested change';
+    Failure := 'Windows could not confirm the LCDSirPlus startup task after the requested change';
     Result := False;
   end
   else if ResultCode = 24 then begin
-    Failure := 'the original user SID could not be resolved';
+    Failure := 'the Windows account that started setup could not be identified';
     Result := False;
   end
   else if ResultCode = 25 then begin
-    Failure := 'the stored startup task SID or name does not match the original user';
+    Failure := 'the saved Windows account or task name does not match this installation';
     Result := False;
   end
   else if ResultCode = 30 then begin
-    Failure := 'Task Scheduler rejected registration; the exact prior task was restored';
+    Failure := 'Windows refused to update the task; the previous task was restored';
     Result := False;
   end
   else if ResultCode = 31 then begin
-    Failure := 'Task Scheduler rejected registration and rollback of the prior/new task failed';
+    Failure := 'Windows refused to update the task, and setup could not restore the previous task or remove the new task';
     Result := False;
   end
   else if ResultCode = 32 then begin
-    Failure := 'post-registration verification failed; the exact prior task was restored';
+    Failure := 'Windows could not confirm the updated task; the previous task was restored';
     Result := False;
   end
   else if ResultCode = 33 then begin
-    Failure := 'post-registration verification failed and rollback of the prior/new task failed';
+    Failure := 'Windows could not confirm the updated task, and setup could not restore the previous task or remove the new task';
     Result := False;
   end
   else if ResultCode = 34 then begin
-    Failure := 'Task Scheduler refused deletion; the exact prior task was restored';
+    Failure := 'Windows refused to remove the verified task; the previous task was restored';
     Result := False;
   end
   else if ResultCode = 35 then begin
-    Failure := 'Task Scheduler refused deletion and restoration of the exact prior task failed';
+    Failure := 'Windows refused to remove the verified task, and setup could not restore the previous task';
     Result := False;
   end
   else if ResultCode = 36 then begin
-    Failure := 'post-deletion verification failed; the exact prior task was restored';
+    Failure := 'Windows could not confirm that the verified task was removed; the previous task was restored';
     Result := False;
   end
   else if ResultCode = 37 then begin
-    Failure := 'post-deletion verification failed and restoration of the exact prior task failed';
+    Failure := 'Windows could not confirm that the verified task was removed, and setup could not restore the previous task';
     Result := False;
   end
   else if ResultCode <> 0 then begin
-    Failure := Format('the Task Scheduler ownership helper failed with exit code %d', [ResultCode]);
+    Failure := Format('the Windows Task Scheduler check failed with exit code %d', [ResultCode]);
     Result := False;
   end;
   if Result and (Mode = 'identify') then
     if not LoadStringFromFile(SidPath, SidBytes) or
         not LoadStringFromFile(NamePath, NameBytes) then begin
-      Failure := 'the startup task SID/name metadata could not be read';
+      Failure := 'the saved Windows account and task details could not be read';
       Result := False;
     end
     else begin
       OwnerSid := Trim(String(SidBytes));
       TaskName := Trim(String(NameBytes));
       if (OwnerSid = '') or (TaskName = '') then begin
-        Failure := 'the startup task SID/name metadata was empty';
+        Failure := 'the saved Windows account or task name was empty';
         Result := False;
       end;
     end
@@ -709,22 +713,23 @@ begin
   PreviousInstallDir := '';
   if not RunTaskMutation('identify', '', '', True, CurrentUserSid,
       CurrentTaskName, Failure) then begin
-    Result := 'Setup could not resolve the original user''s stable SID/task identity: ' +
-      Failure + '.';
+    Result := 'Setup could not identify the Windows account that started it. ' +
+      'No installed files or startup task were changed. Start setup again from that account''s normal Windows desktop and retry. Details: ' + Failure + '.';
     Exit;
   end;
   if not IsSidValue(CurrentUserSid) then begin
-    Result := 'Setup refused an invalid original-user SID.';
+    Result := 'Setup could not verify the Windows account that started it. ' +
+      'No installed files or startup task were changed. Start setup again from that account''s normal Windows desktop and retry.';
     Exit;
   end;
   AppDir := ExpandConstant('{app}');
   if FileExists(AddBackslash(AppDir) + 'INSTALL-MANIFEST.txt') or
       FileExists(AddBackslash(AppDir) + 'Install.ps1') or
       FileExists(AddBackslash(AppDir) + 'Uninstall.ps1') then begin
-    Result := 'A legacy PowerShell LCDSirPlus installation exists at ' + AppDir + '. ' +
-      'Cancel setup and run powershell.exe -NoProfile -File "' +
+    Result := 'A previous LCDSirPlus installation exists at ' + AppDir + '. ' +
+      'No files or startup task were changed. Cancel setup and run powershell.exe -NoProfile -File "' +
       AddBackslash(AppDir) + 'Uninstall.ps1" -InstallRoot "' + AppDir +
-      '" first. Automatic migration is not supported.';
+      '" first, then run LCDSirPlus Setup again. Automatic migration is not supported.';
     Exit;
   end;
 
@@ -732,8 +737,8 @@ begin
   if SameScopeExists then begin
     if not RegQueryStringValue(ScopeRoot, UninstallKey, 'InstallLocation',
         PreviousInstallDir) or (Trim(PreviousInstallDir) = '') then begin
-      Result := 'The existing same-scope LCDSirPlus uninstall registration is damaged. ' +
-        'Uninstall it from Windows Installed apps before running setup again.';
+      Result := 'Windows has an incomplete ''LCDSirPlus 0.3.0'' entry in Settings > Apps > Installed apps. ' +
+        'No installed files or startup task were changed. Uninstall ''LCDSirPlus 0.3.0'' from that screen, then run LCDSirPlus Setup again.';
       Exit;
     end
     end;
@@ -742,8 +747,8 @@ begin
     if not ReadOwnerMetadata(PreviousInstallDir, OppositeOwnerSid,
         TaskName) or
         (CompareText(OppositeOwnerSid, CurrentUserSid) <> 0) then begin
-      Result := 'The existing same-scope LCDSirPlus owner metadata is invalid or belongs to another user SID. ' +
-        'Uninstall it from its owner account before running setup again.';
+      Result := 'Setup could not verify the existing ''LCDSirPlus 0.3.0'' installation for this Windows account. ' +
+        'The installation and its startup task were left unchanged. Sign in to the Windows account that installed ''LCDSirPlus 0.3.0'', uninstall it from Settings > Apps > Installed apps, then run LCDSirPlus Setup again.';
       Exit;
     end;
   end;
@@ -751,8 +756,8 @@ begin
   if IsAdminInstallMode then begin
     OppositeExists := OriginalUserHasRegistration(QueryFailure);
     if QueryFailure then begin
-      Result := 'Setup could not safely query the original user''s LCDSirPlus registration. ' +
-        'Start setup from that user''s normal desktop session and try again.';
+      Result := 'Setup could not check ''LCDSirPlus 0.3.0'' in Settings > Apps > Installed apps for this Windows account. ' +
+        'No installed files or startup task were changed. Start setup again from this account''s normal Windows desktop and retry.';
       Exit;
     end;
   end
@@ -763,22 +768,22 @@ begin
           OppositeInstallDir) or (Trim(OppositeInstallDir) = '') or
           not ReadOwnerMetadata(OppositeInstallDir, OppositeOwnerSid,
           TaskName) then begin
-        Result := 'Setup cannot authenticate the owner of the existing all-users LCDSirPlus registration. ' +
-          'Uninstall it from its owner account before continuing.';
+        Result := 'Setup could not verify the existing ''LCDSirPlus 0.3.0'' installation in Settings > Apps > Installed apps. ' +
+          'The installation and its startup task were left unchanged. Sign in to the Windows account that installed it, uninstall ''LCDSirPlus 0.3.0'' from that screen, then run LCDSirPlus Setup again.';
         Exit;
       end;
       OppositeExists := CompareText(OppositeOwnerSid, CurrentUserSid) = 0;
     end;
   end;
   if OppositeExists then begin
-    Result := 'LCDSirPlus is already registered for this user SID in the opposite install scope. ' +
-      'Uninstall that copy before changing scope. Registrations owned by other accounts may coexist.';
+    Result := '''LCDSirPlus 0.3.0'' is already installed for this Windows account. ' +
+      'That installation and its startup task were left unchanged. Uninstall ''LCDSirPlus 0.3.0'' from Settings > Apps > Installed apps, then run LCDSirPlus Setup again and choose the other installation option.';
     Exit;
   end;
   if not RunTaskMutation('validate-setup', CurrentUserSid, CurrentTaskName,
       True, OwnerSid, TaskName, Failure) then begin
-    Result := 'Setup cannot safely use the LCDSirPlus startup task name: ' +
-      Failure + '. Resolve the Task Scheduler collision or query error, then retry.';
+    Result := 'Setup could not safely update the ''LCDSirPlus startup task'' in Task Scheduler > Task Scheduler Library: ' +
+      Failure + '. The existing task and installed files were left unchanged. Do not delete the task unless you have verified that it belongs to LCDSirPlus. Correct the Windows error, then run LCDSirPlus Setup again.';
     Exit;
   end;
 
@@ -794,9 +799,9 @@ begin
   DeleteFile(PriorOwnerCopy);
   if HadPriorCache and not SourceIsCache and
       not CopyFile(CachePath, PriorCacheCopy, False) then
-    Result := 'Setup could not preserve the existing cached installer before startup task mutation.'
+    Result := 'Setup could not preserve the existing repair file before updating the ''LCDSirPlus startup task''. No startup task was changed. Close setup and retry.'
   else if HadPriorOwner and not CopyFile(OwnerPath, PriorOwnerCopy, False) then
-    Result := 'Setup could not preserve the existing owner metadata before startup task mutation.';
+    Result := 'Setup could not preserve the existing uninstall details before updating the ''LCDSirPlus startup task''. No startup task was changed. Close setup and retry.';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -826,9 +831,9 @@ begin
   if not MetadataPrepared then begin
     MetadataRolledBack := RollbackPreparedMetadata;
     if MetadataRolledBack then
-      RaiseException('Could not prepare the setup cache and owner metadata file; prior files were restored.')
+      RaiseException('Setup could not prepare the files needed to repair or uninstall LCDSirPlus. The previous maintenance files were restored. Retry setup.')
     else
-      RaiseException('Could not prepare the setup cache and owner metadata file, and file rollback also failed.');
+      RaiseException('Setup could not prepare the files needed to repair or uninstall LCDSirPlus, and could not restore the previous maintenance files. Personal LCDSirPlus settings were not touched. Close setup and retry.');
   end;
 
   if WizardIsTaskSelected('startup') then
@@ -840,11 +845,11 @@ begin
   if not MetadataPrepared then begin
     MetadataRolledBack := RollbackPreparedMetadata;
     if MetadataRolledBack then
-      RaiseException('LCDSirPlus startup task change failed: ' + Failure +
-        '. Prior setup metadata was restored.')
+      RaiseException('Setup could not update the ''LCDSirPlus startup task'' in Task Scheduler > Task Scheduler Library: ' + Failure +
+        '. The previous task and maintenance files were restored. Personal LCDSirPlus settings were not touched. Retry setup.')
     else
-      RaiseException('LCDSirPlus startup task change failed: ' + Failure +
-        '. Setup metadata rollback also failed.');
+      RaiseException('Setup could not update the ''LCDSirPlus startup task'' in Task Scheduler > Task Scheduler Library: ' + Failure +
+        '. Setup could not restore all previous task or maintenance data. Personal LCDSirPlus settings were not touched. Close setup and retry.');
   end;
 end;
 
@@ -857,7 +862,7 @@ begin
   UninstallTaskName := '';
   if not ReadOwnerMetadata(ExpandConstant('{app}'), UninstallTaskSid,
       UninstallTaskName) then begin
-    SuppressibleMsgBox('LCDSirPlus uninstall stopped because the protected owner metadata file could not be authenticated.',
+    SuppressibleMsgBox('LCDSirPlus uninstall could not verify whether it created the ''LCDSirPlus startup task'' in Task Scheduler > Task Scheduler Library. The startup task, installed files, and personal settings were left unchanged. Sign in to the Windows account that installed ''LCDSirPlus 0.3.0'', then retry uninstall from Settings > Apps > Installed apps.',
       mbError, MB_OK, IDOK);
     Result := False;
     Exit;
@@ -869,8 +874,8 @@ begin
   Result := RunTaskMutation('validate-uninstall', UninstallTaskSid,
     UninstallTaskName, False, OwnerSid, TaskName, Failure);
   if not Result then
-    SuppressibleMsgBox('LCDSirPlus uninstall stopped during startup task validation: ' +
-      Failure + '. Resolve the startup task collision or Task Scheduler error, then retry uninstall.',
+    SuppressibleMsgBox('LCDSirPlus uninstall could not verify the ''LCDSirPlus startup task'' in Task Scheduler > Task Scheduler Library: ' +
+      Failure + '. The task, installed files, and personal settings were left unchanged. Do not delete the task unless you have verified that it belongs to LCDSirPlus. Correct the Windows error, then retry uninstall from Settings > Apps > Installed apps.',
       mbError, MB_OK, IDOK);
 end;
 
@@ -882,6 +887,6 @@ begin
     Exit;
   if not RunTaskMutation('uninstall-delete', UninstallTaskSid,
       UninstallTaskName, False, OwnerSid, TaskName, Failure) then
-    RaiseException('LCDSirPlus uninstall stopped before removing application files: ' +
-      Failure + '. Resolve the startup task collision or Task Scheduler error, then retry uninstall.');
+    RaiseException('LCDSirPlus uninstall could not remove the verified ''LCDSirPlus startup task'' from Task Scheduler > Task Scheduler Library: ' +
+      Failure + '. Application files and personal settings were left unchanged. Correct the Windows error, then retry uninstall from Settings > Apps > Installed apps.');
 end;

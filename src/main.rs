@@ -1,5 +1,5 @@
-// LCDSirPlus: LCDSirReal-style dashboard for the Logitech G13 160x43 LCD.
-// Rust port of the original Go implementation — native-first telemetry,
+// Windows dashboard for the Logitech G13.
+// Native-first telemetry,
 // direct-HID G13 backend, no Logitech runtime dependency.
 
 #![windows_subsystem = "windows"]
@@ -35,7 +35,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn usage() -> String {
     format!(
-        "LCDSirPlus {VERSION} — LCDSirReal-style dashboard for the Logitech G13 160x43 LCD\n\
+        "LCDSirPlus {VERSION} - Windows dashboard for the Logitech G13\n\
          \n\
          USAGE:\n\
          \x20 LCDSirPlus.exe [--config PATH] [COMMAND]\n\
@@ -46,13 +46,13 @@ fn usage() -> String {
          \x20 --list-hwinfo-sensors  List usable HWiNFO sensor/reading labels and exit\n\
          \x20 --preview          Run with the virtual preview forced on\n\
          \x20 --hardware-test    Run the deterministic 10-step G13 test sequence\n\
-         \x20 --hardware-discover  List compatible G13 HID discovery results\n\
+         \x20 --hardware-discover  Inspect up to 256 HID interfaces for the first exact G13 match\n\
          \x20 --diagnostics      Write a bounded offline diagnostics ZIP and exit\n\
-         \x20 --discord-authorize  Authorize local RPC (no browser or redirect listener)\n\
+         \x20 --discord-authorize  Authorize the active Discord Desktop account\n\
          \x20 --discord-clear-token  Remove all LCDSirPlus Discord credentials\n\
-         \x20 --backend auto|sdk|hid|virtual  Backend for --hardware-test (default hid)\n\
-         \x20 --duration-secs N  Visible-sequence duration for --hardware-test\n\
-         \x20 --safe-mode        Run with providers/destructive actions disabled\n\
+         \x20 --backend auto|sdk|hid|virtual  Hardware test: sdk=Logitech software, hid=direct USB\n\
+         \x20 --duration-secs N  Duration for timed test commands (1..3600 seconds)\n\
+         \x20 --safe-mode        Disable optional dashboard data sources and destructive actions\n\
          \x20 --diagnostic-dir PATH  Log/diagnostic output directory\n\
          \x20 --help, -h         Print command help\n\
          \x20 --version, -v      Print version"
@@ -550,6 +550,26 @@ mod tests {
         assert!(usage().contains("--list-hwinfo-sensors"));
         assert_eq!(run_hwinfo_inventory(Ok(Vec::new())), 0);
         assert_eq!(run_hwinfo_inventory(Err("inactive".into())), 1);
+    }
+
+    #[test]
+    fn help_explains_public_options_without_exposing_internal_commands() {
+        let help = usage();
+        assert!(help.contains("Windows dashboard for the Logitech G13"));
+        assert!(help.contains("active Discord Desktop account"));
+        assert!(help.contains("sdk=Logitech software, hid=direct USB"));
+        assert!(help.contains("Duration for timed test commands"));
+        assert!(help.contains("Disable optional dashboard data sources and destructive actions"));
+        for internal in [
+            "--hang-test-harness",
+            "--hang-detector-smoke",
+            "--hang-action-smoke",
+            "--hang-action-negative-smoke",
+            "--instance-smoke",
+            "--instance-smoke-child",
+        ] {
+            assert!(!help.contains(internal), "exposed {internal}");
+        }
     }
 
     #[test]

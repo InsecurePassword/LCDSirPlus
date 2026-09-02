@@ -1,240 +1,193 @@
-# LCDSirPlus 0.3.0 product specification
+# LCDSirPlus 0.3.0 Product Specification
 
-Status: **Draft / Unreleased**. Live PresentMon and Discord gates described
-below remain open; this specification is not a completed-release claim.
+Status: **Draft / Unreleased**. Existing b7 downloads are older. Final
+downloadable package testing remains pending.
 
-## Purpose
+Audience: maintainers deciding whether source and package behavior satisfy the
+0.3.0 contract. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation
+ownership, [REFERENCE-LAYOUT.md](REFERENCE-LAYOUT.md) for fixed geometry, and
+[HARDWARE-ACCEPTANCE.md](HARDWARE-ACCEPTANCE.md) for unpublished release gates.
+User procedures remain in [INSTRUCTION-MANUAL.md](INSTRUCTION-MANUAL.md).
 
-LCDSirPlus provides three selectable fixed built-in displays for the Logitech
-G13 160×43 monochrome LCD when games occupy the user's normal displays. The 0.3.0 Rust
-port preserves the 0.2.0 product contract while removing Process Lasso and
-per-tick network polling for core telemetry. Direct HID requires no Logitech
-runtime, while the supported SDK path interoperates with a trusted running
-LCore installation.
+## Product purpose
 
-## Normal screen
+LCDSirPlus is a Windows 11 x64 dashboard for the Logitech G13 160x43 monochrome
+LCD. It keeps useful system, game, device, network, and voice information visible
+while another display is occupied. The preview provides the same dashboard
+without a G13.
 
-Every normal main display shows:
+The product runs as a standard user. It installs no driver or service and opens
+no incoming network listener.
 
-- Windows-local date/day/time;
-- independent Cache-CCD and Frequency-CCD CPU load (dual-CCD CPUs), or one
-  full-height CPU load bar (single-CCD CPUs);
-- system memory load;
-- four button-aligned configurable telemetry modules.
+## User-visible layout
 
-Layouts 1 and 2 also show GPU and VRAM load from available native vendor
-providers, with explicit unavailable state when prerequisites are absent.
-Layouts 2 and 3 show current network ingress and egress.
+Every layout has a compact Windows-local date/time header, a fixed main reading
+area, and four button-aligned lower slots.
 
-`main_display` selects layout 1 (original CPU/RAM and GPU/VRAM halves), layout 2
-(CPU/RAM, GPU/VRAM, and OUT/IN thirds), or layout 3 (original CPU/RAM paired
-with NET IN/NET OUT). It defaults to 1, accepts only 1..3, and applies on valid
-hot reload. All three share the compact date/time header and fixed four-button
-row. The network bars show current throughput using
-`network_graph_ceiling_mbps`; 1000 Mbps is full scale for 1 Gbps.
+- Layout 1: CPU/RAM and GPU/VRAM halves.
+- Layout 2: CPU/RAM, GPU/VRAM, and outgoing/incoming thirds.
+- Layout 3: CPU/RAM and incoming/outgoing halves.
 
-The slot registry contains exactly 53 tokens. Graph variants show exactly the
-trailing 30 seconds. Configured ceilings affect graph scale; additionally,
-`network_graph_ceiling_mbps` scales the network bars in Main Displays 2
-and 3.
-Native system, disk, connection, battery, and vendor GPU sources require no
-helper. Board, cooling, total-power, and CPU-temperature fallbacks fail closed
-when their exact optional source is unavailable.
+`main_display` accepts `1..3`, defaults to `1`, and applies after a valid settings
+save. Network bars in layouts 2 and 3 show current throughput and use
+`network_graph_ceiling_mbps`. One CPU domain uses one full-height CPU bar. Two
+domains use Cache and Frequency bars. Manual CCD topology requires both
+processor lists to be automatic or both to be explicit, disjoint `0..63` lists.
 
-The three built-in layouts are intentionally fixed; there is no layout editor.
-The selected layout and lower slot contents are the user-customizable surface.
+The button registry contains exactly 53 values in `src/config.rs` order;
+[modules.md](../modules.md) is their sole description reference. Graphs cover
+the trailing 30 seconds. There is no layout editor or plug-in system.
 
 ## Button behavior
 
-- Physical button 1–4 short press: cycle matching slot forward.
-- Preview left click: equivalent short press. Preview right click: backward.
-- Selection wraps and persists across config reloads (module identity is
-  preserved when a list changes).
-- Unavailable modules display an explicit unavailable/stale state; they are
-  never silently replaced by unrelated data.
-- Safe mode disables destructive hung-target binding/action, not harmless slot
-  cycling or alert acknowledgement.
+- Physical button 1 through 4 cycles its matching slot forward.
+- Preview left-click cycles forward; right-click cycles backward.
+- A changed slot list keeps the selected value when it still exists.
+- Button 4 acknowledges the highest active alert before ordinary cycling.
+- Safe mode keeps harmless cycling and acknowledgement available.
 
-## CCD bars (Process Lasso removed)
+The stored selection is not always the value rendered. Dynamic substitution in
+the shared slot resolver temporarily shows the next eligible configured value
+without changing slot state when:
 
-Detection is native and automatic:
+- selected `PROC_HANG` has no target;
+- selected `BOTTLENECK` reports current `NONE`;
+- `presentmon_deferred 1` and the selected PresentMon value is unavailable.
 
-1. `GetLogicalProcessorInformationEx(RelationCache)` groups logical
-   processors by L3 cache domain; NUMA nodes are the fallback grouping.
-2. Pinned-thread CPUID `Fn8000_001D` compares L3 sizes to label the 3D
-   V-Cache die (larger L3 = cache CCD; e.g. 96 MB vs 32 MB on the 9950X3D).
-3. Per-logical-processor busy time from
-   `NtQuerySystemInformation(SystemProcessorPerformanceInformation)` deltas
-   is aggregated over each die's mask. No sensors, no drivers, no services.
-4. Manual override: `ccd_cache_processors` / `ccd_frequency_processors`.
-5. One detected domain renders the single-bar layout.
+The resolver skips inactive `PROC_HANG` and `BOTTLENECK`. PresentMon deferral
+also skips other unavailable PresentMon values. No eligible value shows `CLEAR`.
+With `presentmon_deferred 0`, the selected PresentMon pane remains visible with
+its native inactive message.
 
-## G13 backend
+## G13 operation
 
-Modes are `auto`, `sdk`, `hid`, and `virtual`. `auto` uses only the trusted
-Logitech LCD SDK while LCore owns the display and otherwise attempts direct HID.
-Direct HID also refuses the exact Logitech LampArray process, which can
-exclusively claim the G13. The SDK is loaded only from the canonical signed
-LCore installation and all calls are serialized on one bounded owner thread.
-Explicit modes retry their selected transport and never cross-fallback. Exact
-owner checks do not blanket-block unrelated G HUB processes.
+Connection modes are `auto`, `sdk`, `hid`, and `virtual`. `auto` selects the
+trusted Logitech LCD SDK when validated exact `LCore.exe` is present; otherwise,
+it attempts direct HID. Direct HID requires both exact `LCore.exe` and
+`logi_lamparray_service.AMD64.exe` to be absent and fails closed if process
+enumeration fails. Explicit physical modes do not switch to one another.
+LCDSirPlus never stops Logitech software.
 
-## Required telemetry sources
+Hardware discovery scans at most 256 HID interfaces until the first exact G13
+match. It reports that candidate plus preceding rejection reasons, omits device
+paths, performs no writes, and does not inspect competing processes. Discovery
+cannot establish ownership.
 
-- Windows local clock: date/day/time.
-- Windows scheduler: per-logical-processor CPU load (CCD aggregation).
-- GlobalMemoryStatusEx: memory load.
-- NVIDIA NVAPI / AMD ADLX vendor DLLs provide GPU load, VRAM, and temperature;
-  NVML can provide safely aligned NVIDIA power. HWiNFO shared memory and
-  LibreHardwareMonitor loopback JSON are optional fallbacks only where no safe
-  native source exists.
-- Official signed bundled PresentMon v2.5.1 console: FPS/frame timing only;
-  default targetless local observation automatically selects one active
-  PID/application while capture is enabled, with no service/MSI/API.
-- Explicitly profiled SteelSeries Arctis/GameBuds wireless USB receiver
-  families: optional battery, connection, and model-dependent charging state.
-- Discord local RPC: implemented and software-tested active-speaker overlay with RPC OAuth and
-  active-account-bound, per-Discord-user DPAPI credential storage; authorization
-  uses no redirect URI or callback listener. Each user's application supplies a
-  temporarily exposed client secret for the generic OAuth exchange; Social SDK
-  Public Client authorization is not implemented.
+Device loss triggers reconnect with a configured capped delay. Unchanged frames
+are not resubmitted. Only one normal or direct-HID runtime can run in a Windows
+session.
 
-PresentMon is implemented, software-tested, pinned, and remains enabled by
-default in autonomous `presenting` mode because it is a required feature. The
-selector ranks bounded sustained PresentMon graphics/CPU frame workload, uses
-foreground/recent activity for seeding and fallback, applies switch hysteresis,
-and resets full statistics on PID, creation-time, or executable-image changes.
-In autonomous mode, a valid bounded read-only NVIDIA App private local catalog
-gates candidates to exact full-path records carrying every required
-high-confidence game flag. Generic inference is retained only when that catalog
-is unavailable or invalid. NVIDIA App is optional; no NVIDIA process/API, DRS,
-Xbox catalog, network lookup, vendor write, or raw inventory logging is used.
-Unsupported catalog games can therefore be false negatives while a valid
-catalog is active. `presentmon_deferred` defaults on and performs render-only
-cyclic fallback for unavailable PresentMon panels without changing stored slot
-selection. `presentmon_persist` defaults off; its opt-in autonomous mode treats
-the catalog as unavailable only for the existing generic selector, permitting
-non-game presenters while preserving exclusions, identity binding, workload
-hysteresis, expiry, cleanup, and privacy bounds. Live capture against an actively
-presenting game is not yet release-qualified and is deferred while this PC's
-memory is occupied by the local LLM; release remains pending that gate. Discord
-is also implemented and software-tested, but live voice/OAuth qualification is
-pending unless explicitly deferred. Each user creates and registers their own
-Discord application, and tokens remain DPAPI-protected local data.
+## Reading sources
 
-## Operational requirements
+Windows supplies date/time, CPU load, memory, network throughput, audio, disk,
+connections, system battery, and page-read pressure. XInput supplies controller
+battery. Installed NVIDIA or AMD drivers supply GPU load, video memory,
+temperature, and available power values.
 
-- Standard user; medium integrity; no elevation.
-- Local-first and offline except bounded Discord token exchange/refresh and
-  explicitly enabled operator probes.
-- No arbitrary scripts/plugins; no kernel drivers; no services; no listeners.
-- Provider failures isolated; explicit stale/unavailable states.
-- Config hot reload preserves last valid state.
-- Installed configuration defaults to
-  `%LOCALAPPDATA%\LCDSirPlus\Config\lcdsirplus.txt`; portable/development
-  configuration is adjacent to the executable. Explicit `--config` takes
-  precedence. A validated installer template seeds the installed user file only
-  when it is first missing and never replaces it on update.
-- Reconnect after device loss with bounded, capped backoff.
-- No unchanged-frame submission.
-- Bounded histories/logs/protocol inputs.
-- A local-only diagnostics command produces an atomic, redacted ZIP capped at
-  1 MiB from typed offline facts; it excludes raw logs/configuration and private
-  identifiers/content and starts no hardware, provider, network, or action path.
-- One native LCDSirPlus application executable plus the bundled PresentMon
-  console helper; no framework/runtime installation.
-- No raw MSR, SMBus, EC, or Super-I/O probing. Optional HWiNFO/LHM processes
-  remain user-managed and are never bundled, started, or configured.
-  Missing LHM is an acceptable unavailable state; exact LHM SensorIds are copied
-  from its loopback `data.json`, not from diagnostics.
-- One normal/direct-HID runtime per Windows session; read-only and virtual test
-  commands remain available alongside it.
-- Optional network-quality probes are disabled by default, bounded to one
-  configured IP-literal endpoint and one overall timeout, and always disabled
-  in safe mode.
-- Portable startup registration never replaces or removes a foreign current-user
-  Run value and is never mutated in safe mode. Installed startup instead uses a
-  stable SID-specific, per-installing-user ONLOGON task with interactive-token
-  and least-privilege settings; every mutation authenticates the protected
-  installer owner file and all ownership-critical definition fields.
-  Create/update restores the exact prior definition on registration or
-  verification failure.
-- Standard Inno setup supports current-user and elevated all-users scopes and
-  refuses the same SID's opposite-scope or legacy PowerShell installs. Another
-  SID's all-users registration may coexist with a current-user install; setup
-  does not enumerate offline user hives. Rerun/Modify uses the cached exact setup
-  to restore owned files while preserving LocalAppData. Uninstall validates the
-  task without mutation during initialization, revalidates/deletes it when
-  uninstall commits immediately before files, removes shortcuts and setup cache,
-  and preserves configuration, logs, and credentials. Cancellation leaves the
-  task intact.
+HWiNFO and LibreHardwareMonitor are optional for readings without a suitable
+Windows or driver source. Both remain user-managed. HWiNFO is read only through
+exact label pairs. LibreHardwareMonitor is local-only and uses exact or limited
+automatic sensor selection. LCDSirPlus does not read raw MSR, SMBus, EC, or
+Super-I/O registers.
 
-## Alerts and preview
+Headset battery support is limited to exact documented SteelSeries
+Arctis/GameBuds wireless USB receiver profiles. Bluetooth-only, wired, unknown,
+or name-only matches are unsupported.
 
-Current CPU/GPU temperature, memory/VRAM load, and headset battery readings
-produce deterministic configured alert episodes. Temperature and memory
-categories are independently hot-reloaded and enabled by default. Disabling a
-category prevents its episodes; temperature disable also prevents pane
-flashing. It does not affect memory or headset alerts, and memory disable does
-not affect temperature or headset alerts. Only current readings trigger, with
-RAM/VRAM thresholds inclusive at `>=`; stale and unavailable readings do not.
-Memory thresholds default to 100%, while `0` remains a compatibility disable
-value. Existing explicit installed thresholds are preserved on update.
-Existing episodes survive unknown or stale readings. A first current valid
-recovery removes severity-2 warnings immediately and starts
-`critical_alert_linger_ms` only for severity-3 episodes. Disabling a warning
-category clears its episodes; disabling the headset provider clears its episode.
+Network quality probing is off by default. When enabled, it sends ICMP or TCP to
+one configured IP literal. Safe mode sends no probe traffic.
 
-With temperature warnings enabled, compatibility key `warning=1` makes
-selected temperature panes at their shared graph/warning threshold invert on
-alternating 100 ms phases and suppresses CPU/GPU full-screen overlays;
-`warning=0` retains those overlays. Hung-target interaction has highest display
-priority, followed by remaining unacknowledged overlays, Discord speakers, and
-the dashboard. Physical button 4 acknowledges the highest episode; an episode
-rearms only after clearing and recurring, and critical linger behavior is
-as described above.
+`PROVIDER_STATUS` reports tracked normal-dashboard sources that may be disabled,
+unconfigured, disconnected, or otherwise not ready as `DOWN`; `DOWN` is not
+necessarily a failure. A draft default setup can therefore show Discord and the
+disabled hung action as down. In safe mode it summarizes only the safe-mode
+dashboard source set and reports that healthy restricted state as `OK`.
 
-Preview mode `auto` hides the preview when either HID or SDK is connected as a
-physical backend, `always` starts visible unless minimized, and `never` starts
-hidden. Backend reconnect state changes reuse the existing preview window
-rather than creating another UI owner and do not override a manual tray toggle.
-The preview uses Win32 no-activate creation/showing so startup cannot take focus;
-mouse slot clicks and tray/manual visibility remain available.
+## PresentMon behavior
 
-## Hung-window detector
+PresentMon is enabled by default and is included in release packages. It supplies
+frame and game-session values while capture is active. Game selection is
+automatic and requires no user-maintained game list.
 
-The query-only detector considers visible, titled top-level windows outside the
-Windows directory and configured ignore list. A target appears only after its
-exact HWND, PID, creation time, and normalized image path fail consecutive
-bounded `WM_NULL` probes for the configured minimum duration. Responsiveness,
-absence, identity replacement, safe mode, or disabling the detector removes it
-immediately. A detector publication is display input only and is never sufficient
-authorization for the guarded action.
+`presentmon_deferred` defaults on, so an unavailable FPS screen can temporarily
+show another configured option without changing the saved selection.
+`presentmon_persist` defaults off as the normal game preference. When a valid
+NVIDIA App game list is available, ordinary desktop apps are rejected. If the
+list is unavailable, automatic fallback may still select another app. Enabling
+persist allows desktop apps even when the game list is available. The selected
+filename and FPS may appear, and old readings are not preserved. Disabling
+PresentMon prevents filename and FPS exposure.
 
-The guarded action binds the exact selected target only at physical button-down
-on the slot whose currently selected token is `PROC_HANG`; the legacy
-`hang_button` value does not choose the runtime button. `PROC_HANG` is globally
-unique, and no-target display fallback does not change its selection.
-The same input source must remain continuously held. Reaching the configured
-duration requests termination automatically, and release afterward only resets
-the hold. Recovery, disappearance, identity or selection change, device loss,
-provider failure, safe mode, disable, or any hang-policy reload irreversibly
-cancels that press. The action boundary independently repeats native eligibility,
-timeout, exclusion, and process identity checks before using narrowly scoped
-terminate/query/synchronize rights. A loop delayed beyond the maximum press
-duration refuses the hold as stale instead of firing late.
-It never elevates or retries with broader access.
+Values become stale after five seconds without frames and expire after another
+five seconds. Advanced selection and privacy rules are documented in
+[CONFIGURATION.md](CONFIGURATION.md), [SECURITY.md](../SECURITY.md), and
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
-`hang_enabled` defaults to `0`. `PROC_HANG` remains in its shipped slot and its
-button assignment is unchanged until the user explicitly opts in. The provider
-reports disabled/unavailable while the no-target pane falls through without
-changing selection. The destructive action remains unqualified until the
-disposable-child physical-button acceptance gate passes; software tests alone
-do not establish release acceptance.
+## Discord behavior
+
+Discord Desktop voice state is optional. Each user supplies a developer
+application and authorizes each Discord account. The numeric client ID is public.
+The generic OAuth exchange requires a client secret supplied only through the
+temporary masked environment workflow.
+
+Credentials are separated by immutable Discord user ID and protected for the
+current Windows account. The local Discord process, user, session,
+executable, signature, and publisher are checked before use. Authorization opens
+no browser or callback listener. LCDSirPlus reads voice state only and publishes
+no Rich Presence.
+
+## Alerts and safe mode
+
+Current CPU/GPU temperature, RAM/VRAM use, and headset battery can create alert
+episodes. Temperature and memory categories are independent and enabled by
+default. Stale or unavailable readings do not create an alert. Warning recovery
+is immediate; critical recovery uses `critical_alert_linger_ms`.
+
+`warning 1` flashes selected temperature panes and suppresses full-screen
+temperature alerts. `warning 0` keeps those full-screen alerts. Memory and
+headset alerts are unchanged.
+
+Safe mode restricts the dashboard snapshot to Windows-local date/time, native
+CPU and RAM, the fixed layout shell, and the safe-mode health marker. It starts
+no optional data-source, Discord, probe, startup-change, hung-target, or
+termination work. Preview, slot cycling, and acknowledgement remain available.
+
+## Hung-window behavior
+
+Detection and destructive action default off. When enabled, only repeatedly
+unresponsive visible top-level windows outside fixed/configured exclusions can
+be offered. The detector cannot terminate a process.
+
+The selected `PROC_HANG` slot owns the physical button. Button-down binds the
+exact displayed target. A short release changes detail or target. A continuous
+hold requests termination at `hang_hold_ms` after all checks repeat. Recovery,
+selection or identity change, device loss, settings change, disable, or safe mode
+cancels the press. The action never elevates and can lose unsaved work.
+
+Physical-button testing with a disposable child remains pending.
+
+## Configuration, diagnostics, and install
+
+Valid settings saves replace runtime settings. Invalid saves leave the last
+valid version active. Installed configuration is under
+`%LOCALAPPDATA%\LCDSirPlus\Config`; portable/development configuration is beside
+the executable. Explicit `--config` wins.
+
+Diagnostics is offline, capped at 1 MiB, and built from a fixed allowlist. It
+reads no configuration and starts no hardware, optional source, network, Discord,
+or action work. Private content and identifiers are excluded.
+
+Setup supports current-user and all-users scope. Installed startup uses an owned
+per-user sign-in task. Portable startup uses only its exact current-user Run
+value. Update and repair preserve LocalAppData. Uninstall removes installed
+files, shortcuts, and the owned task while preserving configuration, logs, and
+credentials.
 
 ## Non-goals
 
-- G19 color LCD.
-- Steam/NVIDIA overlay hooking; kernel-driver sensor access.
-- Email integration; remote telemetry/control; arbitrary third-party
-  modules; layout editor; Process Lasso integration.
+- G19 color LCD support.
+- Display hooking or kernel sensor drivers.
+- Remote monitoring or control.
+- Arbitrary scripts, plug-ins, or third-party button modules.
+- A visual layout editor.
+- A user-maintained game list.

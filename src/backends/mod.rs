@@ -1,8 +1,8 @@
 //! LCD backend worker: owns the physical device thread, serializes all
 //! device I/O, and exposes a message surface to the application.
 //!
-//! Backend selection is ownership-driven: `auto` uses SDK while LCore owns
-//! the device and direct HID only while competing Logitech owners are absent.
+//! Backend selection is process-presence-driven: `auto` uses the SDK while
+//! exact `LCore.exe` is running and direct HID while competing processes are absent.
 //! The worker suppresses unchanged frames and reconnects with bounded,
 //! capped backoff. Device loss emits canceled button releases.
 
@@ -322,7 +322,7 @@ fn select_physical_kind(kind: BackendKind, lcore_present: bool) -> Result<Backen
             Err("Logitech SDK mode requires a running trusted LCore.exe".into())
         }
         (BackendKind::Hid, true) => {
-            Err("direct HID is refused while LCore.exe owns the G13 LCD".into())
+            Err("direct HID is refused while competing process LCore.exe is running".into())
         }
         (BackendKind::Virtual, _) => Err("virtual is not a physical backend".into()),
     }

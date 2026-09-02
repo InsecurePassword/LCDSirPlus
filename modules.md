@@ -1,57 +1,60 @@
-# LCDSirPlus Button Modules
+# LCDSirPlus Button Options
 
-Put these values in `slot_0` through `slot_3` to choose what each button slot displays.
+This is the canonical and sole description reference for all 53 button options,
+in source order. For setup and editing steps, see the
+[instruction manual](docs/INSTRUCTION-MANUAL.md#choose-layouts-and-button-options).
+Put these values in `slot_0` through `slot_3`.
 
-HEADSET_BATTERY - Displays a supported SteelSeries wireless headset or earbud battery state.
-CONTROLLER_BATTERY - Displays the selected XInput controller battery or wired state.
-FPS_CURRENT - Displays current frames per second from PresentMon.
-FPS_1LOW - Displays the 1% low frame rate from PresentMon.
-FPS_01LOW - Displays the 0.1% low frame rate from PresentMon.
-FRAME_TIME - Displays current frame time and a trailing 30-second graph.
-CPU_TEMP - Displays the CPU temperature in degrees Celsius.
-GPU_TEMP - Displays the GPU temperature in degrees Celsius.
-NET_IN - Displays the current incoming decimal SI bit rate.
-NET_OUT - Displays the current outgoing decimal SI bit rate.
-NET_BOTH - Displays the combined incoming and outgoing decimal SI bit rate.
-NET_IN_GRAPH - Displays incoming network traffic over the trailing 30 seconds.
-NET_OUT_GRAPH - Displays outgoing network traffic over the trailing 30 seconds.
-NET_GRAPH - Displays incoming and outgoing traffic over the trailing 30 seconds.
-PING - Displays the latest latency from the optional network probe.
-JITTER - Displays latency variation from the optional network probe.
-PACKET_LOSS - Displays packet loss from the optional network probe.
-MIC_STATUS - Displays whether the default microphone is live or muted.
-AUDIO - Displays the default output volume percentage.
-SESSION_TIME - Displays elapsed time for the active PresentMon capture session.
-SESSION_SUMMARY - Displays capture-session duration and stutter count.
-CLOCK - Displays the current local time.
-GAME_NAME - Displays the captured game or process name.
-ALERTS - Displays the unacknowledged alert count and highest severity.
-PROVIDER_STATUS - Displays the number of unhealthy tracked providers.
-CPU_LOAD - Displays whole-system CPU utilization.
-RAM_USAGE - Displays physical memory utilization and capacity.
-GPU_LOAD - Displays GPU utilization from native vendor telemetry.
-VRAM_USAGE - Displays video-memory utilization and capacity.
-CPU_CACHE_TEMP - Reserved for Cache-domain temperature and currently displays N/A.
-CPU_FREQ_TEMP - Reserved for Frequency-domain temperature and currently displays N/A.
-CPU_LOAD_GRAPH - Displays CPU utilization over the trailing 30 seconds.
-GPU_LOAD_GRAPH - Displays GPU utilization over the trailing 30 seconds.
-CPU_TEMP_GRAPH - Displays CPU temperature over the trailing 30 seconds.
-GPU_TEMP_GRAPH - Displays GPU temperature over the trailing 30 seconds.
-VRM_TEMP - Displays an exact configured LHM VRM temperature.
-CPU_FAN - Displays CPU-fan duty or calibrated RPM-derived percentage.
-PUMP_RPM - Displays pump duty or calibrated RPM-derived percentage, not raw RPM.
-POWER_LIMIT - Displays an exact configured total-power reading.
-CPU_GPU_POWER - Displays the current CPU-package and GPU-board power subtotal.
-CHIPSET_TEMP - Displays an exact configured LHM chipset temperature.
-MOTHERBOARD_TEMP - Displays an exact configured LHM motherboard temperature.
-DISK_IO - Displays aggregate disk read and write rates.
-DISK_IO_GRAPH - Displays aggregate disk activity over the trailing 30 seconds.
-RAM_DETAIL - Displays used and total physical memory.
-FPS_GRAPH - Displays frame rate over the trailing 30 seconds.
-THERMALS - Displays current CPU and GPU temperatures together.
-CONNECTIONS - Displays the established IPv4 and IPv6 TCP connection count.
-NET_HEALTH - Displays network-probe ping, jitter, and packet loss together.
-SYSTEM_BATTERY - Displays system AC, battery, and charging state.
-HARD_FAULTS - Displays an approximation of page-read pressure per second.
-BOTTLENECK - Displays a sustained CPU, GPU, memory, disk, or none heuristic.
-PROC_HANG - Displays a detected hung window and provides a guarded emergency hold action.
+HEADSET_BATTERY - Shows battery and connection. What you need: A supported SteelSeries Arctis/GameBuds wireless USB receiver.
+CONTROLLER_BATTERY - Shows controller battery or WIRED. What you need: A controller that Windows recognizes as an Xbox (XInput) controller.
+FPS_CURRENT - Shows current FPS. What you need: PresentMon, planned for the 0.3.0 package.
+FPS_1LOW - Shows common FPS slowdowns. What you need: PresentMon, planned for the 0.3.0 package.
+FPS_01LOW - Shows rarer severe FPS slowdowns. What you need: PresentMon, planned for the 0.3.0 package.
+FRAME_TIME - Shows frame time and a 30-second graph. What you need: PresentMon, planned for the 0.3.0 package.
+CPU_TEMP - Shows CPU temperature. What you need: HWiNFO or LibreHardwareMonitor, installed and set up separately.
+GPU_TEMP - Shows GPU temperature. What you need: An NVIDIA/AMD graphics driver, or LibreHardwareMonitor set up separately.
+NET_IN - Shows the current incoming rate. What you need: Built into Windows and LCDSirPlus; no extra software.
+NET_OUT - Shows the current outgoing rate. What you need: Built into Windows and LCDSirPlus; no extra software.
+NET_BOTH - Shows incoming plus outgoing. What you need: Built into Windows and LCDSirPlus; no extra software.
+NET_IN_GRAPH - Shows incoming traffic for 30 seconds. What you need: Built into Windows and LCDSirPlus; no extra software.
+NET_OUT_GRAPH - Shows outgoing traffic for 30 seconds. What you need: Built into Windows and LCDSirPlus; no extra software.
+NET_GRAPH - Shows both network directions for 30 seconds. What you need: Built into Windows and LCDSirPlus; no extra software.
+PING - Shows the latest network delay. What you need: The optional network probe, enabled and configured separately.
+JITTER - Shows network delay variation. What you need: The optional network probe, enabled and configured separately.
+PACKET_LOSS - Shows the percentage of failed checks. What you need: The optional network probe, enabled and configured separately.
+MIC_STATUS - Shows LIVE or MUTED. What you need: Built into Windows and LCDSirPlus; no extra software.
+AUDIO - Shows default output volume. What you need: Built into Windows and LCDSirPlus; no extra software.
+SESSION_TIME - Shows active game-session time. What you need: PresentMon, planned for the 0.3.0 package.
+SESSION_SUMMARY - Shows session time and stutters. What you need: PresentMon, planned for the 0.3.0 package.
+CLOCK - Shows local time. What you need: Built into Windows and LCDSirPlus; no extra software.
+GAME_NAME - Shows the selected game or app filename. What you need: PresentMon, planned for the 0.3.0 package. A filename may appear under either persist setting; set `presentmon_enabled 0` to prevent this exposure.
+ALERTS - Shows unacknowledged active alerts or CLEAR. What you need: Built into Windows and LCDSirPlus; no extra software.
+PROVIDER_STATUS - Shows unavailable tracked data sources or OK. What you need: Built into Windows and LCDSirPlus; no extra software.
+CPU_LOAD - Shows total CPU use. What you need: Built into Windows and LCDSirPlus; no extra software.
+RAM_USAGE - Shows memory use and capacity. What you need: Built into Windows and LCDSirPlus; no extra software.
+GPU_LOAD - Shows GPU use. What you need: An NVIDIA or AMD graphics driver.
+VRAM_USAGE - Shows video memory use and capacity. What you need: An NVIDIA or AMD graphics driver.
+CPU_CACHE_TEMP - Shows N/A. What you need: Not available in the draft 0.3.0 build.
+CPU_FREQ_TEMP - Shows N/A. What you need: Not available in the draft 0.3.0 build.
+CPU_LOAD_GRAPH - Shows CPU use for 30 seconds. What you need: Built into Windows and LCDSirPlus; no extra software.
+GPU_LOAD_GRAPH - Shows GPU use for 30 seconds. What you need: An NVIDIA or AMD graphics driver.
+CPU_TEMP_GRAPH - Shows CPU temperature for 30 seconds. What you need: HWiNFO or LibreHardwareMonitor, installed and set up separately.
+GPU_TEMP_GRAPH - Shows GPU temperature for 30 seconds. What you need: An NVIDIA/AMD graphics driver, or LibreHardwareMonitor set up separately.
+VRM_TEMP - Shows motherboard power-circuit temperature. What you need: LibreHardwareMonitor with the correct VRM temperature selected.
+CPU_FAN - Shows CPU fan percentage. What you need: LibreHardwareMonitor with the correct CPU fan selected.
+PUMP_RPM - Shows pump percentage. What you need: LibreHardwareMonitor, set up with the matching pump reading selected.
+POWER_LIMIT - Shows total system power. What you need: One total-power reading selected in HWiNFO or LibreHardwareMonitor.
+CPU_GPU_POWER - Shows CPU plus GPU power. What you need: CPU power from HWiNFO or LibreHardwareMonitor, plus GPU power from the graphics driver, HWiNFO, or LibreHardwareMonitor.
+CHIPSET_TEMP - Shows chipset temperature. What you need: LibreHardwareMonitor, set up with the matching sensor selected.
+MOTHERBOARD_TEMP - Shows motherboard temperature. What you need: LibreHardwareMonitor, set up with the matching sensor selected.
+DISK_IO - Shows total disk read and write rates. What you need: Built into Windows and LCDSirPlus; no extra software.
+DISK_IO_GRAPH - Shows disk activity for 30 seconds. What you need: Built into Windows and LCDSirPlus; no extra software.
+RAM_DETAIL - Shows used and total memory. What you need: Built into Windows and LCDSirPlus; no extra software.
+FPS_GRAPH - Shows FPS for 30 seconds. What you need: PresentMon, planned for the 0.3.0 package.
+THERMALS - Shows CPU and GPU temperatures. What you need: Both CPU and GPU temperature sources set up and current.
+CONNECTIONS - Shows established IPv4 and IPv6 TCP connections only. What you need: Built into Windows and LCDSirPlus; no extra software.
+NET_HEALTH - Shows ping, jitter, and packet loss. What you need: The optional network probe, enabled and configured separately.
+SYSTEM_BATTERY - Shows AC, battery, and charging. What you need: Built into Windows and LCDSirPlus; no extra software.
+HARD_FAULTS - Shows memory-to-disk pressure. What you need: Built into Windows and LCDSirPlus; no extra software.
+BOTTLENECK - Shows CPU, GPU, RAM, or disk. With current NONE, the next eligible option appears temporarily or the slot shows CLEAR. What you need: Built-in system readings; GPU results also need a supported graphics driver.
+PROC_HANG - Shows a hung-window target. With no target, including while disabled, the next eligible option appears temporarily or the slot shows CLEAR. What you need: Not supported for end users in this draft release; leave `hang_enabled 0`.

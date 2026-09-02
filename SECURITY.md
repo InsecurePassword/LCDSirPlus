@@ -1,119 +1,83 @@
 # Security
 
-## Scope
+## Supported versions
 
-LCDSirPlus is a local-first Windows application with current-user and optional
-all-users installation modes. It opens the selected
-G13 HID interface, optional local provider interfaces, Discord Desktop's local
-named pipe, and explicitly configured outbound endpoints. It does not install a
-service, driver, listener, or browser extension. All-users setup uses normal UAC
-elevation; the installed application and its per-user startup task run limited.
-Discord RPC authorization sends no redirect URI and opens no callback listener.
+LCDSirPlus 0.3.0 is a draft, unpublished release. The planned package has not
+completed final package testing. Older b7 builds are not final 0.3.0 builds.
 
-Telemetry is native-first. LCDSirPlus uses documented Win32/vendor APIs and
-never probes raw MSRs, SMBus, EC, or Super-I/O registers. Optional HWiNFO access
-is read-only shared memory; LCDSirPlus does not start or configure it. Optional
-LibreHardwareMonitor access is HTTP restricted to loopback, but the user is
-responsible for safely enabling and operating that web server. LHM is
-user-managed and not bundled; its absence is an acceptable unavailable state.
+## Report a vulnerability
 
-Planned release packages bundle the official Intel-signed PresentMon v2.5.1
-console and exact `licenses/PresentMon/LICENSE.txt`/`THIRD_PARTY.txt` notices. LCDSirPlus validates
-the automatic artifact and starts it without a shell only while frame capture is
-enabled. Default mode receives targetless local application/PID frame timing and
-rejects invalid, excluded, and LCDSirPlus identities before retaining bounded
-candidate activity and selected-only statistics. Candidates are bound to PID,
-creation time, and executable image through cached original-process handles;
-failed identity queries are rejected. Selection uses bounded PresentMon
-frame-level graphics/CPU workload. Autonomous mode optionally reads only
-`%LOCALAPPDATA%\NVIDIA Corporation\NVIDIA App\NvBackend\ApplicationStorage.json`
-as a same-user, untrusted selection hint. Reads are capped at 1 MiB, 4096
-application records, and 64 detected paths per record. Malformed or ambiguous
-application records are skipped, but at least one fully typed record is required;
-malformed roots, unsupported record-only inputs, and unsafe or changing files are
-unavailable. A valid catalog admits only an exact
-full-process-image path with all required high-confidence flags and rejects all
-other presenters. The cache retains only normalized qualified paths, is cleared
-with the provider, and logs only state transitions with a fixed reason code or
-bounded qualified-path count, never raw catalog paths, records, names, or
-timestamps. LCDSirPlus never writes or scans NVIDIA data, invokes NVIDIA/NVAPI
-DRS, accesses Xbox catalogs, uses network catalog services, or treats this hint
-as an authorization boundary. Generic workload/activity inference is used only
-when the catalog is unavailable. It terminates only its owned
-child and exact ETW session and installs no PresentMon service, MSI, GUI, or API.
-Opt-in `presentmon_persist` treats the catalog as unavailable only for autonomous
-candidate selection. It broadens eligible local presenters, so a desktop
-application's executable name and FPS may appear on the LCD/preview and in
-existing PresentMon status detail, but it does not weaken process identity,
-exclusions, queue/bounds, stale expiry, cleanup, or catalog privacy controls.
-Local ETW policy can require Performance Log Users membership or elevation for
-capture; neither is granted by LCDSirPlus.
+Use [GitHub private vulnerability reporting](https://github.com/InsecurePassword/LCDSirPlus/security/advisories/new).
+Include the affected version, reproduction steps, impact, and whether Discord
+credentials or the hung-window action are involved. Never submit a live secret,
+token, private log, or unreviewed diagnostic bundle.
 
-Published LCDSirPlus packages will not be code-signed even though the bundled PresentMon
-binary is. Verify `LCDSirPlus-0.3.0-SHA256SUMS.txt` and the package's sorted
-`PACKAGE-MANIFEST.txt` before running ZIP contents, and verify the setup EXE's
-outer checksum before running it. Setup refuses the same SID's opposite-scope
-registration, legacy PowerShell installs, and unverified scheduled-task
-collisions; it does not claim to enumerate offline user hives. Another SID's
-all-users registration may coexist with a current-user install. It never
-overwrites or removes a task until the stored SID/name and exact product source,
-stable description, action, working directory, trigger, principal, logon type,
-and run level are authenticated. Create/update preserves the exact prior task
-definition and restores it if registration or post-verification fails. Uninstall
-validates without mutation at startup, then revalidates and removes the task only
-when file removal commits, so cancellation leaves the task intact.
+If private reporting is unavailable, open a
+[public issue](https://github.com/InsecurePassword/LCDSirPlus/issues/new) with no
+sensitive details and request a private contact method. Allow time for a fix
+before disclosure.
 
-Diagnostics are local, offline, capped, and allowlist-only. They ignore
-`--config` and exclude raw configuration/logs, credentials, identifiers,
-titles, paths, addresses, environment values, command lines, registry values,
-serials, arbitrary listings, and device paths. Review a bundle before sharing.
+## Protect secrets and tokens
 
-## Secrets
+The numeric `discord_client_id` is public. Discord client secrets, access
+tokens, and refresh tokens are not. Never place them in source, settings,
+arguments, logs, screenshots, issues, chat, or diagnostics.
 
-Each user must create and register their own Discord application. Never put
-Discord client secrets or tokens in source, configuration, command arguments,
-issues, chat, diagnostics, logs, screenshots, or package fixtures. The generic
-OAuth exchange used by LCDSirPlus requires the client secret; Public Client
-no-secret authorization is Social SDK-specific and is not implemented. Enter
-the secret through a masked prompt, expose it only through
-`LCDSIRPLUS_DISCORD_CLIENT_SECRET` for authorization, and remove the environment
-variable immediately afterward. The secret is retained only inside that
-account's DPAPI-protected v2 credential so refresh can use it. Credentials stay
-in current-user DPAPI-protected local files
-under `%LOCALAPPDATA%\LCDSirPlus`; installed configuration is separately stored
-at `%LOCALAPPDATA%\LCDSirPlus\Config\lcdsirplus.txt`, while portable/development
-configuration is adjacent to the executable. Explicit `--config` takes
-precedence; the installed template seeds only a missing user file on first use
-and does not overwrite it. Runtime accepts a credential only when its immutable Discord
-user ID and client ID match the trusted pipe's current `READY` session and the
-authenticated user has all required scopes. Revoke exposed credentials with
-Discord.
+Use only the masked PowerShell 5/7 workflow in the
+[instruction manual](docs/INSTRUCTION-MANUAL.md#connect-discord). It removes the
+temporary `LCDSIRPLUS_DISCORD_CLIENT_SECRET` environment value in a `finally`
+block. Authorization requests exactly the `rpc`, `identify`, and
+`rpc.voice.read` scopes. Windows protects stored records for the current Windows
+account. To disconnect, run the explicit `--discord-clear-token` command and
+separately revoke the app under Discord **User Settings > Authorized Apps**.
 
-Discord support is implemented and software-tested, but live voice/OAuth
-qualification remains pending unless explicitly deferred; this document does
-not claim that live gate has passed.
+## Limit data exposure
 
-## Reporting
+- PresentMon runs only while frame capture is enabled, and LCDSirPlus stops only
+  the child it starts. With `presentmon_persist 0`, a valid NVIDIA App game
+  catalog rejects ordinary desktop apps; if that catalog is unavailable,
+  automatic fallback may still select another app. Setting it to `1` permits
+  desktop apps even with a valid catalog. A selected executable filename and
+  FPS may appear, and old readings are not preserved. Set
+  `presentmon_enabled 0` if that exposure is unacceptable.
+- If Windows denies PresentMon capture, add the user to **Performance Log
+  Users**, sign out, and sign in. Elevation is for diagnosis, not normal use.
+- HWiNFO access is read only. LibreHardwareMonitor is restricted to the local
+  computer; do not expose its web server to other computers.
+- The optional network quality probe is off by default. Enabling it sends ICMP
+  or TCP traffic to the configured IP address. Discord authorization and refresh
+  use outgoing HTTPS.
 
-If GitHub private vulnerability reporting is enabled and available, use
-<https://github.com/InsecurePassword/LCDSirPlus/security/advisories/new>. This
-URL does not imply that the repository feature is enabled. Include the affected
-version, reproduction steps, impact, and whether credentials or destructive
-actions are involved, but never include live secrets or personal diagnostics.
+## Use diagnostics and hardware tests safely
 
-If private reporting is unavailable, open
-<https://github.com/InsecurePassword/LCDSirPlus/issues/new> with no sensitive
-details and request a private contact channel. Allow time for triage and a
-corrected release before public disclosure.
+Diagnostics is a bounded offline summary and does not collect active provider
+state. It ignores `--config`, starts no HID, provider, Discord, network, or
+hung-action work, and excludes raw logs, settings, credentials, identifiers,
+content, process/window names, paths, addresses, targets, environment values,
+command lines, registry values, serial numbers, directory listings, and device
+paths. Review the ZIP before sharing it; review raw logs privately and
+separately.
 
-## Local Safety
+`--hardware-discover` reports HID compatibility without raw device paths or
+writes and does not inspect running processes. A direct-HID hardware test writes
+to the G13 and refuses to run if another LCDSirPlus process is running, either
+competing Logitech process is running, or running-process enumeration fails.
+Prefer Logitech Gaming Software and follow the bounded LampArray procedure in the
+[instruction manual](docs/INSTRUCTION-MANUAL.md#check-a-logitech-g13).
 
-The hung-window action is destructive and disabled by default. `PROC_HANG`
-remains selected in its shipped slot; its provider reports disabled/unavailable
-and its no-target pane falls through until the user explicitly sets
-`hang_enabled 1`. When enabled, it can terminate an exact,
-repeatedly revalidated process automatically when a continuous physical-button
-hold reaches its configured threshold. Releasing afterward only resets the
-hold. The action remains unqualified until the disposable-child physical-button
-gate passes. Use safe mode while investigating, test only with the harness in
-`docs/HARDWARE-ACCEPTANCE.md`, and never target unsaved work.
+## Avoid destructive actions
+
+Run LCDSirPlus as a standard Windows user. Keep `hang_enabled 0`; the
+hung-window action can terminate a program and lose unsaved work, its physical
+behavior has not completed release testing, and there is no supported end-user
+test.
+
+Safe mode limits the dashboard to the clock, built-in CPU load, memory, preview,
+slot cycling, and alert acknowledgement. It disables optional dashboard data,
+Discord dashboard access, probes, startup changes, and the destructive action.
+The explicit Discord authorize and clear commands remain available.
+
+The planned LCDSirPlus packages are unsigned. Verify their supplied SHA-256
+checksums before use; planned PresentMon content has its own Intel signature.
+Uninstall preserves `%LOCALAPPDATA%\LCDSirPlus`, including settings, logs, and
+Discord credentials. Remove that folder only when its data is no longer needed.

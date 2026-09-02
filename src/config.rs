@@ -1,7 +1,7 @@
 //! LCDSirPlus v2 configuration: schema, defaults, validation.
 //!
-//! LCDSirReal-style text format: `#` comments, whitespace-separated
-//! key/value lines, ordered `slot_0`..`slot_3` module lists, `include`
+//! Plain-text format: `#` comments, whitespace-separated key/value lines,
+//! ordered `slot_0`..`slot_3` button-option lists, `include`
 //! override files, hot reload with last-valid-state preservation.
 //!
 //! Selectors generally default to `auto`; `network_probe_method` accepts
@@ -18,6 +18,7 @@ pub const MAX_CONFIG_INCLUDE_DIRECTIVES: usize = 64;
 pub const MAX_CONFIG_TOKEN_BYTES: usize = 16 * 1024;
 pub const MAX_CONFIG_STRING_BYTES: usize = 4 * 1024;
 pub const MAX_CONFIG_LIST_ITEMS: usize = 256;
+const MAX_CCD_PROCESSOR_INDEX: u32 = 63;
 
 /// The four button-aligned slot defaults, byte-identical to the shipped
 /// LCDSirPlus portable configuration.
@@ -444,7 +445,24 @@ pub fn validate(c: &Config) -> Result<(), String> {
     if !matches!(c.ccd_source.as_str(), "auto" | "manual") {
         return Err("ccd_source must be auto or manual".into());
     }
-    if let (Some(cache), Some(freq)) = (&c.ccd_cache_processors, &ccd_frequency(c)) {
+    if c.ccd_cache_processors.is_some() != c.ccd_frequency_processors.is_some() {
+        return Err(
+            "ccd_cache_processors and ccd_frequency_processors must both be auto or both explicit"
+                .into(),
+        );
+    }
+    for (name, processors) in [
+        ("ccd_cache_processors", &c.ccd_cache_processors),
+        ("ccd_frequency_processors", &c.ccd_frequency_processors),
+    ] {
+        if processors
+            .as_ref()
+            .is_some_and(|processors| processors.iter().any(|&p| p > MAX_CCD_PROCESSOR_INDEX))
+        {
+            return Err(format!("{name} processor indexes must be 0..63"));
+        }
+    }
+    if let (Some(cache), Some(freq)) = (&c.ccd_cache_processors, &c.ccd_frequency_processors) {
         if cache.iter().any(|p| freq.contains(p)) {
             return Err("ccd_cache_processors and ccd_frequency_processors overlap".into());
         }
@@ -731,11 +749,17 @@ pub fn validate(c: &Config) -> Result<(), String> {
     )?;
     for i in 0..4 {
         if c.slots[i].is_empty() {
-            return Err(format!("slot_{} must contain at least one module", i));
+            return Err(format!(
+                "slot_{} must contain at least one button option",
+                i
+            ));
         }
         for module in &c.slots[i] {
             if !valid_module(module) {
-                return Err(format!("slot_{} contains unknown module {:?}", i, module));
+                return Err(format!(
+                    "slot_{} contains unknown button option {:?}",
+                    i, module
+                ));
             }
         }
     }
@@ -776,10 +800,6 @@ pub(crate) fn parse_network_target(
         .map_err(|_| {
             "network_probe_target must be an IP literal, optionally with a TCP port".into()
         })
-}
-
-fn ccd_frequency(c: &Config) -> &Option<Vec<u32>> {
-    &c.ccd_frequency_processors
 }
 
 fn check_range_i32(name: &str, v: i32, lo: i32, hi: i32) -> Result<(), String> {
@@ -834,7 +854,7 @@ pub fn parse_processor_list(v: &str) -> Result<Option<Vec<u32>>, String> {
                 .trim()
                 .parse()
                 .map_err(|_| format!("invalid processor range {:?}", part))?;
-            if hi < lo || hi > 1023 {
+            if hi < lo || hi > MAX_CCD_PROCESSOR_INDEX {
                 return Err(format!("invalid processor range {:?}", part));
             }
             for i in lo..=hi {
@@ -852,7 +872,7 @@ pub fn parse_processor_list(v: &str) -> Result<Option<Vec<u32>>, String> {
             let n: u32 = part
                 .parse()
                 .map_err(|_| format!("invalid processor {:?}", part))?;
-            if n > 1023 {
+            if n > MAX_CCD_PROCESSOR_INDEX {
                 return Err(format!("invalid processor {:?}", part));
             }
             if !out.contains(&n) {
@@ -1098,6 +1118,38 @@ mod tests {
     }
 
     #[test]
+    fn ccd_processor_lists_require_matching_modes_and_indexes_0_to_63() {
+        let mut cfg = Config {
+            ccd_source: "manual".into(),
+            ccd_cache_processors: Some(vec![0]),
+            ccd_frequency_processors: Some(vec![63]),
+            ..Config::default()
+        };
+        assert!(validate(&cfg).is_ok());
+
+        cfg.ccd_frequency_processors = None;
+        assert_eq!(
+            validate(&cfg).unwrap_err(),
+            "ccd_cache_processors and ccd_frequency_processors must both be auto or both explicit"
+        );
+        cfg.ccd_cache_processors = None;
+        cfg.ccd_frequency_processors = Some(vec![1]);
+        assert!(validate(&cfg).is_err());
+
+        cfg.ccd_cache_processors = Some(vec![64]);
+        assert_eq!(
+            validate(&cfg).unwrap_err(),
+            "ccd_cache_processors processor indexes must be 0..63"
+        );
+        cfg.ccd_cache_processors = Some(vec![0]);
+        cfg.ccd_frequency_processors = Some(vec![64]);
+        assert_eq!(
+            validate(&cfg).unwrap_err(),
+            "ccd_frequency_processors processor indexes must be 0..63"
+        );
+    }
+
+    #[test]
     fn lhm_url_requires_loopback() {
         let c = Config {
             lhm_url: "http://192.168.1.5:8085/data.json".into(),
@@ -1142,7 +1194,9 @@ mod tests {
             parse_processor_list("0-3;2").unwrap(),
             Some(vec![0, 1, 2, 3])
         );
+        assert_eq!(parse_processor_list("63").unwrap(), Some(vec![63]));
         assert!(parse_processor_list("5-3").is_err());
-        assert!(parse_processor_list("9999").is_err());
+        assert!(parse_processor_list("64").is_err());
+        assert!(parse_processor_list("0-64").is_err());
     }
 }

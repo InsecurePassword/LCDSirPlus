@@ -2,7 +2,7 @@
 name = "lcdsirplus"
 version = "0.3.0"
 edition = "2021"
-description = "LCDSirPlus: LCDSirReal-style dashboard for the Logitech G13 160x43 monochrome LCD"
+description = "Windows dashboard for the Logitech G13"
 license = "MIT"
 
 [[bin]]

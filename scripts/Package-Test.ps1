@@ -1,3 +1,38 @@
+<#
+.SYNOPSIS
+Validates release packages, packaging contracts, or installer lifecycles.
+
+.DESCRIPTION
+Runs the selected package-test mode. All is the default and validates an existing release without installing it; focused static modes use temporary fixtures. Lifecycle modes install, repair, and uninstall the product, clean owned system changes, and retain qualification logs under the temporary directory. Other modes create no durable output artifacts.
+
+.PARAMETER ArtifactDir
+Directory containing release artifacts. Required by All and InstallerStatic.
+
+.PARAMETER ExpectedCommit
+Expected 40-character source commit. Required by All and must equal ExpectedSourceIdentity.
+
+.PARAMETER InstallerPayloadDir
+Staged installer payload used for static source-to-payload checks. Required by All and InstallerStatic; optional for lifecycle modes.
+
+.PARAMETER SetupPath
+Absolute path to the release-named setup executable. Required only by CurrentUserLifecycle and AllUsersQualification.
+
+.PARAMETER ExpectedSetupSha256
+Expected lowercase SHA-256 of the setup executable. Required by All, InstallerStatic, and both lifecycle modes.
+
+.PARAMETER ExpectedSourceIdentity
+Expected commit or WORKTREE source identity embedded in the setup payload. Required by All, InstallerStatic, and both lifecycle modes.
+
+.PARAMETER ConfirmSystemMutation
+Explicitly permits installer, registry, shortcut, and scheduled-task changes in either lifecycle mode. Cleanup is attempted, and qualification logs are retained.
+
+.PARAMETER Mode
+Selects All, InstallerStatic, CurrentUserLifecycle, AllUsersQualification, LifecycleCleanupStatic, ReleaseTransaction, NoticeInventory, or SourcePrivacy. CurrentUserLifecycle must be non-elevated; AllUsersQualification must be elevated.
+
+.EXAMPLE
+PS> .\scripts\Package-Test.ps1 -Mode LifecycleCleanupStatic
+Checks lifecycle cleanup contracts using temporary fixtures without installing the product.
+#>
 #Requires -Version 7.0
 [CmdletBinding()]
 param(
@@ -240,6 +275,10 @@ function Test-InstallerStatic {
         'Name: "startmenu"; Description: "Create Start Menu shortcuts"',
         'Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked',
         'Name: "startup"; Description: "Start LCDSirPlus when I sign in"',
+        'Source: "{#PayloadRoot}\RELEASE-NOTES.md"; DestDir: "{app}"; Flags: ignoreversion notimestamp',
+        'Source: "{#PayloadRoot}\SECURITY.md"; DestDir: "{app}"; Flags: ignoreversion notimestamp',
+        'Name: "{autoprograms}\LCDSirPlus\Instruction Manual"; Filename: "{app}\docs\LCDSirPlus-Instruction-Manual.pdf"; Tasks: startmenu',
+        'Name: "{autoprograms}\LCDSirPlus\Security"; Filename: "{app}\SECURITY.md"; Tasks: startmenu',
         'ExecAsOriginalUser',
         'Const TaskNotFound = -2147024894',
         'Function IsOwned(candidate)',
@@ -270,23 +309,31 @@ function Test-InstallerStatic {
         'INSTALL-MANIFEST.txt',
         'Automatic migration is not supported.',
         'OriginalUserHasRegistration',
-        'Registrations owned by other accounts may coexist.',
+        'Settings > Apps > Installed apps',
+        'Task Scheduler > Task Scheduler Library',
+        'Do not delete the task unless you have verified that it belongs to LCDSirPlus.',
         'installer\LCDSirPlus-Setup.exe',
         'ModifyPath',
         'LCDSirPlus installer owner v1',
         'ScopeSwitch := ''/ALLUSERS''',
         'ScopeSwitch := ''/CURRENTUSER''',
         'function InitializeUninstall',
-        'SuppressibleMsgBox(''LCDSirPlus uninstall stopped',
+        'SuppressibleMsgBox(''LCDSirPlus uninstall could not verify',
         'RunTaskMutation(''validate-uninstall''',
         'procedure CurUninstallStepChanged',
         'CurUninstallStep <> usUninstall',
         'RunTaskMutation(''uninstall-delete''',
-        'uninstall stopped before removing application files',
+        'Application files and personal settings were left unchanged.',
         '[UninstallDelete]'
     )
     foreach ($text in $required) {
         if ($iss.IndexOf($text, [StringComparison]::Ordinal) -lt 0) { throw "installer source contract missing: $text" }
+    }
+    foreach ($retiredMessage in @('same-scope LCDSirPlus', 'user SID in the opposite install scope',
+        'owner metadata is invalid', 'Task Scheduler collision', 'startup task collision', 'ownership helper')) {
+        if ($iss.IndexOf($retiredMessage, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            throw "installer still contains retired user-facing collision language: $retiredMessage"
+        }
     }
     $modifyPathCode = [regex]::Match($iss,
         '(?s)function GetModifyPath\(const Param: String\): String;.*?(?=function OwnerMetadataPath)').Value
@@ -479,7 +526,7 @@ function Test-InstallerStatic {
     $sourceFiles = @([regex]::Matches($iss, '(?m)^Source: "\{#PayloadRoot\}\\([^\"]+)"; DestDir:') | ForEach-Object { $_.Groups[1].Value.Replace('\', '/') })
     $expectedFiles = @(
         'LCDSirPlus.exe', 'PresentMon.exe', 'lcdsirplus.default.txt', 'lcdsirplus.layout', 'SOURCE-COMMIT.txt',
-        'README.md', 'modules.md', 'LICENSE', 'THIRD_PARTY_LICENSES.txt',
+        'README.md', 'modules.md', 'RELEASE-NOTES.md', 'SECURITY.md', 'LICENSE', 'THIRD_PARTY_LICENSES.txt',
         'docs/CONFIGURATION.md', 'docs/INSTRUCTION-MANUAL.md',
         'docs/LCDSirPlus-Instruction-Manual.pdf', 'licenses/PresentMon/LICENSE.txt',
         'licenses/PresentMon/THIRD_PARTY.txt'
@@ -703,7 +750,7 @@ function Assert-QualificationInstall {
         throw 'Apps & Features registration or owner metadata file mismatch'
     }
     foreach ($relative in @('LCDSirPlus.exe', 'PresentMon.exe', 'lcdsirplus.default.txt', 'lcdsirplus.layout',
-        'README.md', 'modules.md', 'LICENSE', 'THIRD_PARTY_LICENSES.txt', 'SOURCE-COMMIT.txt', 'docs\CONFIGURATION.md',
+        'README.md', 'modules.md', 'RELEASE-NOTES.md', 'SECURITY.md', 'LICENSE', 'THIRD_PARTY_LICENSES.txt', 'SOURCE-COMMIT.txt', 'docs\CONFIGURATION.md',
         'docs\INSTRUCTION-MANUAL.md', 'docs\LCDSirPlus-Instruction-Manual.pdf',
         'licenses\PresentMon\LICENSE.txt', 'licenses\PresentMon\THIRD_PARTY.txt',
         'installer\LCDSirPlus-Setup.exe', 'installer\LCDSirPlus-Owner.txt')) {
@@ -721,7 +768,7 @@ function Assert-QualificationInstall {
     }
     Assert-StartupTaskContract -InstallRoot $InstallRoot -ExpectedSid $owner.OwnerSid
     $programs = if ($Machine) { Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\LCDSirPlus' } else { Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\LCDSirPlus' }
-    foreach ($shortcut in @('LCDSirPlus.lnk', 'Uninstall LCDSirPlus.lnk')) {
+    foreach ($shortcut in @('LCDSirPlus.lnk', 'Instruction Manual.lnk', 'Security.lnk', 'Uninstall LCDSirPlus.lnk')) {
         Assert-RegularSingleLinkFile (Join-Path $programs $shortcut) | Out-Null
     }
     $desktop = if ($Machine) { Join-Path $env:PUBLIC 'Desktop\LCDSirPlus.lnk' } else { Join-Path ([Environment]::GetFolderPath('Desktop')) 'LCDSirPlus.lnk' }
@@ -747,7 +794,7 @@ function Assert-QualificationSentinel {
 }
 
 function Remove-QualificationShortcut {
-    param([string]$Path, [string]$InstallRoot, [switch]$Uninstaller)
+    param([string]$Path, [string]$InstallRoot, [string]$Target = 'LCDSirPlus.exe', [switch]$Uninstaller)
     if (-not [IO.File]::Exists($Path)) { return }
     Assert-RegularSingleLinkFile $Path | Out-Null
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($Path)
@@ -757,7 +804,7 @@ function Remove-QualificationShortcut {
         if ([IO.Path]::GetFileName($target) -cnotmatch '^unins[0-9]*\.exe$') { throw "uninstall shortcut ownership is uncertain: $Path" }
         Join-Path $root ([IO.Path]::GetFileName($target))
     }
-    else { Join-Path $root 'LCDSirPlus.exe' }
+    else { Join-Path $root $Target }
     $ansi = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage)
     $ansiExpected = $ansi.GetString($ansi.GetBytes($expected))
     if (-not $target.Equals($expected, [StringComparison]::OrdinalIgnoreCase) -and
@@ -805,8 +852,10 @@ function Invoke-InstallerLifecycleQualification {
     $desktop = if ($Machine) { Join-Path $env:PUBLIC 'Desktop\LCDSirPlus.lnk' } else { Join-Path ([Environment]::GetFolderPath('Desktop')) 'LCDSirPlus.lnk' }
     $programsExisted = [IO.Directory]::Exists($programs)
     $appShortcut = Join-Path $programs 'LCDSirPlus.lnk'
+    $manualShortcut = Join-Path $programs 'Instruction Manual.lnk'
+    $securityShortcut = Join-Path $programs 'Security.lnk'
     $uninstallShortcut = Join-Path $programs 'Uninstall LCDSirPlus.lnk'
-    foreach ($shortcut in @($appShortcut, $uninstallShortcut, $desktop)) {
+    foreach ($shortcut in @($appShortcut, $manualShortcut, $securityShortcut, $uninstallShortcut, $desktop)) {
         if ([IO.File]::Exists($shortcut) -or [IO.Directory]::Exists($shortcut)) { throw "qualification requires exact final shortcut path to be unused: $shortcut" }
     }
     $logRoot = Join-Path ([IO.Path]::GetTempPath()) ("LCDSirPlus-Qualification-Logs-$id")
@@ -961,6 +1010,7 @@ function Invoke-InstallerLifecycleQualification {
         Assert-QualificationSentinel $sentinelPath $sentinelBytes $sentinelIdentity
         if ($null -ne (Get-UninstallRegistration -Machine:$Machine) -or $null -ne (Get-StartupTaskXml -AllowMissing) -or
             [IO.Directory]::Exists($installRoot) -or [IO.File]::Exists($appShortcut) -or
+            [IO.File]::Exists($manualShortcut) -or [IO.File]::Exists($securityShortcut) -or
             [IO.File]::Exists($uninstallShortcut) -or [IO.File]::Exists($desktop)) {
             throw 'uninstall did not remove registration/task/payload/shortcuts or preserve LocalAppData'
         }
@@ -1043,6 +1093,8 @@ function Invoke-InstallerLifecycleQualification {
         }
         Invoke-BestEffortCleanup 'qualification shortcuts' {
             Remove-QualificationShortcut $appShortcut $installRoot
+            Remove-QualificationShortcut $manualShortcut $installRoot -Target 'docs\LCDSirPlus-Instruction-Manual.pdf'
+            Remove-QualificationShortcut $securityShortcut $installRoot -Target 'SECURITY.md'
             Remove-QualificationShortcut $uninstallShortcut $installRoot -Uninstaller
             Remove-QualificationShortcut $desktop $installRoot
             if (-not $programsExisted -and [IO.Directory]::Exists($programs) -and @(Get-ChildItem -LiteralPath $programs -Force).Count -eq 0) {
@@ -1057,7 +1109,8 @@ function Invoke-InstallerLifecycleQualification {
         if ($null -ne (Get-UninstallRegistration) -or $null -ne (Get-UninstallRegistration -Machine) -or
             $null -ne (Get-StartupTaskXml -AllowMissing) -or [IO.Directory]::Exists($installRoot) -or
             ($null -ne $oppositeRoot -and [IO.Directory]::Exists($oppositeRoot)) -or
-            [IO.File]::Exists($appShortcut) -or [IO.File]::Exists($uninstallShortcut) -or [IO.File]::Exists($desktop) -or
+            [IO.File]::Exists($appShortcut) -or [IO.File]::Exists($manualShortcut) -or [IO.File]::Exists($securityShortcut) -or
+            [IO.File]::Exists($uninstallShortcut) -or [IO.File]::Exists($desktop) -or
             [IO.File]::Exists($sentinelPath) -or [IO.Directory]::Exists($sentinelDir) -or
             (Test-ExactProcessRunning (Join-Path $installRoot 'LCDSirPlus.exe'))) {
             throw 'final lifecycle registration/task/install/shortcut/cache/sentinel/process cleanup is incomplete'
@@ -1461,7 +1514,7 @@ try {
     $portableFiles = @(
         'LCDSirPlus.exe', 'PresentMon.exe', 'lcdsirplus.txt', 'LICENSE', 'THIRD_PARTY_LICENSES.txt', 'SOURCE-COMMIT.txt', 'README.md', 'modules.md',
         'RELEASE-NOTES.md', 'SECURITY.md', 'docs/CONFIGURATION.md',
-        'docs/HARDWARE-ACCEPTANCE.md', 'docs/INSTRUCTION-MANUAL.md',
+        'docs/INSTRUCTION-MANUAL.md',
         'docs/LCDSirPlus-Instruction-Manual.pdf',
         'licenses/PresentMon/LICENSE.txt', 'licenses/PresentMon/THIRD_PARTY.txt'
     )

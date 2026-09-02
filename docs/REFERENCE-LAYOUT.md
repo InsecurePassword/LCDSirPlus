@@ -1,4 +1,10 @@
-# Fixed 160x43 built-in layout reference
+# Fixed 160x43 Layout Reference
+
+Audience: renderer maintainers reviewing fixed coordinates and golden frames.
+This reference describes current source-renderer geometry. Its hashes are
+implementation checks, not final package or physical-release evidence. Use
+[PRODUCT-SPEC.md](PRODUCT-SPEC.md) for behavior and
+[HARDWARE-ACCEPTANCE.md](HARDWARE-ACCEPTANCE.md) for physical review.
 
 ## Shared geometry
 
@@ -77,10 +83,8 @@ The renderer's canonical sample and state fixtures are pinned to these hashes:
 | Layout 2 | `c6bf7ef1e919ef47dfc7ed13ef9a9f937253e47a449fe8558f00adf98a881701` |
 | Layout 3 | `ef1dbde8de40632b213b7c149789a716165719b0ab4f40ab80aa508930b6ff8b` |
 
-These hashes are current implementation invariants enforced by tests in
-`src/render/renderer.rs`; they are not evidence that release artifacts were
-built or physically accepted. A change to any hash is a built-in-layout change
-and requires explicit visual review and an updated reference sample.
+Tests in `src/render/renderer.rs` enforce these hashes. A changed hash is a
+built-in-layout change and requires visual review plus an updated reference.
 
 ## Bar state grammar
 

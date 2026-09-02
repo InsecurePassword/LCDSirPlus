@@ -1,104 +1,85 @@
-# LCDSirPlus 0.3.0 Draft Release Notes (Unreleased)
+# LCDSirPlus 0.3.0 Draft Release Notes
 
-LCDSirPlus 0.3.0 is an unreleased draft of the Rust port for Windows 11 x64.
-There is no completed release claim. Its implemented software
-scope includes deterministic rendering, direct G13 HID, native telemetry,
-Discord active-speaker integration, alerts, guarded hung-window action,
-single-instance/startup ownership, offline diagnostics, and transactional
-per-user packaging.
+## Draft status
 
-## Highlights
+LCDSirPlus 0.3.0 is unpublished. The package described below is planned, and
+final package testing remains pending. Older b7 builds do not contain every
+delta below and are not final 0.3.0 builds.
 
-- Added three selectable fixed main-display layouts with a compact shared
-  header. `main_display` accepts `1` through `3`, defaults to `1`, and applies
-  on valid hot reload; layouts 2 and 3 reuse `network_graph_ceiling_mbps` for
-  their current network bars.
-- Direct Logitech G13 HID transport without Logitech runtime or elevation.
-- Native NVAPI/ADLX GPU metrics, pinned PresentMon frame-capture support, optional
-  LHM, headset/XInput/audio/network providers, and deterministic
-  stale/unavailable rendering.
-- Expanded the slot registry to 53 modules, including trailing
-  30-second load/temperature/disk/FPS graphs, board/cooling/power telemetry,
-  native disk/connections/system-battery detail, network health, bottleneck,
-  and selected-slot hung-window controls.
-- Added native-first source arbitration: documented Win32/vendor APIs first,
-  configured HWiNFO shared memory next, then exact/automatic LHM loopback only
-  where no safe native source exists. No raw MSR/SMBus/EC/Super-I/O probing.
-- Added independently hot-reloaded temperature and memory warning categories,
-  both enabled by default.
-  Temperature presentation remains compatible through `warning`: pane-local
-  100 ms flashing when enabled, or full-screen temperature overlays when off.
-  RAM/VRAM thresholds default to 100%, trigger inclusively, and retain explicit
-  installed values during update. Severity-2 recovery removes immediately;
-  severity-3 linger starts on the first current valid recovery. Unknown/stale
-  readings retain existing episodes, while disabling the applicable category or
-  headset provider clears them.
-- Pinned and software-tested Intel's official signed PresentMon v2.5.1 console
-  and its MIT/third-party notices for release packaging. Package-level Rust and
-  Windows dependency notices are in
-  `THIRD_PARTY_LICENSES.txt`. Default targetless capture autonomously selects a
-  strong sustained local presenter from bounded PresentMon graphics/CPU workload
-  with foreground/activity fallback, without a game-name list or vendor API.
-  Targeted expert overrides remain available. LCDSirPlus owns PresentMon only during active frame capture;
-  uninstall removes it. No PresentMon service, MSI, GUI, or API is installed.
-- Implemented and software-tested Discord Desktop IPC with bounded OAuth,
-  DPAPI-local credential storage, cancellation, and redacted errors. Each user
-  creates and registers their own Discord application.
-- Offline diagnostics ZIP with fixed entries, a 1 MiB cap, manifest hashes,
-  no configuration read, and identity-checked no-overwrite publication.
-- Standard current-user/all-users Inno Setup EXE with preserved LocalAppData,
-  same-scope cached repair, scope/legacy collision refusal, and authenticated
-  per-installing-user scheduled-task ownership.
+## Deltas
 
-## Requirements and Gaps
+- Adds three fixed main layouts, four button slots, and 53 exact display values.
+  [modules.md](modules.md) is the sole option table.
+- Adds trusted Logitech Gaming Software access, direct Logitech G13 HID access,
+  and a virtual preview that does not require a G13 or take focus from the active
+  app.
+- Adds native Windows CPU, memory, audio, disk, connection, battery, and network
+  readings; NVIDIA/AMD GPU readings; XInput and supported SteelSeries receiver
+  state; and HWiNFO and LibreHardwareMonitor support.
+- Adds 30-second graphs, alerts, safe mode, bounded offline diagnostics, and
+  Discord Desktop active-speaker display.
+- Adds PresentMon automatic selection with
+  `presentmon_target_mode presenting`. The planned package is intended to place
+  one Intel-signed PresentMon v2.5.1 console beside `LCDSirPlus.exe`.
+- Adds `presentmon_deferred 1` by default. An unavailable PresentMon option
+  temporarily shows the next eligible option without changing the stored
+  selection. `PROC_HANG` and `BOTTLENECK` are not temporary replacements; an
+  all-unavailable list shows `CLEAR`.
+- Adds `presentmon_persist 0` as the normal game preference. A valid NVIDIA App
+  catalog rejects ordinary desktop apps; if it is unavailable, fallback may
+  select another app. Setting it to `1` permits desktop apps even with a valid
+  catalog. A filename and FPS may appear, and old readings are not preserved.
+- Inactive `PROC_HANG` and `BOTTLENECK` selections now temporarily show the next
+  eligible option without changing the stored selection.
+- Adds independent `temperature_warning_enabled` and
+  `memory_warning_enabled` switches. Memory warning thresholds default to `100`
+  and trigger at or above the configured value.
+- Keeps network probing and the destructive hung-window action off by default.
 
-- Windows 11 x64 and a standard user account.
-- Optional telemetry requires its corresponding vendor driver/hardware.
-  HWiNFO and LibreHardwareMonitor remain user-managed and are not bundled;
-  HWiNFO64 Free shared-memory monitoring has the vendor's 12-hour limit.
-- Discord features require Discord Desktop, a developer application/tester
-  setup, user consent, and network access for token exchange/refresh.
-- The LCDSirPlus executable and package archives are not code-signed; verify
-  supplied SHA-256 manifests. The bundled PresentMon executable has its own
-  Intel signature.
-- The Discord implementation is software-tested, but live voice/OAuth workflow
-  acceptance is pending. Release remains pending this gate unless it is
-  explicitly deferred; tokens remain current-user DPAPI-protected local data.
-- PresentMon remains enabled by default because it is a required product
-  feature. Autonomous mode optionally gates selection through the current
-  user's bounded, read-only NVIDIA App local catalog using exact full-path and
-  high-confidence flags; unavailable/invalid catalogs retain generic workload
-  fallback. NVIDIA App is not required, and no catalog inventory is logged or
-  written. Live capture against an actively presenting game is not yet
-  release-qualified and is deferred because this PC's memory is occupied by the
-  local LLM. Release remains pending that live gate.
-- PresentMon panels now default to render-only deferred fallback
-  (`presentmon_deferred 1`) without changing button selection; disabling it keeps
-  existing `N/A`/`STALE`/`00:00`/`IDLE` text. Optional
-  `presentmon_persist 1` allows generic presenters only in autonomous mode while
-  retaining identity, exclusions, workload hysteresis, expiry, cleanup, and
-  catalog privacy controls; it defaults to `0`.
-- Guarded hung-window detection and termination are opt-in (`hang_enabled 0` by
-  default). `PROC_HANG` remains selected in the shipped slot while its provider
-  reports disabled/unavailable and its no-target pane falls through until
-  enabled. The destructive action is unqualified until the
-  disposable-child physical-button gate passes; automated tests do not
-  establish that evidence.
-- Current-session display and installer observations are not final-package
-  release evidence. See `docs/HARDWARE-ACCEPTANCE.md` for the dated status and
-  required rebinding/reruns.
+## Migration
 
-## Upgrade and Removal
+- Existing installed settings are preserved during update or repair, including
+  existing memory warning thresholds.
+- `ccd_source` accepts `auto` or `manual`. Manual
+  `ccd_cache_processors` and `ccd_frequency_processors` indexes are `0..63`;
+  both lists must be explicit together and must not overlap.
+- Review `presentmon_deferred` and `presentmon_persist` after migration. Set
+  `presentmon_enabled 0` if executable-name or FPS exposure is unacceptable.
+- Keep `hang_enabled 0`. Do not migrate an experimental enabled value into
+  normal use.
 
-If release artifacts are published, run the versioned setup EXE again to update
-or repair owned files. The standard
-Windows registration points Modify to an exact cached setup copy with the same
-current-user or all-users scope. Setup refuses the same account's opposite-scope
-registration, a legacy PowerShell installation in the destination, or a foreign
-collision on the stable SID-specific startup task. Another account's all-users
-registration may coexist with a current-user install. Uninstall validates task
-ownership during initialization, revalidates and removes it only when uninstall
-commits, then removes application files. Cancellation leaves the task intact;
-Task Scheduler failure preserves retry. Installed configuration at
-`%LOCALAPPDATA%\LCDSirPlus\Config\lcdsirplus.txt`, plus logs and credentials
-elsewhere under `%LOCALAPPDATA%\LCDSirPlus`, remain untouched.
+See [CONFIGURATION.md](docs/CONFIGURATION.md) for configuration syntax and
+accepted values.
+
+## Update or remove
+
+When 0.3.0 is published, exit LCDSirPlus, verify the planned setup checksum, and
+run setup in the same current-user or all-users scope. Running the same setup
+repairs installed files. Remove an opposite-scope installation owned by the
+same Windows account before changing scope.
+
+Uninstall from Windows **Installed apps**. It removes installed files,
+shortcuts, and its owned sign-in task but preserves configuration, logs, and
+Discord credentials under `%LOCALAPPDATA%\LCDSirPlus`. Remove that folder only
+when its data is no longer needed, and revoke Discord access separately.
+
+For a portable copy, set `start_at_login 0`, run that exact copy once, exit it,
+and then remove its folder.
+
+## Known limitations
+
+- Windows 11 x64 is required. A G13 is required only for physical display and
+  button use.
+- Final planned-package, installer, physical G13, and live Discord acceptance
+  remain pending.
+- The planned LCDSirPlus packages are unsigned. Planned PresentMon content has
+  its own Intel signature.
+- PresentMon capture can require **Performance Log Users** membership followed
+  by sign-out and sign-in. Elevation is for diagnosis only.
+- HWiNFO and LibreHardwareMonitor are not planned package contents. HWiNFO64
+  Free shared-memory monitoring has a 12-hour limit; LibreHardwareMonitor must
+  be started and configured locally by the user.
+- Only documented SteelSeries Arctis/GameBuds wireless USB receivers are
+  supported; Bluetooth-only and wired models are not.
+- The destructive hung-window action can lose unsaved work. Its physical
+  behavior has not completed release testing, and no end-user test is supported.

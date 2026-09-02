@@ -1,15 +1,14 @@
 ##############################################################################
-# LCDSirPlus 0.3.0 configuration (Rust port)
+# LCDSirPlus 0.3.0 configuration
 #
-# Blank lines and lines beginning with # are ignored. Each setting is a key
-# followed by whitespace-separated values. The physical 160x43 framebuffer is
-# fixed; these settings select its layout, data sources, thresholds, and ordered
-# module list for each LCD button. Saving a valid file hot-reloads it. Parse or
-# token errors identify the source line; final range or cross-field errors can
-# report line 0. Invalid changes are rejected; the prior valid config stays active.
-#
-# Selectors generally default to "auto"; network_probe_method accepts "auto"
-# but intentionally defaults to "icmp".
+# Lines starting with # are notes. Each other line is a setting followed by its
+# value. Save this file while LCDSirPlus is running to apply valid changes.
+# Invalid changes are rejected, so the last working settings stay active.
+# Values marked "auto" choose a safe default; the resolved default is shown
+# after # where useful.
+# Installed documentation is in the program folder; the instruction manual is
+# also available from the Start Menu. Portable documentation is in the docs
+# folder beside this file, with modules.md beside the executable.
 
 config_refresh_ms       1000
 telemetry_interval_ms   auto          # 300
@@ -17,14 +16,10 @@ render_interval_ms      auto          # 100
 # Main dashboard: 1 classic CPU/GPU, 2 thirds, 3 CPU/RAM + network.
 main_display            1             # 1 | 2 | 3
 preview_mode            auto          # auto | always | never
-preview_scale           4
+preview_scale           4             # restart required
 start_minimized         0
-start_at_login          0
+start_at_login          0             # portable only; installer startup is chosen in setup
 safe_mode               0
-
-# Date/time render from the Windows local clock and locale.
-date_format             yyyy-MM-dd dddd
-time_format             HH:mm:ss
 
 ##############################################################################
 # Four physical button slots. A short press cycles the matching list.
@@ -35,9 +30,8 @@ slot_2  PROC_HANG GPU_TEMP PING JITTER AUDIO
 slot_3  THERMALS PACKET_LOSS MIC_STATUS SESSION_SUMMARY PROVIDER_STATUS
 
 ##############################################################################
-# Cache/Frequency CCD bars (dual-CCD Ryzen). Detection is fully native:
-# L3/NUMA topology groups the dies; CPUID L3 size labels the 3D V-Cache die
-# (e.g. 96 MB vs 32 MB on the 9950X3D). Process Lasso is not required.
+# Dual-CCD Ryzen systems can show separate Cache and Frequency CPU bars.
+# Auto detection uses Windows and CPU information; Process Lasso is not needed.
 #
 # ccd_source             auto | manual
 # ccd_cache_processors   auto or logical-processor list (0,1,2 / 0-15)
@@ -48,9 +42,14 @@ ccd_cache_processors    auto
 ccd_frequency_processors auto
 
 ##############################################################################
-# Logitech G13 backend. Auto uses the trusted SDK while LCore.exe owns the LCD;
-# direct HID also requires Logitech LampArray service to be stopped.
-# Explicit modes never fall back.
+# Logitech G13 connection. Auto selects the SDK when validated LCore.exe is
+# present and otherwise tries direct access. Direct access requires exact
+# LCore.exe and logi_lamparray_service.AMD64.exe to both be absent and stops if
+# running processes cannot be checked. LCDSirPlus does not stop either program.
+# Hardware discovery checks at most 256 HID interfaces through the first exact
+# G13 match, reports that candidate and earlier rejections without device paths,
+# performs no writes, and does not inspect competing processes. A discovery
+# result cannot establish ownership.
 #
 # logitech_backend       auto | sdk | hid | virtual
 
@@ -64,17 +63,15 @@ logitech_orientation    normal        # normal | flip_x | flip_y | rotate_180
 logitech_invert         0
 
 ##############################################################################
-# Native Win32/vendor APIs are used first. HWiNFO, then exact/automatic LHM,
-# covers only readings with no safe native source. LCDSirPlus never probes raw
-# MSRs, SMBus, EC, or Super-I/O. LHM is user-managed: explicitly start it and
-# safely enable its loopback web server (normally port 8085). It is not bundled;
-# absence and unavailable LHM readings are acceptable.
+# Optional sensor tools. HWiNFO and LibreHardwareMonitor are not included.
+# Install and set them up separately only for readings Windows and the graphics
+# driver cannot provide. Use the instruction manual at the location above.
 
 lhm_mode                auto          # auto | on | off
 lhm_url                 auto          # http://127.0.0.1:8085/data.json
 lhm_interval_ms         auto          # 300
 lhm_stale_ms            auto          # 3000
-# Optional stable SensorId overrides copied from LHM's loopback data.json:
+# Optional sensor paths copied from LHM's local data.json page:
 # lhm_cpu_temp_sensor    /amdcpu/0/temperature/2
 # lhm_gpu_temp_sensor    /lpc/it8720f/temperature/2
 # lhm_vrm_temp_sensor
@@ -90,13 +87,11 @@ lhm_stale_ms            auto          # 3000
 cpu_fan_max_rpm         0
 pump_max_rpm            0
 
-# Exact, case-sensitive HWiNFO original-label pairs. Leave both values blank by
-# omitting a pair. Exact HWiNFO CPU temperature is preferred over LHM. Enter
-# labels shown by your own HWiNFO; LCDSirPlus only reads shared memory and never
-# starts or configures HWiNFO. Start Sensors-only, enable Shared Memory Support,
-# then run LCDSirPlus.exe --list-hwinfo-sensors. HWiNFO64 Free shared memory is
-# limited to 12 hours; use HWiNFO32 or appropriately licensed Pro for unattended
-# use according to vendor terms.
+# Copy exact, case-sensitive HWiNFO labels from this command:
+# LCDSirPlus.exe --list-hwinfo-sensors
+# Start HWiNFO in Sensors-only mode and enable Shared Memory Support first.
+# HWiNFO64 Free shared memory stops after 12 hours. Use HWiNFO32 or an
+# appropriately licensed HWiNFO Pro for unattended use.
 # hwinfo_cpu_temp_sensor "<exact sensor original label>"
 # hwinfo_cpu_temp_reading "<exact temperature original label>"
 # hwinfo_total_power_sensor "System"
@@ -107,33 +102,33 @@ pump_max_rpm            0
 # hwinfo_gpu_power_reading "GPU Power"
 hwinfo_stale_ms         5000
 
-# Native GPU provider (Phase 2): auto tries nvapi then adlx; off disables it.
+# GPU readings: auto tries NVIDIA and then AMD; off turns GPU readings off.
 gpu_provider            auto          # auto | nvapi | adlx | off
 
 ##############################################################################
-# Official signed PresentMon v2.5.1 console bundled for frame/FPS timing only.
-# Default presenting mode uses a valid optional NVIDIA App local catalog as an
-# exact-path game gate; generic workload fallback applies only when unavailable.
-# NVIDIA App is not required, and its catalog is never written or logged.
-# LCDSirPlus owns one child only while capture is enabled.
+# PresentMon supplies game FPS and frame timing. It is planned for the 0.3.0
+# package, and FPS is enabled by default. Start LCDSirPlus before the game.
 
 presentmon_enabled      1
 presentmon_path         auto
 presentmon_interval_ms  auto          # 1000
 presentmon_window_ms    auto          # 60000
 presentmon_target_mode  presenting    # presenting | foreground | process_name | disabled
-presentmon_deferred     1             # skip unavailable PresentMon panels without changing selection
-presentmon_persist      0             # presenting only: 1 allows generic non-game presenters
+presentmon_deferred     1             # 1 hides unavailable FPS screens; the saved choice stays selected
+# 0 prefers games. A valid NVIDIA game list rejects desktop apps; fallback may
+# select another app if the list is unavailable.
+# 1 allows desktop apps even when the list is available. A selected filename/FPS
+# may appear; old readings are not kept. Set presentmon_enabled 0 to prevent it.
+presentmon_persist      0
 presentmon_process_name ""
-# presentmon_exclude dwm.exe explorer.exe applicationframehost.exe textinputhost.exe searchhost.exe lcdsirplus.exe lcdsirplus.console.exe
+presentmon_exclude      dwm.exe explorer.exe applicationframehost.exe textinputhost.exe searchhost.exe lcdsirplus.exe lcdsirplus.console.exe
 stutter_threshold_ms    33.34
 
 ##############################################################################
-# Explicitly supported SteelSeries wireless USB receiver families (VID 1038).
-# Includes selected Arctis 1, 7X/7P, 9, Pro Wireless, 7+/7P+, Nova 3/5/7, and
-# GameBuds profiles; not generic support for every SteelSeries, Bluetooth, or
-# wired device. See docs/CONFIGURATION.md for the exact 32 PIDs across eight
-# protocols and battery granularity. GG is not required as a data source.
+# Supported SteelSeries Arctis/GameBuds wireless USB receivers only.
+# Bluetooth-only and wired models do not work. SteelSeries GG is not required.
+# Use CONFIGURATION.md in the documentation location described above for the
+# exact receiver list.
 
 headset_enabled         1
 headset_poll_ms         auto          # 15000
@@ -141,14 +136,13 @@ headset_query_timeout_ms auto         # 1200
 headset_stale_ms        auto          # 45000
 headset_warn_percent    25
 headset_critical_percent 0
-headset_estimate_hours  1
 
-# XInput controller battery — Phase 2.
+# XInput controller battery.
 controller_enabled      1
 controller_index        -1            # -1 = first connected
 controller_poll_ms      auto          # 10000
 
-# Optional network-quality probe — Phase 2.
+# Optional network-quality probe. Off by default because it sends traffic.
 network_probe_enabled   0
 network_probe_method    icmp          # auto | icmp | tcp
 network_probe_target    1.1.1.1       # IP literal; optional TCP port
@@ -161,9 +155,8 @@ network_graph_ceiling_mbps 1000
 disk_graph_ceiling_mbps 1000
 fps_graph_ceiling       240
 
-# Legacy warning controls temperature pane presentation. The category switch
-# independently disables temperature alerts and flashing. When both are 1,
-# render_interval_ms must be <=100.
+# Temperature alerts. With both switches set to 1, render_interval_ms must be
+# 100 or lower.
 warning                 1
 temperature_warning_enabled 1
 cpu_temp_max_c          90
@@ -174,35 +167,30 @@ bottleneck_memory_percent 90
 bottleneck_disk_mbps    500
 bottleneck_sustain_ms   2000
 
-# Windows default audio endpoints — Phase 2.
+# Windows default audio devices.
 audio_enabled           1
 audio_poll_ms           auto          # 1000
 
 ##############################################################################
-# Discord local RPC active-speaker overlay — Phase 3.
+# Discord Desktop active-speaker overlay.
 # Create a Discord developer application, add your account as a tester, put
-# the client ID below, run Discord Desktop, then use:
-# LCDSirPlus.exe --discord-authorize. RPC opens no listener and uses no redirect.
+# the public Application ID below, and run Discord Desktop. Never put the client
+# secret in this file or a command. Follow the manual's masked authorization
+# steps and paste the secret only into its masked prompt.
 
 discord_enabled         1
 discord_client_id       ""
-discord_redirect_uri    http://127.0.0.1 # Legacy accepted/no-op key.
 discord_linger_ms       700
 discord_max_speakers    2
 discord_show_self       0
 discord_show_channel    0
 
 ##############################################################################
-# Hung-window detector and destructive guarded action. It is opt-in and remains
-# unqualified until the disposable-child physical-button acceptance gate passes.
-# PROC_HANG stays selected in its slot; its provider reports disabled/unavailable
-# and the existing no-target fallback renders the next token until enabled.
-# While selected, its slot's physical button owns the binding. No target
-# dynamically shows the next token without changing selection. Safe mode cannot
-# terminate.
+# Do not enable the hung-window action in the draft 0.3.0 build. It can terminate a
+# program and lose unsaved work. Its physical behavior is not release-tested,
+# and there is no supported end-user test. Safe mode cannot terminate programs.
 
 hang_enabled            0
-hang_button             3             # Legacy accepted; selected PROC_HANG slot owns runtime button.
 hang_hold_ms            2000
 hang_probe_interval_ms  2000
 hang_probe_timeout_ms   350
@@ -210,7 +198,7 @@ hang_failures_required  3
 hang_minimum_ms         6000
 hang_ignore LCDSirPlus.exe explorer.exe dwm.exe winlogon.exe csrss.exe services.exe lsass.exe smss.exe fontdrvhost.exe sihost.exe taskhostw.exe
 
-# Alert categories and thresholds. Memory capacity defaults to alert only at 100%.
+# Alert categories and thresholds. Memory alerts default to 100%.
 memory_warning_enabled  1
 cpu_temp_warning        85
 cpu_temp_critical       95
@@ -218,9 +206,7 @@ gpu_temp_warning        83
 gpu_temp_critical       90
 memory_warning          100
 vmem_warning            100
-# Severity-2 recovery removes immediately. Severity-3 linger starts on the first
-# current valid recovery; unknown/stale retains an episode. Disabling its
-# category or the headset provider clears the corresponding episode.
+# Critical alerts remain briefly after the reading recovers.
 critical_alert_linger_ms 3000
 
 ##############################################################################

@@ -1,3 +1,17 @@
+<#
+.SYNOPSIS
+Builds and validates the provisional Windows release artifacts.
+
+.DESCRIPTION
+Requires a clean worktree, pinned Rust tooling, and verified third-party caches. Runs quality and package gates, reproducibly builds the application and installer, and publishes setup, portable, source, checksum, and reproducibility artifacts beneath artifacts/.
+
+.PARAMETER OutputDir
+Release output directory relative to the repository root. Defaults to .\artifacts\release and must remain beneath artifacts/; a prior release may be retained by the output transaction.
+
+.EXAMPLE
+PS> .\scripts\Build.ps1
+Builds the provisional release into .\artifacts\release.
+#>
 #Requires -Version 7.0
 [CmdletBinding()]
 param([string]$OutputDir = '.\artifacts\release')
@@ -183,7 +197,7 @@ try {
         [IO.File]::WriteAllText((Join-Path $portableRoot 'SOURCE-COMMIT.txt'), $head + "`n", [Text.Encoding]::ASCII)
         Copy-Allowlist -SourceRoot $sourceRoot -Destination $portableRoot -Paths @(
             'LICENSE', 'THIRD_PARTY_LICENSES.txt', 'README.md', 'modules.md', 'RELEASE-NOTES.md', 'SECURITY.md',
-            'docs/CONFIGURATION.md', 'docs/HARDWARE-ACCEPTANCE.md', 'docs/INSTRUCTION-MANUAL.md',
+            'docs/CONFIGURATION.md', 'docs/INSTRUCTION-MANUAL.md',
             'docs/LCDSirPlus-Instruction-Manual.pdf'
         )
         $presentMonLicenses = Join-Path $portableRoot 'licenses\PresentMon'
@@ -200,7 +214,7 @@ try {
         [IO.File]::WriteAllText((Join-Path $innoPayload 'lcdsirplus.layout'), 'installed-v1', (New-Object Text.UTF8Encoding($false)))
         [IO.File]::WriteAllText((Join-Path $innoPayload 'SOURCE-COMMIT.txt'), $head + "`n", [Text.Encoding]::ASCII)
         Copy-Allowlist -SourceRoot $sourceRoot -Destination $innoPayload -Paths @(
-            'LICENSE', 'THIRD_PARTY_LICENSES.txt', 'README.md', 'modules.md',
+            'LICENSE', 'THIRD_PARTY_LICENSES.txt', 'README.md', 'modules.md', 'RELEASE-NOTES.md', 'SECURITY.md',
             'docs/CONFIGURATION.md', 'docs/INSTRUCTION-MANUAL.md',
             'docs/LCDSirPlus-Instruction-Manual.pdf'
         )

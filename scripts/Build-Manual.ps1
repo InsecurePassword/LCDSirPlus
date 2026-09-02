@@ -1,3 +1,14 @@
+<#
+.SYNOPSIS
+Builds the PDF instruction manual from its Markdown source.
+
+.DESCRIPTION
+Uses PowerShell 7 and an installed Chrome or Edge browser to render docs/INSTRUCTION-MANUAL.md. Creates or atomically replaces docs/LCDSirPlus-Instruction-Manual.pdf and removes temporary files.
+
+.EXAMPLE
+PS> .\scripts\Build-Manual.ps1
+Renders the repository instruction manual PDF.
+#>
 #Requires -Version 7.0
 [CmdletBinding()]
 param()
@@ -54,7 +65,7 @@ try {
 <style>
 @page { size: A4; margin: 16mm 14mm 18mm; }
 html { font-family: "Segoe UI", Arial, sans-serif; font-size: 10pt; color: #17202a; }
-body { max-width: 180mm; margin: 0 auto; line-height: 1.38; }
+body { max-width: 180mm; margin: 0 auto; line-height: 1.35; }
 h1 { font-size: 24pt; border-bottom: 2px solid #283747; padding-bottom: 6px; }
 h2 { font-size: 16pt; margin-top: 22px; border-bottom: 1px solid #aab7b8; padding-bottom: 3px; }
 h3 { font-size: 12pt; margin-top: 16px; }

@@ -43,17 +43,17 @@ const MAX_INTERFACES_VISITED: usize = 256;
 const COMPETING_OWNERS: [(&str, &str); 2] = [
     (
         "LCore.exe",
-        "Logitech Gaming Software (LCore.exe) owns the G13 LCD; exit Logitech Gaming Software to release the G13 LCD",
+        "competing process LCore.exe is running; exit Logitech Gaming Software before using direct HID",
     ),
     (
         "logi_lamparray_service.AMD64.exe",
-        "Logitech LampArray service owns the G13 LCD; stop Logitech LampArray service to release the G13 LCD for direct HID",
+        "competing process logi_lamparray_service.AMD64.exe is running; stop Logitech LampArray service before using direct HID",
     ),
 ];
 
 fn owner_gate(processes: Result<Vec<String>, String>) -> Result<(), String> {
     let processes = processes
-        .map_err(|e| format!("cannot verify G13 LCD ownership ({e}); refusing direct HID"))?;
+        .map_err(|e| format!("cannot enumerate running processes ({e}); refusing direct HID"))?;
     if let Some((_, message)) = COMPETING_OWNERS.iter().find(|(owner, _)| {
         processes
             .iter()
@@ -342,7 +342,7 @@ impl HidDevice {
                 let _ = CloseHandle(handle);
             }
             return Err(format!(
-                "LCore ownership changed after exclusive HID open: {error}"
+                "running-process check failed after exclusive HID open: {error}"
             ));
         }
         let (read_event, write_event) = create_io_events(
@@ -497,7 +497,7 @@ impl HidDevice {
         blank_result.map_err(|e| format!("HID blank on close: {e}"))
     }
 
-    /// Close immediately without a final write when LCore has taken ownership.
+    /// Close immediately without a final write when LCore.exe is found running.
     pub fn close_without_blank(&mut self) {
         self.close_handles();
     }

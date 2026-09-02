@@ -1,218 +1,232 @@
-# Final Hardware Acceptance Checklist
+# Hardware and Release Acceptance
 
-Record the tested source commit, release executable SHA-256, package SHA-256,
-Windows build, device/driver versions, date, operator, and evidence location.
-Any executable or package byte change invalidates all evidence below and
-requires a complete rerun.
+Audience: maintainers qualifying final package bytes on disposable Windows 11
+x64 systems and physical hardware. This source-only ledger is not included in
+the installer or portable package. Build instructions are in
+[DEVELOPMENT.md](DEVELOPMENT.md); trust boundaries are in
+[ARCHITECTURE.md](ARCHITECTURE.md). Record the source commit, checksums, Windows
+build, hardware/driver versions, date, and operator. Test the final downloads
+again if any included file changes.
 
-## Status as of 2026-08-31
+## Current status: 2026-09-01
 
-- **No release:** LCDSirPlus 0.3.0 remains Draft/Unreleased. This block records
-  current work-order status only and is not signed acceptance evidence.
-- **Displays 1-3:** physically accepted in the current development session.
-  Those observations are not bound to a final release executable/package and
-  must be repeated against the final package bytes.
-- **Inno lifecycle:** current-user and all-users lifecycle runs passed against
-  setup SHA-256 `9ff678...` (the operator-provided abbreviated value; no full
-  digest is asserted here). Later package-byte changes require both lifecycle
-  modes to be rerun against the final setup.
-- **PresentMon:** implemented, software-tested, pinned, and enabled by default,
-  but live game capture is not release-qualified. The live run is deferred
-  because this PC's memory is occupied by the local LLM; release remains pending
-  this gate.
-- **Discord:** implemented and software-tested, but live voice/OAuth workflow is
-  pending. Each user creates and registers their own Discord application, and
-  tokens remain current-user DPAPI-protected local data. Release remains pending
-  unless this live gate is explicitly deferred.
-- **Guarded termination:** disabled by default and unqualified until the
-  disposable-child physical-button gate below passes.
+| Area | Current evidence | Final package status |
+|---|---|---|
+| Release | 0.3.0 remains draft. Existing b7 downloads are older. | Pending. |
+| Main layouts 1-3 | Observed during local development. | Test the final download. |
+| Installer lifecycle | Earlier current-user/all-users runs used older downloads. | Test both modes with one final setup file. |
+| PresentMon | Basic start, game detection, and stop behavior were observed during local development; this is not a final-package claim. | Test one final portable build. |
+| Discord | Implementation and software tests exist. | Live voice/authorization check pending. |
+| Hung action | Disabled by default. | Disposable-child physical-button check pending. |
+| PDF manual | The Markdown manual changed; the tracked PDF is not durable final evidence. | After the final Markdown change, regenerate and validate the PDF, then package that exact file. Pending. |
 
-## Preconditions
+Observed during local development; final downloadable package testing remains pending.
+Do not publish a final release claim until the checks below use the
+unchanged files selected for publication.
 
-- Verify the setup EXE and portable ZIP against `LCDSirPlus-0.3.0-SHA256SUMS.txt`.
-  Also verify the portable ZIP's internal `PACKAGE-MANIFEST.txt` covers
-  `SOURCE-COMMIT.txt`; record its exact 40-lowercase-hex identity and the hashes.
-- Use a standard unelevated Windows 11 x64 account.
-- Back up the active configuration: installed
-  `%LOCALAPPDATA%\LCDSirPlus\Config\lcdsirplus.txt`, or adjacent
-  `lcdsirplus.txt` for portable/development use. Ensure no unsaved work is used
-  for hang-action tests.
-- Record optional NVAPI/ADLX, PresentMon, LHM, headset, controller, and Discord
-  prerequisites actually present. Absence is acceptable only when the UI shows
-  explicit unavailable state.
+## Record package identity
 
-Run both lifecycle qualifications against one unchanged final setup artifact:
+- Verify setup and portable ZIP with `LCDSirPlus-0.3.0-SHA256SUMS.txt`.
+- Verify portable `PACKAGE-MANIFEST.txt` and `SOURCE-COMMIT.txt`.
+- Record the extracted `LCDSirPlus.exe` checksum.
+- Verify adjacent `PresentMon.exe` is 956768 bytes, SHA-256
+  `9bec3083069f58f911e6a512f4806db51a27bd096103087bc1d05ef54c80a191`,
+  and signed by `Intel Corporation`.
+- Use the same unchanged setup file for current-user and all-users lifecycle
+  checks.
 
 ```powershell
-$setup = (Resolve-Path .\LCDSirPlus-0.3.0-win-x64-setup.exe).Path
+$setup = (Resolve-Path .\artifacts\release\LCDSirPlus-0.3.0-win-x64-setup.exe).Path
+$portable = (Resolve-Path .\artifacts\release\LCDSirPlus-0.3.0-win-x64-portable.zip).Path
 $setupSha = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
-$sourceIdentity = (& tar.exe -xOf .\LCDSirPlus-0.3.0-win-x64-portable.zip `
+$sourceIdentity = (& tar.exe -xOf $portable `
   LCDSirPlus-0.3.0-win-x64-portable/SOURCE-COMMIT.txt).Trim()
 pwsh -NoProfile -File .\scripts\Package-Test.ps1 -Mode CurrentUserLifecycle `
   -SetupPath $setup -ExpectedSetupSha256 $setupSha `
   -ExpectedSourceIdentity $sourceIdentity -ConfirmSystemMutation
-# Repeat from elevated PowerShell on the all-users disposable VM.
+```
+
+From elevated PowerShell at the repository root on a disposable VM, run:
+
+```powershell
+$setup = (Resolve-Path .\artifacts\release\LCDSirPlus-0.3.0-win-x64-setup.exe).Path
+$portable = (Resolve-Path .\artifacts\release\LCDSirPlus-0.3.0-win-x64-portable.zip).Path
+$setupSha = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+$sourceIdentity = (& tar.exe -xOf $portable `
+  LCDSirPlus-0.3.0-win-x64-portable/SOURCE-COMMIT.txt).Trim()
 pwsh -NoProfile -File .\scripts\Package-Test.ps1 -Mode AllUsersQualification `
   -SetupPath $setup -ExpectedSetupSha256 $setupSha `
   -ExpectedSourceIdentity $sourceIdentity -ConfirmSystemMutation
 ```
 
-Archive both transcripts and retained `qualification-evidence.txt` files. Their
-reported setup SHA-256 and source identity must be identical; copying or
-rebuilding setup between runs invalidates both results.
+Keep both transcripts and confirm their setup checksum and source identity
+match.
 
-## Logitech G13
+## Prepare the final portable executable
 
-- Exit Logitech Gaming Software normally and verify `LCore.exe` is no longer
-  running before direct-HID testing. If present, stop only Logitech LampArray
-  service, which can exclusively own the G13; do not stop unrelated G HUB
-  services.
-- Run `LCDSirPlus.exe --hardware-discover`; record the accepted VID/PID, usage,
-  input/output report lengths, and rejection summary. Device paths are private
-  and must not be published.
-- Run `LCDSirPlus.exe --hardware-test --backend hid --duration-secs 60` and
-  visually confirm STEP 01-10, correct geometry, no tearing or full-screen
-  disappear/return flicker, and blank-on-close.
-- Press each physical LCD button during the test and record down/release events.
-- Start Logitech Gaming Software normally, verify signed `LCore.exe` is running,
-  then run `LCDSirPlus.exe --hardware-test --backend sdk --duration-secs 60`.
-  Confirm STEP 01-10, all four buttons, and blank-on-close. Do not copy or load
-  any SDK DLL outside its canonical LCore installation.
-- In normal `auto` mode, start and exit LGS normally. Confirm one clean
-  HID-to-SDK and SDK-to-HID transition with no overlap or flicker.
-- Confirm STEP 07 names the selected `HID` or `SDK` transport. A failure during
-  the STEP 10 remainder or final blank/shutdown must produce a failed verdict.
-- Start normal mode and verify all four slot buttons, alert acknowledgement,
-  preview fallback, tray controls, orientation, and inversion.
-- Unplug/replug during normal operation; confirm bounded reconnect, preview
-  continuity, no duplicate owner, and recovery without restart.
-- Run for at least two hours, including sleep/wake if supported; record memory,
-  CPU, log sizes/rotation, frame continuity, and any stale/unavailable states.
-
-## PresentMon executable acceptance
-
-This final-package gate is currently **PENDING/DEFERRED** because the local LLM
-occupies the memory needed for a representative game run. The deferral is not a
-pass: release acceptance remains blocked until every item below passes against
-one unchanged final package.
-
-- Bind the run to the final portable ZIP SHA-256 from
-  `LCDSirPlus-0.3.0-SHA256SUMS.txt`, its `SOURCE-COMMIT.txt`, and the extracted
-  `LCDSirPlus.exe` SHA-256. Verify colocated `PresentMon.exe` is exactly 956768
-  bytes, SHA-256
-  `9bec3083069f58f911e6a512f4806db51a27bd096103087bc1d05ef54c80a191`,
-  and has a valid `Intel Corporation` Authenticode signer:
+From a standard unelevated PowerShell session at the repository root, extract
+the unchanged final portable ZIP to a new private directory and bind every
+executable check below to that copy:
 
 ```powershell
-$package = (Resolve-Path .\LCDSirPlus-0.3.0-win-x64-portable.zip).Path
-$root = (Resolve-Path .\LCDSirPlus-0.3.0-win-x64-portable).Path
-$pm = Join-Path $root 'PresentMon.exe'
-Get-FileHash -LiteralPath $package,$pm -Algorithm SHA256
+$portable = (Resolve-Path .\artifacts\release\LCDSirPlus-0.3.0-win-x64-portable.zip).Path
+$acceptanceRoot = Join-Path $env:TEMP "LCDSirPlus-0.3.0-acceptance-$PID"
+Expand-Archive -LiteralPath $portable -DestinationPath $acceptanceRoot
+$packageRoot = Join-Path $acceptanceRoot 'LCDSirPlus-0.3.0-win-x64-portable'
+$exe = (Resolve-Path -LiteralPath (Join-Path $packageRoot 'LCDSirPlus.exe')).Path
+$pm = (Resolve-Path -LiteralPath (Join-Path $packageRoot 'PresentMon.exe')).Path
+Get-FileHash -LiteralPath $portable,$exe,$pm -Algorithm SHA256
 Get-Item -LiteralPath $pm | Select-Object FullName,Length
 Get-AuthenticodeSignature -FilePath $pm |
   Select-Object Status,@{n='Signer';e={$_.SignerCertificate.GetNameInfo('SimpleName',$false)}}
 ```
 
-- Use a standard unelevated Windows 11 x64 account. Record membership in
-  **Performance Log Users**, sign out/in after changing membership, and record
-  whether a separate elevated troubleshooting run was required. Do not install
-  a PresentMon service, MSI, driver, GUI, or SDK. Before each run, record
-  existing `PresentMon` PIDs and do not stop unrelated instances. Use a copied
-  acceptance configuration with `presentmon_enabled 1`, `presentmon_path auto`,
-  `log_level debug`, and a new evidence directory selected with
-  `--diagnostic-dir`.
-- Test default `presenting` mode first with one exact-path high-confidence game
-  in a valid NVIDIA App local catalog plus Chrome or OpenCode presenting at a
-  higher frame rate, then run the final packaged
-  `LCDSirPlus.exe --config <acceptance-config> --diagnostic-dir <evidence-dir>`.
-  Record the LCD/preview and the single child `PresentMon.exe` PID. Cycle through
-  `FPS_CURRENT`, `FPS_1LOW`, `FPS_01LOW`, `FRAME_TIME`, `SESSION_TIME`,
-  `SESSION_SUMMARY`, and `GAME_NAME`; confirm plausible FPS/lows/frame time,
-  advancing session time, accumulated stutter count, and autonomous selection of
-  the catalog-qualified game without a configured name. Confirm Chrome/OpenCode
-  is never selected, then Alt-Tab to excluded shell/noise and confirm the active
-  game remains sticky. Stop it beyond expiry and confirm the provider waits
-  unavailable rather than publishing desktop metrics, statistics/session reset,
-  and the same single LCDSirPlus-owned PresentMon child remains. Separately make
-  the catalog unavailable without modifying it and confirm the R4 generic
-  workload fallback still selects deterministically.
-- With `presentmon_deferred 1`, stop the game and verify every configured
-  PresentMon panel falls through to the next eligible token while button cycling
-  and the stored selection remain unchanged; verify an all-deferred slot shows
-  `CLEAR`. Repeat with `presentmon_deferred 0` and confirm `N/A`, `STALE`,
-  `00:00`, `IDLE`, and game-name `N/A` appear as appropriate.
-- Repeat autonomous capture with `presentmon_persist 1` and a valid catalog.
-  Confirm a sustained non-game presenter can be selected through generic R4
-  inference, then confirm exclusions, PID/image identity, switching hysteresis,
-  stale expiry, config reset, and one-child ownership still hold. Restore the
-  default `presentmon_persist 0` and confirm the valid catalog rejects it again.
-- Then test both targeted expert overrides. Set `presentmon_target_mode
-  process_name` with the exact game executable, then set
-  `presentmon_target_mode foreground`, clear `presentmon_process_name`, and
-  repeat after focusing the game. Confirm each target change starts a new child
-  and session, excluded/no-target state does not capture the shell, and no more
-  than one LCDSirPlus-owned PresentMon child exists.
-- Stop rendering without exiting for at least five seconds and confirm metrics
-  become `STALE`; continue beyond ten seconds and confirm they expire. Resume
-  and confirm recovery. Change target and PresentMon settings while capturing,
-  then close the target and exit LCDSirPlus from the tray. Each old child PID
-  must exit promptly, no stale session data may cross the target boundary, all
-  LCDSirPlus-owned children must be gone after shutdown, and every unrelated
-  baseline PresentMon PID must remain untouched.
-- Exercise and retain executable debug-log evidence for all four failure
-  diagnostics in a controlled account/policy environment: `PresentMon produced
-  no CSV header in 45 seconds`; `PresentMon produced a CSV header but no matching
-  frames ... in 45 seconds` (a selected non-presenting process is suitable);
-  `PresentMon exited (...) while capturing ...`; and an early-exit/timeout line
-  with bounded sanitized `; stderr:` detail. The UI must show unavailable rather
-  than stale valid data, retry must remain bounded, and no child may survive the
-  failure. Do not replace the pinned binary or weaken release-tree permissions
-  to inject these faults.
-- Mark every case pass/fail with timestamped screenshots/video, private debug
-  logs, package/executable hashes, source identity, account/elevation state,
-  target names, child PID timeline, and failure-diagnostic excerpts. Review for
-  private paths before sharing. Include this signed record in the final gate;
-  any missing case, unexpected child, hash change, or unexplained metric is a
-  release failure.
+Retain `$exe` for the remaining commands. A rebuilt or re-extracted candidate
+requires a new evidence record; do not substitute a Cargo or installed binary.
 
-## Discord
+## Check the Logitech G13
 
-- Use a dedicated developer application/test account and its OAuth client
-  secret. No portal redirect is required. Never record the client secret or
-  DPAPI token bytes; use the manual's masked temporary environment procedure.
-- Authorize with Discord Desktop running; confirm a missing/blank secret fails
-  before IPC, no listener/browser is opened, and the client-secret environment
-  variable is cleared immediately. Switch to a second dedicated
-  test account, authorize it once, and confirm switching either direction uses
-  only that account's voice session without another authorization.
-- Join a voice channel with another participant. Confirm channel label,
-  self/other speaking order, mute/deafen transitions, linger, leave/rejoin,
-  Discord restart, LCDSirPlus restart, and token refresh.
-- Revoke authorization and run `--discord-clear-token`; confirm all LCDSirPlus
-  Discord account records are removed and the overlay becomes unavailable
-  without leaking remote error content.
+Use a standard Windows 11 x64 account.
 
-## Guarded Hung Action
+1. Exit Logitech Gaming Software. If and only if exact
+   `logi_lamparray_service.AMD64.exe` is running, record the prior status and
+   startup type of **Logitech LampArray Service**, stop that exact service for
+   steps 2 through 6, and do not change its startup type. Do not stop unrelated
+   G HUB services.
+2. Run `& $exe --hardware-discover`. Confirm it scans at most 256 HID interfaces
+   until the first exact G13 match, reports that candidate plus preceding
+   rejection reasons, omits device paths, performs no writes, and does not
+   inspect competing processes. Discovery cannot establish ownership.
+3. Run `& $exe --hardware-test --backend hid --duration-secs 60`.
+   Confirm direct HID requires both exact `LCore.exe` and
+   `logi_lamparray_service.AMD64.exe` to be absent and fails closed if process
+   enumeration fails.
+4. Confirm steps 1 through 10, geometry, no tearing/flicker, all four button
+   down/release events, and blank-on-close.
+5. Start signed Logitech Gaming Software normally, confirm validated exact
+   `LCore.exe` is present, and run the same test with
+   `& $exe --hardware-test --backend sdk --duration-secs 60`.
+6. In normal `auto` mode, confirm it selects SDK when validated exact
+   `LCore.exe` is present, plus one clean HID-to-SDK and SDK-to-HID change.
+7. If step 1 stopped **Logitech LampArray Service**, restore its recorded prior
+   state and confirm its startup type is unchanged.
+8. Check all four slot buttons, button 4 alert acknowledgement, tray and preview,
+   orientation, inversion, unplug/replug recovery, and no duplicate display
+   output.
+9. Run for two hours, including sleep/wake when supported. Record CPU, memory,
+   log rotation, frame continuity, and unavailable/stale states.
 
-- Explicitly set `hang_enabled 1` only for this disposable test. The shipped
-  default is `0`; `PROC_HANG` otherwise remains selected in its slot, its
-  provider reports disabled/unavailable, and the no-target pane falls through.
-- Use only `LCDSirPlus.exe --hang-test-harness`; never use an application with
-  unsaved data.
-- Confirm a bound short release navigates target detail/selection without
-  terminating; with no bound target it performs ordinary slot cycling. Confirm
-  target/identity/recovery/provider/config/safe-mode/slot/device changes cancel,
-  a qualified continuous physical hold terminates the disposable child
-  automatically at `hang_hold_ms`, and release afterward only resets without a
-  second action. Confirm an app-loop resume after the maximum press duration is
-  refused as stale rather than firing a delayed action.
-- Record positive and negative harness results. Do not treat software unit tests
-  as physical-button action evidence.
+Each hardware-test step normally lasts two seconds. A 60-second test therefore
+runs all ten steps and leaves the remainder on step 10's live dashboard. The
+two-hour check is a separate normal-dashboard soak, not a longer hardware test.
 
-## Acceptance
+## Check PresentMon
 
-- Attach logs only after private review; diagnostics ZIP is preferred and raw
-  logs/configuration must not be shared.
-- Mark each item pass/fail/not-present with evidence. Release acceptance requires
-  all present-hardware checks and both G13 and Discord gates applicable to the
-  release claim. Sign and date the record.
+Use one copied settings file and a private evidence directory. Do not install a
+PresentMon service, MSI, GUI, or SDK. Record unrelated PresentMon processes and
+do not stop them.
+
+1. Start with `presentmon_enabled 1`, `presentmon_path auto`,
+   `presentmon_target_mode presenting`, `presentmon_deferred 1`,
+   `presentmon_persist 0`, and `log_level debug`.
+2. Use a valid NVIDIA App catalog with one exact-path qualifying game plus a
+   higher-frame-rate ordinary presenter. Confirm only the game is selected.
+3. Test at least two representative games independently from closed state to
+   active capture and back to closed state. Record one LCDSirPlus-owned
+   PresentMon child, FPS,
+   low FPS, frame time, session time, stutters, game name, and cleanup.
+4. Use exact test line `slot_2 PROC_HANG FPS_CURRENT GPU_TEMP`. Confirm stopped
+   game display moves from unavailable FPS to GPU temperature without changing
+   the stored `FPS_CURRENT` selection.
+5. Test every PresentMon value with `presentmon_deferred 1`. Confirm the next
+   eligible option or `CLEAR`. Repeat with `0` and confirm native inactive text.
+6. Make the NVIDIA catalog unavailable without editing it. Confirm automatic
+   workload selection still works. Restore a valid catalog and confirm ordinary
+   desktop presenters are rejected.
+7. Set `presentmon_persist 1`. Confirm a sustained ordinary presenter can be
+   selected and its executable name/FPS can appear. Confirm exclusions,
+   identity changes, switching, stale expiry, settings reset, and one-child
+   ownership still hold. Restore `0`.
+8. Test `process_name` and `foreground` separately. Confirm each targeted change
+   starts a fresh session and never leaves more than one owned child.
+9. Stop frames for five seconds and confirm stale display. Continue past ten
+   seconds and confirm expiry. Resume and confirm recovery.
+10. Exit LCDSirPlus. Confirm every owned child is gone and unrelated PresentMon
+    processes remain.
+11. Capture expected startup/no-frame/early-exit errors in controlled tests.
+    Confirm unavailable display, delayed retry, sanitized detail, and no child
+    leak.
+
+If capture access is denied, record **Performance Log Users** membership and
+whether sign-out/sign-in fixed it. Elevation is a diagnosis only. Keep names,
+paths, and debug logs private.
+
+## Check Discord
+
+Use a dedicated application and test accounts. Never record the client secret or
+credential bytes.
+
+1. Authorize through the manual's masked environment workflow. Confirm a blank
+   secret fails before Discord use and the environment value is removed.
+2. Authorize two test accounts separately. Switch accounts and confirm only the
+   active account's voice state appears.
+3. Check channel title, self/other speakers, speaking order, mute/deafen,
+   linger, leave/rejoin, Discord restart, LCDSirPlus restart, and refresh.
+4. Revoke access and follow the manual's
+   [disconnect instructions](INSTRUCTION-MANUAL.md#disconnect-discord). Confirm
+   local credentials are removed and no private remote error text appears.
+
+## Check the guarded hung action
+
+Use no valuable or unsaved work.
+
+1. Set `hang_enabled 1` only in a copied test file.
+2. Start only `& $exe --hang-test-harness --duration-secs 120` as the target.
+3. Confirm short release changes detail/target without termination.
+4. Confirm target, identity, recovery, data-source, settings, safe-mode, slot,
+   and device changes cancel a held action.
+5. Confirm a continuous physical hold terminates only the disposable child at
+   `hang_hold_ms` and release cannot trigger a second action.
+6. Confirm a delayed app-loop resume refuses the old hold.
+7. Restore `hang_enabled 0`.
+
+Software tests do not replace this physical-button check.
+
+## Run internal smoke modes
+
+These hidden maintainer modes belong only in this source-only ledger. Run them
+from the final portable package in a disposable session and retain exit codes
+and output after the harness check above; they supplement rather than replace
+the live checks:
+
+```powershell
+& $exe --hang-detector-smoke
+& $exe --hang-action-smoke
+& $exe --hang-action-negative-smoke
+& $exe --instance-smoke
+```
+
+`--instance-smoke` invokes the internal `--instance-smoke-child`; do not invoke
+the child directly or record it as an independent gate. The hang modes create
+only disposable targets, but still require no valuable or unsaved work.
+
+## Check installer and removal
+
+- Confirm current-user and all-users destinations and registration.
+- Confirm default Start Menu/sign-in choices and optional desktop shortcut.
+- Confirm opposite-scope, legacy install, and foreign startup-task collisions
+  are refused without changing existing data.
+- Confirm same-scope update and cached Modify repair restore installed files.
+- Confirm cancellation leaves the startup task and files intact.
+- Confirm uninstall removes installed files, shortcuts, and the owned task.
+- Confirm `%LOCALAPPDATA%\LCDSirPlus` settings, logs, and credentials are
+  preserved.
+
+## Sign off
+
+Review diagnostics and logs for private data before sharing. Mark each item
+pass, fail, or not present with evidence. Final acceptance requires all claimed
+hardware/integration checks against one unchanged final package set. Publication
+also requires the packaged PDF to be the validated tracked PDF generated after
+the last Markdown manual change; any later manual or PDF byte change reopens
+that gate.
