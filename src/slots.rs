@@ -132,9 +132,9 @@ mod tests {
         let c = Config::default();
         let mut m = Manager::new(&c, [0; 4]);
         m.cycle(2, 2);
-        assert_eq!(m.current(2), "PING");
+        assert_eq!(m.current(2), "DISK_IO");
         m.apply(&Config::default());
-        assert_eq!(m.current(2), "PING");
+        assert_eq!(m.current(2), "DISK_IO");
     }
 
     #[test]
@@ -149,7 +149,7 @@ mod tests {
         assert_eq!(manager.current(2), "PROC_HANG");
         assert_eq!(
             manager.next_except(2, &["PROC_HANG", "BOTTLENECK"]),
-            Some("GPU_TEMP".into())
+            Some("FPS_1LOW".into())
         );
         assert_eq!(manager.current(2), "PROC_HANG");
         let manager = Manager::new(&cfg_with(0, &["PROC_HANG", "BOTTLENECK"]), [0; 4]);

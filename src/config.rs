@@ -24,15 +24,24 @@ const MAX_CCD_PROCESSOR_INDEX: u32 = 63;
 /// LCDSirPlus portable configuration.
 pub const DEFAULT_SLOTS: [&[&str]; 4] = [
     &["HEADSET_BATTERY", "CPU_TEMP", "CONTROLLER_BATTERY"],
-    &["FPS_CURRENT", "FPS_1LOW", "FRAME_TIME", "SESSION_TIME"],
-    &["PROC_HANG", "GPU_TEMP", "PING", "JITTER", "AUDIO"],
     &[
-        "THERMALS",
-        "PACKET_LOSS",
-        "MIC_STATUS",
-        "SESSION_SUMMARY",
-        "PROVIDER_STATUS",
+        "FPS_CURRENT",
+        "NET_BOTH",
+        "NET_GRAPH",
+        "FRAME_TIME",
+        "SESSION_TIME",
     ],
+    &[
+        "PROC_HANG",
+        "FPS_1LOW",
+        "DISK_IO",
+        "DISK_IO_GRAPH",
+        "GPU_TEMP",
+        "PING",
+        "JITTER",
+        "AUDIO",
+    ],
+    &["BOTTLENECK", "THERMALS", "POWER_LIMIT"],
 ];
 
 pub const MODULES: &[&str] = &[

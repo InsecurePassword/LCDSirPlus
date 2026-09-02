@@ -197,9 +197,9 @@ Each slot is an ordered list for one physical button and preview area:
 
 ```text
 slot_0  HEADSET_BATTERY CPU_TEMP CONTROLLER_BATTERY
-slot_1  FPS_CURRENT FPS_1LOW FRAME_TIME SESSION_TIME
-slot_2  PROC_HANG GPU_TEMP PING JITTER AUDIO
-slot_3  THERMALS PACKET_LOSS MIC_STATUS SESSION_SUMMARY PROVIDER_STATUS
+slot_1  FPS_CURRENT NET_BOTH NET_GRAPH FRAME_TIME SESSION_TIME
+slot_2  PROC_HANG FPS_1LOW DISK_IO DISK_IO_GRAPH GPU_TEMP PING JITTER AUDIO
+slot_3  BOTTLENECK THERMALS POWER_LIMIT
 ```
 
 A short physical press moves forward. Preview left-click moves forward and
@@ -426,8 +426,8 @@ network_probe_enabled 0
 ```
 
 Safe mode reports only its healthy safe-mode state, so the button option shows
-`OK`. To hide the summary during normal use, remove `PROVIDER_STATUS` from
-`slot_3`.
+`OK`. Add `PROVIDER_STATUS` to any slot if you want this summary; during normal
+use, `DOWN` can reflect intentionally unused sources as described above.
 
 An inactive `PROC_HANG` or `BOTTLENECK` selection temporarily shows the next
 eligible option without changing the stored selection. Neither option is used

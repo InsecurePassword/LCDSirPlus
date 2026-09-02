@@ -1534,7 +1534,7 @@ mod tests {
         assert_eq!(slots.current(2), "PROC_HANG");
         assert_eq!(
             effective_slot_modules(&slots, &snapshot, &cfg)[2],
-            "GPU_TEMP"
+            "DISK_IO"
         );
         assert_eq!(slots.current(2), "PROC_HANG");
 

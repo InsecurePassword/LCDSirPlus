@@ -25,9 +25,9 @@ safe_mode               0
 # Four physical button slots. A short press cycles the matching list.
 
 slot_0  HEADSET_BATTERY CPU_TEMP CONTROLLER_BATTERY
-slot_1  FPS_CURRENT FPS_1LOW FRAME_TIME SESSION_TIME
-slot_2  PROC_HANG GPU_TEMP PING JITTER AUDIO
-slot_3  THERMALS PACKET_LOSS MIC_STATUS SESSION_SUMMARY PROVIDER_STATUS
+slot_1  FPS_CURRENT NET_BOTH NET_GRAPH FRAME_TIME SESSION_TIME
+slot_2  PROC_HANG FPS_1LOW DISK_IO DISK_IO_GRAPH GPU_TEMP PING JITTER AUDIO
+slot_3  BOTTLENECK THERMALS POWER_LIMIT
 
 ##############################################################################
 # Dual-CCD Ryzen systems can show separate Cache and Frequency CPU bars.
