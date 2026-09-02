@@ -24,15 +24,30 @@ no incoming network listener.
 Every layout has a compact Windows-local date/time header, a fixed main reading
 area, and four button-aligned lower slots.
 
+The header and `CLOCK` use the current user's Windows Short time pattern without
+independently adding seconds.
+
 - Layout 1: CPU/RAM and GPU/VRAM halves.
 - Layout 2: CPU/RAM, GPU/VRAM, and outgoing/incoming thirds.
 - Layout 3: CPU/RAM and incoming/outgoing halves.
 
 `main_display` accepts `1..3`, defaults to `1`, and applies after a valid settings
-save. Network bars in layouts 2 and 3 show current throughput and use
-`network_graph_ceiling_mbps`. One CPU domain uses one full-height CPU bar. Two
+save. Network bars in layouts 2 and 3 show current throughput. Download/inbound
+uses `network_graph_ceiling_download_mbps`; upload/outbound uses
+`network_graph_ceiling_upload_mbps`. Both default to `1000`, accept finite
+`1..100000` values, and scale utilization independently. For example, a
+1000-down/40-up plan uses `1000` and `40`. The values are configured plan rates,
+not auto-detected limits. One CPU domain uses one full-height CPU bar. Two
 domains use Cache and Frequency bars. Manual CCD topology requires both
 processor lists to be automatic or both to be explicit, disjoint `0..63` lists.
+
+Download maps to `NET_IN_GRAPH`, the inbound/top half of `NET_GRAPH`, layout 2
+IN, and layout 3 NET IN. Upload maps to `NET_OUT_GRAPH`, the outbound/bottom half
+of `NET_GRAPH`, layout 2 OUT, and layout 3 NET OUT. Numeric network readings and
+network telemetry/history are unchanged. The active legacy
+`network_graph_ceiling_mbps` spelling sets both directional values at its parse
+position. Later assignments win sequentially through includes; same-spelling
+duplicates within one file remain invalid.
 
 The button registry contains exactly 53 values in `src/config.rs` order. Their
 descriptions appear in the canonical [modules.md](../modules.md) quick reference

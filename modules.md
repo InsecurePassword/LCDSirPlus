@@ -29,7 +29,7 @@ Put these values in `slot_0` through `slot_3`.
 | `AUDIO` | Shows default output volume. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `SESSION_TIME` | Shows active game-session time. What you need: PresentMon, planned for the 0.3.0 package. |
 | `SESSION_SUMMARY` | Shows session time and stutters. What you need: PresentMon, planned for the 0.3.0 package. |
-| `CLOCK` | Shows local time. What you need: Built into Windows and LCDSirPlus; no extra software. |
+| `CLOCK` | Shows time using the Windows Short time format. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `GAME_NAME` | Shows the selected game or app filename. What you need: PresentMon, planned for the 0.3.0 package. A filename may appear under either persist setting; set `presentmon_enabled 0` to prevent this exposure. |
 | `ALERTS` | Shows unacknowledged active alerts or CLEAR. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `PROVIDER_STATUS` | Shows unavailable tracked data sources or OK. What you need: Built into Windows and LCDSirPlus; no extra software. |

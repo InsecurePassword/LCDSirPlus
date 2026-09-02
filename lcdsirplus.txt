@@ -150,8 +150,11 @@ network_probe_interval_ms auto        # 1000
 network_probe_timeout_ms auto         # 1500
 network_probe_window    30
 # Every graph covers exactly the trailing 30 seconds. Fixed scales only; numeric
-# values are never clipped. Network/disk range 1..100000; FPS range 1..1000.
-network_graph_ceiling_mbps 1000
+# values are never clipped. Set network ceilings to your internet plan's
+# downstream and upstream Mbps; these values are not auto-detected.
+# Network/disk range 1..100000; FPS range 1..1000.
+network_graph_ceiling_download_mbps 1000
+network_graph_ceiling_upload_mbps 1000
 disk_graph_ceiling_mbps 1000
 fps_graph_ceiling       240
 

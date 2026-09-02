@@ -163,7 +163,9 @@ manual checks where automation cannot reproduce them.
 
 `modules.md` is the canonical quick reference for all 53 values. Its table must
 contain exactly the `src/config.rs` values in code order and be mirrored exactly
-in the instruction manual/PDF. `scripts/Test.ps1` checks both inventories,
+in the instruction manual/PDF. The parser/document inventory has 123 accepted
+entries, the default template has 96 active keys, and exactly five advanced
+compatibility-only keys are ignored. `scripts/Test.ps1` checks these inventories,
 source order, row parity, and required links.
 
 After any Markdown manual change, regenerate the PDF before packaging:

@@ -190,8 +190,30 @@ main_display 1
 - `2`: CPU/RAM, GPU/VRAM, and outgoing/incoming thirds.
 - `3`: CPU/RAM and incoming/outgoing halves.
 
-All three keep the date/time header and four lower button slots. Layouts 2 and
-3 scale network bars with `network_graph_ceiling_mbps`.
+All three keep the date/time header and four lower button slots. Set the network
+ceilings to your internet plan's downstream and upstream Mbps; LCDSirPlus does
+not auto-detect them. For a 1000-down/40-up plan:
+
+```text
+network_graph_ceiling_download_mbps 1000
+network_graph_ceiling_upload_mbps 40
+```
+
+Download is inbound/IN: `NET_IN_GRAPH`, the top half of `NET_GRAPH`, layout 2
+IN, and layout 3 NET IN. Upload is outbound/OUT: `NET_OUT_GRAPH`, the bottom half
+of `NET_GRAPH`, layout 2 OUT, and layout 3 NET OUT. Each direction reaches full
+utilization independently at its own ceiling. Numeric `NET_IN`, `NET_OUT`, and
+`NET_BOTH` readings do not change.
+
+Old `network_graph_ceiling_mbps` lines remain active and set both directions at
+that point in file/include order. A later directional line replaces only its
+direction; a later legacy line replaces both. Use the two directional lines for
+new configurations. Both directional defaults are `1000`, and all three
+spellings accept finite values from `1` through `100000`.
+
+The header and `CLOCK` use your current Windows Short time preference, including
+the Windows 12/24-hour selection (for example, `2:25 PM` or `14:25`). Changes to
+that Windows preference are picked up while LCDSirPlus runs.
 
 Each slot is an ordered list for one physical button and preview area:
 
@@ -234,7 +256,7 @@ In an installed or portable package, open `modules.md` beside `LCDSirPlus.exe`.
 | `AUDIO` | Shows default output volume. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `SESSION_TIME` | Shows active game-session time. What you need: PresentMon, planned for the 0.3.0 package. |
 | `SESSION_SUMMARY` | Shows session time and stutters. What you need: PresentMon, planned for the 0.3.0 package. |
-| `CLOCK` | Shows local time. What you need: Built into Windows and LCDSirPlus; no extra software. |
+| `CLOCK` | Shows time using the Windows Short time format. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `GAME_NAME` | Shows the selected game or app filename. What you need: PresentMon, planned for the 0.3.0 package. A filename may appear under either persist setting; set `presentmon_enabled 0` to prevent this exposure. |
 | `ALERTS` | Shows unacknowledged active alerts or CLEAR. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `PROVIDER_STATUS` | Shows unavailable tracked data sources or OK. What you need: Built into Windows and LCDSirPlus; no extra software. |

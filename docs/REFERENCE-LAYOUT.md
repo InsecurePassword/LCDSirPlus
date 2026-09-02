@@ -66,10 +66,14 @@ label and display no per-bar glyphs. Detected topology selects the mode.
 
 ## Network scale
 
-Layouts 2 and 3 network bars show current direction throughput. They use the
-same `network_graph_ceiling_mbps` scale as network graph modules. At the default
-1000 Mbps ceiling, 125,000,000 bytes/s (1 Gbps) is full width; higher values
-clip at full width.
+Layouts 2 and 3 network bars show current direction throughput. Inbound/IN uses
+`network_graph_ceiling_download_mbps`; outbound/OUT uses
+`network_graph_ceiling_upload_mbps`. The same mapping applies to
+`NET_IN_GRAPH`/`NET_OUT_GRAPH` and the top/bottom halves of `NET_GRAPH`. Each
+direction scales independently. Both defaults are 1000 Mbps, so 125,000,000
+bytes/s (1 Gbps) is full width or height; higher values clip at full scale. A
+1000-down/40-up plan sets the download ceiling to `1000` and upload ceiling to
+`40`; these plan rates are not auto-detected.
 
 ## Golden frames
 

@@ -32,8 +32,8 @@ any PowerShell window, an installed copy can use:
 
 Most valid changes apply while the app runs. Invalid changes are rejected and
 the last valid settings stay active. `preview_scale`, `log_level`,
-`log_max_bytes`, and `log_backups` take effect after restart. Compatibility-only
-settings are accepted but ignored.
+`log_max_bytes`, and `log_backups` take effect after restart. The five advanced
+compatibility-only settings are accepted but ignored.
 
 ## Write valid lines
 
@@ -46,7 +46,7 @@ Boolean values accept `1`, `true`, `yes`, or `on`, and `0`, `false`, `no`, or
 `off`. Each string is limited to 4096 bytes and cannot contain control
 characters. One line can contain at most 256 values. Other limits are 8 include
 levels, 64 files, 64 include lines, 8 MiB total input, 16384 lines, and 16 KiB
-per token. Duplicate keys in one file are rejected.
+per token. Duplicate keys with the same spelling in one file are rejected.
 
 An `auto` interval uses the numeric default shown in its table. Other selectors
 that accept `auto` are described separately.
@@ -77,8 +77,9 @@ Layouts are fixed:
 - `2`: CPU/RAM, GPU/VRAM, and outgoing/incoming thirds.
 - `3`: CPU/RAM and incoming/outgoing halves.
 
-Layouts 2 and 3 scale their network bars with
-`network_graph_ceiling_mbps`.
+Layouts 2 and 3 scale inbound/IN bars with
+`network_graph_ceiling_download_mbps` and outbound/OUT bars with
+`network_graph_ceiling_upload_mbps`.
 
 ## Set button slots
 
@@ -313,7 +314,9 @@ mode. Host names are rejected. TCP defaults to port 443 when no port is given.
 
 | Key | Default | Accepted value or constraint | What it controls |
 |---|---:|---|---|
-| `network_graph_ceiling_mbps` | `1000` | `1..100000` | Network graphs and layout 2/3 current bars. |
+| `network_graph_ceiling_download_mbps` | `1000` | finite `1..100000` | Inbound/IN network graphs and layout 2/3 current bars. |
+| `network_graph_ceiling_upload_mbps` | `1000` | finite `1..100000` | Outbound/OUT network graphs and layout 2/3 current bars. |
+| `network_graph_ceiling_mbps` | none | finite `1..100000` | Active legacy alias that sets both directional network ceilings at that point in parse order. |
 | `disk_graph_ceiling_mbps` | `1000` | `1..100000` | Disk graph. |
 | `fps_graph_ceiling` | `240` | `1..1000` | FPS graph. |
 | `warning` | `1` | boolean | `1` flashes selected temperature panes; `0` uses full-screen temperature alerts. |
@@ -328,6 +331,29 @@ mode. Host names are rejected. TCP defaults to port 443 when no port is given.
 All graphs cover the trailing 30 seconds. CPU/GPU load graphs use a fixed
 0..100% scale. `FRAME_TIME` scales to its observed 30-second range. Ceilings do
 not clip numeric text.
+
+Set the directional ceilings to the downstream and upstream rates in your
+internet plan; LCDSirPlus does not auto-detect them. For a 1000 Mbps downstream,
+40 Mbps upstream plan:
+
+```text
+network_graph_ceiling_download_mbps 1000
+network_graph_ceiling_upload_mbps 40
+```
+
+Each direction independently reaches full graph height or bar width at its own
+ceiling. Download means inbound/IN: `NET_IN_GRAPH`, the top half of `NET_GRAPH`,
+the layout 2 IN bar, and the layout 3 NET IN bar. Upload means outbound/OUT:
+`NET_OUT_GRAPH`, the bottom half of `NET_GRAPH`, the layout 2 OUT bar, and the
+layout 3 NET OUT bar. Numeric `NET_IN`, `NET_OUT`, and `NET_BOTH` values are not
+scaled by these settings.
+
+Old files may keep `network_graph_ceiling_mbps`; it remains an active alias, not
+an ignored compatibility key. Assignments execute sequentially across includes:
+the legacy spelling sets both directions when encountered, and a later
+directional assignment replaces only that direction. A later legacy assignment
+replaces both. Distinct legacy and directional spellings may coexist in one
+file, but repeating the same spelling in one file is an error.
 
 ## Set Discord
 
@@ -385,7 +411,7 @@ them but ignores their values. New files should omit them.
 | Key | Default | Accepted value or constraint | Compatibility behavior |
 |---|---:|---|---|
 | `date_format` | `yyyy-MM-dd dddd` | non-empty reserved string; not validated as a Windows format | Header date remains fixed. |
-| `time_format` | `HH:mm:ss` | non-empty reserved string; not validated as a Windows format | Header time remains fixed. |
+| `time_format` | `HH:mm:ss` | non-empty reserved string; not validated as a Windows format | Ignored; Windows Short time controls output. |
 | `headset_estimate_hours` | `1` | boolean | No battery-hours estimate is shown. |
 | `discord_redirect_uri` | `http://127.0.0.1` | exactly one reserved string | No redirect is sent, registered, or opened. |
 | `hang_button` | `3` | integer `1..4` | The slot containing selected `PROC_HANG` owns the actual button. |

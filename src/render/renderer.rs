@@ -22,7 +22,8 @@ pub struct OverlayOptions {
     pub discord_max_speakers: usize,
     pub discord_show_self: bool,
     pub discord_show_channel: bool,
-    pub network_graph_ceiling_mbps: f64,
+    pub network_graph_ceiling_download_mbps: f64,
+    pub network_graph_ceiling_upload_mbps: f64,
     pub disk_graph_ceiling_mbps: f64,
     pub fps_graph_ceiling: f64,
     pub cpu_temp_max_c: f64,
@@ -39,7 +40,8 @@ impl Default for OverlayOptions {
             discord_max_speakers: 2,
             discord_show_self: false,
             discord_show_channel: false,
-            network_graph_ceiling_mbps: 1000.0,
+            network_graph_ceiling_download_mbps: 1000.0,
+            network_graph_ceiling_upload_mbps: 1000.0,
             disk_graph_ceiling_mbps: 1000.0,
             fps_graph_ceiling: 240.0,
             cpu_temp_max_c: 90.0,
@@ -180,8 +182,18 @@ impl Renderer {
             f.v_line(x, 26, 42, true);
         }
         match opts.main_display {
-            2 => self.main_display_2(f, s, opts.network_graph_ceiling_mbps),
-            3 => self.main_display_3(f, s, opts.network_graph_ceiling_mbps),
+            2 => self.main_display_2(
+                f,
+                s,
+                opts.network_graph_ceiling_download_mbps,
+                opts.network_graph_ceiling_upload_mbps,
+            ),
+            3 => self.main_display_3(
+                f,
+                s,
+                opts.network_graph_ceiling_download_mbps,
+                opts.network_graph_ceiling_upload_mbps,
+            ),
             _ => {
                 f.v_line(79, 7, 24, true);
                 if s.cpu_dual {
@@ -231,7 +243,13 @@ impl Renderer {
         }
     }
 
-    fn main_display_2(&mut self, f: &mut Frame, s: &Snapshot, ceiling_mbps: f64) {
+    fn main_display_2(
+        &mut self,
+        f: &mut Frame,
+        s: &Snapshot,
+        download_ceiling_mbps: f64,
+        upload_ceiling_mbps: f64,
+    ) {
         f.v_line(52, 7, 24, true);
         f.v_line(105, 7, 24, true);
         if s.cpu_dual {
@@ -266,11 +284,37 @@ impl Renderer {
             51,
             7,
         );
-        self.network_bar(f, 107, 9, 8, "OUT", s.network_out, 157, 7, ceiling_mbps);
-        self.network_bar(f, 107, 18, 17, "IN ", s.network_in, 157, 7, ceiling_mbps);
+        self.network_bar(
+            f,
+            107,
+            9,
+            8,
+            "OUT",
+            s.network_out,
+            157,
+            7,
+            upload_ceiling_mbps,
+        );
+        self.network_bar(
+            f,
+            107,
+            18,
+            17,
+            "IN ",
+            s.network_in,
+            157,
+            7,
+            download_ceiling_mbps,
+        );
     }
 
-    fn main_display_3(&mut self, f: &mut Frame, s: &Snapshot, ceiling_mbps: f64) {
+    fn main_display_3(
+        &mut self,
+        f: &mut Frame,
+        s: &Snapshot,
+        download_ceiling_mbps: f64,
+        upload_ceiling_mbps: f64,
+    ) {
         f.v_line(79, 7, 24, true);
         if s.cpu_dual {
             self.cpu_split(f, 1, 8, s.cpu_cache_load, s.cpu_freq_load, 77);
@@ -286,7 +330,17 @@ impl Renderer {
             75,
             7,
         );
-        self.network_bar(f, 81, 9, 8, "NET IN ", s.network_in, 157, 7, ceiling_mbps);
+        self.network_bar(
+            f,
+            81,
+            9,
+            8,
+            "NET IN ",
+            s.network_in,
+            157,
+            7,
+            download_ceiling_mbps,
+        );
         self.network_bar(
             f,
             81,
@@ -296,7 +350,7 @@ impl Renderer {
             s.network_out,
             157,
             7,
-            ceiling_mbps,
+            upload_ceiling_mbps,
         );
     }
 
@@ -508,7 +562,7 @@ impl Renderer {
                 "I",
                 s.network_in,
                 "netin",
-                opts.network_graph_ceiling_mbps,
+                opts.network_graph_ceiling_download_mbps,
             ),
             "NET_OUT_GRAPH" => self.network_graph_slot(
                 f,
@@ -517,7 +571,7 @@ impl Renderer {
                 "O",
                 s.network_out,
                 "netout",
-                opts.network_graph_ceiling_mbps,
+                opts.network_graph_ceiling_upload_mbps,
             ),
             "NET_GRAPH" => self.network_dual_graph_slot(
                 f,
@@ -525,7 +579,8 @@ impl Renderer {
                 width,
                 s.network_in,
                 s.network_out,
-                opts.network_graph_ceiling_mbps,
+                opts.network_graph_ceiling_download_mbps,
+                opts.network_graph_ceiling_upload_mbps,
             ),
             "PING" => self.numeric_slot(f, left, width, "PING", s.ping_ms, 0, "MS"),
             "JITTER" => self.numeric_slot(f, left, width, "JITTER", s.jitter_ms, 0, "MS"),
@@ -800,7 +855,8 @@ impl Renderer {
         w: i32,
         network_in: Metric,
         network_out: Metric,
-        ceiling_mbps: f64,
+        download_ceiling_mbps: f64,
+        upload_ceiling_mbps: f64,
     ) {
         self.label(f, x, w, "I/O");
         let state = if !network_in.valid
@@ -837,10 +893,10 @@ impl Renderer {
         f.h_line(start_x, start_x + count as i32 - 1, baseline, true);
         for offset in 0..count {
             let in_height = in_values[in_start + offset]
-                .map(|value| network_graph_height(value, ceiling_mbps, 4))
+                .map(|value| network_graph_height(value, download_ceiling_mbps, 4))
                 .unwrap_or(0);
             let out_height = out_values[out_start + offset]
-                .map(|value| network_graph_height(value, ceiling_mbps, 5))
+                .map(|value| network_graph_height(value, upload_ceiling_mbps, 5))
                 .unwrap_or(0);
             if in_height > 0 {
                 f.v_line(
@@ -2366,7 +2422,8 @@ mod tests {
             s,
             OverlayOptions {
                 main_display,
-                network_graph_ceiling_mbps: ceiling_mbps,
+                network_graph_ceiling_download_mbps: ceiling_mbps,
+                network_graph_ceiling_upload_mbps: ceiling_mbps,
                 ..Default::default()
             },
             &golden_view(),
@@ -3035,6 +3092,7 @@ mod tests {
                 metric,
                 Metric::valid(1.0, at),
                 1000.0,
+                1000.0,
             );
             let mut expected = Frame::new();
             renderer.label(&mut expected, 1, 38, "I/O");
@@ -3058,7 +3116,15 @@ mod tests {
         assert!(single.equal(&expected));
 
         let mut dual = Frame::new();
-        renderer.network_dual_graph_slot(&mut dual, 1, 38, stale, Metric::valid(1.0, at), 1000.0);
+        renderer.network_dual_graph_slot(
+            &mut dual,
+            1,
+            38,
+            stale,
+            Metric::valid(1.0, at),
+            1000.0,
+            1000.0,
+        );
         let mut expected = Frame::new();
         renderer.label(&mut expected, 1, 38, "I/O");
         expected.text_centered(1, 38, 35, "STALE", 1, true);
@@ -3115,6 +3181,7 @@ mod tests {
                 Metric::valid(in_rate, at(2)),
                 Metric::valid(out_rate, at(2)),
                 1000.0,
+                1000.0,
             );
             frame
         };
@@ -3124,6 +3191,62 @@ mod tests {
         assert!(!(1..39).any(|x| ingress.get(x, 42)));
         assert!((1..39).any(|x| egress.get(x, 42)));
         assert!(!(1..39).any(|x| egress.get(x, 33)));
+    }
+
+    #[test]
+    fn asymmetric_network_ceilings_map_to_every_directional_graph() {
+        let sampled_at = at(30);
+        let snapshot = Snapshot {
+            now: Some(sampled_at),
+            network_in: Metric::valid(625_000.0, sampled_at),
+            network_out: Metric::valid(625_000.0, sampled_at),
+            ..Default::default()
+        };
+        let options = |main_display| OverlayOptions {
+            main_display,
+            network_graph_ceiling_download_mbps: 10.0,
+            network_graph_ceiling_upload_mbps: 100.0,
+            ..Default::default()
+        };
+
+        let clear_view = View {
+            slot_modules: std::array::from_fn(|_| "CLEAR".into()),
+            ..Default::default()
+        };
+        let layout_2 = Renderer::new().render(&snapshot, options(2), &clear_view);
+        assert!(layout_2.get(130, 20), "layout 2 IN must use download");
+        assert!(!layout_2.get(130, 11), "layout 2 OUT must use upload");
+        let layout_3 = Renderer::new().render(&snapshot, options(3), &clear_view);
+        assert!(layout_3.get(120, 11), "layout 3 NET IN must use download");
+        assert!(!layout_3.get(120, 20), "layout 3 NET OUT must use upload");
+
+        let graph = |module: &str| {
+            Renderer::new().render(
+                &snapshot,
+                options(1),
+                &View {
+                    slot_modules: [
+                        module.into(),
+                        "CLEAR".into(),
+                        "CLEAR".into(),
+                        "CLEAR".into(),
+                    ],
+                    ..Default::default()
+                },
+            )
+        };
+        let inbound = graph("NET_IN_GRAPH");
+        let outbound = graph("NET_OUT_GRAPH");
+        assert!(inbound.get(34, 38), "NET_IN_GRAPH must use download");
+        assert!(!outbound.get(34, 38), "NET_OUT_GRAPH must use upload");
+
+        let both = graph("NET_GRAPH");
+        assert!(both.get(34, 35), "NET_GRAPH top/inbound must use download");
+        assert!(both.get(34, 38), "NET_GRAPH bottom/outbound must render");
+        assert!(
+            !both.get(34, 39),
+            "NET_GRAPH bottom/outbound must use upload"
+        );
     }
 
     #[test]

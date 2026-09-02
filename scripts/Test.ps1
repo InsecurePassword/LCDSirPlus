@@ -181,6 +181,13 @@ $parserSource = [IO.File]::ReadAllText((Join-Path $repo 'src\parser.rs'))
 $applyBlock = [regex]::Match($parserSource, 'fn apply\(.*?match key \{(.*?)other =>', [Text.RegularExpressions.RegexOptions]::Singleline)
 if (-not $applyBlock.Success) { throw 'configuration parser key registry not found' }
 $acceptedConfigKeys = @('include') + @([regex]::Matches($applyBlock.Groups[1].Value, '"([a-z][a-z0-9_]*)"\s*(?:\||=>)') | ForEach-Object { $_.Groups[1].Value })
+$acceptedConfigKeyCount = 123
+$templateConfigKeyCount = 96
+$ignoredConfigKeyCount = 5
+if ($acceptedConfigKeys.Count -ne $acceptedConfigKeyCount -or
+    @($acceptedConfigKeys | Group-Object | Where-Object Count -ne 1).Count -ne 0) {
+    throw "configuration parser inventory mismatch: expected=$acceptedConfigKeyCount actual=$($acceptedConfigKeys.Count)"
+}
 $configuration = [IO.File]::ReadAllText((Join-Path $repo 'docs\CONFIGURATION.md'))
 $documentedConfigKeys = @([regex]::Matches($configuration, '(?m)^\| `([a-z][a-z0-9_]*)` \|') | ForEach-Object { $_.Groups[1].Value })
 $missingConfigKeys = @($acceptedConfigKeys | Where-Object { $_ -cnotin $documentedConfigKeys })
@@ -192,6 +199,11 @@ foreach ($key in $acceptedConfigKeys) {
     if (@($documentedConfigKeys | Where-Object { $_ -ceq $key }).Count -ne 1) { throw "configuration reference entry mismatch: $key" }
 }
 $compatibilityConfigKeys = @('date_format', 'time_format', 'headset_estimate_hours', 'discord_redirect_uri', 'hang_button')
+$parserOnlyConfigKeys = @('network_graph_ceiling_mbps')
+if ($compatibilityConfigKeys.Count -ne $ignoredConfigKeyCount -or
+    @($parserOnlyConfigKeys | Where-Object { $_ -cin $compatibilityConfigKeys }).Count -ne 0) {
+    throw "ignored configuration inventory mismatch: expected=$ignoredConfigKeyCount actual=$($compatibilityConfigKeys.Count)"
+}
 $compatibilitySection = [regex]::Match($configuration, '(?ms)^## Advanced compatibility-only settings\s+(.*?)(?=^## |\z)')
 if (-not $compatibilitySection.Success) { throw 'advanced compatibility-only configuration section is missing' }
 $documentedCompatibilityKeys = @([regex]::Matches($compatibilitySection.Groups[1].Value, '(?m)^\| `([a-z][a-z0-9_]*)` \|') | ForEach-Object { $_.Groups[1].Value })
@@ -201,6 +213,12 @@ foreach ($key in $compatibilityConfigKeys) {
 }
 $template = [IO.File]::ReadAllText($config)
 $templateKeys = @([regex]::Matches($template, '(?m)^([a-z][a-z0-9_]*)\s+') | ForEach-Object { $_.Groups[1].Value })
+if ($templateKeys.Count -ne $templateConfigKeyCount -or
+    'network_graph_ceiling_mbps' -cin $templateKeys -or
+    'network_graph_ceiling_download_mbps' -cnotin $templateKeys -or
+    'network_graph_ceiling_upload_mbps' -cnotin $templateKeys) {
+    throw "default template inventory mismatch: expected=$templateConfigKeyCount actual=$($templateKeys.Count)"
+}
 foreach ($key in $compatibilityConfigKeys) {
     if ($key -cin $templateKeys) { throw "compatibility-only key appears in default template: $key" }
 }
@@ -217,7 +235,8 @@ $omittedSensorConfigKeys = @(
     'hwinfo_cpu_power_reading', 'hwinfo_gpu_power_sensor', 'hwinfo_gpu_power_reading'
 )
 $expectedTemplateKeys = @($acceptedConfigKeys | Where-Object {
-        $_ -cne 'include' -and $_ -cnotin $compatibilityConfigKeys -and $_ -cnotin $omittedSensorConfigKeys
+        $_ -cne 'include' -and $_ -cnotin $compatibilityConfigKeys -and
+        $_ -cnotin $parserOnlyConfigKeys -and $_ -cnotin $omittedSensorConfigKeys
     })
 if ($templateKeys.Count -ne $expectedTemplateKeys.Count -or
     @($expectedTemplateKeys | Where-Object { $_ -cnotin $templateKeys }).Count -ne 0) {

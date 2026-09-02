@@ -35,11 +35,16 @@ delta below and are not final 0.3.0 builds.
   `memory_warning_enabled` switches. Memory warning thresholds default to `100`
   and trigger at or above the configured value.
 - Keeps network probing and the destructive hung-window action off by default.
+- Adds independent download/inbound and upload/outbound network graph ceilings,
+  both defaulting to `1000` Mbps.
 
 ## Migration
 
 - Existing installed settings are preserved during update or repair, including
   existing memory warning thresholds.
+- Existing `network_graph_ceiling_mbps` lines remain active and set both new
+  directional ceilings at their parse position. Later directional assignments
+  replace one direction; a later legacy assignment replaces both.
 - `ccd_source` accepts `auto` or `manual`. Manual
   `ccd_cache_processors` and `ccd_frequency_processors` indexes are `0..63`;
   both lists must be explicit together and must not overlap.

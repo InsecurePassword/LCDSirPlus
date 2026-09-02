@@ -454,7 +454,17 @@ impl ParseContext {
                 cfg.network_probe_timeout = ms_auto(v, Duration::from_millis(1500))?;
             }
             "network_probe_window" => cfg.network_probe_window = checked_i32(key, intv(v)?)?,
-            "network_graph_ceiling_mbps" => cfg.network_graph_ceiling_mbps = floatv(v)?,
+            "network_graph_ceiling_download_mbps" => {
+                cfg.network_graph_ceiling_download_mbps = floatv(v)?
+            }
+            "network_graph_ceiling_upload_mbps" => {
+                cfg.network_graph_ceiling_upload_mbps = floatv(v)?
+            }
+            "network_graph_ceiling_mbps" => {
+                let ceiling = floatv(v)?;
+                cfg.network_graph_ceiling_download_mbps = ceiling;
+                cfg.network_graph_ceiling_upload_mbps = ceiling;
+            }
             "disk_graph_ceiling_mbps" => cfg.disk_graph_ceiling_mbps = floatv(v)?,
             "fps_graph_ceiling" => cfg.fps_graph_ceiling = floatv(v)?,
             "warning" => cfg.warning = boolv(v)?,
@@ -773,12 +783,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_network_modules_and_graph_ceiling() {
+    fn parses_network_modules_and_asymmetric_graph_ceilings() {
         let cfg = parse_standalone(
-            b"slot_0 NET_IN NET_OUT NET_BOTH NET_IN_GRAPH NET_OUT_GRAPH NET_GRAPH\nnetwork_graph_ceiling_mbps 2500.5\n",
+            b"slot_0 NET_IN NET_OUT NET_BOTH NET_IN_GRAPH NET_OUT_GRAPH NET_GRAPH\nnetwork_graph_ceiling_download_mbps 2500.5\nnetwork_graph_ceiling_upload_mbps 40\n",
         )
         .unwrap();
-        assert_eq!(cfg.network_graph_ceiling_mbps, 2500.5);
+        assert_eq!(cfg.network_graph_ceiling_download_mbps, 2500.5);
+        assert_eq!(cfg.network_graph_ceiling_upload_mbps, 40.0);
         assert_eq!(
             cfg.slots[0],
             vec![
@@ -790,8 +801,44 @@ mod tests {
                 "NET_GRAPH"
             ]
         );
-        assert!(parse_standalone(b"network_graph_ceiling_mbps 0\n").is_err());
-        assert!(parse_standalone(b"network_graph_ceiling_mbps NaN\n").is_err());
+        for key in [
+            "network_graph_ceiling_download_mbps",
+            "network_graph_ceiling_upload_mbps",
+            "network_graph_ceiling_mbps",
+        ] {
+            assert!(parse_standalone(format!("{key} 0\n").as_bytes()).is_err());
+            assert!(parse_standalone(format!("{key} NaN\n").as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_network_ceiling_sets_both_and_mixed_spelling_order_wins() {
+        let legacy = parse_standalone(b"network_graph_ceiling_mbps 75\n").unwrap();
+        assert_eq!(legacy.network_graph_ceiling_download_mbps, 75.0);
+        assert_eq!(legacy.network_graph_ceiling_upload_mbps, 75.0);
+
+        let canonical_last = parse_standalone(
+            b"network_graph_ceiling_mbps 75\nnetwork_graph_ceiling_download_mbps 1000\nnetwork_graph_ceiling_upload_mbps 40\n",
+        )
+        .unwrap();
+        assert_eq!(canonical_last.network_graph_ceiling_download_mbps, 1000.0);
+        assert_eq!(canonical_last.network_graph_ceiling_upload_mbps, 40.0);
+
+        let legacy_last = parse_standalone(
+            b"network_graph_ceiling_download_mbps 1000\nnetwork_graph_ceiling_upload_mbps 40\nnetwork_graph_ceiling_mbps 75\n",
+        )
+        .unwrap();
+        assert_eq!(legacy_last.network_graph_ceiling_download_mbps, 75.0);
+        assert_eq!(legacy_last.network_graph_ceiling_upload_mbps, 75.0);
+
+        for key in [
+            "network_graph_ceiling_download_mbps",
+            "network_graph_ceiling_upload_mbps",
+            "network_graph_ceiling_mbps",
+        ] {
+            let error = parse_standalone(format!("{key} 10\n{key} 20\n").as_bytes()).unwrap_err();
+            assert!(error.message.contains("duplicate key"), "{key}: {error}");
+        }
     }
 
     #[test]
@@ -891,6 +938,31 @@ mod tests {
         let loaded = load(&main).unwrap();
         assert_eq!(loaded.config.preview_scale, 5);
         assert_eq!(loaded.files.len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn network_ceiling_assignments_follow_include_position() {
+        let dir =
+            std::env::temp_dir().join(format!("lcdsirplus-net-ceiling-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = dir.join("main.txt");
+        let local = dir.join("local.txt");
+        std::fs::write(
+            &main,
+            "network_graph_ceiling_download_mbps 1000\ninclude local.txt\nnetwork_graph_ceiling_upload_mbps 40\n",
+        )
+        .unwrap();
+        std::fs::write(&local, "network_graph_ceiling_mbps 75\n").unwrap();
+        let loaded = load(&main).unwrap();
+        assert_eq!(loaded.config.network_graph_ceiling_download_mbps, 75.0);
+        assert_eq!(loaded.config.network_graph_ceiling_upload_mbps, 40.0);
+
+        std::fs::write(&main, "network_graph_ceiling_mbps 75\ninclude local.txt\n").unwrap();
+        std::fs::write(&local, "network_graph_ceiling_download_mbps 1000\n").unwrap();
+        let loaded = load(&main).unwrap();
+        assert_eq!(loaded.config.network_graph_ceiling_download_mbps, 1000.0);
+        assert_eq!(loaded.config.network_graph_ceiling_upload_mbps, 75.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

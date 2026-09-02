@@ -289,13 +289,13 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                     discord_max_speakers: cfg.discord_max_speakers.max(1) as usize,
                     discord_show_self: cfg.discord_show_self,
                     discord_show_channel: cfg.discord_show_channel,
-                    network_graph_ceiling_mbps: cfg.network_graph_ceiling_mbps,
                     disk_graph_ceiling_mbps: cfg.disk_graph_ceiling_mbps,
                     fps_graph_ceiling: cfg.fps_graph_ceiling,
                     cpu_temp_max_c: cfg.cpu_temp_max_c,
                     gpu_temp_max_c: cfg.gpu_temp_max_c,
                     warning: temperature_pane_warning(&cfg),
                     warning_phase: (process_epoch.elapsed().as_millis() / 100) % 2 == 1,
+                    ..network_overlay_options(&cfg)
                 },
                 &view,
             );
@@ -476,6 +476,14 @@ fn temperature_pane_warning(cfg: &Config) -> bool {
     cfg.temperature_warning_enabled && cfg.warning
 }
 
+fn network_overlay_options(cfg: &Config) -> OverlayOptions {
+    OverlayOptions {
+        network_graph_ceiling_download_mbps: cfg.network_graph_ceiling_download_mbps,
+        network_graph_ceiling_upload_mbps: cfg.network_graph_ceiling_upload_mbps,
+        ..Default::default()
+    }
+}
+
 fn backend_config_changed(old: &Config, new: &Config) -> bool {
     old.logitech_backend != new.logitech_backend
         || old.logitech_reconnect != new.logitech_reconnect
@@ -588,11 +596,10 @@ pub fn run_hardware_test(
         &snapshot,
         OverlayOptions {
             main_display: cfg.main_display,
-            network_graph_ceiling_mbps: cfg.network_graph_ceiling_mbps,
             cpu_temp_max_c: cfg.cpu_temp_max_c,
             gpu_temp_max_c: cfg.gpu_temp_max_c,
             warning: temperature_pane_warning(&cfg),
-            ..Default::default()
+            ..network_overlay_options(&cfg)
         },
         &View {
             slot_modules: [
@@ -1099,6 +1106,18 @@ fn file_signature(path: &std::path::Path) -> Option<FileSignature> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_overlay_options_preserve_directional_ceilings() {
+        let cfg = Config {
+            network_graph_ceiling_download_mbps: 1000.0,
+            network_graph_ceiling_upload_mbps: 40.0,
+            ..Config::default()
+        };
+        let options = network_overlay_options(&cfg);
+        assert_eq!(options.network_graph_ceiling_download_mbps, 1000.0);
+        assert_eq!(options.network_graph_ceiling_upload_mbps, 40.0);
+    }
 
     #[test]
     fn hardware_discovery_summary_omits_raw_device_path() {

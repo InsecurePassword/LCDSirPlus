@@ -190,7 +190,8 @@ pub struct Config {
     pub network_probe_interval: Duration,
     pub network_probe_timeout: Duration,
     pub network_probe_window: i32,
-    pub network_graph_ceiling_mbps: f64,
+    pub network_graph_ceiling_download_mbps: f64,
+    pub network_graph_ceiling_upload_mbps: f64,
     pub disk_graph_ceiling_mbps: f64,
     pub fps_graph_ceiling: f64,
 
@@ -327,7 +328,8 @@ impl Default for Config {
             network_probe_interval: Duration::from_secs(1),
             network_probe_timeout: Duration::from_millis(1500),
             network_probe_window: 30,
-            network_graph_ceiling_mbps: 1000.0,
+            network_graph_ceiling_download_mbps: 1000.0,
+            network_graph_ceiling_upload_mbps: 1000.0,
             disk_graph_ceiling_mbps: 1000.0,
             fps_graph_ceiling: 240.0,
             warning: true,
@@ -657,8 +659,14 @@ pub fn validate(c: &Config) -> Result<(), String> {
         30000,
     )?;
     check_range_f64(
-        "network_graph_ceiling_mbps",
-        c.network_graph_ceiling_mbps,
+        "network_graph_ceiling_download_mbps",
+        c.network_graph_ceiling_download_mbps,
+        1.0,
+        100000.0,
+    )?;
+    check_range_f64(
+        "network_graph_ceiling_upload_mbps",
+        c.network_graph_ceiling_upload_mbps,
         1.0,
         100000.0,
     )?;
@@ -968,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn network_graph_ceiling_is_positive_finite_and_bounded() {
+    fn network_graph_ceilings_default_and_validate_independently() {
         for module in [
             "NET_IN",
             "NET_OUT",
@@ -979,15 +987,26 @@ mod tests {
         ] {
             assert!(valid_module(module));
         }
-        for value in [0.0, f64::NAN, f64::INFINITY, 100001.0] {
-            let cfg = Config {
-                network_graph_ceiling_mbps: value,
-                ..Config::default()
-            };
-            assert!(validate(&cfg).is_err(), "accepted {value}");
+        let defaults = Config::default();
+        assert_eq!(defaults.network_graph_ceiling_download_mbps, 1000.0);
+        assert_eq!(defaults.network_graph_ceiling_upload_mbps, 1000.0);
+        for value in [0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 100001.0] {
+            for cfg in [
+                Config {
+                    network_graph_ceiling_download_mbps: value,
+                    ..Config::default()
+                },
+                Config {
+                    network_graph_ceiling_upload_mbps: value,
+                    ..Config::default()
+                },
+            ] {
+                assert!(validate(&cfg).is_err(), "accepted {value}");
+            }
         }
         let cfg = Config {
-            network_graph_ceiling_mbps: 100000.0,
+            network_graph_ceiling_download_mbps: 1.0,
+            network_graph_ceiling_upload_mbps: 100000.0,
             ..Config::default()
         };
         assert!(validate(&cfg).is_ok());
@@ -1002,6 +1021,14 @@ mod tests {
         .expect("canonical shipped configuration must parse");
         let defaults = Config::default();
         assert_eq!(defaults.slots, shipped.slots);
+        assert_eq!(
+            defaults.network_graph_ceiling_download_mbps,
+            shipped.network_graph_ceiling_download_mbps
+        );
+        assert_eq!(
+            defaults.network_graph_ceiling_upload_mbps,
+            shipped.network_graph_ceiling_upload_mbps
+        );
         assert_eq!(
             (
                 &defaults.presentmon_target_mode,

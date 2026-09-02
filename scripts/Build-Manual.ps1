@@ -74,6 +74,7 @@ a { color: #1f618d; text-decoration: none; }
 pre, code { font-family: Consolas, "Courier New", monospace; }
 code { background: #f2f4f4; padding: 1px 3px; }
 pre { background: #f4f6f7; border-left: 3px solid #5d6d7e; padding: 8px; white-space: pre-wrap; break-inside: avoid; }
+p:has(+ pre) { break-after: avoid; }
 table { width: 100%; border-collapse: collapse; margin: 8px 0 14px; font-size: 8.2pt; }
 th, td { border: 1px solid #aab7b8; padding: 4px 5px; text-align: left; vertical-align: top; }
 th { background: #d6eaf8; color: #154360; }
