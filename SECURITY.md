@@ -40,6 +40,11 @@ separately revoke the app under Discord **User Settings > Authorized Apps**.
   desktop apps even with a valid catalog. A selected executable filename and
   FPS may appear, and old readings are not preserved. Set
   `presentmon_enabled 0` if that exposure is unacceptable.
+- NVIDIA catalog parsing is local and read only; catalog JSON, names, paths, and
+  record details are not logged. The fingerprint field remains required and
+  boolean-typed, but a stale false value is tolerated only for an otherwise-safe
+  eligible exact path matching the running executable. All other qualification,
+  identity, exclusion, workload, staleness, and cleanup gates remain in force.
 - If Windows denies PresentMon capture, add the user to **Performance Log
   Users**, sign out, and sign in. Elevation is for diagnosis, not normal use.
 - HWiNFO access is read only. LibreHardwareMonitor is restricted to the local

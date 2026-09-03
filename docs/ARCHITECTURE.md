@@ -138,9 +138,12 @@ the session without restarting the child.
 
 Automatic mode can read the fixed current-user NVIDIA App
 `ApplicationStorage.json`. Input size, record count, path count, file identity,
-and schema are limited. A valid catalog keeps normalized exact paths only when
-all required game flags qualify. Raw JSON, names, paths, and record details are
-not logged or retained. No write, NVIDIA process call, DRS use, Xbox source, or
+and schema are limited. Records still require a boolean
+`IsFingerprintDetected`, but its value is not a qualification predicate because
+`false` can be stale. A stale `false` admits only an otherwise-eligible
+noncreative, OPS-supported, nonmanual, safe normalized fixed-drive path. Raw
+JSON, names, paths, and record details are not logged or retained. Parsing is
+local and read only; no write, NVIDIA process call, DRS use, Xbox source, or
 catalog network access occurs.
 
 For catalog matching, exact path spelling means an absolute drive path

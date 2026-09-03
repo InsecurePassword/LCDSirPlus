@@ -29,6 +29,12 @@ delta below and are not final 0.3.0 builds.
   catalog rejects ordinary desktop apps; if it is unavailable, fallback may
   select another app. Setting it to `1` permits desktop apps even with a valid
   catalog. A filename and FPS may appear, and old readings are not preserved.
+- PresentMon now tolerates a stale false NVIDIA fingerprint value only for an
+  otherwise-eligible exact live executable path. Every other catalog, path,
+  process identity, exclusion, workload, staleness, and cleanup gate is
+  unchanged. There is no configuration migration or default change. A
+  previously suppressed app may now show its filename and FPS; disable
+  PresentMon if that exposure is unacceptable.
 - Inactive `PROC_HANG` and `BOTTLENECK` selections now temporarily show the next
   eligible option without changing the stored selection.
 - Adds independent `temperature_warning_enabled` and

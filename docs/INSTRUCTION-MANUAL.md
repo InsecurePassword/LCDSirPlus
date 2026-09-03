@@ -323,6 +323,10 @@ unavailable, automatic fallback may still select another app. Set it to `1` to
 allow desktop apps even when the game list is available. Under either persist
 value, the selected executable filename and FPS may appear; old readings are
 not preserved. If that exposure is not acceptable, set `presentmon_enabled 0`.
+LCDSirPlus parses the catalog locally and read only, without logging its names or
+paths. A stale false fingerprint flag is tolerated only when the record remains
+noncreative, OPS-supported, nonmanual, and its safe full path exactly matches the
+running executable.
 Advanced details are in
 [CONFIGURATION.md](CONFIGURATION.md#use-presentmon).
 

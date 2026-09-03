@@ -116,7 +116,8 @@ presentmon_window_ms    auto          # 60000
 presentmon_target_mode  presenting    # presenting | foreground | process_name | disabled
 presentmon_deferred     1             # 1 hides unavailable FPS screens; the saved choice stays selected
 # 0 prefers games. A valid NVIDIA game list rejects desktop apps; fallback may
-# select another app if the list is unavailable.
+# select another app if the list is unavailable. A stale false fingerprint flag
+# is tolerated only for an otherwise-eligible exact live executable path.
 # 1 allows desktop apps even when the list is available. A selected filename/FPS
 # may appear; old readings are not kept. Set presentmon_enabled 0 to prevent it.
 presentmon_persist      0

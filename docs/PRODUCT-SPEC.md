@@ -134,6 +134,11 @@ persist allows desktop apps even when the game list is available. The selected
 filename and FPS may appear, and old readings are not preserved. Disabling
 PresentMon prevents filename and FPS exposure.
 
+Catalog parsing is local and read only and does not log catalog names or paths.
+The fingerprint field remains required and boolean-typed, but a potentially
+stale false value is tolerated only for an otherwise-eligible noncreative,
+OPS-supported, nonmanual exact safe path matching the live executable.
+
 Values become stale after five seconds without frames and expire after another
 five seconds. Advanced selection and privacy rules are documented in
 [CONFIGURATION.md](CONFIGURATION.md), [SECURITY.md](../SECURITY.md), and

@@ -129,8 +129,11 @@ do not stop them.
 1. Start with `presentmon_enabled 1`, `presentmon_path auto`,
    `presentmon_target_mode presenting`, `presentmon_deferred 1`,
    `presentmon_persist 0`, and `log_level debug`.
-2. Use a valid NVIDIA App catalog with one exact-path qualifying game plus a
-   higher-frame-rate ordinary presenter. Confirm only the game is selected.
+2. Use a valid synthetic NVIDIA App catalog case whose noncreative,
+   OPS-supported, nonmanual exact safe path has `IsFingerprintDetected` set to
+   `false`, plus a higher-workload ordinary desktop presenter. Confirm the exact
+   catalog path is selected and the desktop presenter is rejected. Repeat with
+   the fingerprint value set to `true`.
 3. Test at least two representative games independently from closed state to
    active capture and back to closed state. Record one LCDSirPlus-owned
    PresentMon child, FPS,

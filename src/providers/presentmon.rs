@@ -472,9 +472,7 @@ fn parse_catalog(bytes: &[u8]) -> Result<Vec<String>, CatalogUnavailableReason> 
         let Some(ops) = catalog_field(fields, "IsOpsSupported").and_then(Json::as_bool) else {
             continue;
         };
-        let Some(fingerprint) =
-            catalog_field(fields, "IsFingerprintDetected").and_then(Json::as_bool)
-        else {
+        let Some(_) = catalog_field(fields, "IsFingerprintDetected").and_then(Json::as_bool) else {
             continue;
         };
         let Some(manual) = catalog_field(fields, "IsManuallyAdded").and_then(Json::as_bool) else {
@@ -486,7 +484,7 @@ fn parse_catalog(bytes: &[u8]) -> Result<Vec<String>, CatalogUnavailableReason> 
         recognized = true;
         for path in detected {
             let path = path.as_str().expect("validated catalog path type");
-            if !creative && ops && fingerprint && !manual {
+            if !creative && ops && !manual {
                 if let Some(path) = normalize_catalog_path(path) {
                     qualified.push(path);
                 }
@@ -3499,63 +3497,73 @@ mod tests {
     }
 
     #[test]
-    fn r5_catalog_requires_exact_qualified_full_path() {
-        let game_path = r"C:\PrivateFixture\EscapeFromTarkov.exe";
+    fn r5_catalog_requires_exact_eligible_full_path_and_tolerates_stale_fingerprint() {
+        let stale_path = r"C:\CatalogFixture\StaleFlag.exe";
+        let verified_path = r"C:\CatalogFixture\Verified.exe";
         let records = vec![
-            catalog_record(&[game_path], false, true, true, false),
-            catalog_record(&[game_path], false, true, true, false),
+            catalog_record(&[stale_path], false, true, false, false),
+            catalog_record(&[verified_path], false, true, true, false),
+            catalog_record(&[verified_path], false, true, true, false),
             catalog_record(
-                &[r"C:\PrivateFixture\Creative.exe"],
+                &[r"C:\CatalogFixture\Creative.exe"],
                 true,
                 true,
                 true,
                 false,
             ),
-            catalog_record(&[r"C:\PrivateFixture\NoOps.exe"], false, false, true, false),
             catalog_record(
-                &[r"C:\PrivateFixture\NoFingerprint.exe"],
+                &[r"C:\CatalogFixture\OpsUnsupported.exe"],
+                false,
                 false,
                 true,
                 false,
-                false,
             ),
-            catalog_record(&[r"C:\PrivateFixture\Manual.exe"], false, true, true, true),
+            catalog_record(&[r"C:\CatalogFixture\Manual.exe"], false, true, true, true),
             catalog_record(
                 &[
-                    "EscapeFromTarkov.exe",
-                    r"\\server\share\EscapeFromTarkov.exe",
-                    r"\\?\C:\PrivateFixture\EscapeFromTarkov.exe",
-                    r"C:\PrivateFixture\..\EscapeFromTarkov.exe",
-                    r"C:\PrivateFixture\EscapeFromTarkov.exe:stream",
+                    "Relative.exe",
+                    r"\\server\share\Remote.exe",
+                    r"\\?\C:\CatalogFixture\Namespaced.exe",
+                    r"C:\CatalogFixture\..\Parent.exe",
+                    r"C:\CatalogFixture\Alternate.exe:stream",
                 ],
                 false,
                 true,
-                true,
+                false,
                 false,
             ),
         ];
         let paths = parse_catalog(&catalog_document(&records)).unwrap();
-        assert_eq!(paths, vec![normalize_catalog_path(game_path).unwrap()]);
+        assert_eq!(
+            paths,
+            vec![
+                normalize_catalog_path(stale_path).unwrap(),
+                normalize_catalog_path(verified_path).unwrap(),
+            ]
+        );
         let catalog = CatalogState::Available(paths);
         let process = |path: &str| ProcessInfo {
             pid: 1,
             creation_time: 1,
-            name: "EscapeFromTarkov.exe".into(),
+            name: "Synthetic.exe".into(),
             image_path: path.into(),
         };
         assert_eq!(
-            catalog.classify(&process(r"c:\PRIVATEfixture\ESCAPEFROMTARKOV.EXE")),
+            catalog.classify(&process(r"c:\CATALOGfixture\STALEFLAG.EXE")),
             CatalogClassification::Game
         );
         assert_eq!(
-            catalog.classify(&process(r"C:\Other\EscapeFromTarkov.exe")),
+            catalog.classify(&process(verified_path)),
+            CatalogClassification::Game
+        );
+        assert_eq!(
+            catalog.classify(&process(r"C:\Other\StaleFlag.exe")),
             CatalogClassification::NotGame
         );
         for rejected in [
-            r"C:\PrivateFixture\Creative.exe",
-            r"C:\PrivateFixture\NoOps.exe",
-            r"C:\PrivateFixture\NoFingerprint.exe",
-            r"C:\PrivateFixture\Manual.exe",
+            r"C:\CatalogFixture\Creative.exe",
+            r"C:\CatalogFixture\OpsUnsupported.exe",
+            r"C:\CatalogFixture\Manual.exe",
         ] {
             assert_eq!(
                 catalog.classify(&process(rejected)),
@@ -3563,16 +3571,16 @@ mod tests {
             );
         }
         assert_eq!(
-            catalog.classify(&process(r"C:\PrivateFixture\Absent.exe")),
+            catalog.classify(&process(r"C:\CatalogFixture\Absent.exe")),
             CatalogClassification::NotGame
         );
         for rejected in [
-            "EscapeFromTarkov.exe",
-            r"\\server\share\EscapeFromTarkov.exe",
-            r"\\?\C:\PrivateFixture\EscapeFromTarkov.exe",
-            r"C:\PrivateFixture\..\EscapeFromTarkov.exe",
-            r"C:\PrivateFixture\EscapeFromTarkov.exe:stream",
-            r"C:\PrivateFixture\unsafe.\EscapeFromTarkov.exe",
+            "Relative.exe",
+            r"\\server\share\Remote.exe",
+            r"\\?\C:\CatalogFixture\Namespaced.exe",
+            r"C:\CatalogFixture\..\Parent.exe",
+            r"C:\CatalogFixture\Alternate.exe:stream",
+            r"C:\CatalogFixture\unsafe.\Trailing.exe",
         ] {
             assert!(normalize_catalog_path(rejected).is_none(), "{rejected}");
         }
@@ -3672,12 +3680,16 @@ mod tests {
         let nested_conflict = direct_and_nested(&nonqualifying, &qualified);
         let missing = r#"{"SanitizedApplication":{"DetectedFiles":[]}}"#.to_string();
         let wrong_type = r#"{"SanitizedApplication":{"DetectedFiles":[],"IsCreativeApplication":false,"IsOpsSupported":"true","IsFingerprintDetected":true,"IsManuallyAdded":false}}"#.to_string();
+        let missing_fingerprint = r#"{"DetectedFiles":[],"IsCreativeApplication":false,"IsOpsSupported":true,"IsManuallyAdded":false}"#.to_string();
+        let wrong_fingerprint = r#"{"DetectedFiles":[],"IsCreativeApplication":false,"IsOpsSupported":true,"IsFingerprintDetected":"false","IsManuallyAdded":false}"#.to_string();
         let duplicate = r#"{"DetectedFiles":[],"IsCreativeApplication":false,"IsOpsSupported":true,"IsOpsSupported":true,"IsFingerprintDetected":true,"IsManuallyAdded":false}"#.to_string();
         let unsupported = [
             ("unknown", r#"{"Other":true}"#.to_string()),
             ("null", "null".to_string()),
             ("missing", missing.clone()),
             ("wrong_type", wrong_type.clone()),
+            ("missing_fingerprint", missing_fingerprint.clone()),
+            ("wrong_fingerprint", wrong_fingerprint.clone()),
             ("ambiguous_direct", direct_conflict.clone()),
             ("ambiguous_nested", nested_conflict.clone()),
             ("duplicate", duplicate.clone()),
@@ -3695,6 +3707,8 @@ mod tests {
             "null".to_string(),
             missing,
             wrong_type,
+            missing_fingerprint,
+            wrong_fingerprint,
             direct_conflict,
             nested_conflict,
             duplicate,
@@ -3757,26 +3771,26 @@ mod tests {
     }
 
     #[test]
-    fn r5_selector_uses_valid_catalog_and_unavailable_fallback() {
+    fn r5_selector_uses_stale_fingerprint_catalog_and_unavailable_fallback() {
         let cfg = Config::default();
         let base = Instant::now();
-        let game = ProcessInfo {
+        let catalog_app = ProcessInfo {
             pid: 1,
             creation_time: 1,
-            name: "Game.exe".into(),
-            image_path: r"C:\Games\Game.exe".into(),
+            name: "CatalogApp.exe".into(),
+            image_path: r"C:\CatalogFixture\CatalogApp.exe".into(),
         };
-        let chrome = ProcessInfo {
+        let desktop = ProcessInfo {
             pid: 2,
             creation_time: 2,
-            name: "chrome.exe".into(),
-            image_path: r"C:\Program Files\Chrome\chrome.exe".into(),
+            name: "Desktop.exe".into(),
+            image_path: r"C:\DesktopFixture\Desktop.exe".into(),
         };
-        let opencode = ProcessInfo {
+        let busier_desktop = ProcessInfo {
             pid: 3,
             creation_time: 3,
-            name: "OpenCode.exe".into(),
-            image_path: r"C:\Tools\OpenCode.exe".into(),
+            name: "BusierDesktop.exe".into(),
+            image_path: r"C:\DesktopFixture\BusierDesktop.exe".into(),
         };
         let populate = |capture: &mut Capture, processes: &[(&ProcessInfo, f64)]| {
             for second in 0..=3 {
@@ -3796,27 +3810,50 @@ mod tests {
         let mut valid = Capture::default();
         populate(
             &mut valid,
-            &[(&game, 0.40), (&chrome, 0.90), (&opencode, 0.95)],
+            &[
+                (&catalog_app, 0.40),
+                (&desktop, 0.90),
+                (&busier_desktop, 0.95),
+            ],
         );
-        valid.catalog.state =
-            CatalogState::Available(vec![normalize_catalog_path(&game.image_path).unwrap()]);
-        valid.pick_presenter(&cfg, base + Duration::from_secs(3), || chrome.pid);
-        assert_eq!(valid.target, game);
+        valid.catalog.state = CatalogState::Available(
+            parse_catalog(&catalog_document(&[catalog_record(
+                &[&catalog_app.image_path],
+                false,
+                true,
+                false,
+                false,
+            )]))
+            .unwrap(),
+        );
+        valid.pick_presenter(&cfg, base + Duration::from_secs(3), || desktop.pid);
+        assert_eq!(valid.target, catalog_app);
 
         let mut no_game = Capture::default();
-        populate(&mut no_game, &[(&chrome, 0.90), (&opencode, 0.95)]);
+        populate(&mut no_game, &[(&desktop, 0.90), (&busier_desktop, 0.95)]);
         no_game.catalog.state = CatalogState::Available(Vec::new());
-        no_game.pick_presenter(&cfg, base + Duration::from_secs(3), || chrome.pid);
+        no_game.pick_presenter(&cfg, base + Duration::from_secs(3), || desktop.pid);
         assert_eq!(no_game.target, ProcessInfo::default());
 
         let mut unavailable = Capture::default();
         populate(
             &mut unavailable,
-            &[(&game, 0.40), (&chrome, 0.90), (&opencode, 0.95)],
+            &[
+                (&catalog_app, 0.40),
+                (&desktop, 0.90),
+                (&busier_desktop, 0.95),
+            ],
         );
-        unavailable.catalog.state = CatalogState::Unavailable;
+        let metadata = CatalogMetadata {
+            volume: 1,
+            index: 2,
+            size: 3,
+            modified: 4,
+        };
+        unavailable.catalog.state =
+            load_catalog_with(|| Ok((metadata, b"{".to_vec(), metadata))).state;
         unavailable.pick_presenter(&cfg, base + Duration::from_secs(3), || 0);
-        assert_eq!(unavailable.target, opencode);
+        assert_eq!(unavailable.target, busier_desktop);
 
         let persistent_cfg = Config {
             presentmon_persist: true,
@@ -3825,12 +3862,18 @@ mod tests {
         let mut persistent = Capture::default();
         populate(
             &mut persistent,
-            &[(&game, 0.40), (&chrome, 0.90), (&opencode, 0.95)],
+            &[
+                (&catalog_app, 0.40),
+                (&desktop, 0.90),
+                (&busier_desktop, 0.95),
+            ],
         );
         persistent.catalog.state =
-            CatalogState::Available(vec![normalize_catalog_path(&game.image_path).unwrap()]);
+            CatalogState::Available(vec![
+                normalize_catalog_path(&catalog_app.image_path).unwrap()
+            ]);
         persistent.pick_presenter(&persistent_cfg, base + Duration::from_secs(3), || 0);
-        assert_eq!(persistent.target, opencode);
+        assert_eq!(persistent.target, busier_desktop);
 
         let targeted_cfg = Config {
             presentmon_target_mode: "foreground".into(),
@@ -3901,7 +3944,7 @@ mod tests {
         let private_path = r"C:\PrivateFixture\SecretGame.exe";
         let private_name = "Private Catalog Display Name";
         let bytes = format!(
-            r#"{{"Applications":[{{"DetectedFiles":["C:\\PrivateFixture\\SecretGame.exe"],"IsCreativeApplication":false,"IsOpsSupported":true,"IsFingerprintDetected":true,"IsManuallyAdded":false,"DisplayName":"{private_name}"}}]}}"#
+            r#"{{"Applications":[{{"DetectedFiles":["C:\\PrivateFixture\\SecretGame.exe"],"IsCreativeApplication":false,"IsOpsSupported":true,"IsFingerprintDetected":false,"IsManuallyAdded":false,"DisplayName":"{private_name}"}}]}}"#
         );
         assert!(parse_catalog(bytes.as_bytes()).is_ok());
         let process = ProcessInfo {

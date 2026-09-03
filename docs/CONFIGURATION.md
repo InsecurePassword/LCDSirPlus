@@ -223,14 +223,17 @@ active game automatically. It optionally reads only:
 %LOCALAPPDATA%\NVIDIA Corporation\NVIDIA App\NvBackend\ApplicationStorage.json
 ```
 
-The file is treated as untrusted, read only, and limited to 1 MiB, 4096
-application records, and 64 detected paths per record. A usable record must
-provide all expected typed fields. A path qualifies only when the record is not
-creative, supports OPS, is fingerprint-detected, and is not manually added.
-The running executable's normalized full fixed-drive path must match a qualified
-catalog path; matching is case-insensitive and is not a physical-file identity
-check. LCDSirPlus never writes or lists the catalog, starts NVIDIA software,
-uses DRS, reads Xbox catalogs, or contacts a catalog service.
+The file is parsed locally as untrusted, read-only input and limited to 1 MiB,
+4096 application records, and 64 detected paths per record. A usable record must
+provide all expected typed fields, including a boolean `IsFingerprintDetected`.
+Because that value can be stale, either boolean value is accepted; `false` is
+tolerated only for an otherwise-eligible exact path. The record must still be
+noncreative, OPS-supported, and nonmanual, and the path must be a safe normalized
+fixed-drive path. The running executable's normalized full path must match it
+exactly, case-insensitively; this is not a physical-file identity check.
+LCDSirPlus never writes or lists the catalog, logs its raw JSON, names, paths, or
+record details, starts NVIDIA software, uses DRS, reads Xbox catalogs, or
+contacts a catalog service.
 
 With `presentmon_persist 0`, a usable catalog rejects non-game paths. If the
 catalog is unavailable, unsafe, changing, too large, malformed, or has an
