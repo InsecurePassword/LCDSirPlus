@@ -2,8 +2,8 @@
 
 ## Supported versions
 
-LCDSirPlus 0.3.0 is a draft, unpublished release. The planned package has not
-completed final package testing. Older b7 builds are not final 0.3.0 builds.
+LCDSirPlus 0.3.0 is the currently supported release. Older b7 builds are not
+supported 0.3.0 builds.
 
 ## Report a vulnerability
 
@@ -82,7 +82,7 @@ slot cycling, and alert acknowledgement. It disables optional dashboard data,
 Discord dashboard access, probes, startup changes, and the destructive action.
 The explicit Discord authorize and clear commands remain available.
 
-The planned LCDSirPlus packages are unsigned. Verify their supplied SHA-256
-checksums before use; planned PresentMon content has its own Intel signature.
+The LCDSirPlus packages are unsigned. Verify their supplied SHA-256 checksums
+before use; included PresentMon content has its own Intel signature.
 Uninstall preserves `%LOCALAPPDATA%\LCDSirPlus`, including settings, logs, and
 Discord credentials. Remove that folder only when its data is no longer needed.

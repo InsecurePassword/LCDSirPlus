@@ -1,7 +1,7 @@
 # LCDSirPlus 0.3.0
 
-> **Draft / unreleased:** LCDSirPlus 0.3.0 is not published. There is no
-> supported public download yet, and final package testing is still pending.
+> LCDSirPlus release packages are unsigned. Verify the supplied SHA-256
+> checksum before running or extracting a download.
 
 LCDSirPlus is a Windows dashboard for the Logitech G13. It shows system, game,
 device, network, and Discord voice information on the G13 LCD or an on-screen
@@ -12,17 +12,17 @@ preview. The preview works without a G13.
 - Windows 11 x64
 - A Logitech G13 for the physical LCD and buttons; optional for preview use
 - Logitech Gaming Software for the recommended G13 connection
-- PresentMon for FPS; planned packages include the approved executable
+- PresentMon for FPS; release packages include the approved executable
 - HWiNFO or LibreHardwareMonitor for CPU temperature; neither is bundled
 - Discord Desktop and your own Discord application for voice names
 
 ## Start LCDSirPlus
 
-When a release is published, verify its SHA-256 checksum before running it. The
+Verify a release package's SHA-256 checksum before running it. The
 [instruction manual](docs/INSTRUCTION-MANUAL.md#verify-a-download) contains the
 complete verification and installation steps.
 
-For an installed copy, open **LCDSirPlus** from the Start Menu. The planned
+For an installed copy, open **LCDSirPlus** from the Start Menu. The
 installer also adds shortcuts to the instruction manual and security guide.
 
 For a portable copy, extract the ZIP, open its folder in Terminal, and run:
@@ -84,6 +84,6 @@ when an installed copy is removed; the manual explains how to remove them.
 - [Configuration reference](docs/CONFIGURATION.md)
 - [Button option reference](modules.md)
 - [Security guide](SECURITY.md)
-- [Draft release notes](RELEASE-NOTES.md)
+- [Release notes](RELEASE-NOTES.md)
 - [MIT license](LICENSE)
 - [Third-party notices](THIRD_PARTY_LICENSES.txt)

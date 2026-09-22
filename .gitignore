@@ -13,11 +13,29 @@
 *.bak
 *.orig
 *.rej
+*.dmp
+*.stackdump
+*.profraw
+*.profdata
 LCDSirPlus-Diagnostics-*.zip
+/coverage/
+/closure-review-*
+/remediation-REM-*
+/docs/OldDocs.7z
+/docs/.LCDSirPlus-Manual-*
+/third_party/PresentMon/.PresentMon.*.download.exe
 
 /.idea/
 /.vs/
 /.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+*.Zone.Identifier
 
 .env
 .env.*

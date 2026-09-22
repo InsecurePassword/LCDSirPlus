@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Builds and validates the provisional Windows release artifacts.
+Builds and validates the Windows release artifacts.
 
 .DESCRIPTION
 Requires a clean worktree, pinned Rust tooling, and verified third-party caches. Runs quality and package gates, reproducibly builds the application and installer, and publishes setup, portable, source, checksum, and reproducibility artifacts beneath artifacts/.
@@ -10,7 +10,7 @@ Release output directory relative to the repository root. Defaults to .\artifact
 
 .EXAMPLE
 PS> .\scripts\Build.ps1
-Builds the provisional release into .\artifacts\release.
+Builds the release into .\artifacts\release.
 #>
 #Requires -Version 7.0
 [CmdletBinding()]
@@ -280,7 +280,7 @@ try {
 
     if (@(git status --porcelain).Count -ne 0 -or (git rev-parse HEAD).Trim() -ne $head) { throw 'source changed during package build' }
     Complete-ReleaseOutputTransaction -Transaction $release
-    Write-Host "Provisional release artifacts: $output" -ForegroundColor Green
+    Write-Host "Release artifacts: $output" -ForegroundColor Green
 }
 catch {
     if ($null -ne $release -and $null -ne $release.Prior) {

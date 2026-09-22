@@ -1,10 +1,9 @@
-# LCDSirPlus 0.3.0 Draft Release Notes
+# LCDSirPlus 0.3.0 Release Notes
 
-## Draft status
+## Release status
 
-LCDSirPlus 0.3.0 is unpublished. The package described below is planned, and
-final package testing remains pending. Older b7 builds do not contain every
-delta below and are not final 0.3.0 builds.
+These notes describe the LCDSirPlus 0.3.0 release. Older b7 builds do not
+contain every delta below and are not final 0.3.0 builds.
 
 ## Deltas
 
@@ -19,7 +18,7 @@ delta below and are not final 0.3.0 builds.
 - Adds 30-second graphs, alerts, safe mode, bounded offline diagnostics, and
   Discord Desktop active-speaker display.
 - Adds PresentMon automatic selection with
-  `presentmon_target_mode presenting`. The planned package is intended to place
+  `presentmon_target_mode presenting`. The release package places
   one Intel-signed PresentMon v2.5.1 console beside `LCDSirPlus.exe`.
 - Adds `presentmon_deferred 1` by default. An unavailable PresentMon option
   temporarily shows the next eligible option without changing the stored
@@ -64,8 +63,8 @@ accepted values.
 
 ## Update or remove
 
-When 0.3.0 is published, exit LCDSirPlus, verify the planned setup checksum, and
-run setup in the same current-user or all-users scope. Running the same setup
+To update to 0.3.0, exit LCDSirPlus, verify the setup checksum, and run setup in
+the same current-user or all-users scope. Running the same setup
 repairs installed files. Remove an opposite-scope installation owned by the
 same Windows account before changing scope.
 
@@ -81,13 +80,11 @@ and then remove its folder.
 
 - Windows 11 x64 is required. A G13 is required only for physical display and
   button use.
-- Final planned-package, installer, physical G13, and live Discord acceptance
-  remain pending.
-- The planned LCDSirPlus packages are unsigned. Planned PresentMon content has
+- The LCDSirPlus packages are unsigned. Included PresentMon content has
   its own Intel signature.
 - PresentMon capture can require **Performance Log Users** membership followed
   by sign-out and sign-in. Elevation is for diagnosis only.
-- HWiNFO and LibreHardwareMonitor are not planned package contents. HWiNFO64
+- HWiNFO and LibreHardwareMonitor are not package contents. HWiNFO64
   Free shared-memory monitoring has a 12-hour limit; LibreHardwareMonitor must
   be started and configured locally by the user.
 - Only documented SteelSeries Arctis/GameBuds wireless USB receivers are

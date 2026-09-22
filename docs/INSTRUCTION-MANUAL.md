@@ -1,7 +1,7 @@
 # LCDSirPlus 0.3.0 Instruction Manual
 
-> **Draft / Unpublished:** LCDSirPlus 0.3.0 is not published. The package
-> described here is planned, and final package testing remains pending.
+> LCDSirPlus release packages are unsigned. Verify the supplied SHA-256
+> checksum before running or extracting a download.
 
 LCDSirPlus runs on Windows 11 x64. A Logitech G13 is needed only for the
 physical LCD and buttons. The virtual preview works without one.
@@ -63,8 +63,8 @@ they do not mean safe mode itself failed.
 
 ## Verify a download
 
-The planned LCDSirPlus packages are unsigned. When they are published, open
-Terminal in the folder containing the package and
+The LCDSirPlus packages are unsigned. Open Terminal in the folder containing
+the package and
 `LCDSirPlus-0.3.0-SHA256SUMS.txt`, then run the matching command:
 
 ```powershell
@@ -74,7 +74,7 @@ Get-FileHash .\LCDSirPlus-0.3.0-win-x64-portable.zip -Algorithm SHA256
 
 The displayed hash must exactly match the line for the same filename in the
 checksum file. Do not run or extract the package if the filename is missing or
-the hash differs. The planned ZIP also has `PACKAGE-MANIFEST.txt`, which lists
+the hash differs. The ZIP also has `PACKAGE-MANIFEST.txt`, which lists
 every file's checksum and size. PresentMon has its own Intel signature.
 
 ## Install or run portable
@@ -90,7 +90,7 @@ Exit LCDSirPlus, then run `LCDSirPlus-0.3.0-win-x64-setup.exe`.
   selected by default, as is **Start LCDSirPlus when I sign in**.
 - The desktop shortcut is optional.
 
-The planned install also includes `SECURITY.md`, `RELEASE-NOTES.md`, and
+The install also includes `SECURITY.md`, `RELEASE-NOTES.md`, and
 `modules.md` in the program folder.
 
 An all-users install makes program files available to every user. The selected
@@ -237,10 +237,10 @@ In an installed or portable package, open `modules.md` beside `LCDSirPlus.exe`.
 |---|---|
 | `HEADSET_BATTERY` | Shows battery and connection. What you need: A supported SteelSeries Arctis/GameBuds wireless USB receiver. |
 | `CONTROLLER_BATTERY` | Shows controller battery or WIRED. What you need: A controller that Windows recognizes as an Xbox (XInput) controller. |
-| `FPS_CURRENT` | Shows current FPS. What you need: PresentMon, planned for the 0.3.0 package. |
-| `FPS_1LOW` | Shows common FPS slowdowns. What you need: PresentMon, planned for the 0.3.0 package. |
-| `FPS_01LOW` | Shows rarer severe FPS slowdowns. What you need: PresentMon, planned for the 0.3.0 package. |
-| `FRAME_TIME` | Shows frame time and a 30-second graph. What you need: PresentMon, planned for the 0.3.0 package. |
+| `FPS_CURRENT` | Shows current FPS. What you need: PresentMon, included in the 0.3.0 package. |
+| `FPS_1LOW` | Shows common FPS slowdowns. What you need: PresentMon, included in the 0.3.0 package. |
+| `FPS_01LOW` | Shows rarer severe FPS slowdowns. What you need: PresentMon, included in the 0.3.0 package. |
+| `FRAME_TIME` | Shows frame time and a 30-second graph. What you need: PresentMon, included in the 0.3.0 package. |
 | `CPU_TEMP` | Shows CPU temperature. What you need: HWiNFO or LibreHardwareMonitor, installed and set up separately. |
 | `GPU_TEMP` | Shows GPU temperature. What you need: An NVIDIA/AMD graphics driver, or LibreHardwareMonitor set up separately. |
 | `NET_IN` | Shows the current incoming rate. What you need: Built into Windows and LCDSirPlus; no extra software. |
@@ -254,18 +254,18 @@ In an installed or portable package, open `modules.md` beside `LCDSirPlus.exe`.
 | `PACKET_LOSS` | Shows the percentage of failed checks. What you need: The optional network probe, enabled and configured separately. |
 | `MIC_STATUS` | Shows LIVE or MUTED. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `AUDIO` | Shows default output volume. What you need: Built into Windows and LCDSirPlus; no extra software. |
-| `SESSION_TIME` | Shows active game-session time. What you need: PresentMon, planned for the 0.3.0 package. |
-| `SESSION_SUMMARY` | Shows session time and stutters. What you need: PresentMon, planned for the 0.3.0 package. |
+| `SESSION_TIME` | Shows active game-session time. What you need: PresentMon, included in the 0.3.0 package. |
+| `SESSION_SUMMARY` | Shows session time and stutters. What you need: PresentMon, included in the 0.3.0 package. |
 | `CLOCK` | Shows time using the Windows Short time format. What you need: Built into Windows and LCDSirPlus; no extra software. |
-| `GAME_NAME` | Shows the selected game or app filename. What you need: PresentMon, planned for the 0.3.0 package. A filename may appear under either persist setting; set `presentmon_enabled 0` to prevent this exposure. |
+| `GAME_NAME` | Shows the selected game or app filename. What you need: PresentMon, included in the 0.3.0 package. A filename may appear under either persist setting; set `presentmon_enabled 0` to prevent this exposure. |
 | `ALERTS` | Shows unacknowledged active alerts or CLEAR. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `PROVIDER_STATUS` | Shows unavailable tracked data sources or OK. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `CPU_LOAD` | Shows total CPU use. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `RAM_USAGE` | Shows memory use and capacity. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `GPU_LOAD` | Shows GPU use. What you need: An NVIDIA or AMD graphics driver. |
 | `VRAM_USAGE` | Shows video memory use and capacity. What you need: An NVIDIA or AMD graphics driver. |
-| `CPU_CACHE_TEMP` | Shows N/A. What you need: Not available in the draft 0.3.0 build. |
-| `CPU_FREQ_TEMP` | Shows N/A. What you need: Not available in the draft 0.3.0 build. |
+| `CPU_CACHE_TEMP` | Shows N/A. What you need: Not available in version 0.3.0. |
+| `CPU_FREQ_TEMP` | Shows N/A. What you need: Not available in version 0.3.0. |
 | `CPU_LOAD_GRAPH` | Shows CPU use for 30 seconds. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `GPU_LOAD_GRAPH` | Shows GPU use for 30 seconds. What you need: An NVIDIA or AMD graphics driver. |
 | `CPU_TEMP_GRAPH` | Shows CPU temperature for 30 seconds. What you need: HWiNFO or LibreHardwareMonitor, installed and set up separately. |
@@ -280,18 +280,18 @@ In an installed or portable package, open `modules.md` beside `LCDSirPlus.exe`.
 | `DISK_IO` | Shows total disk read and write rates. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `DISK_IO_GRAPH` | Shows disk activity for 30 seconds. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `RAM_DETAIL` | Shows used and total memory. What you need: Built into Windows and LCDSirPlus; no extra software. |
-| `FPS_GRAPH` | Shows FPS for 30 seconds. What you need: PresentMon, planned for the 0.3.0 package. |
+| `FPS_GRAPH` | Shows FPS for 30 seconds. What you need: PresentMon, included in the 0.3.0 package. |
 | `THERMALS` | Shows CPU and GPU temperatures. What you need: Both CPU and GPU temperature sources set up and current. |
 | `CONNECTIONS` | Shows established IPv4 and IPv6 TCP connections only. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `NET_HEALTH` | Shows ping, jitter, and packet loss. What you need: The optional network probe, enabled and configured separately. |
 | `SYSTEM_BATTERY` | Shows AC, battery, and charging. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `HARD_FAULTS` | Shows memory-to-disk pressure. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `BOTTLENECK` | Shows CPU, GPU, RAM, or disk. With current NONE, the next eligible option appears temporarily or the slot shows CLEAR. What you need: Built-in system readings; GPU results also need a supported graphics driver. |
-| `PROC_HANG` | Shows a hung-window target. With no target, including while disabled, the next eligible option appears temporarily or the slot shows CLEAR. What you need: Not supported for end users in this draft release; leave `hang_enabled 0`. |
+| `PROC_HANG` | Shows a hung-window target. With no target, including while disabled, the next eligible option appears temporarily or the slot shows CLEAR. What you need: Not supported for end users in version 0.3.0; leave `hang_enabled 0`. |
 
 ## Show game FPS
 
-The planned packages include PresentMon, and FPS is enabled by default.
+The release packages include PresentMon, and FPS is enabled by default.
 
 1. Keep `FPS_CURRENT` in a slot. The default `slot_1` already has it.
 2. Start LCDSirPlus.
@@ -666,7 +666,7 @@ normally hides the preview.
 
 ### PresentMon shows no game data
 
-The planned packages place `PresentMon.exe` beside `LCDSirPlus.exe`. Confirm
+The release packages place `PresentMon.exe` beside `LCDSirPlus.exe`. Confirm
 that layout, start LCDSirPlus before the game, and select an FPS button option.
 Set `presentmon_deferred 0` temporarily to keep the unavailable FPS panel
 visible. If capture is denied, add your user to **Performance Log Users**, sign
