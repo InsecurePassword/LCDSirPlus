@@ -52,8 +52,6 @@ setting, and the [button option reference](modules.md) for all 53 LCD choices.
 
 ## Safety And Privacy
 
-- Keep `hang_enabled 0`. The hung-window action can terminate a program and
-  lose unsaved work, and its physical behavior is not release-qualified.
 - Never put a Discord client secret in settings, command arguments, logs,
   screenshots, issues, or chat. Paste it only into the manual's masked prompt.
 - PresentMon can display a selected program filename and FPS. Set
