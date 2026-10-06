@@ -52,6 +52,8 @@ pub enum BackendState {
 pub enum Message {
     State(BackendState),
     Buttons(Vec<Event>),
+    PhysicalHealthy(BackendKind),
+    ReconnectStarted,
 }
 
 pub struct Backend {
@@ -65,6 +67,7 @@ type Pixels = Box<[u8; crate::model::WIDTH * crate::model::HEIGHT]>;
 struct CommandQueue {
     latest: Mutex<Option<Pixels>>,
     shutdown: AtomicBool,
+    reconnect: AtomicBool,
     wake: SyncSender<()>,
 }
 
@@ -86,6 +89,11 @@ impl CommandQueue {
     fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
     }
+
+    fn request_reconnect(&self) {
+        self.reconnect.store(true, Ordering::Release);
+        let _ = self.wake.try_send(());
+    }
 }
 
 impl Backend {
@@ -97,6 +105,7 @@ impl Backend {
         let commands = Arc::new(CommandQueue {
             latest: Mutex::new(None),
             shutdown: AtomicBool::new(false),
+            reconnect: AtomicBool::new(false),
             wake: wake_tx,
         });
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
@@ -137,6 +146,11 @@ impl Backend {
         let mut boxed = Box::new([0u8; crate::model::WIDTH * crate::model::HEIGHT]);
         boxed.copy_from_slice(&frame.pixels);
         self.commands.submit(boxed);
+    }
+
+    /// Wake backoff and reacquire the device, without resetting SDK quarantine.
+    pub fn request_reconnect(&self) {
+        self.commands.request_reconnect();
     }
 
     pub fn shutdown(mut self) {
@@ -368,6 +382,10 @@ fn physical_worker(
     let mut tracker = ButtonTracker::default();
 
     'outer: loop {
+        if commands.reconnect.swap(false, Ordering::AcqRel) {
+            backoff = reconnect;
+            let _ = msg_tx.send(Message::ReconnectStarted);
+        }
         match open_physical(kind, &friendly_name) {
             Err(reason) => {
                 let _ = msg_tx.send(Message::State(BackendState::Disconnected { reason }));
@@ -386,6 +404,7 @@ fn physical_worker(
                     tracker.disconnect(Instant::now(), active_kind.name()),
                 ));
                 let mut last_sent: Option<Vec<u8>> = None;
+                let mut health_reported = false;
                 backoff = reconnect;
 
                 loop {
@@ -395,6 +414,17 @@ fn physical_worker(
                                 msg_tx.send(Message::State(BackendState::Disconnected { reason }));
                         }
                         break 'outer;
+                    }
+                    if commands.reconnect.load(Ordering::Acquire) {
+                        if replay.is_none() {
+                            replay = current.take();
+                        }
+                        let _ = device.close(false);
+                        let _ = msg_tx.send(Message::State(BackendState::Discovering));
+                        let _ = msg_tx.send(Message::Buttons(
+                            tracker.disconnect(Instant::now(), active_kind.name()),
+                        ));
+                        continue 'outer;
                     }
                     match ownership_changed(&device) {
                         Ok(true) => {
@@ -425,7 +455,7 @@ fn physical_worker(
                             Ok(()) | Err(RecvTimeoutError::Timeout) => {}
                             Err(RecvTimeoutError::Disconnected) => break 'outer,
                         }
-                        if commands.is_shutdown() {
+                        if commands.is_shutdown() || commands.reconnect.load(Ordering::Acquire) {
                             continue;
                         }
                         pixels = next_frame(commands, &mut replay);
@@ -469,7 +499,12 @@ fn physical_worker(
                         }
                     }
 
-                    match device.poll(button_poll.max(Duration::from_millis(10))) {
+                    let poll = device.poll(button_poll.max(Duration::from_millis(10)));
+                    if !health_reported && last_sent.is_some() && poll.is_ok() {
+                        let _ = msg_tx.send(Message::PhysicalHealthy(active_kind));
+                        health_reported = true;
+                    }
+                    match poll {
                         Ok(Some(buttons)) => {
                             let events = tracker.observe(
                                 Instant::now(),
@@ -522,6 +557,9 @@ fn sleep_interruptible(
         }
         if commands.is_shutdown() {
             return true;
+        }
+        if commands.reconnect.load(Ordering::Acquire) {
+            return false;
         }
         match wake_rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
             Ok(()) | Err(RecvTimeoutError::Timeout) => {}
@@ -580,6 +618,7 @@ mod tests {
             Arc::new(CommandQueue {
                 latest: Mutex::new(None),
                 shutdown: AtomicBool::new(false),
+                reconnect: AtomicBool::new(false),
                 wake,
             }),
             receiver,
@@ -625,6 +664,36 @@ mod tests {
         let replay = transform_frame(&newest, "normal", false);
         assert!(queue.take_latest().is_none());
         assert_eq!(replay[32], 0xFF, "newest nonzero frame is replayed once");
+    }
+
+    #[test]
+    fn reconnect_request_wakes_a_worker_in_long_backoff_without_losing_its_frame() {
+        let (commands, wake) = command_queue();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_commands = Arc::clone(&commands);
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let shutdown = sleep_interruptible(&worker_commands, &wake, Duration::from_secs(120));
+            done_tx.send(shutdown).unwrap();
+        });
+        let backend = Backend {
+            commands,
+            msg_rx: std::sync::mpsc::channel().1,
+            thread: Some(thread),
+        };
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        backend.commands.submit(pixels(7));
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "ordinary frame wakes must not bypass backoff"
+        );
+        backend.request_reconnect();
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        assert!(backend.commands.reconnect.load(Ordering::Acquire));
+        assert_eq!(backend.commands.take_latest().unwrap()[0], 7);
+        backend.shutdown();
+        assert!(!result.unwrap(), "retry, not shutdown");
     }
 
     #[test]

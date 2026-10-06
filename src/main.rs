@@ -18,6 +18,7 @@ mod logging;
 mod model;
 mod parser;
 mod providers;
+mod recovery;
 mod render;
 mod runtime;
 mod sha256;
@@ -455,13 +456,28 @@ fn main() {
         std::process::exit(code);
     }
 
+    let recovery_handoff = match recovery::wait_for_parent() {
+        Ok(true) => recovery::Handoff::Verified,
+        Ok(false) => recovery::Handoff::None,
+        Err(error) => {
+            recovery::startup_failed(&error);
+            // Keep the dashboard available, but do not escalate an unverified handoff.
+            recovery::Handoff::Failed
+        }
+    };
     let instance = match runtime::InstanceGuard::acquire() {
         Ok(Some(guard)) => guard,
         Ok(None) => {
+            if recovery_handoff != recovery::Handoff::None {
+                recovery::startup_failed("single-instance ownership is still held");
+            }
             report_startup_error("LCDSirPlus is already running", gui_launch);
             std::process::exit(5);
         }
         Err(error) => {
+            if recovery_handoff != recovery::Handoff::None {
+                recovery::startup_failed(&error);
+            }
             report_startup_error(
                 &format!("single-instance ownership failed: {error}"),
                 gui_launch,
@@ -474,11 +490,15 @@ fn main() {
         preview_always: cli.preview,
         safe_mode: cli.safe_mode,
         diagnostic_dir: cli.diagnostic_dir,
+        recovery_handoff,
     });
     drop(instance);
     let code = match result {
         Ok(code) => code,
         Err((code, message)) => {
+            if recovery_handoff != recovery::Handoff::None {
+                recovery::startup_failed(&message);
+            }
             report_startup_error(&message, gui_launch);
             code
         }

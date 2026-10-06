@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use windows::core::{PCSTR, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, FreeLibrary, ERROR_ACCESS_DENIED, ERROR_NO_MORE_FILES, GENERIC_READ,
-    GENERIC_WRITE, HANDLE,
+    GENERIC_WRITE, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetDriveTypeW, GetFileInformationByHandle, GetFileVersionInfoSizeW,
@@ -36,8 +36,11 @@ use windows::Win32::System::LibraryLoader::{
     GetModuleFileNameW, GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
     LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
+use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+    WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 use windows::Win32::System::WindowsProgramming::DRIVE_FIXED;
 use windows::Win32::UI::Shell::{
@@ -60,9 +63,14 @@ const EXPORTS: [&str; 6] = [
 ];
 static CIRCUIT_OPEN: AtomicBool = AtomicBool::new(false);
 static SDK_OWNER_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RECOVERY_BLOCKED: AtomicBool = AtomicBool::new(false);
 
 pub fn circuit_open() -> bool {
     CIRCUIT_OPEN.load(Ordering::Acquire)
+}
+
+pub fn recovery_blocked() -> bool {
+    RECOVERY_BLOCKED.load(Ordering::Acquire)
 }
 
 fn claim_sdk_owner() -> Result<(), String> {
@@ -168,6 +176,86 @@ pub fn lcore() -> Result<Option<LCore>, String> {
         )))
         .map_err(|e| format!("canonicalize LCore.exe: {e}"))?;
         Ok(Some(LCore { path, pid }))
+    }
+}
+
+/// One identity-bound restart. Called off the dashboard thread, never elevated.
+pub fn restart_lcore(
+    permit: &crate::recovery::RestartPermit,
+    deadline: Instant,
+) -> Result<(), String> {
+    let owner = lcore()?.ok_or("LCore.exe is not running; Logitech restart skipped")?;
+    unsafe {
+        let process = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+            false,
+            owner.pid,
+        )
+        .map_err(|error| format!("cannot open Logitech Gaming Software for restart: {error}"))?;
+        let result = (|| {
+            let mut session = 0;
+            let mut current_session = 0;
+            ProcessIdToSessionId(owner.pid, &mut session).map_err(|error| error.to_string())?;
+            ProcessIdToSessionId(GetCurrentProcessId(), &mut current_session)
+                .map_err(|error| error.to_string())?;
+            if session != current_session {
+                return Err("LCore.exe belongs to another session; restart skipped".into());
+            }
+            let mut path = vec![0u16; 32768];
+            let mut length = path.len() as u32;
+            QueryFullProcessImageNameW(
+                process,
+                PROCESS_NAME_WIN32,
+                PWSTR(path.as_mut_ptr()),
+                &mut length,
+            )
+            .map_err(|error| error.to_string())?;
+            let actual = fs::canonicalize(PathBuf::from(String::from_utf16_lossy(
+                &path[..length as usize],
+            )))
+            .map_err(|error| error.to_string())?;
+            if actual != owner.path || WaitForSingleObject(process, 0) != WAIT_TIMEOUT {
+                return Err("LCore.exe identity changed or exited; restart skipped".into());
+            }
+            // Reuse all existing signature, version, directory and file-identity gates.
+            let _pinned = discover_pinned(&owner)?;
+            if !lcore()?
+                .is_some_and(|current| current.pid == owner.pid && current.path == owner.path)
+            {
+                return Err("LCore.exe discovery changed before restart; restart skipped".into());
+            }
+            permit.commit(deadline)?;
+            TerminateProcess(process, 0)
+                .map_err(|error| format!("cannot close Logitech Gaming Software: {error}"))?;
+            if WaitForSingleObject(process, 5_000) != WAIT_OBJECT_0 {
+                return Err(
+                    "Logitech Gaming Software did not exit within 5 seconds; relaunch skipped"
+                        .into(),
+                );
+            }
+            let mut child = std::process::Command::new(&owner.path)
+                .current_dir(
+                    owner
+                        .path
+                        .parent()
+                        .ok_or("LCore.exe has no parent directory")?,
+                )
+                .spawn()
+                .map_err(|error| {
+                    format!("Logitech Gaming Software closed but could not relaunch: {error}")
+                })?;
+            std::thread::sleep(Duration::from_millis(500));
+            if child
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                return Err("relaunched Logitech Gaming Software exited; no retry".into());
+            }
+            Ok(())
+        })();
+        let _ = CloseHandle(process);
+        result
     }
 }
 
@@ -833,6 +921,7 @@ impl Native {
         if module_len == 0 || module_len >= module_path.len() {
             let _ = FreeLibrary(library);
             CIRCUIT_OPEN.store(true, Ordering::Release);
+            RECOVERY_BLOCKED.store(true, Ordering::Release);
             return Err("loaded SDK module path is unavailable; circuit opened".into());
         }
         let loaded_path = PathBuf::from(String::from_utf16_lossy(&module_path[..module_len]));
@@ -841,6 +930,7 @@ impl Native {
             Err(error) => {
                 let _ = FreeLibrary(library);
                 CIRCUIT_OPEN.store(true, Ordering::Release);
+                RECOVERY_BLOCKED.store(true, Ordering::Release);
                 return Err(format!(
                     "loaded SDK module cannot be pinned: {error}; circuit opened"
                 ));
@@ -849,6 +939,7 @@ impl Native {
         if let Err(error) = require_same_identity(&pinned.dll.identity, &loaded.identity) {
             let _ = FreeLibrary(library);
             CIRCUIT_OPEN.store(true, Ordering::Release);
+            RECOVERY_BLOCKED.store(true, Ordering::Release);
             return Err(format!("{error}; circuit opened"));
         }
         macro_rules! proc {
@@ -964,7 +1055,9 @@ impl SdkDevice {
                         if current.pid == expected_owner.pid
                             && current.path == expected_owner.path =>
                     {
-                        discover_pinned(&current)
+                        discover_pinned(&current).inspect_err(|_| {
+                            RECOVERY_BLOCKED.store(true, Ordering::Release);
+                        })
                     }
                     Ok(_) => Err("LCore.exe identity changed before SDK discovery".into()),
                     Err(error) => Err(error),

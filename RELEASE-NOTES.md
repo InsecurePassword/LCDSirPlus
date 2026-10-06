@@ -7,6 +7,13 @@ contain every delta below and are not final 0.3.0 builds.
 
 ## Deltas
 
+- Adds one-shot recovery for a lost, previously working physical G13
+  connection while LCDSirPlus remains responsive: one LCDSirPlus relaunch,
+  followed if needed by one trusted Logitech Gaming Software restart.
+  A persistent recovery log prevents repeated attempts across launches and
+  records failures; initial connection failures and application crashes do
+  not trigger recovery. Safe mode disables these restart actions.
+
 - Adds three fixed main layouts, four button slots, and 53 exact display values.
   [modules.md](modules.md) is the sole option table.
 - Adds trusted Logitech Gaming Software access, direct Logitech G13 HID access,

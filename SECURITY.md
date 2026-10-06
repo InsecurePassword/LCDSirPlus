@@ -72,6 +72,15 @@ Prefer Logitech Gaming Software and follow the bounded LampArray procedure in th
 
 ## Avoid destructive actions
 
+Lost-connection recovery can restart LCDSirPlus once and, if necessary,
+terminate and relaunch the exact trusted Logitech Gaming Software `LCore.exe`
+in the same Windows session once. It requires a previously working physical
+connection and a responsive LCDSirPlus dashboard; it is not crash recovery.
+The persistent `connection-recovery.log` consumes each action before execution.
+No automatic retry or reset is performed, and safe mode disables these actions.
+See [connection recovery](docs/INSTRUCTION-MANUAL.md#g13-display-disappears-but-lcdsirplus-keeps-running)
+for failure handling and an explicit manual reset.
+
 Run LCDSirPlus as a standard Windows user. Keep `hang_enabled 0`; the
 hung-window action can terminate a program and lose unsaved work, its physical
 behavior has not completed release testing, and there is no supported end-user
@@ -79,7 +88,8 @@ test.
 
 Safe mode limits the dashboard to the clock, built-in CPU load, memory, preview,
 slot cycling, and alert acknowledgement. It disables optional dashboard data,
-Discord dashboard access, probes, startup changes, and the destructive action.
+Discord dashboard access, probes, startup changes, connection-recovery restarts,
+and the destructive action.
 The explicit Discord authorize and clear commands remain available.
 
 The LCDSirPlus packages are unsigned. Verify their supplied SHA-256 checksums

@@ -22,6 +22,7 @@ pub struct RunOptions {
     pub preview_always: bool,
     pub safe_mode: bool,
     pub diagnostic_dir: Option<std::path::PathBuf>,
+    pub recovery_handoff: crate::recovery::Handoff,
 }
 
 pub struct ValidateOutcome {
@@ -120,6 +121,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
     }
     crate::log_info!("LCDSirPlus {} starting", env!("CARGO_PKG_VERSION"));
     crate::log_info!("configuration: {}", cfg.path);
+    let mut recovery = crate::recovery::Recovery::start(opts.recovery_handoff);
     let startup_executable = crate::runtime::canonical_executable().ok();
     let mut startup_synced = None;
     sync_startup_if_needed(
@@ -214,6 +216,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                         }
                         watcher.replace(&files);
                         if backend_changed {
+                            recovery.suspend();
                             backend.reconfigure(
                                 crate::backends::resolve_kind(&cfg.logitech_backend),
                                 &cfg,
@@ -321,6 +324,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                         }
                     }
                     BackendState::Disconnected { reason } => {
+                        recovery.disconnected(now);
                         crate::log_warn!("backend disconnected: {}", reason);
                         backend_state = BackendState::Disconnected { reason };
                         if !opts.preview_always
@@ -330,7 +334,10 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                             ui.set_preview_auto_visible(true);
                         }
                     }
-                    BackendState::Discovering => backend_state = BackendState::Discovering,
+                    BackendState::Discovering => {
+                        recovery.disconnected(now);
+                        backend_state = BackendState::Discovering;
+                    }
                     BackendState::ShutDown => backend_state = BackendState::ShutDown,
                 },
                 Message::Buttons(events) => {
@@ -343,6 +350,8 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                         }
                     }
                 }
+                Message::PhysicalHealthy(kind) => recovery.healthy(kind),
+                Message::ReconnectStarted => recovery.reconnect_started(),
             }
         }
 
@@ -368,6 +377,16 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
             }
         }
 
+        if running
+            && recovery.tick(
+                now,
+                !cfg.safe_mode && cfg.logitech_backend != "virtual",
+                || backend.request_reconnect(),
+            )
+        {
+            running = false;
+        }
+
         if let Some(audit) = hang_hold.set_owner(proc_hang_owner(&slots)) {
             log_hang_audit(&audit);
         }
@@ -381,6 +400,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
     }
 
     crate::log_info!("shutting down");
+    drop(recovery);
     backend.shutdown();
     ui.shutdown();
     Ok(0)

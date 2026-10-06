@@ -664,6 +664,45 @@ Left-click the tray icon. Run `.\LCDSirPlus.exe --preview`, or set
 `preview_mode always` and `start_minimized 0`. In `auto`, a working G13
 normally hides the preview.
 
+### G13 display disappears but LCDSirPlus keeps running
+
+LCDSirPlus normally reconnects after a physical connection is lost. If a
+previously working connection remains unavailable for 30 seconds while the G13
+is still identifiable, it can restart itself once, preserving its launch
+arguments and configuration. A working connection requires a successful frame
+write and connection poll; merely opening the SDK or showing the preview does
+not qualify.
+
+The replacement acquires and verifies the old process handle before the old
+process shuts down. If it cannot acknowledge readiness within 10 seconds, the
+old dashboard stays running and the restart allowance remains consumed. The
+replacement waits for a normal exit and checks the connection for another
+30 seconds. If it is still disconnected, it attempts one restart
+of the trusted Logitech Gaming Software `LCore.exe` in the current Windows
+session. It does not elevate, restart services, or perform another LCDSirPlus
+restart. After a successful Logitech restart it wakes the existing backend to
+retry immediately, then checks the connection for 30 seconds. This does not
+reset the SDK circuit breaker. If connection recovery still fails, the preview
+remains available.
+
+Each action is recorded before it is attempted in
+`%LOCALAPPDATA%\LCDSirPlus\connection-recovery.log`. This persistent log is
+checked at startup and is not rotated or moved by `--diagnostic-dir`. Its
+directory is created independently of any diagnostic-directory override;
+failure to prepare or write the log disables automatic actions. Outcomes
+and failures name the software involved. Both actions are one-shot: success,
+failure, an interrupted recovery, and later application launches do not restore
+the allowance. An unreadable, incomplete, or invalid log disables automatic
+actions. To explicitly allow another sequence, exit LCDSirPlus and manually
+archive this log before launching again; otherwise keep it intact.
+
+This is not crash recovery. Initial connection failure, intentional virtual
+mode, safe mode, SDK trust failures, and an absent or unidentifiable G13 do not
+initiate automatic restarts. A manual launch does not continue an interrupted
+sequence. A timed-out SDK owner may leave the replacement's circuit breaker
+open even after Logitech restarts; this is logged as failed recovery without
+any additional restart.
+
 ### PresentMon shows no game data
 
 The release packages place `PresentMon.exe` beside `LCDSirPlus.exe`. Confirm
