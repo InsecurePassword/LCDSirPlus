@@ -9,7 +9,7 @@ Validates the tracked manifest and license, then downloads and verifies Inno Set
 Verifies the existing installer cache without downloading or creating artifacts.
 
 .PARAMETER ExtractVerified
-Verifies the cached installer and extracts a portable compiler to OutputDir. Cannot be combined with VerifyOnly.
+Verifies the cached installer and extracts a portable compiler to OutputDir without requesting elevation. Cannot be combined with VerifyOnly.
 
 .PARAMETER OutputDir
 New extraction directory used with ExtractVerified. Relative paths are resolved from the repository root, and the directory must not already exist.
@@ -143,7 +143,7 @@ if ($VerifyOnly -or $ExtractVerified) {
     [IO.Directory]::CreateDirectory((Split-Path $output -Parent)) | Out-Null
     $succeeded = $false
     try {
-        $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/PORTABLE=1', ('/DIR="' + $output + '"'))
+        $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/CURRENTUSER', '/PORTABLE=1', ('/DIR="' + $output + '"'))
         $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
         try {
             if ($process.ExitCode -ne 0) { throw "Inno Setup portable extraction failed with exit code $($process.ExitCode)" }
