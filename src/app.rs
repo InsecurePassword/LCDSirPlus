@@ -4,7 +4,7 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::backends::{Backend, BackendKind, BackendState, Message};
+use crate::backends::{Backend, BackendKind, BackendState, LossCause, Message};
 use crate::config::Config;
 use crate::hardware_test::{self, TestConfig, Transport};
 use crate::logging::Level;
@@ -323,10 +323,10 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                             ));
                         }
                     }
-                    BackendState::Disconnected { reason } => {
-                        recovery.disconnected(now);
+                    BackendState::Disconnected { cause, reason } => {
+                        recovery.disconnected(now, cause);
                         crate::log_warn!("backend disconnected: {}", reason);
-                        backend_state = BackendState::Disconnected { reason };
+                        backend_state = BackendState::Disconnected { cause, reason };
                         if !opts.preview_always
                             && cfg.preview_mode == "auto"
                             && !cfg.start_minimized
@@ -335,7 +335,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                         }
                     }
                     BackendState::Discovering => {
-                        recovery.disconnected(now);
+                        recovery.disconnected(now, LossCause::DeviceAbsent);
                         backend_state = BackendState::Discovering;
                     }
                     BackendState::ShutDown => backend_state = BackendState::ShutDown,
@@ -680,7 +680,7 @@ pub fn run_hardware_test(
             let (mut results, buttons) = hardware_test::run(&Transport::DirectSdk(&device), &test);
             if let Err(error) = device.close(true) {
                 eprintln!("hardware test SDK close failed: {error}");
-                hardware_test::record_final_error(&mut results, "SDK shutdown", error);
+                hardware_test::record_final_error(&mut results, "SDK shutdown", error.to_string());
             }
             report_test_results(&results, &buttons)
         }
@@ -708,7 +708,7 @@ pub fn run_hardware_test(
             if let Err(error) = device.close() {
                 crate::log_error!("hardware test close failed: {}", error);
                 eprintln!("hardware test close failed: {error}");
-                hardware_test::record_final_error(&mut results, "HID shutdown", error);
+                hardware_test::record_final_error(&mut results, "HID shutdown", error.to_string());
             }
             report_test_results(&results, &buttons)
         }
@@ -1263,6 +1263,7 @@ mod tests {
         assert!(preview_for_backend(
             &cfg,
             &BackendState::Disconnected {
+                cause: LossCause::DeviceAbsent,
                 reason: "test".into()
             }
         ));

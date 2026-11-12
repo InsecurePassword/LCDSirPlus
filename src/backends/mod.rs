@@ -41,11 +41,102 @@ impl BackendKind {
     }
 }
 
+/// Named loss cause behind a `Disconnected` publication (RC-1). The cause
+/// classifies why the device connection was lost; recovery-side outcomes keep
+/// their own journal event labels, so the two are never written alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LossCause {
+    DeviceAbsent,
+    OpenFailed { code: u32 },
+    CallTimeout,
+    CircuitOpen,
+    TransferIncomplete { code: u32 },
+    OwnerConflict,
+    ProbeFail,
+    ShutdownRequested,
+}
+
+impl LossCause {
+    /// All causes producers may emit; used by the label-whitelist test.
+    #[cfg(test)]
+    pub fn all() -> [LossCause; 8] {
+        [
+            LossCause::DeviceAbsent,
+            LossCause::OpenFailed { code: 0 },
+            LossCause::CallTimeout,
+            LossCause::CircuitOpen,
+            LossCause::TransferIncomplete { code: 0 },
+            LossCause::OwnerConflict,
+            LossCause::ProbeFail,
+            LossCause::ShutdownRequested,
+        ]
+    }
+
+    /// Short journal-safe code (bounded by the 500-char detail clamp).
+    pub fn short(self) -> String {
+        match self {
+            Self::DeviceAbsent => "device-absent".to_string(),
+            Self::OpenFailed { code } => format!("open-failed({code:#010x})"),
+            Self::CallTimeout => "call-timeout".to_string(),
+            Self::CircuitOpen => "circuit-open".to_string(),
+            Self::TransferIncomplete { code } => format!("transfer-incomplete({code})"),
+            Self::OwnerConflict => "owner-conflict".to_string(),
+            Self::ProbeFail => "probe-fail".to_string(),
+            Self::ShutdownRequested => "shutdown-requested".to_string(),
+        }
+    }
+}
+
+/// Transport failure carrying the named cause plus its human-readable detail;
+/// numeric OS codes ride alongside at their origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LossError {
+    pub cause: LossCause,
+    pub detail: String,
+}
+
+impl LossError {
+    pub fn new(cause: LossCause, detail: String) -> Self {
+        Self { cause, detail }
+    }
+}
+
+impl std::fmt::Display for LossError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.cause.short(), self.detail)
+    }
+}
+
+/// Single construction point for disconnect publications: the human-readable
+/// reason is derived from cause + code + origin detail.
+fn disconnect(error: &LossError) -> Message {
+    Message::State(BackendState::Disconnected {
+        cause: error.cause,
+        reason: error.to_string(),
+    })
+}
+
+/// Close failure on the shutdown exit: the loss is the requested shutdown.
+fn shutdown_close_error(error: &LossError) -> LossError {
+    LossError::new(
+        LossCause::ShutdownRequested,
+        format!("close on shutdown failed: {}", error.detail),
+    )
+}
+
+/// Close failure after a submit/poll loss: keep the origin cause, record the
+/// close outcome in the detail only.
+fn append_close_failure(mut error: LossError, close_error: &LossError) -> LossError {
+    error.detail.push_str("; close failed: ");
+    error.detail.push_str(&close_error.detail);
+    error
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackendState {
     Discovering,
     Connected { kind: BackendKind },
-    Disconnected { reason: String },
+    Disconnected { cause: LossCause, reason: String },
     ShutDown,
 }
 
@@ -264,7 +355,7 @@ impl PhysicalDevice {
         }
     }
 
-    fn submit(&self, frame: &crate::render::Frame) -> Result<Vec<u8>, String> {
+    fn submit(&self, frame: &crate::render::Frame) -> Result<Vec<u8>, LossError> {
         match self {
             Self::Hid(device) => {
                 let report = pack_report(frame);
@@ -279,12 +370,14 @@ impl PhysicalDevice {
         }
     }
 
-    fn poll(&self, timeout: Duration) -> Result<Option<[bool; 4]>, String> {
+    fn poll(&self, timeout: Duration) -> Result<Option<[bool; 4]>, LossError> {
         match self {
             Self::Hid(device) => {
                 let mut raw = [0u8; 8];
                 if device.read_input_timeout(&mut raw, timeout)? {
-                    parse_input(&raw).map(Some)
+                    parse_input(&raw)
+                        .map(Some)
+                        .map_err(|reason| LossError::new(LossCause::ProbeFail, reason))
                 } else {
                     Ok(None)
                 }
@@ -294,13 +387,16 @@ impl PhysicalDevice {
                 if connected {
                     Ok(Some(buttons))
                 } else {
-                    Err("Logitech SDK reports the monochrome LCD disconnected".into())
+                    Err(LossError::new(
+                        LossCause::DeviceAbsent,
+                        "Logitech SDK reports the monochrome LCD disconnected".into(),
+                    ))
                 }
             }
         }
     }
 
-    fn close(&mut self, blank: bool) -> Result<(), String> {
+    fn close(&mut self, blank: bool) -> Result<(), LossError> {
         match self {
             Self::Hid(device) if blank => device.close(),
             Self::Hid(device) => {
@@ -312,11 +408,14 @@ impl PhysicalDevice {
     }
 }
 
-fn open_physical(kind: BackendKind, friendly_name: &str) -> Result<PhysicalDevice, String> {
+fn open_physical(kind: BackendKind, friendly_name: &str) -> Result<PhysicalDevice, LossError> {
     if sdk::circuit_open() {
-        return Err("physical backend circuit is open after an unreturning SDK owner".into());
+        return Err(LossError::new(
+            LossCause::CircuitOpen,
+            "physical backend circuit is open after an unreturning SDK owner".into(),
+        ));
     }
-    let owner = sdk::lcore()?;
+    let owner = sdk::lcore().map_err(|reason| LossError::new(LossCause::ProbeFail, reason))?;
     match (select_physical_kind(kind, owner.is_some())?, owner) {
         (BackendKind::Sdk, Some(owner)) => {
             sdk::SdkDevice::open(&owner, friendly_name).map(PhysicalDevice::Sdk)
@@ -328,22 +427,30 @@ fn open_physical(kind: BackendKind, friendly_name: &str) -> Result<PhysicalDevic
     }
 }
 
-fn select_physical_kind(kind: BackendKind, lcore_present: bool) -> Result<BackendKind, String> {
+fn select_physical_kind(kind: BackendKind, lcore_present: bool) -> Result<BackendKind, LossError> {
     match (kind, lcore_present) {
         (BackendKind::Auto, true) | (BackendKind::Sdk, true) => Ok(BackendKind::Sdk),
         (BackendKind::Auto, false) | (BackendKind::Hid, false) => Ok(BackendKind::Hid),
-        (BackendKind::Sdk, false) => {
-            Err("Logitech SDK mode requires a running trusted LCore.exe".into())
-        }
-        (BackendKind::Hid, true) => {
-            Err("direct HID is refused while competing process LCore.exe is running".into())
-        }
-        (BackendKind::Virtual, _) => Err("virtual is not a physical backend".into()),
+        (BackendKind::Sdk, false) => Err(LossError::new(
+            LossCause::DeviceAbsent,
+            "Logitech SDK mode requires a running trusted LCore.exe".into(),
+        )),
+        (BackendKind::Hid, true) => Err(LossError::new(
+            LossCause::OwnerConflict,
+            "direct HID is refused while competing process LCore.exe is running".into(),
+        )),
+        (BackendKind::Virtual, _) => Err(LossError::new(
+            LossCause::ProbeFail,
+            "virtual is not a physical backend".into(),
+        )),
     }
 }
 
-fn ownership_changed(device: &PhysicalDevice) -> Result<bool, String> {
-    Ok(ownership_conflict(device.kind(), sdk::lcore()?.is_some()))
+fn ownership_changed(device: &PhysicalDevice) -> Result<bool, LossError> {
+    let present = sdk::lcore()
+        .map_err(|reason| LossError::new(LossCause::ProbeFail, reason))?
+        .is_some();
+    Ok(ownership_conflict(device.kind(), present))
 }
 
 fn ownership_conflict(kind: BackendKind, lcore_present: bool) -> bool {
@@ -387,8 +494,8 @@ fn physical_worker(
             let _ = msg_tx.send(Message::ReconnectStarted);
         }
         match open_physical(kind, &friendly_name) {
-            Err(reason) => {
-                let _ = msg_tx.send(Message::State(BackendState::Disconnected { reason }));
+            Err(error) => {
+                let _ = msg_tx.send(disconnect(&error));
                 if sleep_interruptible(commands, wake_rx, backoff) {
                     break 'outer;
                 }
@@ -409,9 +516,8 @@ fn physical_worker(
 
                 loop {
                     if commands.is_shutdown() {
-                        if let Err(reason) = device.close(true) {
-                            let _ =
-                                msg_tx.send(Message::State(BackendState::Disconnected { reason }));
+                        if let Err(error) = device.close(true) {
+                            let _ = msg_tx.send(disconnect(&shutdown_close_error(&error)));
                         }
                         break 'outer;
                     }
@@ -438,13 +544,12 @@ fn physical_worker(
                             ));
                             continue 'outer;
                         }
-                        Err(reason) => {
+                        Err(error) => {
                             if replay.is_none() {
                                 replay = current.take();
                             }
                             let _ = device.close(false);
-                            let _ =
-                                msg_tx.send(Message::State(BackendState::Disconnected { reason }));
+                            let _ = msg_tx.send(disconnect(&error));
                             continue 'outer;
                         }
                         Ok(false) => {}
@@ -474,16 +579,12 @@ fn physical_worker(
                                     last_sent = Some(sent);
                                     current = Some(pixels);
                                 }
-                                Err(mut reason) => {
+                                Err(mut error) => {
                                     replay = Some(pixels);
                                     if let Err(close_error) = device.close(true) {
-                                        reason.push_str("; ");
-                                        reason.push_str(&close_error);
+                                        error = append_close_failure(error, &close_error);
                                     }
-                                    let _ =
-                                        msg_tx.send(Message::State(BackendState::Disconnected {
-                                            reason,
-                                        }));
+                                    let _ = msg_tx.send(disconnect(&error));
                                     let _ = msg_tx.send(Message::Buttons(
                                         tracker.disconnect(Instant::now(), active_kind.name()),
                                     ));
@@ -517,17 +618,14 @@ fn physical_worker(
                             }
                         }
                         Ok(None) => {}
-                        Err(reason) => {
+                        Err(mut error) => {
                             if replay.is_none() {
                                 replay = current.take();
                             }
-                            let mut reason = reason;
                             if let Err(close_error) = device.close(true) {
-                                reason.push_str("; ");
-                                reason.push_str(&close_error);
+                                error = append_close_failure(error, &close_error);
                             }
-                            let _ =
-                                msg_tx.send(Message::State(BackendState::Disconnected { reason }));
+                            let _ = msg_tx.send(disconnect(&error));
                             let _ = msg_tx.send(Message::Buttons(
                                 tracker.disconnect(Instant::now(), active_kind.name()),
                             ));
@@ -742,8 +840,20 @@ mod tests {
             select_physical_kind(BackendKind::Auto, false).unwrap(),
             BackendKind::Hid
         );
-        assert!(select_physical_kind(BackendKind::Sdk, false).is_err());
-        assert!(select_physical_kind(BackendKind::Hid, true).is_err());
+        assert_eq!(
+            select_physical_kind(BackendKind::Sdk, false)
+                .unwrap_err()
+                .cause,
+            LossCause::DeviceAbsent,
+            "sdk mode without LCore.exe names the absent service"
+        );
+        assert_eq!(
+            select_physical_kind(BackendKind::Hid, true)
+                .unwrap_err()
+                .cause,
+            LossCause::OwnerConflict,
+            "hid refusal under a competing owner names the conflict"
+        );
     }
 
     #[test]
@@ -765,5 +875,112 @@ mod tests {
         assert_eq!(next_frame(&queue, &mut replay).unwrap()[0], 3);
         assert!(replay.is_none());
         assert!(next_frame(&queue, &mut replay).is_none());
+    }
+
+    fn published(error: &LossError) -> (LossCause, String) {
+        match disconnect(error) {
+            Message::State(BackendState::Disconnected { cause, reason }) => (cause, reason),
+            _ => panic!("disconnect producers publish state messages"),
+        }
+    }
+
+    #[test]
+    fn open_fail_producer_publishes_open_failed_with_the_origin_code() {
+        let (cause, reason) = published(&LossError::new(
+            LossCause::OpenFailed { code: 0x8007_0002 },
+            "open failed: device not present".into(),
+        ));
+        assert_eq!(cause, LossCause::OpenFailed { code: 0x8007_0002 });
+        assert_eq!(
+            reason,
+            "open-failed(0x80070002): open failed: device not present"
+        );
+    }
+
+    #[test]
+    fn ownership_probe_fail_producer_publishes_probe_fail() {
+        let (cause, reason) = published(&LossError::new(
+            LossCause::ProbeFail,
+            "enumerate LCore.exe processes: injected".into(),
+        ));
+        assert_eq!(cause, LossCause::ProbeFail);
+        assert!(reason.starts_with("probe-fail: "), "{reason}");
+    }
+
+    #[test]
+    fn submit_fail_producer_keeps_transfer_cause_and_appends_close_detail() {
+        let origin = LossError::new(
+            LossCause::TransferIncomplete { code: 991 },
+            "HID write completed 991 of 992 bytes".into(),
+        );
+        let close = LossError::new(
+            LossCause::ProbeFail,
+            "HID blank on close: handle denied".into(),
+        );
+        let (cause, reason) = published(&append_close_failure(origin, &close));
+        assert_eq!(cause, LossCause::TransferIncomplete { code: 991 });
+        assert!(reason.contains("transfer-incomplete(991)"), "{reason}");
+        assert!(reason.contains("close failed:"), "{reason}");
+    }
+
+    #[test]
+    fn poll_fail_producer_publishes_call_timeout() {
+        let (cause, reason) = published(&LossError::new(
+            LossCause::CallTimeout,
+            "Logitech SDK native call timed out; owner quarantined and circuit opened".into(),
+        ));
+        assert_eq!(cause, LossCause::CallTimeout);
+        assert!(reason.starts_with("call-timeout: "), "{reason}");
+    }
+
+    #[test]
+    fn shutdown_close_producer_publishes_shutdown_requested() {
+        let origin = LossError::new(
+            LossCause::TransferIncomplete { code: 0 },
+            "LogiLcdMonoSetBackground blank returned false".into(),
+        );
+        let (cause, reason) = published(&shutdown_close_error(&origin));
+        assert_eq!(cause, LossCause::ShutdownRequested);
+        assert!(reason.starts_with("shutdown-requested: "), "{reason}");
+    }
+
+    #[test]
+    fn circuit_open_producer_publishes_circuit_open() {
+        let (cause, _) = published(&LossError::new(
+            LossCause::CircuitOpen,
+            "physical backend circuit is open after an unreturning SDK owner".into(),
+        ));
+        assert_eq!(cause, LossCause::CircuitOpen);
+    }
+
+    #[test]
+    fn device_absent_producer_publishes_device_absent() {
+        let (cause, reason) = published(&LossError::new(
+            LossCause::DeviceAbsent,
+            "HID discovery: no G13 collection matched".into(),
+        ));
+        assert_eq!(cause, LossCause::DeviceAbsent);
+        assert!(reason.starts_with("device-absent: "), "{reason}");
+    }
+
+    #[test]
+    fn every_named_loss_cause_is_distinct_and_short() {
+        let labels: Vec<_> = LossCause::all().iter().map(|c| c.short()).collect();
+        let unique: std::collections::HashSet<_> = labels
+            .iter()
+            .map(|l| l.split('(').next().unwrap())
+            .collect();
+        assert_eq!(
+            unique.len(),
+            8,
+            "the cause vocabulary carries eight distinct names"
+        );
+        for label in &labels {
+            assert!(label.len() <= 30, "journal codes stay short: {label}");
+            assert!(
+                !label.contains("healthy") && !label.contains("finished"),
+                "{label}"
+            );
+        }
     }
 }

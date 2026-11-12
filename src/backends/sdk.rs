@@ -47,6 +47,8 @@ use windows::Win32::UI::Shell::{
     FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
 };
 
+use super::{LossCause, LossError};
+
 const LCD_TYPE_MONO: i32 = 1;
 const CALL_TIMEOUT: Duration = Duration::from_secs(3);
 const PIXELS: usize = crate::model::WIDTH * crate::model::HEIGHT;
@@ -73,19 +75,30 @@ pub fn recovery_blocked() -> bool {
     RECOVERY_BLOCKED.load(Ordering::Acquire)
 }
 
-fn claim_sdk_owner() -> Result<(), String> {
+fn claim_sdk_owner() -> Result<(), LossError> {
     SDK_OWNER_ACTIVE
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .map(|_| ())
-        .map_err(|_| "Logitech SDK discovery/owner operation is already active".into())
+        .map_err(|_| {
+            LossError::new(
+                LossCause::OwnerConflict,
+                "Logitech SDK discovery/owner operation is already active".into(),
+            )
+        })
 }
 
-fn wait_ready(receiver: &Receiver<Result<(), String>>, timeout: Duration) -> Result<(), String> {
+fn wait_ready(
+    receiver: &Receiver<Result<(), LossError>>,
+    timeout: Duration,
+) -> Result<(), LossError> {
     match receiver.recv_timeout(timeout) {
         Ok(result) => result,
         Err(_) => {
             CIRCUIT_OPEN.store(true, Ordering::Release);
-            Err("Logitech SDK discovery/initialization timed out; owner quarantined and circuit opened".into())
+            Err(LossError::new(
+                LossCause::CallTimeout,
+                "Logitech SDK discovery/initialization timed out; owner quarantined and circuit opened".into(),
+            ))
         }
     }
 }
@@ -908,21 +921,31 @@ struct Native {
 }
 
 impl Native {
-    unsafe fn load(pinned: PinnedSdk, friendly_name: &str) -> Result<Self, String> {
+    unsafe fn load(pinned: PinnedSdk, friendly_name: &str) -> Result<Self, LossError> {
         let path_wide = wide(&pinned.path);
         let library = LoadLibraryExW(
             PCWSTR(path_wide.as_ptr()),
             None,
             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
         )
-        .map_err(|e| format!("secure LoadLibraryExW {}: {e}", pinned.path.display()))?;
+        .map_err(|e| {
+            LossError::new(
+                LossCause::OpenFailed {
+                    code: e.code().0 as u32,
+                },
+                format!("secure LoadLibraryExW {}: {e}", pinned.path.display()),
+            )
+        })?;
         let mut module_path = vec![0u16; 32768];
         let module_len = GetModuleFileNameW(library, &mut module_path) as usize;
         if module_len == 0 || module_len >= module_path.len() {
             let _ = FreeLibrary(library);
             CIRCUIT_OPEN.store(true, Ordering::Release);
             RECOVERY_BLOCKED.store(true, Ordering::Release);
-            return Err("loaded SDK module path is unavailable; circuit opened".into());
+            return Err(LossError::new(
+                LossCause::CircuitOpen,
+                "loaded SDK module path is unavailable; circuit opened".into(),
+            ));
         }
         let loaded_path = PathBuf::from(String::from_utf16_lossy(&module_path[..module_len]));
         let loaded = match pin_file(&loaded_path) {
@@ -931,8 +954,9 @@ impl Native {
                 let _ = FreeLibrary(library);
                 CIRCUIT_OPEN.store(true, Ordering::Release);
                 RECOVERY_BLOCKED.store(true, Ordering::Release);
-                return Err(format!(
-                    "loaded SDK module cannot be pinned: {error}; circuit opened"
+                return Err(LossError::new(
+                    LossCause::CircuitOpen,
+                    format!("loaded SDK module cannot be pinned: {error}; circuit opened"),
                 ));
             }
         };
@@ -940,14 +964,20 @@ impl Native {
             let _ = FreeLibrary(library);
             CIRCUIT_OPEN.store(true, Ordering::Release);
             RECOVERY_BLOCKED.store(true, Ordering::Release);
-            return Err(format!("{error}; circuit opened"));
+            return Err(LossError::new(
+                LossCause::CircuitOpen,
+                format!("{error}; circuit opened"),
+            ));
         }
         macro_rules! proc {
             ($name:literal, $ty:ty) => {{
                 let name = CString::new($name).unwrap();
                 let Some(address) = GetProcAddress(library, PCSTR(name.as_ptr().cast())) else {
                     let _ = FreeLibrary(library);
-                    return Err(format!("SDK DLL lost required export {}", $name));
+                    return Err(LossError::new(
+                        LossCause::ProbeFail,
+                        format!("SDK DLL lost required export {}", $name),
+                    ));
                 };
                 std::mem::transmute::<unsafe extern "system" fn() -> isize, $ty>(address)
             }};
@@ -965,7 +995,10 @@ impl Native {
         let friendly: Vec<u16> = friendly_name.encode_utf16().chain(Some(0)).collect();
         if init(friendly.as_ptr(), LCD_TYPE_MONO) == 0 {
             let _ = FreeLibrary(native.library);
-            return Err("LogiLcdInit returned false".into());
+            return Err(LossError::new(
+                LossCause::ProbeFail,
+                "LogiLcdInit returned false".into(),
+            ));
         }
         Ok(native)
     }
@@ -1038,9 +1071,12 @@ pub struct SdkDevice {
 }
 
 impl SdkDevice {
-    pub fn open(owner: &LCore, friendly_name: &str) -> Result<Self, String> {
+    pub fn open(owner: &LCore, friendly_name: &str) -> Result<Self, LossError> {
         if CIRCUIT_OPEN.load(Ordering::Acquire) {
-            return Err("Logitech SDK circuit is open after an unreturning native owner".into());
+            return Err(LossError::new(
+                LossCause::CircuitOpen,
+                "Logitech SDK circuit is open after an unreturning native owner".into(),
+            ));
         }
         claim_sdk_owner()?;
         let expected_owner = owner.clone();
@@ -1055,12 +1091,17 @@ impl SdkDevice {
                         if current.pid == expected_owner.pid
                             && current.path == expected_owner.path =>
                     {
-                        discover_pinned(&current).inspect_err(|_| {
-                            RECOVERY_BLOCKED.store(true, Ordering::Release);
-                        })
+                        discover_pinned(&current)
+                            .inspect_err(|_| {
+                                RECOVERY_BLOCKED.store(true, Ordering::Release);
+                            })
+                            .map_err(|error| LossError::new(LossCause::ProbeFail, error))
                     }
-                    Ok(_) => Err("LCore.exe identity changed before SDK discovery".into()),
-                    Err(error) => Err(error),
+                    Ok(_) => Err(LossError::new(
+                        LossCause::ProbeFail,
+                        "LCore.exe identity changed before SDK discovery".into(),
+                    )),
+                    Err(error) => Err(LossError::new(LossCause::ProbeFail, error)),
                 };
                 match result.and_then(|pinned| Native::load(pinned, &friendly_name)) {
                     Ok(native) => {
@@ -1075,7 +1116,10 @@ impl SdkDevice {
             });
         if let Err(error) = spawn {
             SDK_OWNER_ACTIVE.store(false, Ordering::Release);
-            return Err(format!("spawn Logitech SDK owner: {error}"));
+            return Err(LossError::new(
+                LossCause::ProbeFail,
+                format!("spawn Logitech SDK owner: {error}"),
+            ));
         }
         match wait_ready(&ready_rx, CALL_TIMEOUT) {
             Ok(()) => {
@@ -1090,10 +1134,11 @@ impl SdkDevice {
                             std::thread::sleep(Duration::from_millis(750));
                         }
                         Ok((false, _)) => {
-                            return Err(
+                            return Err(LossError::new(
+                                LossCause::DeviceAbsent,
                                 "Logitech SDK monochrome LCD did not connect within 5 seconds"
                                     .into(),
-                            )
+                            ))
                         }
                         Err(error) => return Err(error),
                     }
@@ -1103,15 +1148,17 @@ impl SdkDevice {
         }
     }
 
-    fn call(&self, request: Request) -> Result<Reply, String> {
+    fn call(&self, request: Request) -> Result<Reply, LossError> {
         self.call_timeout(request, CALL_TIMEOUT)
     }
 
-    fn call_timeout(&self, request: Request, timeout: Duration) -> Result<Reply, String> {
-        let requests = self
-            .requests
-            .as_ref()
-            .ok_or("Logitech SDK device is closed")?;
+    fn call_timeout(&self, request: Request, timeout: Duration) -> Result<Reply, LossError> {
+        let requests = self.requests.as_ref().ok_or_else(|| {
+            LossError::new(
+                LossCause::ShutdownRequested,
+                "Logitech SDK device is closed".into(),
+            )
+        })?;
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         let deadline = Instant::now() + timeout;
         let mut envelope = Envelope {
@@ -1127,42 +1174,66 @@ impl SdkDevice {
                 }
                 Err(TrySendError::Full(_)) => {
                     CIRCUIT_OPEN.store(true, Ordering::Release);
-                    return Err("Logitech SDK request dispatch timed out; circuit opened".into());
+                    return Err(LossError::new(
+                        LossCause::CircuitOpen,
+                        "Logitech SDK request dispatch timed out; circuit opened".into(),
+                    ));
                 }
                 Err(TrySendError::Disconnected(_)) => {
-                    return Err("Logitech SDK owner disconnected".into());
+                    return Err(LossError::new(
+                        LossCause::ShutdownRequested,
+                        "Logitech SDK owner disconnected".into(),
+                    ));
                 }
             }
         }
         reply_rx.recv_timeout(timeout).map_err(|_| {
             CIRCUIT_OPEN.store(true, Ordering::Release);
-            "Logitech SDK native call timed out; owner quarantined and circuit opened".to_string()
+            LossError::new(
+                LossCause::CallTimeout,
+                "Logitech SDK native call timed out; owner quarantined and circuit opened".into(),
+            )
         })
     }
 
-    pub fn submit(&self, pixels: Vec<u8>) -> Result<(), String> {
+    pub fn submit(&self, pixels: Vec<u8>) -> Result<(), LossError> {
         match self.call(Request::Submit(pixels))? {
             Reply::Unit => Ok(()),
-            Reply::Error(error) => Err(error),
-            Reply::Poll { .. } => Err("unexpected Logitech SDK submit reply".into()),
+            Reply::Error(error) => Err(LossError::new(
+                LossCause::TransferIncomplete { code: 0 },
+                error,
+            )),
+            Reply::Poll { .. } => Err(LossError::new(
+                LossCause::ProbeFail,
+                "unexpected Logitech SDK submit reply".into(),
+            )),
         }
     }
 
-    pub fn poll(&self) -> Result<(bool, [bool; 4]), String> {
+    pub fn poll(&self) -> Result<(bool, [bool; 4]), LossError> {
         match self.call(Request::Poll)? {
             Reply::Poll { connected, buttons } => Ok((connected, buttons)),
-            Reply::Error(error) => Err(error),
-            Reply::Unit => Err("unexpected Logitech SDK poll reply".into()),
+            Reply::Error(error) => Err(LossError::new(LossCause::ProbeFail, error)),
+            Reply::Unit => Err(LossError::new(
+                LossCause::ProbeFail,
+                "unexpected Logitech SDK poll reply".into(),
+            )),
         }
     }
 
-    pub fn close(&mut self, blank: bool) -> Result<(), String> {
+    pub fn close(&mut self, blank: bool) -> Result<(), LossError> {
         let reply = self.call(Request::Close { blank });
         self.requests.take();
         match reply? {
             Reply::Unit => Ok(()),
-            Reply::Error(error) => Err(error),
-            Reply::Poll { .. } => Err("unexpected Logitech SDK close reply".into()),
+            Reply::Error(error) => Err(LossError::new(
+                LossCause::TransferIncomplete { code: 0 },
+                error,
+            )),
+            Reply::Poll { .. } => Err(LossError::new(
+                LossCause::ProbeFail,
+                "unexpected Logitech SDK close reply".into(),
+            )),
         }
     }
 }
@@ -1461,9 +1532,22 @@ mod tests {
             .call_timeout(Request::Submit(vec![0; PIXELS]), Duration::from_millis(1))
             .err()
             .unwrap();
-        assert!(error.contains("timed out") && circuit_open());
+        assert_eq!(error.cause, LossCause::CallTimeout);
+        assert!(error.detail.contains("timed out") && circuit_open());
         device.requests.take();
         thread.join().unwrap();
+        CIRCUIT_OPEN.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn open_refused_while_the_circuit_is_open_names_circuit_open() {
+        CIRCUIT_OPEN.store(true, Ordering::Release);
+        let owner = LCore {
+            path: PathBuf::from(r"C:\fixture\Logitech Gaming Software\LCore.exe"),
+            pid: 0,
+        };
+        let error = SdkDevice::open(&owner, "fixture").err().unwrap();
+        assert_eq!(error.cause, LossCause::CircuitOpen);
         CIRCUIT_OPEN.store(false, Ordering::Release);
     }
 
@@ -1472,7 +1556,10 @@ mod tests {
         CIRCUIT_OPEN.store(false, Ordering::Release);
         SDK_OWNER_ACTIVE.store(false, Ordering::Release);
         claim_sdk_owner().unwrap();
-        assert!(claim_sdk_owner().is_err());
+        assert_eq!(
+            claim_sdk_owner().err().unwrap().cause,
+            LossCause::OwnerConflict
+        );
         let (ready, receiver) = mpsc::sync_channel(1);
         let thread = std::thread::spawn(move || {
             let owned = String::from("owned validation data");
@@ -1481,7 +1568,10 @@ mod tests {
             let _ = ready.send(Ok(()));
             SDK_OWNER_ACTIVE.store(false, Ordering::Release);
         });
-        assert!(wait_ready(&receiver, Duration::from_millis(1)).is_err());
+        let error = wait_ready(&receiver, Duration::from_millis(1))
+            .err()
+            .unwrap();
+        assert_eq!(error.cause, LossCause::CallTimeout);
         assert!(circuit_open() && claim_sdk_owner().is_err());
         thread.join().unwrap();
         CIRCUIT_OPEN.store(false, Ordering::Release);

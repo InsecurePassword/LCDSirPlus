@@ -25,7 +25,7 @@ use windows::Win32::System::Threading::{
     EVENT_MODIFY_STATE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
 };
 
-use crate::backends::BackendKind;
+use crate::backends::{BackendKind, LossCause};
 
 const PARENT_ENV: &str = "LCDSIRPLUS_CONNECTION_RECOVERY_PARENT";
 const READY_TIMEOUT_MS: u32 = 10_000;
@@ -215,6 +215,7 @@ pub struct Recovery {
     previously_connected: bool,
     lost_since: Option<Instant>,
     waiting_since: Instant,
+    last_cause: Option<LossCause>,
     logitech_result: Option<Receiver<Result<(), String>>>,
     permit: Arc<RestartPermit>,
     interrupted: bool,
@@ -279,6 +280,7 @@ impl Recovery {
             previously_connected: false,
             lost_since: None,
             waiting_since: now,
+            last_cause: None,
             logitech_result: None,
             permit: Arc::new(RestartPermit::new()),
             interrupted: false,
@@ -293,6 +295,7 @@ impl Recovery {
         }
         self.previously_connected = true;
         self.lost_since = None;
+        self.last_cause = None;
         if self.logitech_result.is_some() {
             self.permit.cancel();
         }
@@ -307,7 +310,8 @@ impl Recovery {
         }
     }
 
-    pub fn disconnected(&mut self, now: Instant) {
+    pub fn disconnected(&mut self, now: Instant, cause: LossCause) {
+        self.last_cause = Some(cause);
         if self.previously_connected {
             self.lost_since.get_or_insert(now);
         }
@@ -359,9 +363,17 @@ impl Recovery {
     }
 
     fn restart_application(&mut self, launch: impl FnOnce() -> Result<u32, String>) -> bool {
+        // RC-1: the loss cause rides in the detail of this journal line; recovery
+        // outcomes keep their own event labels ("logitech-result", "finished").
+        let cause = self
+            .last_cause
+            .map(|cause| format!("; loss-cause={}", cause.short()))
+            .unwrap_or_default();
         if !self.record(
             "application-attempt",
-            "LCDSirPlus lost a previously working physical connection; restart once",
+            &format!(
+                "LCDSirPlus lost a previously working physical connection; restart once{cause}"
+            ),
         ) {
             return false;
         }
@@ -720,9 +732,9 @@ mod tests {
         let root = TestDir::new();
         let now = Instant::now();
         let mut recovery = Recovery::load(root.journal(), false, 1, now);
-        recovery.disconnected(now);
+        recovery.disconnected(now, LossCause::DeviceAbsent);
         recovery.healthy(BackendKind::Virtual);
-        recovery.disconnected(now + GRACE);
+        recovery.disconnected(now + GRACE, LossCause::DeviceAbsent);
         assert_eq!(recovery.due(now + GRACE * 10), None);
         assert!(
             !root.journal().exists(),
@@ -730,13 +742,13 @@ mod tests {
         );
 
         recovery.healthy(BackendKind::Sdk);
-        recovery.disconnected(now);
-        recovery.disconnected(now + GRACE / 2);
+        recovery.disconnected(now, LossCause::DeviceAbsent);
+        recovery.disconnected(now + GRACE / 2, LossCause::DeviceAbsent);
         assert_eq!(recovery.due(now + GRACE - Duration::from_millis(1)), None);
         assert_eq!(recovery.due(now + GRACE), Some(Stage::Fresh));
         recovery.healthy(BackendKind::Sdk);
         assert_eq!(recovery.due(now + GRACE * 10), None);
-        recovery.disconnected(now + GRACE * 10);
+        recovery.disconnected(now + GRACE * 10, LossCause::DeviceAbsent);
         recovery.suspend();
         assert_eq!(recovery.due(now + GRACE * 20), None);
     }
@@ -747,7 +759,7 @@ mod tests {
         let now = Instant::now();
         let mut first = Recovery::load(root.journal(), false, 1, now);
         first.healthy(BackendKind::Sdk);
-        first.disconnected(now);
+        first.disconnected(now, LossCause::DeviceAbsent);
         assert!(first.restart_application(|| {
             assert_eq!(
                 Journal::load(root.journal()).unwrap().stage,
@@ -783,7 +795,7 @@ mod tests {
 
         let mut later = Recovery::load(root.journal(), false, 99, now);
         later.healthy(BackendKind::Hid);
-        later.disconnected(now);
+        later.disconnected(now, LossCause::DeviceAbsent);
         assert_eq!(later.due(now + GRACE * 10), None);
         let text = std::fs::read_to_string(root.journal()).unwrap();
         assert_eq!(
@@ -828,7 +840,7 @@ mod tests {
         drop(first);
         let mut replacement = Recovery::load(root.journal(), true, 42, now);
         replacement.healthy(BackendKind::Sdk);
-        replacement.disconnected(now);
+        replacement.disconnected(now, LossCause::DeviceAbsent);
         assert_eq!(replacement.due(now + GRACE * 10), None);
         assert!(!replacement.record("logitech-attempt", "forbidden after success"));
         drop(replacement);
@@ -871,7 +883,7 @@ mod tests {
             let mut recovery = Recovery::load(root.journal(), false, 1, now);
             assert!(recovery.journal.is_none());
             recovery.healthy(BackendKind::Sdk);
-            recovery.disconnected(now);
+            recovery.disconnected(now, LossCause::DeviceAbsent);
             assert_eq!(recovery.due(now + GRACE * 10), None);
             assert!(!recovery.restart_application(|| panic!("corrupt state launched software")));
         }
@@ -883,12 +895,12 @@ mod tests {
         let now = Instant::now();
         let mut recovery = Recovery::load(root.journal(), true, 42, now);
         recovery.healthy(BackendKind::Sdk);
-        recovery.disconnected(now);
+        recovery.disconnected(now, LossCause::DeviceAbsent);
         assert_eq!(recovery.due(now + GRACE * 10), None);
         drop(recovery);
         let mut later = Recovery::load(root.journal(), false, 99, now);
         later.healthy(BackendKind::Sdk);
-        later.disconnected(now);
+        later.disconnected(now, LossCause::DeviceAbsent);
         assert_eq!(later.due(now + GRACE * 10), None);
         assert_eq!(
             Journal::load(root.journal()).unwrap().stage,
@@ -941,6 +953,92 @@ mod tests {
         assert!(std::fs::read_to_string(root.journal())
             .unwrap()
             .contains("restart timed out"));
+    }
+
+    #[test]
+    fn loss_cause_and_logitech_result_are_written_under_distinct_event_names() {
+        let root = TestDir::new();
+        let now = Instant::now();
+        let mut first = Recovery::load(root.journal(), false, 1, now);
+        first.healthy(BackendKind::Sdk);
+        first.disconnected(now, LossCause::OpenFailed { code: 0x8007_0002 });
+        assert!(first.restart_application(|| Ok(42)));
+        drop(first);
+        let mut replacement = Recovery::load(root.journal(), true, 42, now);
+        assert!(replacement.record("logitech-attempt", "one restart"));
+        // Inject a failed worker result; never restart a real Logitech process in tests.
+        let (sender, receiver) = mpsc::sync_channel(1);
+        replacement.logitech_result = Some(receiver);
+        sender.send(Err("injected restart denied".into())).unwrap();
+        assert!(!replacement.tick(now + GRACE / 2, true, || panic!(
+            "failed restart must not request reconnect"
+        )));
+        drop(replacement);
+        let text = std::fs::read_to_string(root.journal()).unwrap();
+        let cause_line = text
+            .lines()
+            .find(|line| line.contains("open-failed(0x80070002)"))
+            .expect("the journal must carry the loss cause code");
+        let result_line = text
+            .lines()
+            .find(|line| line.starts_with("logitech-result\t"))
+            .expect("the failed Logitech outcome is its own journal line");
+        assert_eq!(
+            cause_line.split('\t').next().unwrap(),
+            "application-attempt"
+        );
+        assert_ne!(
+            cause_line.split('\t').next().unwrap(),
+            result_line.split('\t').next().unwrap(),
+            "a loss cause and a recovery failure never share an event name"
+        );
+        assert!(result_line.contains("injected restart denied"));
+    }
+
+    #[test]
+    fn no_cause_label_is_published_as_healthy_or_finished() {
+        for cause in LossCause::all() {
+            let root = TestDir::new();
+            let now = Instant::now();
+            let mut first = Recovery::load(root.journal(), false, 1, now);
+            first.healthy(BackendKind::Sdk);
+            first.disconnected(now, cause);
+            assert!(first.restart_application(|| Ok(42)));
+            drop(first);
+            let mut replacement = Recovery::load(root.journal(), true, 42, now);
+            replacement.healthy(BackendKind::Sdk); // confirms recovery: "finished"
+            drop(replacement);
+            let label = cause.short();
+            let label = label.split('(').next().unwrap();
+            let text = std::fs::read_to_string(root.journal()).unwrap();
+            for line in text.lines() {
+                let event = line.split('\t').next().unwrap();
+                assert_ne!(event, "healthy", "health is not a journal event");
+                assert_ne!(
+                    event, "disconnected",
+                    "the cause rides in detail, not a new event"
+                );
+                if event == "finished" {
+                    assert!(
+                        !line.contains(label),
+                        "cause label {label} leaked into: {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn journal_rejects_a_disconnect_event_shape_for_loss_causes() {
+        // Fail-closed guarantee: causes may not invent journal event types.
+        let root = TestDir::new();
+        let mut journal = Journal::load(root.journal()).unwrap();
+        assert!(journal.record("disconnected", "device-absent").is_err());
+        assert!(journal.record("cause", "probe-fail").is_err());
+        assert!(
+            !root.journal().exists(),
+            "rejected events must not create journal history"
+        );
     }
 
     #[test]
@@ -1032,7 +1130,7 @@ mod tests {
         std::fs::remove_dir(&diagnostic).unwrap();
         let mut later = Recovery::load(persistent, false, 2, now);
         later.healthy(BackendKind::Sdk);
-        later.disconnected(now);
+        later.disconnected(now, LossCause::DeviceAbsent);
         assert_eq!(later.due(now + GRACE * 10), None);
         assert!(!later.restart_application(|| panic!("diagnostic changes reset allowance")));
     }
