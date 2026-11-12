@@ -132,11 +132,34 @@ fn append_close_failure(mut error: LossError, close_error: &LossError) -> LossEr
     error
 }
 
+/// RC-6 ladder-terminal threshold: how many consecutive discovery passes that
+/// yield zero device candidates stop the worker from attempting device opens.
+///
+/// Derived from the existing config pair, no new keys: `logitech_reconnect`
+/// default 5 s and `logitech_reconnect_max` default 60 s (`config.rs`
+/// L270-L271) give N = reconnect_max / reconnect = 60 / 5 = 12, so N base
+/// intervals cover at least the full capped ladder. The real ladder sleeps
+/// double, so 12 passes cover 5+10+20+40+8*60 = 555 s, past `reconnect_max`.
+pub const ABSENT_TERMINATION_PASSES: usize = 12;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackendState {
     Discovering,
-    Connected { kind: BackendKind },
-    Disconnected { cause: LossCause, reason: String },
+    Connected {
+        kind: BackendKind,
+    },
+    Disconnected {
+        cause: LossCause,
+        reason: String,
+    },
+    /// Ladder terminal after `ABSENT_TERMINATION_PASSES` zero-candidate
+    /// discovery passes: paired with `LossCause::DeviceAbsent` as a named
+    /// published state (not a masked failure). Device opens are skipped while
+    /// frame submits, shutdown, and reconnect wakes stay live, and the preview
+    /// policy matches `Disconnected` so the panel is never blanked.
+    Absent {
+        reason: String,
+    },
     ShutDown,
 }
 
@@ -302,6 +325,8 @@ fn worker(
                 orientation,
                 invert,
                 friendly_name,
+                open_physical,
+                device_candidates_present,
             );
             let _ = msg_tx.send(Message::State(BackendState::ShutDown));
         }
@@ -408,6 +433,13 @@ impl PhysicalDevice {
     }
 }
 
+/// The device-open path the ladder attempts, injectable so the RC-6 terminal
+/// is testable without touching hardware.
+type OpenPhysical = fn(BackendKind, &str) -> Result<PhysicalDevice, LossError>;
+/// The candidate probe that ends the RC-6 terminal, injectable for the same
+/// tests.
+type ProbeCandidates = fn(BackendKind) -> bool;
+
 fn open_physical(kind: BackendKind, friendly_name: &str) -> Result<PhysicalDevice, LossError> {
     if sdk::circuit_open() {
         return Err(LossError::new(
@@ -443,6 +475,19 @@ fn select_physical_kind(kind: BackendKind, lcore_present: bool) -> Result<Backen
             LossCause::ProbeFail,
             "virtual is not a physical backend".into(),
         )),
+    }
+}
+
+/// RC-6 candidate probe used while the ladder is terminal: reuse the open
+/// path's own arbitration to answer "is there anything to open". A running
+/// trusted LCore is an SDK candidate; otherwise a G13 HID discovery candidate.
+/// Read-only — it never opens a device, so it cannot start a connection.
+fn device_candidates_present(kind: BackendKind) -> bool {
+    let owner_present = sdk::lcore().ok().flatten().is_some();
+    match select_physical_kind(kind, owner_present) {
+        Ok(BackendKind::Sdk) => true,
+        Ok(BackendKind::Hid) => !hid::discover().candidates.is_empty(),
+        Ok(_) | Err(_) => false,
     }
 }
 
@@ -482,20 +527,61 @@ fn physical_worker(
     orientation: String,
     invert: bool,
     friendly_name: String,
+    open: OpenPhysical,
+    probe: ProbeCandidates,
 ) {
     let mut backoff = reconnect;
     let mut replay: Option<Pixels> = None;
     let mut current: Option<Pixels> = None;
     let mut tracker = ButtonTracker::default();
+    let mut absent_passes: usize = 0;
+    let mut terminal = false;
+    let mut last_probe: Option<Instant> = None;
 
     'outer: loop {
         if commands.reconnect.swap(false, Ordering::AcqRel) {
             backoff = reconnect;
             let _ = msg_tx.send(Message::ReconnectStarted);
         }
-        match open_physical(kind, &friendly_name) {
+        if terminal {
+            // RC-6: the ladder is terminal. Device-open attempts are skipped;
+            // shutdown, frame-submit, and reconnect wakes stay live, and each
+            // wake re-probes for a hotplugged candidate at most once per
+            // `button_poll` — the worker's existing cadence key.
+            if sleep_until_wake(commands, wake_rx, backoff) {
+                break 'outer;
+            }
+            if last_probe.is_none_or(|when| when.elapsed() >= button_poll) {
+                last_probe = Some(Instant::now());
+                if probe(kind) {
+                    terminal = false;
+                    absent_passes = 0;
+                    let _ = msg_tx.send(Message::State(BackendState::Discovering));
+                } else {
+                    continue 'outer;
+                }
+            } else {
+                continue 'outer;
+            }
+        }
+        match open(kind, &friendly_name) {
             Err(error) => {
-                let _ = msg_tx.send(disconnect(&error));
+                if error.cause == LossCause::DeviceAbsent {
+                    absent_passes += 1;
+                } else {
+                    // The pass saw a candidate and failed for another reason:
+                    // it is not a zero-candidate pass.
+                    absent_passes = 0;
+                }
+                if !terminal && absent_passes >= ABSENT_TERMINATION_PASSES {
+                    terminal = true;
+                    last_probe = None;
+                    let _ = msg_tx.send(Message::State(BackendState::Absent {
+                        reason: error.to_string(),
+                    }));
+                } else {
+                    let _ = msg_tx.send(disconnect(&error));
+                }
                 if sleep_interruptible(commands, wake_rx, backoff) {
                     break 'outer;
                 }
@@ -503,6 +589,7 @@ fn physical_worker(
                 continue 'outer;
             }
             Ok(mut device) => {
+                absent_passes = 0;
                 let active_kind = device.kind();
                 let _ = msg_tx.send(Message::State(BackendState::Connected {
                     kind: active_kind,
@@ -666,6 +753,30 @@ fn sleep_interruptible(
     }
 }
 
+/// Terminal-state wait: keeps the same 100 ms shutdown responsiveness as
+/// `sleep_interruptible`, but returns at the first wake so the terminal worker
+/// can re-probe for a hotplugged candidate instead of sleeping out the backoff.
+fn sleep_until_wake(commands: &CommandQueue, wake_rx: &Receiver<()>, duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        if commands.is_shutdown() {
+            return true;
+        }
+        if commands.reconnect.load(Ordering::Acquire) {
+            return false;
+        }
+        match wake_rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(()) => return false,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return true,
+        }
+    }
+}
+
 fn virtual_fallback_loop(
     commands: &CommandQueue,
     wake_rx: &Receiver<()>,
@@ -709,6 +820,7 @@ pub fn resolve_kind(config_backend: &str) -> BackendKind {
 mod tests {
     use super::*;
     use crate::render::Frame;
+    use std::sync::atomic::AtomicUsize;
 
     fn command_queue() -> (Arc<CommandQueue>, Receiver<()>) {
         let (wake, receiver) = std::sync::mpsc::sync_channel(1);
@@ -982,5 +1094,263 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    // RC-6 seams: the ladder terminal is exercised against injected open/probe
+    // functions, so no hardware path is touched.
+    static OPEN_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+    static CANDIDATES: AtomicBool = AtomicBool::new(false);
+
+    fn open_absent(_kind: BackendKind, _friendly_name: &str) -> Result<PhysicalDevice, LossError> {
+        OPEN_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        Err(LossError::new(
+            LossCause::DeviceAbsent,
+            "injected discovery: no G13 candidates".into(),
+        ))
+    }
+
+    fn probe_candidates(_kind: BackendKind) -> bool {
+        CANDIDATES.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn absent_ladder_terminal_covers_the_reconnect_cap_at_defaults() {
+        // 5 s base / 60 s cap (config.rs L270-L271): N = 60 / 5 = 12 passes.
+        assert_eq!(ABSENT_TERMINATION_PASSES, 12);
+        assert!(
+            Duration::from_secs(5) * ABSENT_TERMINATION_PASSES as u32 >= Duration::from_secs(60),
+            "N base intervals cover at least reconnect_max"
+        );
+    }
+
+    #[test]
+    fn ladder_terminal_publishes_absent_once_then_a_candidate_reopens() {
+        let base = Duration::from_millis(1);
+        OPEN_ATTEMPTS.store(0, Ordering::SeqCst);
+        CANDIDATES.store(false, Ordering::SeqCst);
+        let (commands, wake) = command_queue();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_commands = Arc::clone(&commands);
+        let thread = std::thread::spawn(move || {
+            physical_worker(
+                BackendKind::Auto,
+                &worker_commands,
+                &wake,
+                &tx,
+                base,
+                base,
+                base,
+                base,
+                "normal".into(),
+                false,
+                String::new(),
+                open_absent,
+                probe_candidates,
+            );
+        });
+        let budget = Instant::now() + Duration::from_secs(10);
+        let remaining = || budget.saturating_duration_since(Instant::now());
+
+        // (1) After N zero-candidate passes, Absent is published and opens stop.
+        let mut absent = 0usize;
+        while absent == 0 {
+            let left = remaining();
+            assert!(!left.is_zero(), "Absent was never published");
+            if let Ok(Message::State(BackendState::Absent { reason })) = rx.recv_timeout(left) {
+                assert!(reason.starts_with("device-absent: "), "{reason}");
+                absent += 1;
+            }
+        }
+        let attempts = OPEN_ATTEMPTS.load(Ordering::SeqCst);
+        assert_eq!(
+            attempts, ABSENT_TERMINATION_PASSES,
+            "the ladder stops opening at the terminal"
+        );
+
+        // (2) Submitting while Absent keeps preview behavior: the frame stays
+        // newest for replay, nothing panics, and the state is not republished.
+        commands.submit(pixels(9));
+        let mut extra_absent = 0usize;
+        let mut extra_disconnects = 0usize;
+        while let Ok(message) = rx.recv_timeout(Duration::from_millis(300)) {
+            match message {
+                Message::State(BackendState::Absent { .. }) => extra_absent += 1,
+                Message::State(BackendState::Disconnected { .. }) => extra_disconnects += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(absent + extra_absent, 1, "Absent is published exactly once");
+        assert_eq!(
+            extra_disconnects, 0,
+            "the terminal stops the repeating disconnect publication"
+        );
+        assert_eq!(
+            OPEN_ATTEMPTS.load(Ordering::SeqCst),
+            attempts,
+            "no device opens while Absent"
+        );
+        assert_eq!(
+            commands.take_latest().unwrap()[0],
+            9,
+            "the newest submitted frame is retained for preview and replay"
+        );
+
+        // (3) A candidate appearance resumes opens within one wake.
+        CANDIDATES.store(true, Ordering::SeqCst);
+        commands.submit(pixels(10));
+        let mut discovering = false;
+        let reopened = loop {
+            let left = remaining();
+            assert!(!left.is_zero(), "no wake after a candidate appeared");
+            if let Ok(message) = rx.recv_timeout(left) {
+                match message {
+                    Message::State(BackendState::Discovering) => discovering = true,
+                    Message::State(BackendState::Disconnected { .. }) if discovering => break true,
+                    _ => {}
+                }
+            }
+        };
+        assert!(reopened, "the candidate wake returns the ladder to opens");
+        assert!(
+            OPEN_ATTEMPTS.load(Ordering::SeqCst) > attempts,
+            "the ladder opened again after the candidate"
+        );
+
+        // The shutdown wake path stayed live through the terminal state.
+        commands.shutdown();
+        thread.join().unwrap();
+    }
+
+    // F-1 seams: a ladder in which one pass fails for a NON-Absent cause. The
+    // counter is keyed on `LossCause::DeviceAbsent` only, so that pass must
+    // reset the consecutive count instead of advancing the terminal.
+    const NON_ABSENT_INTERLEAVE_PASS: usize = ABSENT_TERMINATION_PASSES;
+    const INTERLEAVED_NON_ABSENT_CODE: u32 = 0x8007_0002;
+    static INTERLEAVED_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+    fn open_interleaved(
+        _kind: BackendKind,
+        _friendly_name: &str,
+    ) -> Result<PhysicalDevice, LossError> {
+        let pass = INTERLEAVED_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+        let cause = if pass == NON_ABSENT_INTERLEAVE_PASS {
+            LossCause::OpenFailed {
+                code: INTERLEAVED_NON_ABSENT_CODE,
+            }
+        } else {
+            LossCause::DeviceAbsent
+        };
+        Err(LossError::new(cause, format!("injected pass {pass}")))
+    }
+
+    fn probe_never(_kind: BackendKind) -> bool {
+        false
+    }
+
+    #[test]
+    fn ladder_counting_ignores_non_absent_cause_passes_and_publishes_absent_once() {
+        let base = Duration::from_millis(1);
+        INTERLEAVED_ATTEMPTS.store(0, Ordering::SeqCst);
+        let (commands, wake) = command_queue();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_commands = Arc::clone(&commands);
+        let thread = std::thread::spawn(move || {
+            physical_worker(
+                BackendKind::Auto,
+                &worker_commands,
+                &wake,
+                &tx,
+                base,
+                base,
+                base,
+                base,
+                "normal".into(),
+                false,
+                String::new(),
+                open_interleaved,
+                probe_never,
+            );
+        });
+        let budget = Instant::now() + Duration::from_secs(10);
+        let remaining = || budget.saturating_duration_since(Instant::now());
+        // Passes that stay pre-terminal: the 11 DeviceAbsent passes before the
+        // interleaved failure, the interleaved failure itself, and the 11
+        // DeviceAbsent passes that re-accumulate without reaching 12.
+        let pre_terminal_passes = NON_ABSENT_INTERLEAVE_PASS - 1 + ABSENT_TERMINATION_PASSES;
+        let terminal_pass = NON_ABSENT_INTERLEAVE_PASS + ABSENT_TERMINATION_PASSES;
+
+        // (1) Every one of those passes publishes a plain disconnect with its
+        // own cause, and no Absent appears: the non-Absent pass reset the
+        // consecutive count rather than advancing it.
+        for pass in 1..=pre_terminal_passes {
+            let left = remaining();
+            assert!(!left.is_zero(), "no publication after pass {pass}");
+            match rx
+                .recv_timeout(left)
+                .expect("a publication per failed open pass")
+            {
+                Message::State(BackendState::Disconnected { cause, reason }) => {
+                    let want = if pass == NON_ABSENT_INTERLEAVE_PASS {
+                        LossCause::OpenFailed {
+                            code: INTERLEAVED_NON_ABSENT_CODE,
+                        }
+                    } else {
+                        LossCause::DeviceAbsent
+                    };
+                    assert_eq!(cause, want, "pass {pass} is keyed by its own cause");
+                    assert!(
+                        reason.contains(&format!("injected pass {pass}")),
+                        "pass {pass}: {reason}"
+                    );
+                }
+                Message::State(BackendState::Absent { reason }) => {
+                    panic!("pass {pass}: Absent published before 12 consecutive DeviceAbsent passes: {reason}")
+                }
+                _ => panic!("pass {pass}: expected a disconnect publication"),
+            }
+        }
+
+        // (2) Absent arrives on the 12th CONSECUTIVE DeviceAbsent pass.
+        let mut absent = 0usize;
+        while absent == 0 {
+            let left = remaining();
+            assert!(!left.is_zero(), "Absent was never published");
+            if let Ok(Message::State(BackendState::Absent { reason })) = rx.recv_timeout(left) {
+                assert!(
+                    reason.starts_with("device-absent: injected pass "),
+                    "{reason}"
+                );
+                absent += 1;
+            }
+        }
+        let attempts = INTERLEAVED_ATTEMPTS.load(Ordering::SeqCst);
+        assert_eq!(
+            attempts, terminal_pass,
+            "Absent published on pass {terminal_pass}: 12 consecutive DeviceAbsent passes after the reset"
+        );
+
+        // (3) Published exactly once, and the terminal keeps device opens off.
+        let mut extra_absent = 0usize;
+        let mut extra_disconnects = 0usize;
+        while let Ok(message) = rx.recv_timeout(Duration::from_millis(300)) {
+            match message {
+                Message::State(BackendState::Absent { .. }) => extra_absent += 1,
+                Message::State(BackendState::Disconnected { .. }) => extra_disconnects += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(absent + extra_absent, 1, "Absent is published exactly once");
+        assert_eq!(
+            extra_disconnects, 0,
+            "the terminal stops the repeating disconnect publication"
+        );
+        assert_eq!(
+            INTERLEAVED_ATTEMPTS.load(Ordering::SeqCst),
+            attempts,
+            "no device opens while Absent"
+        );
+
+        commands.shutdown();
+        thread.join().unwrap();
     }
 }

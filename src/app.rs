@@ -334,6 +334,19 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                             ui.set_preview_auto_visible(true);
                         }
                     }
+                    BackendState::Absent { reason } => {
+                        // Ladder terminal: the preview policy stays consistent
+                        // with `Disconnected`, so the panel is never blanked.
+                        recovery.disconnected(now, LossCause::DeviceAbsent);
+                        crate::log_warn!("backend absent: {}", reason);
+                        backend_state = BackendState::Absent { reason };
+                        if !opts.preview_always
+                            && cfg.preview_mode == "auto"
+                            && !cfg.start_minimized
+                        {
+                            ui.set_preview_auto_visible(true);
+                        }
+                    }
                     BackendState::Discovering => {
                         recovery.disconnected(now, LossCause::DeviceAbsent);
                         backend_state = BackendState::Discovering;
@@ -1267,6 +1280,15 @@ mod tests {
                 reason: "test".into()
             }
         ));
+        assert!(
+            preview_for_backend(
+                &cfg,
+                &BackendState::Absent {
+                    reason: "test".into()
+                }
+            ),
+            "the ladder terminal keeps the preview visible like a disconnect"
+        );
         cfg.preview_mode = "never".into();
         assert!(!preview_for_backend(&cfg, &BackendState::Discovering));
         cfg.preview_mode = "always".into();
