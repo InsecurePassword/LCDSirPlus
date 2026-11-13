@@ -4,6 +4,12 @@
 //! per-LP idle/kernel/user time counters (100 ns units, kernel time includes
 //! idle). Utilization is the busy fraction of the delta between samples — a
 //! memory read per tick, no polling I/O.
+//!
+//! Displayed quantity (EC-5, pinned 2026-11-13): family **(b) TOTAL-MINUS-IDLE**
+//! — `busy_percent` is the one derivation, from the sampled total time
+//! (`d_kernel + d_user`) minus the idle delta. The shipped LCDSirReal app
+//! displays kernel+user busy-time deltas (evidence A-9 b52-21); this product
+//! intentionally displays total-minus-idle. See `docs/ARCHITECTURE.md`.
 
 #![cfg(windows)]
 
@@ -55,6 +61,35 @@ fn decode_samples(
     )
 }
 
+/// The ONE busy-percent derivation (EC-5, family (b) total-minus-idle).
+///
+/// Takes one decoded `[idle, kernel, user]` record pair (100 ns units, kernel
+/// time includes idle), forms the saturating counter deltas, treats
+/// `total = d_kernel + d_user` as the sampled time, and reports
+/// `(total - d_idle) / total * 100` clamped to `0..=100`. `total <= 0` (no
+/// elapsed time, counter reset) reports `0.0`.
+///
+/// Every CPU surface consumes values produced here and nowhere else: the
+/// CPU_LOAD bar, CPU_LOAD_GRAPH, the `cpuload` history feed, the BOTTLENECK
+/// peak input, and the CCD Cache/Frequency split (which averages these percents
+/// in [`aggregate`] and adds no arithmetic of its own). A second, independent
+/// derivation anywhere in that path breaks
+/// `ec5_all_cpu_surfaces_share_this_one_derivation`.
+fn busy_percent(current: &[i64; 3], previous: &[i64; 3]) -> f64 {
+    let d_idle = current[0].saturating_sub(previous[0]);
+    let d_kernel = current[1].saturating_sub(previous[1]);
+    let d_user = current[2].saturating_sub(previous[2]);
+    let total = d_kernel.saturating_add(d_user).max(0);
+    if total <= 0 {
+        return 0.0;
+    }
+    let busy = (total - d_idle).max(0);
+    (busy as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
+}
+
+/// Per-logical-processor busy percent (`0..=100`): one [`busy_percent`] per LP,
+/// in record order. A record-count change means the topology changed, so that
+/// tick reports `0.0` per LP (as does the first sample, which has no delta).
 fn utilization(current: &[[i64; 3]], previous: &[[i64; 3]]) -> Vec<f64> {
     if current.len() != previous.len() {
         return vec![0.0; current.len()];
@@ -62,17 +97,7 @@ fn utilization(current: &[[i64; 3]], previous: &[[i64; 3]]) -> Vec<f64> {
     current
         .iter()
         .zip(previous)
-        .map(|(cur, prev)| {
-            let d_idle = cur[0].saturating_sub(prev[0]);
-            let d_kernel = cur[1].saturating_sub(prev[1]);
-            let d_user = cur[2].saturating_sub(prev[2]);
-            let total = d_kernel.saturating_add(d_user).max(0);
-            if total <= 0 {
-                return 0.0;
-            }
-            let busy = (total - d_idle).max(0);
-            (busy as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
-        })
+        .map(|(cur, prev)| busy_percent(cur, prev))
         .collect()
 }
 
@@ -115,6 +140,11 @@ impl CpuLoadProvider {
 }
 
 /// Aggregate utilization over a logical-processor mask (kernel LP indices).
+///
+/// Pure mean of the per-LP percents that [`busy_percent`] produced: the loop
+/// sums and counts mask members only, so the CCD Cache/Frequency split carries
+/// the same family (b) quantity as the CPU bar. No time delta and no division
+/// by a time total happen here.
 pub fn aggregate(per_lp: &[f64], mask: u64) -> f64 {
     if mask == 0 || per_lp.is_empty() {
         return 0.0;
@@ -179,6 +209,192 @@ mod tests {
         );
         assert!(decode_samples(&records, bytes - 1).is_none());
         assert!(decode_samples(&records, bytes + 48).is_none());
+    }
+
+    /// Family (b) hand-check: docs name this function as the single derivation.
+    #[test]
+    fn ec5_docs_name_the_single_derivation_and_family() {
+        const DOCS: &str = include_str!("../../docs/ARCHITECTURE.md");
+        let name = concat!("providers/cpu.rs::", stringify!(busy_percent));
+        assert!(DOCS.contains(name), "docs must name the derivation {name}");
+        assert!(
+            DOCS.contains("total-minus-idle"),
+            "docs must name the (b) family 'total-minus-idle'"
+        );
+    }
+
+    /// Acceptance (2): known `[idle, kernel, user]` triples -> hand-derived values.
+    /// Family (b): total = d_kernel + d_user; busy = total - d_idle;
+    /// percent = busy / total * 100 clamped to 0..=100; total <= 0 -> 0.0.
+    #[test]
+    fn ec5_synthetic_records_yield_hand_derived_percents() {
+        // (current, previous, expected) with the arithmetic shown in comments.
+        let cases: Vec<([i64; 3], [i64; 3], f64, &str)> = vec![
+            (
+                [50, 100, 50],
+                [0, 0, 0],
+                200.0 / 3.0,
+                "d=50/100/50 total=150 busy=100",
+            ),
+            ([0, 100, 0], [0, 0, 0], 100.0, "total=100 busy=100"),
+            ([100, 100, 0], [0, 0, 0], 0.0, "total=100 busy=0 (all idle)"),
+            (
+                [150, 100, 50],
+                [0, 0, 0],
+                0.0,
+                "total=150 busy=0 (idle >= total)",
+            ),
+            (
+                [0, 100, 25],
+                [0, 0, 0],
+                100.0,
+                "total=125 busy=125 (never idle)",
+            ),
+            ([25, 100, 0], [0, 0, 0], 75.0, "total=100 busy=75"),
+            (
+                [60, 120, 80],
+                [10, 20, 30],
+                200.0 / 3.0,
+                "non-zero baseline d=50/100/50 total=150 busy=100",
+            ),
+            (
+                [0, 0, 0],
+                [100, 100, 100],
+                0.0,
+                "counter reset: saturating deltas are all zero -> total<=0",
+            ),
+            (
+                [0, 300, 100],
+                [100, 200, 100],
+                100.0,
+                "d_idle=-100 -> busy=200 of total=100 -> 200% clamps to 100",
+            ),
+            (
+                [0, i64::MAX, i64::MAX],
+                [0, 0, 0],
+                100.0,
+                "saturating_add total=i64::MAX -> ratio 1.0",
+            ),
+        ];
+        for (current, previous, expected, why) in cases {
+            let got = utilization(&[current], &[previous]);
+            assert_eq!(got.len(), 1, "one value per record: {why}");
+            assert!(
+                (got[0] - expected).abs() < 1e-9,
+                "{why}: got {} expected {expected}",
+                got[0]
+            );
+            assert_eq!(
+                got[0],
+                busy_percent(&current, &previous),
+                "map == derivation"
+            );
+        }
+    }
+
+    /// Acceptance (1)/(7): the CPU bar mean, the graph/history value, the
+    /// BOTTLENECK peak input and the CCD mask split are all the SAME derivation.
+    /// A second, independent derivation in the aggregate path fails this test.
+    #[test]
+    fn ec5_all_cpu_surfaces_share_this_one_derivation() {
+        let previous = vec![[0i64; 3]; 4];
+        let current = vec![
+            [50, 100, 50], // LP0 -> 200/3 = 66.66666666666666
+            [0, 100, 0],   // LP1 -> 100.0
+            [100, 100, 0], // LP2 -> 0.0 (all idle)
+            [25, 100, 0],  // LP3 -> 75.0
+        ];
+        let expected = [200.0 / 3.0, 100.0, 0.0, 75.0];
+        let per_lp = utilization(&current, &previous);
+        assert_eq!(per_lp.len(), 4);
+        for (lp, value) in per_lp.iter().zip(&expected) {
+            assert!((lp - value).abs() < 1e-9, "LP percent {lp} != {value}");
+        }
+
+        // CPU_LOAD bar / CPU_LOAD_GRAPH / history / BOTTLENECK peak input mean over
+        // all LPs (app.rs: sum/len, and reduce(f64::max) for the peak).
+        let bar_mean = per_lp.iter().sum::<f64>() / per_lp.len() as f64;
+        assert!(
+            (bar_mean - (200.0 / 3.0 + 100.0 + 0.0 + 75.0) / 4.0).abs() < 1e-9,
+            "CPU bar mean {bar_mean}"
+        );
+        assert_eq!(
+            bar_mean,
+            aggregate(&per_lp, 0b1111),
+            "CPU bar mean must equal the full-mask split (one derivation, same order)"
+        );
+        assert_eq!(
+            per_lp.iter().copied().reduce(f64::max),
+            Some(100.0),
+            "BOTTLENECK peak input is a member of the same set"
+        );
+
+        // CCD Cache/Frequency split: mean over mask members, hand-derived.
+        let cache = aggregate(&per_lp, 0b0011);
+        assert!(
+            (cache - 250.0 / 3.0).abs() < 1e-9,
+            "cache split {cache} != 250/3"
+        );
+        let freq = aggregate(&per_lp, 0b1100);
+        assert!((freq - 37.5).abs() < 1e-9, "frequency split {freq} != 37.5");
+
+        // Discriminating check: family (a) is the kernel+user delta SUM, which is
+        // the whole sampled window here (kernel time already contains idle), so it
+        // reports 100% whenever any time elapsed. An independent (a) derivation in
+        // the aggregate path therefore changes the split values asserted above.
+        let family_a = |record: &[i64; 3], prior: &[i64; 3]| -> f64 {
+            let window = record[1]
+                .saturating_sub(prior[1])
+                .saturating_add(record[2].saturating_sub(prior[2]));
+            if window <= 0 {
+                0.0
+            } else {
+                100.0
+            }
+        };
+        assert_eq!(
+            family_a(&current[2], &previous[2]),
+            100.0,
+            "family (a) is 100% on the all-idle LP2; the shipped (b) value is 0.0"
+        );
+        assert_ne!(
+            aggregate(&per_lp, 0b1100),
+            family_a(&current[2], &previous[2]),
+            "the split must not collapse to the (a) family"
+        );
+    }
+
+    /// Acceptance (3): absent/invalid records produce NO data, never a 0% sample.
+    #[test]
+    fn ec5_absent_or_invalid_records_are_no_data_not_zero_percent() {
+        let records = vec![SystemProcessorPerformanceInformation::default(); 2];
+        let bytes = std::mem::size_of_val(records.as_slice());
+        assert!(decode_samples(&records, 0).is_none(), "returned == 0");
+        assert!(decode_samples(&records, 8).is_none(), "sub-record tail");
+        assert!(decode_samples(&records, bytes + 8).is_none(), "oversize");
+        assert_eq!(decode_samples(&records, bytes).unwrap().len(), 2);
+
+        // No records -> no per-LP value at all: the snapshot pushes no reading, so
+        // `renderer::canonical_number_metric` returns `Metric::invalid()` (L1352-1354).
+        assert!(
+            utilization(&[], &[]).is_empty(),
+            "no data is not reported as a 0% sample"
+        );
+        assert!(
+            !crate::model::Metric::invalid().valid,
+            "the no-data shape is invalid, not value 0.0"
+        );
+
+        // The provider keeps no prior records before a successful query, so its
+        // first `update()` cannot synthesize a delta (the hardware-gated
+        // `live_provider_returns_one_bounded_sample_per_lp` covers the live shape).
+        let provider = CpuLoadProvider::new();
+        assert!(provider.prev.is_empty(), "fresh provider has no records");
+        assert_eq!(
+            aggregate(&[], 0xffff),
+            0.0,
+            "aggregate of no data is documented 0.0; only the split path masks it (F-EC5-a)"
+        );
     }
 
     #[test]

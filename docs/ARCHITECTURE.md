@@ -116,6 +116,15 @@ requires both `ccd_cache_processors` and `ccd_frequency_processors` to be
 `auto`, or both to be explicit, disjoint lists of logical processors `0..63`.
 One resulting domain uses the single CPU bar; two use Cache and Frequency bars.
 
+The displayed CPU quantity is total-minus-idle busy time: `providers/cpu.rs::busy_percent`
+is the single derivation, forming per-logical-processor `idle`/`kernel`/`user` counter
+deltas and reporting `(d_kernel + d_user - d_idle) / (d_kernel + d_user)` as a percent.
+The CPU bar, the CPU load graph, history, the bottleneck peak input, and the Cache and
+Frequency split all consume that one derivation; no surface derives a CPU percentage on
+its own. Decision 2026-11-13 (EC-5): the shipped LCDSirReal app displays kernel+user
+busy-time deltas from its own sampler, and this product intentionally displays
+total-minus-idle.
+
 HWiNFO access is read-only shared memory with exact original-label pairs.
 LibreHardwareMonitor is user-managed and restricted to loopback HTTP. Exact
 SensorIds come from its live `data.json`, not diagnostics. Total power is never
