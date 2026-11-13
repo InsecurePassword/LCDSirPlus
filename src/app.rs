@@ -9,8 +9,8 @@ use crate::config::Config;
 use crate::hardware_test::{self, TestConfig, Transport};
 use crate::logging::Level;
 use crate::model::{
-    BottleneckDetector, BottleneckInputs, BottleneckThresholds, DiscordState, Freshness, Metric,
-    MetricKey, Reading, ReadingsSnapshot, Snapshot,
+    BottleneckDetector, BottleneckInputs, BottleneckThresholds, DeviceStatus, DiscordState,
+    Freshness, Metric, MetricKey, Reading, ReadingsSnapshot, Snapshot,
 };
 use crate::providers::{ccd, clock, cpu, hang, memory};
 use crate::render::renderer::{OverlayOptions, Renderer, View};
@@ -170,6 +170,9 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
     let mut snapshot = Snapshot::default();
     let mut running = true;
     let mut backend_state = BackendState::Discovering;
+    // RC-5: the label last published to the panel/log surface, so a change is
+    // named exactly once on the log.
+    let mut published_status = DeviceStatus::Healthy;
     let process_epoch = Instant::now();
 
     while running {
@@ -275,6 +278,17 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
             log_hang_audit(&audit);
         }
         alerts.evaluate(&mut snapshot, &cfg, now);
+
+        // RC-5: publish the device/recovery label on the display surface every
+        // loop, so a rebuilt snapshot always carries the current state; the log
+        // names each transition once. The frame is rendered and submitted as
+        // before, so the preview-retained fallback never blanks the panel.
+        let device_status = published_device_status(&backend_state, &recovery.display_status());
+        if device_status != published_status {
+            crate::log_warn!("device surface: {}", device_status.label());
+            published_status = device_status.clone();
+        }
+        snapshot.device_status = device_status;
 
         if now.duration_since(last_render) >= cfg.render_interval {
             last_render = now;
@@ -532,6 +546,24 @@ fn backend_config_changed(old: &Config, new: &Config) -> bool {
         || old.logitech_friendly_name != new.logitech_friendly_name
         || old.logitech_orientation != new.logitech_orientation
         || old.logitech_invert != new.logitech_invert
+}
+
+/// RC-5: the single device state published on the human-facing surface.
+/// Terminal recovery outcomes (c)/(d) outrank the transient loss labels, so a
+/// spent allowance is never masked by a fresh disconnect line; (a)/(b) come
+/// from the accepted `Absent` terminal and the RC-1 cause code. The transport
+/// `reason` free text never reaches the label.
+fn published_device_status(state: &BackendState, recovery: &DeviceStatus) -> DeviceStatus {
+    match recovery {
+        DeviceStatus::AllowanceConsumed | DeviceStatus::RecoveryFailed { .. } => recovery.clone(),
+        _ => match state {
+            BackendState::Absent { .. } => DeviceStatus::Absent,
+            BackendState::Disconnected { cause, .. } => DeviceStatus::LinkFailed {
+                code: cause.short(),
+            },
+            _ => DeviceStatus::Healthy,
+        },
+    }
 }
 
 fn apply_preview_policy(ui: &Ui, cfg: &Config, state: &BackendState) {
@@ -1299,6 +1331,163 @@ mod tests {
         assert!(!preview_for_backend(&cfg, &BackendState::Discovering));
         cfg.preview_mode = "always".into();
         assert!(preview_for_backend(&cfg, &BackendState::Discovering));
+    }
+
+    /// RC-5 acceptance (1): four synthetic scenarios publish four distinct
+    /// labels on the display surface. The transport `reason` free text carries
+    /// a sentinel here; it must never reach any published label.
+    #[test]
+    fn four_device_states_publish_four_distinct_labels() {
+        let free_text = "transport prose 0xDEADBEEF";
+        let scenarios = [
+            // (a) device absent: the RC-6 ladder terminal.
+            published_device_status(
+                &BackendState::Absent {
+                    reason: free_text.into(),
+                },
+                &DeviceStatus::Healthy,
+            ),
+            // (b) device present, connection failed: RC-1 cause + code.
+            published_device_status(
+                &BackendState::Disconnected {
+                    cause: LossCause::OpenFailed { code: 0x8007_0002 },
+                    reason: free_text.into(),
+                },
+                &DeviceStatus::Healthy,
+            ),
+            // (c) recovery allowance consumed, published over the live loss.
+            published_device_status(
+                &BackendState::Disconnected {
+                    cause: LossCause::CallTimeout,
+                    reason: free_text.into(),
+                },
+                &DeviceStatus::AllowanceConsumed,
+            ),
+            // (d) recovery action failed, named by cause.
+            published_device_status(
+                &BackendState::Absent {
+                    reason: free_text.into(),
+                },
+                &DeviceStatus::RecoveryFailed {
+                    code: LossCause::WorkerStalled.short(),
+                },
+            ),
+        ];
+        let labels: Vec<String> = scenarios.iter().map(DeviceStatus::label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                DeviceStatus::LABEL_ABSENT.to_string(),
+                format!("{}open-failed(0x80070002)", DeviceStatus::PREFIX_LINK),
+                DeviceStatus::LABEL_ALLOWANCE.to_string(),
+                format!("{}worker-stalled", DeviceStatus::PREFIX_RECOVERY),
+            ]
+        );
+        for (index, left) in labels.iter().enumerate() {
+            for right in labels[index + 1..].iter() {
+                assert_ne!(left, right, "the four states must publish distinctly");
+            }
+        }
+        for label in &labels {
+            assert!(
+                !label.contains("0xDEADBEEF") && !label.contains("transport prose"),
+                "free text reached the published label: {label}"
+            );
+        }
+    }
+
+    /// RC-5 acceptance (4): every published label is an enum-arm template plus
+    /// an RC-1 cause code. The whole accepted cause vocabulary is walked, so no
+    /// label can be a free-text concatenation path.
+    #[test]
+    fn published_device_labels_are_derived_from_cause_codes_only() {
+        let free_text = "transport prose 0xDEADBEEF";
+        let mut link_labels = std::collections::HashSet::new();
+        for cause in LossCause::all() {
+            let status = published_device_status(
+                &BackendState::Disconnected {
+                    cause,
+                    reason: free_text.into(),
+                },
+                &DeviceStatus::Healthy,
+            );
+            let expected = format!("{}{}", DeviceStatus::PREFIX_LINK, cause.short());
+            assert_eq!(status.label(), expected, "label is not code-derived");
+            assert!(!status.label().contains("0xDEADBEEF"));
+            link_labels.insert(status.label());
+
+            let failed = published_device_status(
+                &BackendState::Connected {
+                    kind: BackendKind::Sdk,
+                },
+                &DeviceStatus::RecoveryFailed {
+                    code: cause.short(),
+                },
+            );
+            assert_eq!(
+                failed.label(),
+                format!("{}{}", DeviceStatus::PREFIX_RECOVERY, cause.short())
+            );
+        }
+        assert_eq!(
+            link_labels.len(),
+            LossCause::all().len(),
+            "each cause must name its own published label"
+        );
+        // The two non-cause states are fixed arm templates, never derived text.
+        assert_eq!(
+            published_device_status(
+                &BackendState::Absent {
+                    reason: free_text.into()
+                },
+                &DeviceStatus::Healthy,
+            )
+            .label(),
+            DeviceStatus::LABEL_ABSENT
+        );
+        assert_eq!(
+            published_device_status(&BackendState::Discovering, &DeviceStatus::AllowanceConsumed)
+                .label(),
+            DeviceStatus::LABEL_ALLOWANCE
+        );
+        assert_eq!(
+            published_device_status(&BackendState::Discovering, &DeviceStatus::Healthy).label(),
+            DeviceStatus::LABEL_HEALTHY
+        );
+    }
+
+    /// RC-5: terminal recovery labels (c)/(d) outrank the transient loss labels
+    /// and (b) is published while the allowance is still unspent.
+    #[test]
+    fn recovery_labels_outrank_the_transient_loss_labels() {
+        let loss = BackendState::Disconnected {
+            cause: LossCause::ProbeFail,
+            reason: "probe failed".into(),
+        };
+        assert_eq!(
+            published_device_status(&loss, &DeviceStatus::Healthy),
+            DeviceStatus::LinkFailed {
+                code: "probe-fail".to_string()
+            },
+            "the loss is named before any automatic action ends"
+        );
+        assert_eq!(
+            published_device_status(&loss, &DeviceStatus::AllowanceConsumed),
+            DeviceStatus::AllowanceConsumed
+        );
+        assert_eq!(
+            published_device_status(
+                &BackendState::Absent {
+                    reason: "no candidates".into()
+                },
+                &DeviceStatus::RecoveryFailed {
+                    code: "call-timeout".to_string()
+                },
+            ),
+            DeviceStatus::RecoveryFailed {
+                code: "call-timeout".to_string()
+            }
+        );
     }
 
     #[test]

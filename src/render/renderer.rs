@@ -10,8 +10,9 @@ use super::font::{fit_text, text_width};
 use super::Frame;
 use crate::history::Series;
 use crate::model::{
-    session_duration, AcState, Availability, Freshness, HardwareKind, HardwareRole, HeadsetBattery,
-    HungTarget, Metric, MetricKey, ReadingsSnapshot, Snapshot, Speaker, ValueKind, WIDTH,
+    session_duration, AcState, Availability, DeviceStatus, Freshness, HardwareKind, HardwareRole,
+    HeadsetBattery, HungTarget, Metric, MetricKey, ReadingsSnapshot, Snapshot, Speaker, ValueKind,
+    WIDTH,
 };
 
 /// Overlay knobs the renderer reads from configuration.
@@ -613,7 +614,7 @@ impl Renderer {
                 &first_non_empty(&[&s.game.game_name, &s.game.process_name], "N/A"),
             ),
             "ALERTS" => alert_slot(f, left, width, &s.alerts),
-            "PROVIDER_STATUS" => provider_slot(f, left, width, &s.providers),
+            "PROVIDER_STATUS" => provider_slot(f, left, width, &s.providers, &s.device_status),
             "CPU_LOAD_GRAPH" => self.fixed_graph_slot(
                 f,
                 left,
@@ -1917,8 +1918,22 @@ fn format_alert_summary(count: i32, severity: i32, max_width: i32) -> String {
     }
 }
 
-fn provider_slot(f: &mut Frame, x: i32, w: i32, providers: &HashMap<String, bool>) {
+fn provider_slot(
+    f: &mut Frame,
+    x: i32,
+    w: i32,
+    providers: &HashMap<String, bool>,
+    status: &DeviceStatus,
+) {
     f.text_centered(x, w, 27, "STATUS", 1, true);
+    // RC-5: the device/recovery label replaces the provider summary only while
+    // the device is not healthy, so the four loss/recovery states are distinct
+    // on the panel. Row and font are the existing ones: no new geometry, and
+    // text always lands, so the preview-retained fallback never blanks.
+    if status != &DeviceStatus::Healthy {
+        f.text_centered(x, w, 35, &fit_text(&status.label(), w, 1), 1, true);
+        return;
+    }
     let bad = providers.values().filter(|&&available| !available).count();
     if bad == 0 {
         f.text_centered(x, w, 35, "OK", 1, true);
@@ -2129,6 +2144,9 @@ mod tests {
         "c6bf7ef1e919ef47dfc7ed13ef9a9f937253e47a449fe8558f00adf98a881701";
     const GOLDEN_LAYOUT_3: &str =
         "ef1dbde8de40632b213b7c149789a716165719b0ab4f40ab80aa508930b6ff8b";
+    /// RC-5: healthy `PROVIDER_STATUS` four-slot view (pre-RC-5 summary path).
+    const GOLDEN_PROVIDER_STATUS_HEALTHY: &str =
+        "c1ed6b7a540cdf073dbd3de03c347a09baeda2e1045d968855e3ecb9bb2100cd";
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
@@ -2471,6 +2489,58 @@ mod tests {
         let zero_frame = render_dashboard(&zero);
         assert!(!zero_frame.equal(&render_dashboard(&unavailable)));
         assert!(!zero_frame.equal(&render_dashboard(&stale)));
+    }
+
+    /// RC-5: the provider-status module is the human-facing device surface. The
+    /// four states must each light the panel (preview-retained fallback), render
+    /// distinctly, and leave the healthy provider summary pixel-exact.
+    #[test]
+    fn device_status_states_render_distinctly_and_never_blank_the_panel() {
+        let view = View {
+            slot_modules: [
+                "PROVIDER_STATUS".to_string(),
+                "PROVIDER_STATUS".to_string(),
+                "PROVIDER_STATUS".to_string(),
+                "PROVIDER_STATUS".to_string(),
+            ],
+            ..Default::default()
+        };
+        let render = |snapshot: &Snapshot| {
+            Renderer::new().render(snapshot, OverlayOptions::default(), &view)
+        };
+        let statuses = [
+            DeviceStatus::Absent,
+            DeviceStatus::LinkFailed {
+                code: "call-timeout".to_string(),
+            },
+            DeviceStatus::AllowanceConsumed,
+            DeviceStatus::RecoveryFailed {
+                code: "worker-stalled".to_string(),
+            },
+        ];
+        let frames: Vec<Frame> = statuses
+            .iter()
+            .map(|status| {
+                let mut snapshot = sample_snapshot();
+                snapshot.device_status = status.clone();
+                let frame = render(&snapshot);
+                assert!(
+                    frame.pixels.iter().any(|&pixel| pixel != 0),
+                    "panel blanked for {status:?}"
+                );
+                frame
+            })
+            .collect();
+        for (index, left) in frames.iter().enumerate() {
+            for right in frames[index + 1..].iter() {
+                assert!(!left.equal(right), "the four states must render distinctly");
+            }
+        }
+        assert_eq!(
+            render(&sample_snapshot()).hash_hex(),
+            GOLDEN_PROVIDER_STATUS_HEALTHY,
+            "healthy provider summary changed"
+        );
     }
 
     #[test]

@@ -29,6 +29,7 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::backends::{BackendKind, BackendState, LossCause};
+use crate::model::DeviceStatus;
 
 const PARENT_ENV: &str = "LCDSIRPLUS_CONNECTION_RECOVERY_PARENT";
 const READY_TIMEOUT_MS: u32 = 10_000;
@@ -74,6 +75,13 @@ impl RestartPermit {
 
     fn committed(&self) -> bool {
         self.0.load(Ordering::Acquire) == 1
+    }
+
+    /// RC-5 read-only label exposure: is the single allowance spent (committed
+    /// or cancelled)? The CAS machine is untouched; only the display surface
+    /// reads this.
+    fn spent(&self) -> bool {
+        self.0.load(Ordering::Acquire) != 0
     }
 }
 
@@ -242,6 +250,10 @@ pub struct Recovery {
     /// (`reconnect_max`) by `GRACE`, so a worker in legitimate backoff,
     /// Disconnected, Absent, or mid-reconnect is never read as stalled.
     stall_deadline: Duration,
+    /// RC-5 label exposure: the named cause of a failed recovery action,
+    /// recorded at the sites that already log the failure. Reporting only —
+    /// it never drives a stage transition, a permit, or a journal write.
+    recovery_failure: Option<LossCause>,
 }
 
 impl Recovery {
@@ -314,6 +326,7 @@ impl Recovery {
             liveness_since: None,
             stall_actioned: false,
             stall_deadline: DEFAULT_RECONNECT_MAX + GRACE,
+            recovery_failure: None,
         }
     }
 
@@ -369,6 +382,34 @@ impl Recovery {
         // The wake owns the rebuild: no device is claimed yet, so the liveness
         // clock restarts at the worker's next `Connected`.
         self.liveness_since = None;
+    }
+
+    /// RC-5 label exposure for the human-facing surface: (d) a recovery action
+    /// failed (named cause), else (c) the one restart allowance is spent and the
+    /// journal is `Finished`, so there is no further automatic action. Reads
+    /// permit/stage/cause state only; it never mutates stage, permit, or journal.
+    pub fn display_status(&self) -> DeviceStatus {
+        if let Some(cause) = self.recovery_failure {
+            return DeviceStatus::RecoveryFailed {
+                code: cause.short(),
+            };
+        }
+        if self.permit.spent()
+            && self
+                .journal
+                .as_ref()
+                .is_some_and(|journal| journal.stage == Stage::Finished)
+        {
+            return DeviceStatus::AllowanceConsumed;
+        }
+        DeviceStatus::Healthy
+    }
+
+    /// RC-5: name a failed recovery action with the RC-1 cause that drove it,
+    /// falling back to `probe-fail` when the action itself is the first failure
+    /// (no loss cause recorded). Display recording only.
+    fn note_action_failure(&mut self) {
+        self.recovery_failure = Some(self.last_cause.unwrap_or(LossCause::ProbeFail));
     }
 
     pub fn suspend(&mut self) {
@@ -431,6 +472,7 @@ impl Recovery {
         match launch() {
             Ok(pid) => self.record("application-launched", &pid.to_string()),
             Err(error) => {
+                self.note_action_failure();
                 self.finish(&format!("LCDSirPlus restart failed: {error}; Logitech action skipped because no replacement is running"));
                 false
             }
@@ -485,6 +527,7 @@ impl Recovery {
                     let detail = match result {
                         Ok(()) => "Logitech Gaming Software restarted once".to_string(),
                         Err(error) => {
+                            self.note_action_failure();
                             format!("Logitech Gaming Software restart failed/skipped: {error}")
                         }
                     };
@@ -508,6 +551,7 @@ impl Recovery {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.logitech_result = None;
+                    self.note_action_failure();
                     self.finish("Logitech Gaming Software restart worker failed; no retry");
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -580,7 +624,10 @@ impl Recovery {
                     let _ = sender.send(result);
                 }) {
                     Ok(_) => self.logitech_result = Some(receiver),
-                    Err(error) => self.finish(&format!("Logitech Gaming Software restart worker could not start: {error}; no retry")),
+                    Err(error) => {
+                        self.note_action_failure();
+                        self.finish(&format!("Logitech Gaming Software restart worker could not start: {error}; no retry"))
+                    }
                 }
             }
             Some(Stage::LogitechResult) => self.finish("physical LCD still disconnected after one LCDSirPlus restart and one Logitech attempt; automatic recovery exhausted; preview retained"),
@@ -940,6 +987,118 @@ mod tests {
             Journal::load(root.journal()).unwrap().stage,
             Stage::Finished
         );
+    }
+
+    /// RC-5 acceptance (3): the allowance-consumed label (c) is published only
+    /// on the exhaustion path, after the permit is spent and the journal has
+    /// reached `Finished`.
+    #[test]
+    fn allowance_consumed_label_appears_only_after_the_permit_is_spent() {
+        let root = TestDir::new();
+        let now = Instant::now();
+        // A journal finished without the permit ever taken must not claim (c):
+        // the allowance was never consumed, so the label stays unpublished.
+        std::fs::write(root.journal(), "application-attempt\t42\tonce\n").unwrap();
+        let mismatched = Recovery::load(root.journal(), true, 99, now);
+        assert_eq!(mismatched.journal.as_ref().unwrap().stage, Stage::Finished);
+        assert!(!mismatched.permit.spent());
+        assert_eq!(mismatched.display_status(), DeviceStatus::Healthy);
+        drop(mismatched);
+        std::fs::remove_file(root.journal()).unwrap();
+
+        let mut first = Recovery::load(root.journal(), false, 1, now);
+        first.disconnected(now, LossCause::CallTimeout);
+        assert!(first.restart_application(|| Ok(42)));
+        assert_eq!(first.display_status(), DeviceStatus::Healthy);
+        drop(first);
+
+        let mut replacement = Recovery::load(root.journal(), true, 42, now);
+        assert_eq!(replacement.display_status(), DeviceStatus::Healthy);
+        assert!(!replacement.permit.spent());
+        assert!(replacement.record("logitech-attempt", "restart Logitech Gaming Software once"));
+        replacement.permit.commit(now + GRACE).unwrap();
+        assert!(replacement.permit.spent());
+        // Permit spent, stage `LogitechAttempt`: (c) stays unpublished.
+        assert_eq!(replacement.display_status(), DeviceStatus::Healthy);
+
+        // Inject a successful worker result; never touch a real Logitech process.
+        // The result tick runs inside the grace window, so the exhaustion step
+        // stays a separate, later tick.
+        let (sender, receiver) = mpsc::sync_channel(1);
+        replacement.logitech_result = Some(receiver);
+        sender.send(Ok(())).unwrap();
+        assert!(!replacement.tick(now + GRACE / 2, true, || {}));
+        assert_eq!(
+            replacement.journal.as_ref().unwrap().stage,
+            Stage::LogitechResult
+        );
+        // Permit spent, stage not `Finished`: (c) stays unpublished.
+        assert_eq!(replacement.display_status(), DeviceStatus::Healthy);
+
+        // Exhaustion tick: the journal finishes and (c) is published at last.
+        assert!(!replacement.tick(now + GRACE * 4, true, || {
+            panic!("no action after exhaustion")
+        }));
+        assert_eq!(replacement.journal.as_ref().unwrap().stage, Stage::Finished);
+        assert_eq!(
+            replacement.display_status(),
+            DeviceStatus::AllowanceConsumed
+        );
+        drop(replacement);
+    }
+
+    /// RC-5 state (d): a failed recovery action is named with the RC-1 cause
+    /// code, and is distinct from the allowance-consumed label (c).
+    #[test]
+    fn failed_recovery_action_publishes_the_named_cause() {
+        let root = TestDir::new();
+        let now = Instant::now();
+        let mut recovery = Recovery::load(root.journal(), false, 1, now);
+        recovery.disconnected(now, LossCause::ProbeFail);
+        assert!(!recovery.restart_application(|| Err("injected launch failure".into())));
+        assert_eq!(
+            recovery.display_status(),
+            DeviceStatus::RecoveryFailed {
+                code: "probe-fail".to_string()
+            }
+        );
+        assert_ne!(
+            recovery.display_status().label(),
+            DeviceStatus::AllowanceConsumed.label()
+        );
+        drop(recovery);
+    }
+
+    /// RC-5 state (d) on the Logitech step: the worker's own failure names its
+    /// cause; a failure is never published as a generic loss.
+    #[test]
+    fn failed_logitech_restart_publishes_the_named_cause() {
+        let root = TestDir::new();
+        let now = Instant::now();
+        let mut first = Recovery::load(root.journal(), false, 1, now);
+        assert!(first.restart_application(|| Ok(42)));
+        drop(first);
+
+        let mut replacement = Recovery::load(root.journal(), true, 42, now);
+        replacement.disconnected(now, LossCause::CallTimeout);
+        assert!(replacement.record("logitech-attempt", "restart Logitech Gaming Software once"));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        replacement.logitech_result = Some(receiver);
+        sender.send(Err("injected access denied".into())).unwrap();
+        assert!(!replacement.tick(now + GRACE / 2, true, || {
+            panic!("failed restart must not request reconnect")
+        }));
+        assert_eq!(
+            replacement.display_status(),
+            DeviceStatus::RecoveryFailed {
+                code: "call-timeout".to_string()
+            }
+        );
+        assert!(!replacement
+            .display_status()
+            .label()
+            .contains("injected access denied"));
+        drop(replacement);
     }
 
     #[test]

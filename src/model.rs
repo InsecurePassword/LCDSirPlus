@@ -234,6 +234,47 @@ impl Metric {
     }
 }
 
+/// RC-5 published device/recovery state for the human-facing surface (the
+/// `PROVIDER_STATUS`-family panel module and the log). Each arm has exactly
+/// one fixed label; the cause-coded arms carry an RC-1 cause code
+/// (`LossCause::short()`, code included where the cause has one) and never
+/// the transport `reason` free text, so a failure is named by code rather
+/// than by concatenated prose. All four non-healthy arms keep the existing
+/// preview-retained fallback: the panel is never blanked.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum DeviceStatus {
+    /// Connected: the module keeps the existing provider summary.
+    #[default]
+    Healthy,
+    /// (a) Device absent (RC-6 ladder terminal: no candidates).
+    Absent,
+    /// (b) Device present, connection failed: named RC-1 cause code.
+    LinkFailed { code: String },
+    /// (c) Recovery allowance consumed: no further automatic action.
+    AllowanceConsumed,
+    /// (d) Recovery action failed: named RC-1 cause code.
+    RecoveryFailed { code: String },
+}
+
+impl DeviceStatus {
+    pub const LABEL_HEALTHY: &'static str = "OK";
+    pub const LABEL_ABSENT: &'static str = "ABSENT";
+    pub const LABEL_ALLOWANCE: &'static str = "NO RETRY";
+    pub const PREFIX_LINK: &'static str = "LINK ";
+    pub const PREFIX_RECOVERY: &'static str = "RECOVER ";
+
+    /// Panel/log label: enum arm template plus the cause code, nothing else.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Healthy => Self::LABEL_HEALTHY.to_string(),
+            Self::Absent => Self::LABEL_ABSENT.to_string(),
+            Self::AllowanceConsumed => Self::LABEL_ALLOWANCE.to_string(),
+            Self::LinkFailed { code } => format!("{}{code}", Self::PREFIX_LINK),
+            Self::RecoveryFailed { code } => format!("{}{code}", Self::PREFIX_RECOVERY),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HeadsetBattery {
     pub present: bool,
@@ -475,6 +516,9 @@ pub struct Snapshot {
     pub controller: ControllerBattery,
     pub readings: ReadingsSnapshot,
     pub providers: HashMap<String, bool>,
+    /// RC-5: the device/recovery state published on the human-facing surface.
+    /// `Healthy` reproduces the pre-RC-5 provider summary exactly.
+    pub device_status: DeviceStatus,
     pub alerts: Vec<Alert>,
     pub discord: DiscordState,
     pub hung: Vec<HungTarget>,
@@ -774,5 +818,36 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(59)), "00:59");
         assert_eq!(format_duration(Duration::from_secs(60)), "01:00");
         assert_eq!(format_duration(Duration::from_secs(3661)), "1:01");
+    }
+
+    #[test]
+    fn device_status_labels_are_four_distinct_arm_templates() {
+        let four = [
+            DeviceStatus::Absent,
+            DeviceStatus::LinkFailed {
+                code: "open-failed(0x80070002)".to_string(),
+            },
+            DeviceStatus::AllowanceConsumed,
+            DeviceStatus::RecoveryFailed {
+                code: "worker-stalled".to_string(),
+            },
+        ];
+        assert_eq!(four[0].label(), DeviceStatus::LABEL_ABSENT);
+        assert_eq!(
+            four[1].label(),
+            format!("{}open-failed(0x80070002)", DeviceStatus::PREFIX_LINK)
+        );
+        assert_eq!(four[2].label(), DeviceStatus::LABEL_ALLOWANCE);
+        assert_eq!(
+            four[3].label(),
+            format!("{}worker-stalled", DeviceStatus::PREFIX_RECOVERY)
+        );
+        for (index, left) in four.iter().enumerate() {
+            for right in four[index + 1..].iter() {
+                assert_ne!(left.label(), right.label(), "published labels must differ");
+            }
+        }
+        assert_eq!(DeviceStatus::default(), DeviceStatus::Healthy);
+        assert_eq!(DeviceStatus::Healthy.label(), DeviceStatus::LABEL_HEALTHY);
     }
 }
