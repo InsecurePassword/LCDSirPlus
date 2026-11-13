@@ -12,7 +12,7 @@ use std::os::windows::fs::FileExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf, Prefix};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -1281,42 +1281,103 @@ fn confirm_start_request(
     Ok(())
 }
 
+/// EC-6: named child-exit causes observed at the presentmon child boundary.
+/// Stable short tokens (RC-1 vocabulary discipline, `CatalogUnavailableReason::code` style);
+/// the reason text carries class + numeric exit code only, never child argv or paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildExit {
+    Normal,
+    Failed(u32),
+    DidNotExitInTime,
+}
+
+/// `ExitStatus::code()` is always `Some` on Windows; the sentinel keeps a code-less (signal) death
+/// named as a failure instead of masking it as a normal exit. Not reachable on the pinned target.
+const NO_EXIT_CODE: u32 = u32::MAX;
+
+impl ChildExit {
+    fn classify(status: &ExitStatus) -> Self {
+        match status.code() {
+            Some(0) => Self::Normal,
+            Some(code) => Self::Failed(code as u32),
+            None => Self::Failed(NO_EXIT_CODE),
+        }
+    }
+
+    fn token(self) -> String {
+        match self {
+            Self::Normal => "exited_normal".into(),
+            Self::Failed(code) => format!("exited_failed_{code}"),
+            Self::DidNotExitInTime => "did_not_exit_in_time".into(),
+        }
+    }
+
+    fn reason(self) -> String {
+        format!("presentmon child {}", self.token())
+    }
+
+    /// Full provider-unavailable reason for a child that stopped while capturing (site 1).
+    fn capture_end_reason(self, target: &str) -> String {
+        format!(
+            "{} while capturing {target}; the target may have exited",
+            self.reason()
+        )
+    }
+}
+
 fn wait_bounded(
     timeout: Duration,
     mut exited: impl FnMut() -> Result<bool, String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let deadline = Instant::now() + timeout;
     loop {
         if exited()? {
-            return Ok(());
+            return Ok(true);
         }
         if Instant::now() >= deadline {
-            return Err(format!(
-                "exit was not confirmed within {} ms",
-                timeout.as_millis()
-            ));
+            return Ok(false);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn wait_child_bounded(child: &mut Child, timeout: Duration) -> Result<(), String> {
-    wait_bounded(timeout, || {
+fn wait_child_bounded(child: &mut Child, timeout: Duration) -> Result<ChildExit, String> {
+    let mut observed: Option<ExitStatus> = None;
+    let confirmed = wait_bounded(timeout, || {
         child
             .try_wait()
-            .map(|status| status.is_some())
+            .map(|status| {
+                let done = status.is_some();
+                if done {
+                    observed = status;
+                }
+                done
+            })
             .map_err(|error| format!("query child status: {error}"))
-    })
+    })?;
+    match (confirmed, observed) {
+        (true, Some(status)) => Ok(ChildExit::classify(&status)),
+        // confirmed only happens once a status was observed, so this arm is unreachable.
+        (true, None) => Ok(ChildExit::DidNotExitInTime),
+        (false, _) => Err(format!(
+            "exit was not confirmed within {} ms: {}",
+            timeout.as_millis(),
+            ChildExit::DidNotExitInTime.token()
+        )),
+    }
 }
 
-fn stop_child_bounded(child: &mut Child, timeout: Duration) -> Result<(), String> {
-    if child.try_wait().is_ok_and(|status| status.is_some()) {
-        return Ok(());
+fn stop_child_bounded(child: &mut Child, timeout: Duration) -> Result<ChildExit, String> {
+    if let Ok(Some(status)) = child.try_wait() {
+        return Ok(ChildExit::classify(&status));
     }
     if let Err(kill) = child.kill() {
         return match child.try_wait() {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => Err(format!("kill child: {kill}; child is still running")),
+            Ok(Some(status)) => Ok(ChildExit::classify(&status)),
+            Ok(None) => Err(format!(
+                "kill child: {kill}; child is still running: {}",
+                ChildExit::DidNotExitInTime.token()
+            )),
             Err(wait) => Err(format!("kill child: {kill}; confirm exit: {wait}")),
         };
     }
@@ -1504,6 +1565,7 @@ impl Capture {
         if let Some(child) = &mut self.child {
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    let exit = ChildExit::classify(&status);
                     let target = if presenting {
                         "local frame presenters".into()
                     } else {
@@ -1514,13 +1576,7 @@ impl Capture {
                     self.failure(
                         tx,
                         generation,
-                        with_diagnostic(
-                            format!(
-                                "PresentMon exited ({status}) while capturing {}; the target may have exited",
-                                target
-                            ),
-                            stderr,
-                        ),
+                        with_diagnostic(exit.capture_end_reason(&target), stderr),
                     );
                     return;
                 }
@@ -1987,7 +2043,7 @@ impl Capture {
 
     fn stop_with(
         &mut self,
-        stop_child: impl FnOnce(&mut Child) -> Result<(), String>,
+        stop_child: impl FnOnce(&mut Child) -> Result<ChildExit, String>,
         cleanup: impl FnOnce(&str) -> Result<(), String>,
     ) -> String {
         let mut shutdown = Vec::new();
@@ -3128,12 +3184,23 @@ mod tests {
         let reader = std::thread::spawn(move || read_diagnostic(stderr, reader_output));
         let status = child.wait().unwrap();
         reader.join().unwrap();
-        let detail = with_diagnostic(
-            format!("PresentMon exited ({status})"),
-            diagnostic_text(&output.lock().unwrap()),
-        );
         assert_eq!(status.code(), Some(5));
+        // EC-6: the bounded observation site classifies the real exit and names the code.
+        assert_eq!(
+            wait_child_bounded(&mut child, Duration::ZERO),
+            Ok(ChildExit::Failed(5))
+        );
+        let reason = ChildExit::Failed(5).capture_end_reason("game.exe");
+        assert!(reason.contains("exited_failed_5"), "{reason}");
+        let detail = with_diagnostic(reason, diagnostic_text(&output.lock().unwrap()));
         assert!(detail.contains("access denied"));
+        // privacy: the classification adds class + code only, never the child's argv or path.
+        for leak in ["cmd.exe", "exit /B", "echo", "\\", "/C"] {
+            assert!(
+                !detail.contains(leak),
+                "child detail leaked {leak:?}: {detail}"
+            );
+        }
 
         let output = Arc::new(std::sync::Mutex::new(BoundedDiagnostic::default()));
         read_diagnostic(
@@ -3972,7 +4039,7 @@ mod tests {
             modified: 4,
         });
         capture.catalog.checked_at = Some(Instant::now());
-        capture.stop_with(|_| Ok(()), |_| Ok(()));
+        capture.stop_with(|_| Ok(ChildExit::Normal), |_| Ok(()));
         assert!(matches!(capture.catalog.state, CatalogState::Unavailable));
         assert!(capture.catalog.metadata.is_none() && capture.catalog.checked_at.is_none());
     }
@@ -4620,7 +4687,7 @@ mod tests {
             window: 2,
             wins: 1,
         });
-        capture.stop_with(|_| Ok(()), |_| Ok(()));
+        capture.stop_with(|_| Ok(ChildExit::Normal), |_| Ok(()));
         assert!(
             capture.target.pid == 0
                 && capture.stats.is_none()
@@ -5002,13 +5069,16 @@ mod tests {
     fn failed_cleanup_is_retained_and_gates_retry() {
         let mut capture = Capture::default();
         capture.owned_session = Some("LCDSirPlus-42-owned".into());
-        capture.stop_with(|_| Ok(()), |_| Err("injected failure".into()));
+        capture.stop_with(
+            |_| Ok(ChildExit::Normal),
+            |_| Err("injected failure".into()),
+        );
         #[rustfmt::skip]
         assert_eq!(capture.owned_session.as_deref(), Some("LCDSirPlus-42-owned"));
         capture.schedule_retry(Instant::now());
         assert!(retry_pending(capture.retry_after, Instant::now()));
         #[rustfmt::skip]
-        capture.stop_with(|_| Ok(()), |name| { assert_eq!(name, "LCDSirPlus-42-owned"); Ok(()) });
+        capture.stop_with(|_| Ok(ChildExit::Normal), |name| { assert_eq!(name, "LCDSirPlus-42-owned"); Ok(()) });
     }
 
     #[test]
@@ -5027,7 +5097,12 @@ mod tests {
             image_path: String::new(),
         };
         capture.stop_with(
-            |_| Err("forced kill/wait timeout".into()),
+            |_| {
+                Err(format!(
+                    "kill child: forced kill; child is still running: {}",
+                    ChildExit::DidNotExitInTime.token()
+                ))
+            },
             |_| panic!("ETW cleanup must wait for confirmed child exit"),
         );
         assert!(capture.child.is_some() && capture.reader.is_some());
@@ -5036,7 +5111,13 @@ mod tests {
             Some("LCDSirPlus-42-owned")
         );
         assert_eq!(capture.target.pid, 42);
-        assert!(capture.stop_diagnostic.contains("forced kill/wait timeout"));
+        // EC-6 acceptance (2): a child that survives the bounded confirm keeps its existing class,
+        // and that class is the stable did_not_exit_in_time token.
+        assert!(capture.stop_diagnostic.contains("forced kill"));
+        assert!(capture.stop_diagnostic.contains("child is still running"));
+        assert!(capture
+            .stop_diagnostic
+            .contains(&ChildExit::DidNotExitInTime.token()));
         let error = capture
             .start(
                 &executable,
@@ -5092,10 +5173,119 @@ mod tests {
         let started = Instant::now();
         assert!(take_diagnostic(Some(Arc::clone(&diagnostic)), false).is_empty());
         assert!(started.elapsed() < Duration::from_millis(20));
-        assert!(wait_bounded(Duration::ZERO, || Ok(false))
-            .unwrap_err()
-            .contains("exit was not confirmed"));
+        assert_eq!(
+            wait_bounded(Duration::ZERO, || Ok(false)),
+            Ok(false),
+            "a bounded confirm that never observes an exit reports an unconfirmed loop"
+        );
+        assert_eq!(wait_bounded(Duration::ZERO, || Ok(true)), Ok(true));
         drop(guard);
+    }
+
+    fn synthetic_cmd_child(command: &str) -> Child {
+        Command::new("cmd.exe")
+            .args(["/D", "/C", command])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap()
+    }
+
+    fn synthetic_exit_status(code: u8) -> ExitStatus {
+        let mut child = synthetic_cmd_child(&format!("exit /B {code}"));
+        child.wait().unwrap()
+    }
+
+    fn synthetic_long_running_child() -> Child {
+        synthetic_cmd_child("ping -n 20 127.0.0.1 >nul")
+    }
+
+    #[test]
+    fn child_exit_classification_names_the_synthetic_exit_code() {
+        // EC-6 acceptance (1): a child that exits with code X yields a reason that names X.
+        let failing = synthetic_exit_status(101);
+        assert_eq!(failing.code(), Some(101));
+        let exit = ChildExit::classify(&failing);
+        assert_eq!(exit, ChildExit::Failed(101));
+        assert_eq!(exit.token(), "exited_failed_101");
+        assert_eq!(exit.reason(), "presentmon child exited_failed_101");
+        assert!(exit.capture_end_reason("game.exe").contains("101"));
+
+        // EC-6 acceptance (4): the exit-code-0 path keeps its semantics, named as a normal exit.
+        let clean = synthetic_exit_status(0);
+        assert_eq!(clean.code(), Some(0));
+        assert_eq!(ChildExit::classify(&clean), ChildExit::Normal);
+        assert_eq!(ChildExit::Normal.token(), "exited_normal");
+    }
+
+    #[test]
+    fn child_exit_tokens_are_stable_and_privacy_bounded() {
+        let cases = [
+            (ChildExit::Normal, "exited_normal"),
+            (ChildExit::Failed(5), "exited_failed_5"),
+            (ChildExit::Failed(NO_EXIT_CODE), "exited_failed_4294967295"),
+            (ChildExit::DidNotExitInTime, "did_not_exit_in_time"),
+        ];
+        for (exit, token) in cases {
+            assert_eq!(exit.token(), token);
+            assert_eq!(exit.reason(), format!("presentmon child {token}"));
+            // The classification text carries class + numeric code only: no child argv, path,
+            // session name or target identity.
+            for leak in [
+                "\\",
+                "/",
+                ":",
+                "cmd",
+                "exe",
+                "LCDSirPlus-",
+                "--process_id",
+                "game",
+            ] {
+                assert!(
+                    !exit.reason().contains(leak),
+                    "{} leaks {leak:?}",
+                    exit.reason()
+                );
+            }
+        }
+        // A code-less death is named as a failure, never masked as a normal exit.
+        assert_eq!(ChildExit::Failed(NO_EXIT_CODE), ChildExit::Failed(u32::MAX));
+    }
+
+    #[test]
+    fn wait_child_bounded_names_did_not_exit_in_time_when_the_confirm_expires() {
+        let mut child = synthetic_long_running_child();
+        let error = wait_child_bounded(&mut child, Duration::from_millis(1))
+            .expect_err("a running child cannot confirm its exit within 1 ms");
+        assert!(
+            error.contains("exit was not confirmed within 1 ms"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&ChildExit::DidNotExitInTime.token()),
+            "{error}"
+        );
+        for leak in ["cmd.exe", "ping", "\\", "/C"] {
+            assert!(
+                !error.contains(leak),
+                "timeout reason leaked {leak:?}: {error}"
+            );
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn stop_child_bounded_classifies_the_confirmed_exit_after_kill() {
+        let mut child = synthetic_long_running_child();
+        let exit = stop_child_bounded(&mut child, Duration::from_millis(STOP_TIMEOUT_MS.into()))
+            .expect("the bounded confirm must confirm the kill");
+        let status = child.wait().unwrap();
+        assert_eq!(exit, ChildExit::classify(&status));
+        assert!(!matches!(exit, ChildExit::DidNotExitInTime));
+        assert!(!exit.token().contains('\\') && !exit.token().contains('/'));
     }
 
     #[test]
