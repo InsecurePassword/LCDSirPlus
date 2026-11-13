@@ -3029,6 +3029,94 @@ fn find_named_process(name: &str) -> Result<ProcessInfo, String> {
 mod tests {
     use super::*;
 
+    /// EC-8 (P1 §2 EC-8, acceptance 2): a generation bump while the worker is idle clears the
+    /// capture, and with it the publication-dedupe state, so the new generation republishes its
+    /// own provider state instead of staying suppressed behind the previous generation's detail.
+    /// PresentMon stays disabled: no child process is started and no ETW session is touched.
+    #[test]
+    fn presentmon_config_change_midflight_clears_capture_and_republishes_the_disabled_reason() {
+        let config = Arc::new(RwLock::new(Config {
+            presentmon_enabled: false,
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let thread = {
+            let config = Arc::clone(&config);
+            let generation = Arc::clone(&generation);
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || run(config, generation, shutdown, tx))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut published = None;
+        while published.is_none() && Instant::now() < deadline {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(100)) {
+                if update.generation == 1 {
+                    published = Some(update);
+                }
+            }
+        }
+        let published = published.expect("the worker publishes generation-1 provider state");
+        assert_eq!(published.detail, "disabled");
+        generation.fetch_add(1, Ordering::SeqCst);
+        let mut republished = None;
+        while republished.is_none() && Instant::now() < deadline {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(100)) {
+                if update.generation == 2 {
+                    republished = Some(update);
+                }
+            }
+        }
+        let update = republished.expect(
+            "a mid-flight generation bump clears the capture so the new generation republishes state",
+        );
+        assert_eq!(update.detail, "disabled");
+        assert!(!update.available && !update.error);
+        shutdown.store(true, Ordering::Relaxed);
+        thread.join().unwrap();
+    }
+
+    /// EC-8 (P1 §2 EC-8, acceptance 2): the generation gate that runs immediately before a
+    /// capture start refuses a request whose generation moved mid-flight, and a request whose
+    /// config content moved while the generation counter did not. Presenting mode only, so no
+    /// target enumeration, child process, or ETW session is involved.
+    #[test]
+    fn presentmon_config_change_midflight_refuses_the_capture_start_gate() {
+        let config = Config {
+            presentmon_enabled: true,
+            presentmon_target_mode: "presenting".into(),
+            ..Config::default()
+        };
+        let shared = RwLock::new(config.clone());
+        let generation = AtomicU64::new(2);
+        let shutdown = AtomicBool::new(false);
+        let target = ProcessInfo::default();
+        let key = capture_key(&config, &target);
+        assert!(
+            confirm_start_request(&shared, &generation, &shutdown, &config, 2, &target, &key)
+                .is_ok(),
+            "an unchanged generation and config must be accepted"
+        );
+        let error =
+            confirm_start_request(&shared, &generation, &shutdown, &config, 1, &target, &key)
+                .unwrap_err();
+        assert!(
+            error.contains("changed"),
+            "a generation that moved mid-flight must refuse the start: {error}"
+        );
+        let mut moved = config.clone();
+        moved.presentmon_interval += Duration::from_millis(1);
+        *shared.write().unwrap() = moved.clone();
+        let error =
+            confirm_start_request(&shared, &generation, &shutdown, &moved, 2, &target, &key)
+                .unwrap_err();
+        assert!(
+            error.contains("changed"),
+            "a config change with a stable generation counter must refuse the start: {error}"
+        );
+    }
+
     #[test]
     #[ignore = "reads the optional current-user NVIDIA App catalog"]
     fn r6_real_catalog_probe() {

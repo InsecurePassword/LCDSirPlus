@@ -548,4 +548,65 @@ mod tests {
             std::io::ErrorKind::WouldBlock
         );
     }
+
+    /// EC-8 (P1 §2 EC-8, acceptance 2): a config generation bump that lands while the worker
+    /// is mid-cadence must clear the probe baseline and republish for the new generation —
+    /// the same rule as the template `netif::failure_clears_baseline_and_recovery_requires_a_new_interval`.
+    /// Loopback only: the target is a socket this test binds and never accepts on, so the probe
+    /// is a local `connect` with no external traffic and no privileged path.
+    #[test]
+    fn network_config_change_midflight_clears_baseline_and_republishes_the_new_generation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = Arc::new(RwLock::new(Config {
+            network_probe_enabled: true,
+            network_probe_method: "tcp".into(),
+            network_probe_target: format!("127.0.0.1:{port}"),
+            network_probe_interval: Duration::from_secs(600),
+            network_probe_timeout: Duration::from_millis(500),
+            network_probe_window: 5,
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let thread = {
+            let config = Arc::clone(&config);
+            let generation = Arc::clone(&generation);
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || worker(config, generation, shutdown, tx))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut baseline = None;
+        while baseline.is_none() && Instant::now() < deadline {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(100)) {
+                if update.generation == 1 && update.ping.valid {
+                    baseline = Some(update);
+                }
+            }
+        }
+        assert!(
+            baseline.is_some(),
+            "the loopback probe must publish a generation-1 baseline first"
+        );
+        generation.fetch_add(1, Ordering::SeqCst);
+        let mut cleared = None;
+        while cleared.is_none() && Instant::now() < deadline {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(100)) {
+                if update.generation == 2 {
+                    cleared = Some(update);
+                }
+            }
+        }
+        let cleared = cleared.expect(
+            "a mid-flight generation bump republishes a cleared update for the new generation",
+        );
+        assert!(
+            !cleared.ping.valid && !cleared.jitter.valid && !cleared.loss.valid,
+            "the prior baseline must be cleared, never carried onto the new generation"
+        );
+        assert!(!cleared.available && cleared.error.is_none());
+        shutdown.store(true, Ordering::Relaxed);
+        thread.join().unwrap();
+    }
 }

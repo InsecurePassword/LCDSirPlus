@@ -2274,6 +2274,58 @@ fn is_cargo_test_binary(current: &Path) -> bool {
 mod tests {
     use super::*;
 
+    /// EC-8 (P1 §2 EC-8, acceptance 2): a generation bump that lands while the worker is
+    /// mid-cadence republishes a cleared state for the new generation and resets the
+    /// disabled-publish gate, so the worker cannot keep riding on the old generation.
+    /// The detector stays disabled: no window is enumerated and no target is probed.
+    #[test]
+    fn hang_config_change_midflight_clears_tracker_and_republishes_the_new_generation() {
+        let config = Arc::new(RwLock::new(Config {
+            hang_enabled: false,
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let thread = {
+            let config = Arc::clone(&config);
+            let generation = Arc::clone(&generation);
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || worker(config, generation, shutdown, tx))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut published = None;
+        while published.is_none() && Instant::now() < deadline {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(100)) {
+                if update.generation == 1 {
+                    published = Some(update);
+                }
+            }
+        }
+        assert!(
+            published.is_some(),
+            "the worker publishes generation-1 state before the bump"
+        );
+        generation.fetch_add(1, Ordering::SeqCst);
+        let mut republished = None;
+        while republished.is_none() && Instant::now() < deadline {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(100)) {
+                if update.generation == 2 {
+                    republished = Some(update);
+                }
+            }
+        }
+        let update = republished.expect(
+            "a mid-flight generation bump republishes cleared tracker state for the new generation",
+        );
+        assert!(
+            update.targets.is_empty() && !update.available && update.error.is_none(),
+            "generation 2 must start from an empty tracker, not the previous generation's state"
+        );
+        shutdown.store(true, Ordering::Relaxed);
+        thread.join().unwrap();
+    }
+
     fn target(hwnd: usize, pid: u32, creation: u64, path: &str) -> HungTarget {
         HungTarget {
             hwnd,
