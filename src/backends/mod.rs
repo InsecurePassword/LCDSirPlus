@@ -2530,7 +2530,13 @@ mod tests {
 
         for value in 1..=60u8 {
             commands.submit(&uniform(value));
-            std::thread::sleep(Duration::from_millis(3));
+            // WO-QA-02 driven cadence: the producer advances one scripted-device
+            // read per submit through the pre-existing progress seam
+            // (`wait_for_reads` + `EXCL_READS`), so the scenario carries no fixed
+            // 3 ms/15 ms producer-consumer ratio to lose under CPU
+            // oversubscription; the 60 driven reads make the read/recycle counts
+            // arithmetic, and the assertions below are untouched.
+            wait_for_reads(&EXCL_READS, value as usize);
         }
         commands.shutdown();
         thread.join().unwrap();

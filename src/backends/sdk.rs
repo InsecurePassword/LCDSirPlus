@@ -1968,19 +1968,39 @@ mod tests {
             claim_sdk_owner().err().unwrap().cause,
             LossCause::OwnerConflict
         );
+        // WO-QA-02 driven time: the owner task is stalled on a gate, not on a
+        // 20 ms wall-clock sleep. The recorded 32-way failure was the caller's
+        // 1 ms `recv_timeout` expiring LATE, after the worker's 20 ms send had
+        // already landed, so `wait_ready(..).err()` yielded `None`. Gated, the
+        // worker completes only when this test releases it, so nothing can be in
+        // the channel at the bound: the bound's expiry is no longer a race.
         let (ready, receiver) = mpsc::sync_channel(1);
+        let (running_tx, running_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
         let thread = std::thread::spawn(move || {
             let owned = String::from("owned validation data");
-            std::thread::sleep(Duration::from_millis(20));
+            running_tx
+                .try_send(())
+                .expect("the gated owner announced itself before stalling");
+            release_rx
+                .recv_timeout(DRIVEN_HANDSHAKE_BUDGET)
+                .expect("the gated owner was released by the test");
             assert_eq!(owned, "owned validation data");
             let _ = ready.send(Ok(()));
             SDK_OWNER_ACTIVE.store(false, Ordering::Release);
         });
+        running_rx
+            .recv_timeout(DRIVEN_HANDSHAKE_BUDGET)
+            .expect("the gated owner is running, so the caller's bound cannot be beaten");
         let error = wait_ready(&receiver, Duration::from_millis(1))
             .err()
             .unwrap();
         assert_eq!(error.cause, LossCause::CallTimeout);
         assert!(circuit_open() && claim_sdk_owner().is_err());
+        // The late completion lands after the circuit opened: the overlap is closed.
+        release_tx
+            .try_send(())
+            .expect("the gated owner accepted the release");
         thread.join().unwrap();
         CIRCUIT_OPEN.store(false, Ordering::Release);
     }
@@ -1990,6 +2010,11 @@ mod tests {
     // scripted owner records (payload pointer, lit pixel index, single-lit)
     // per execute, so buffer reuse and exclusivity are observed, not assumed.
     use std::sync::atomic::AtomicUsize;
+
+    /// WO-QA-02: a liveness budget on the driven handshakes only — it panics
+    /// loudly if a handshake never lands. No assertion and no scenario property
+    /// depends on it; the value mirrors the WO-QA-01 alloc-window 10 s budget.
+    const DRIVEN_HANDSHAKE_BUDGET: Duration = Duration::from_secs(10);
 
     type PayloadObservation = (usize, usize, bool);
 
@@ -2001,6 +2026,12 @@ mod tests {
         /// owner thread with the counting harness, so a parallel SDK test's owner
         /// thread can never join a foreign measurement window.
         measured: bool,
+        /// WO-QA-02 driven-time seam: when installed, the owner's first `Submit`
+        /// execute announces its read window on `start` and holds that window open
+        /// until the producer signals that the second send's fill has landed, so
+        /// the exclusivity scenario is an event chain with no wall-clock window to
+        /// lose. `None` keeps the shipped `first_read_ms` window untouched.
+        read_window: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     }
 
     impl Recording {
@@ -2010,6 +2041,7 @@ mod tests {
                 submits: Arc::new(AtomicUsize::new(0)),
                 first_read_ms,
                 measured: false,
+                read_window: None,
             }
         }
 
@@ -2018,6 +2050,15 @@ mod tests {
             Self {
                 measured: true,
                 ..Self::new(first_read_ms)
+            }
+        }
+
+        /// WO-QA-02: the driven read-window instance for the payload-exclusivity
+        /// scenario (the same scripted owner, driven instead of timed).
+        fn driven(start: mpsc::SyncSender<()>, landed: mpsc::Receiver<()>) -> Self {
+            Self {
+                read_window: Some((start, landed)),
+                ..Self::new(0)
             }
         }
     }
@@ -2032,7 +2073,21 @@ mod tests {
             }
             match request {
                 Request::Submit(frame) => {
-                    if self.submits.fetch_add(1, Ordering::SeqCst) == 0 && self.first_read_ms > 0 {
+                    let first_submit = self.submits.fetch_add(1, Ordering::SeqCst) == 0;
+                    if first_submit {
+                        if let Some((start, landed)) = &self.read_window {
+                            // WO-QA-02 driven read window: announce that the owner is
+                            // reading this payload, then hold the window open until the
+                            // producer's second fill has landed inside it.
+                            start
+                                .try_send(())
+                                .expect("the driven read window announced the owner's read");
+                            landed
+                                .recv_timeout(DRIVEN_HANDSHAKE_BUDGET)
+                                .expect("the driven read window was closed by the producer's fill");
+                        }
+                    }
+                    if first_submit && self.first_read_ms > 0 {
                         // The scripted "owner is reading this buffer" window.
                         std::thread::sleep(Duration::from_millis(self.first_read_ms));
                     }
@@ -2058,6 +2113,64 @@ mod tests {
         let mut frame = crate::render::Frame::new();
         frame.pixels[index] = 1;
         frame
+    }
+
+    /// WO-QA-02 driven-time scenario for the payload-exclusivity boundary. Same
+    /// scripted owner, same payload protocol, no wall-clock term: the owner's read
+    /// window opens on its first `Submit` execute (announce) and closes only once
+    /// the second send's fill has provably landed inside it. The proof of "landed"
+    /// is the relay thread's per-envelope signal, so the ordering is an event
+    /// chain: forward #1 (frame 0 enqueued) -> owner announces its read window ->
+    /// frame 1 filled + enqueued -> forward #2 -> window closed. Returns the
+    /// per-execute observations plus the submit counter, so the caller's
+    /// assertions read measured events, not a timer.
+    fn drive_payload_exclusivity() -> (Vec<PayloadObservation>, Arc<AtomicUsize>) {
+        let (start_tx, start_rx) = mpsc::sync_channel(1);
+        let (landed_tx, landed_rx) = mpsc::sync_channel(1);
+        let recorder = Recording::driven(start_tx, landed_rx);
+        let observed = Arc::clone(&recorder.observed);
+        let submits = Arc::clone(&recorder.submits);
+        let (dev_tx, relay_rx) = mpsc::sync_channel(1);
+        let (owner_tx, owner_rx) = mpsc::sync_channel(1);
+        let (forwarded_tx, forwarded_rx) = mpsc::sync_channel(2);
+        let relay = std::thread::spawn(move || {
+            while let Ok(envelope) = relay_rx.recv() {
+                let _ = forwarded_tx.try_send(());
+                if owner_tx.send(envelope).is_err() {
+                    break;
+                }
+            }
+        });
+        let owner = std::thread::spawn(move || owner_loop(Box::new(recorder), owner_rx));
+        let mut device = SdkDevice {
+            requests: Some(dev_tx),
+            payload: Mutex::new(None),
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = device.submit_frame(&lit_frame(0));
+            });
+            start_rx
+                .recv_timeout(DRIVEN_HANDSHAKE_BUDGET)
+                .expect("the driven read window opened on the owner's first read");
+            forwarded_rx
+                .recv_timeout(DRIVEN_HANDSHAKE_BUDGET)
+                .expect("the first send's envelope reached the owner");
+            scope.spawn(|| {
+                let _ = device.submit_frame(&lit_frame(1));
+            });
+            forwarded_rx
+                .recv_timeout(DRIVEN_HANDSHAKE_BUDGET)
+                .expect("the second send's fill landed inside the driven read window");
+            landed_tx
+                .try_send(())
+                .expect("the driven read window was closed by the producer");
+        });
+        drop(device.requests.take().unwrap());
+        relay.join().unwrap();
+        owner.join().unwrap();
+        let events = observed.lock().unwrap().clone();
+        (events, submits)
     }
 
     #[test]
@@ -2148,22 +2261,11 @@ mod tests {
         // observation stays 0 and the order is [0, 1]. Under a shared-buffer
         // protocol (the mutation probe) the second fill lands inside the
         // first read and the first observation flips to 1.
-        let recorder = Recording::new(20);
-        let observed = Arc::clone(&recorder.observed);
-        let submits = Arc::clone(&recorder.submits);
-        let (tx, rx) = mpsc::sync_channel(1);
-        let thread = std::thread::spawn(move || owner_loop(Box::new(recorder), rx));
-        let mut device = SdkDevice {
-            requests: Some(tx),
-            payload: Mutex::new(None),
-        };
-
-        std::thread::scope(|scope| {
-            scope.spawn(|| device.submit_frame(&lit_frame(0)));
-            std::thread::sleep(Duration::from_millis(5));
-            scope.spawn(|| device.submit_frame(&lit_frame(1)));
-        });
-        let observed = observed.lock().unwrap().clone();
+        // WO-QA-02: "for 20 ms" / "5 ms later" is driven, not timed — the window
+        // is opened by the owner's first execute and closed when the second fill
+        // provably lands inside it (see `drive_payload_exclusivity`), so the
+        // scenario keeps its meaning with no wall-clock term to lose.
+        let (observed, submits) = drive_payload_exclusivity();
         assert_eq!(observed.len(), 2);
         assert_eq!(
             submits.load(Ordering::SeqCst),
@@ -2183,7 +2285,34 @@ mod tests {
             "WO-A1-02 EC-2 sdk exclusivity measured: payload ptrs = [0x{:x}, 0x{:x}] (distinct => no buffer shared during the read window)",
             observed[0].0, observed[1].0
         );
-        drop(device.requests.take().unwrap());
-        thread.join().unwrap();
+    }
+
+    #[test]
+    fn the_driven_time_payload_exclusivity_needs_no_real_time_headroom() {
+        // WO-QA-02 proof test (the WO-QA-01 §(B) pattern): the driven SDK payload
+        // timeline is a pure event chain — zero sleeps — so it completes far inside
+        // 2 s of real time under any CPU oversubscription, and it measures the
+        // driven read order, so it cannot go green on an empty run.
+        let started = Instant::now();
+        let (observed, submits) = drive_payload_exclusivity();
+        let elapsed = started.elapsed();
+        assert_eq!(observed.len(), 2, "both scripted executes ran");
+        assert_eq!(
+            observed[0].1, 0,
+            "the owner's first read in driven time was frame 0's content"
+        );
+        assert_eq!(
+            observed[1].1, 1,
+            "the owner's second read in driven time was frame 1's content"
+        );
+        assert_eq!(
+            submits.load(Ordering::SeqCst),
+            2,
+            "counters: the owner ran both executes"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the driven SDK payload timeline needed {elapsed:?} of real time; it must need no real-time headroom"
+        );
     }
 }
