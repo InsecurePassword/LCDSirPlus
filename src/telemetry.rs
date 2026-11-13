@@ -24,6 +24,15 @@ const EXTENDED_STALE: Duration = Duration::from_secs(3);
 const BATTERY_POLL: Duration = Duration::from_secs(5);
 const BATTERY_STALE: Duration = Duration::from_secs(15);
 
+/// WO-QA-03 (TC-4 follow-up F-b, display-only): the provider-health label the hang
+/// detector publishes when a cycle lost probes it could not evaluate. The ONE site that
+/// renders the token `probe-indeterminate-<N>` stays in the provider
+/// (`providers/hang.rs` L110-112 `probe_indeterminate_reason`, read through the public
+/// `Update::availability_reason`); this const is only the matching key by which the
+/// panel (`render/renderer.rs` `provider_slot`) and the app's staleness path recognize
+/// that label, so the vocabulary has one rendering site and one matching site.
+pub const PROBE_INDETERMINATE: &str = "probe-indeterminate";
+
 #[derive(Clone, Debug, Default)]
 pub struct Update {
     pub generation: u64,
@@ -611,8 +620,20 @@ impl Worker {
         if update.generation != generation {
             return;
         }
+        // WO-QA-03 (TC-4 F-b, display-only): carry the named loss cause on the health
+        // record the panel already reads. The cause is read here, before `targets` moves
+        // into the record. Clear-then-carry per publication mirrors the provider-side
+        // per-cycle reset, so the count cannot leak across publications. The entry is
+        // available = true because the cycle SUCCEEDED (`Ok(cycle)` is the only publisher
+        // of a non-zero count), so the token is a CAUSE label: never a DOWN, never a
+        // target.
+        let reason = update.availability_reason();
         self.update.hung = update.targets;
         self.set_provider("Hung window detector", update.available);
+        self.remove_provider_prefix(PROBE_INDETERMINATE);
+        if let Some(reason) = reason {
+            self.set_provider(&reason, true);
+        }
         if let Some(error) = update.error {
             crate::log_debug!("hung-window detector unavailable: {}", error);
         }
@@ -1117,6 +1138,12 @@ impl Worker {
 
     fn remove_provider(&mut self, name: &str) {
         self.update.providers.retain(|(n, _)| n != name);
+    }
+
+    fn remove_provider_prefix(&mut self, prefix: &str) {
+        self.update
+            .providers
+            .retain(|(n, _)| !n.starts_with(prefix));
     }
 }
 
@@ -1922,6 +1949,120 @@ mod tests {
         assert!(
             worker.update.hung.is_empty(),
             "reload clears retained hang state"
+        );
+    }
+
+    /// WO-QA-03 (TC-4 follow-up F-b, display-only): the named loss cause reaches the
+    /// provider-health record the panel reads. Acceptance (1) record layer:
+    /// `Update { probe_indeterminate: 3, targets: [], available: true }` puts
+    /// `probe-indeterminate-3` on the record, and the record says it with ZERO targets
+    /// and with the entry `available = true`, so the operator sees the named cause, never
+    /// a phantom target and never a phantom DOWN.
+    #[test]
+    fn the_named_loss_cause_lands_on_the_provider_health_record() {
+        let mut worker = test_worker(Config::default());
+        worker.reset_state(1);
+        worker.apply_hang_update(
+            hang::Update {
+                generation: 1,
+                targets: Vec::new(),
+                available: true,
+                error: None,
+                probe_indeterminate: 3,
+            },
+            1,
+        );
+        assert!(
+            worker.update.hung.is_empty(),
+            "the loss cause publishes no target"
+        );
+        assert_eq!(
+            worker
+                .update
+                .providers
+                .iter()
+                .find(|(name, _)| name == "Hung window detector")
+                .map(|(_, available)| *available),
+            Some(true),
+            "the provider itself stays available: the cycle succeeded"
+        );
+        assert_eq!(
+            worker
+                .update
+                .providers
+                .iter()
+                .find(|(name, _)| name.starts_with(PROBE_INDETERMINATE))
+                .map(|(name, available)| (name.clone(), *available)),
+            Some(("probe-indeterminate-3".to_string(), true)),
+            "the token reaches the record the panel reads, as an available entry"
+        );
+        assert_eq!(
+            worker
+                .update
+                .providers
+                .iter()
+                .filter(|(_, available)| !available)
+                .count(),
+            0,
+            "the loss cause is never an unavailable-provider count"
+        );
+
+        worker.apply_hang_update(
+            hang::Update {
+                generation: 2,
+                targets: Vec::new(),
+                available: true,
+                error: None,
+                probe_indeterminate: 0,
+            },
+            2,
+        );
+        assert_eq!(
+            worker
+                .update
+                .providers
+                .iter()
+                .filter(|(name, _)| name.starts_with(PROBE_INDETERMINATE))
+                .count(),
+            0,
+            "a quiet cycle drops the token: no count leaks across publish cycles"
+        );
+        assert!(
+            worker
+                .update
+                .providers
+                .iter()
+                .any(|(name, available)| name == "Hung window detector" && *available),
+            "the quiet cycle keeps the provider available, so the surface returns to OK"
+        );
+
+        worker.apply_hang_update(
+            hang::Update {
+                generation: 3,
+                targets: Vec::new(),
+                available: false,
+                error: Some("hung-window poll budget exceeded"),
+                probe_indeterminate: 0,
+            },
+            3,
+        );
+        assert_eq!(
+            worker
+                .update
+                .providers
+                .iter()
+                .filter(|(name, _)| name.starts_with(PROBE_INDETERMINATE))
+                .count(),
+            0,
+            "a hard-failure publication keeps its own class, never this token"
+        );
+        assert!(
+            worker
+                .update
+                .providers
+                .iter()
+                .any(|(name, available)| name == "Hung window detector" && !available),
+            "the unavailable provider stays the counted DOWN cause"
         );
     }
 

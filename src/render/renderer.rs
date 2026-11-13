@@ -14,6 +14,7 @@ use crate::model::{
     HeadsetBattery, HungTarget, Metric, MetricKey, ReadingsSnapshot, Snapshot, Speaker, ValueKind,
     WIDTH,
 };
+use crate::telemetry::PROBE_INDETERMINATE;
 
 /// Overlay knobs the renderer reads from configuration.
 #[derive(Clone, Copy, Debug)]
@@ -1936,10 +1937,37 @@ fn provider_slot(
     }
     let bad = providers.values().filter(|&&available| !available).count();
     if bad == 0 {
+        // WO-QA-03 (TC-4 F-b, display-only): a hang cycle that lost probes it could not
+        // evaluate publishes the NAMED token `probe-indeterminate-<N>` (single rendering
+        // site: `providers/hang.rs` L110-112) on the provider-health record. It lands with
+        // available = true, so `bad` stays 0 and the surface would otherwise read `OK` —
+        // "no timeout observed" — while the detector lost probes. Drawing the token here
+        // is what makes "N probes lost" self-name, and it never invents a target.
+        // Precedence keeps every other label: RC-5 device state > `N DOWN` (other causes
+        // stay named, so this branch masks nothing) > token > `OK`.
+        // shortcut: the token is 21 chars = 83 px (font.rs `text_width`), and a four-slot
+        // interior is 39/40 px, so `fit_text` draws "probe-i..." there and the count is
+        // not legible - exactly the RC-5 label's truncation discipline (L1935). Upgrade
+        // when the count must be legible on-screen: a wider status slot.
+        if let Some(reason) = hang_loss_cause(providers) {
+            f.text_centered(x, w, 35, &fit_text(&reason, w, 1), 1, true);
+            return;
+        }
         f.text_centered(x, w, 35, "OK", 1, true);
     } else {
         f.text_centered(x, w, 35, &format!("{} DOWN", bad), 1, true);
     }
+}
+
+/// WO-QA-03: the hang detector's named loss cause carried on the provider-health record
+/// (`telemetry::apply_hang_update`), i.e. the exact token string the panel draws. A
+/// lookup only: the availability bit of that entry stays `true` by construction, so it
+/// is never counted as a down provider.
+fn hang_loss_cause(providers: &HashMap<String, bool>) -> Option<String> {
+    providers
+        .keys()
+        .find(|name| name.starts_with(PROBE_INDETERMINATE))
+        .cloned()
 }
 
 fn first_non_empty(values: &[&str], fallback: &str) -> String {
@@ -2580,6 +2608,129 @@ mod tests {
                 assert!(!left.equal(right), "the four states must render distinctly");
             }
         }
+    }
+
+    /// WO-QA-03 (TC-4 follow-up F-b, display-only): acceptance (1) rendered layer — the
+    /// token that `telemetry::apply_hang_update` carries on the provider-health record
+    /// (built by the provider's single rendering site) lands on the operator-visible
+    /// hang-provider availability surface and DISCRIMINATES: it is not `OK` ("no timeout
+    /// observed"), not a counted `N DOWN`, and not an RC-5 device label.
+    #[test]
+    fn the_loss_cause_token_replaces_the_healthy_status_label() {
+        const TOKEN: &str = "probe-indeterminate-3";
+        let view = View {
+            slot_modules: [
+                "PROVIDER_STATUS".to_string(),
+                "PROVIDER_STATUS".to_string(),
+                "PROVIDER_STATUS".to_string(),
+                "PROVIDER_STATUS".to_string(),
+            ],
+            ..Default::default()
+        };
+        let render = |snapshot: &Snapshot| {
+            Renderer::new().render(snapshot, OverlayOptions::default(), &view)
+        };
+        // The RC-5 row-35 label band: slot interiors, glyph rows 35..=39 at scale 1.
+        let band = |frame: &Frame| -> Vec<bool> {
+            let mut pixels = Vec::new();
+            for (left, right) in [(0, 38), (40, 78), (80, 118), (120, 159)] {
+                for y in 35..=39 {
+                    for x in left..=right {
+                        pixels.push(frame.get(x, y));
+                    }
+                }
+            }
+            pixels
+        };
+        // The record exactly as the telemetry carry emits it: the token entry available =
+        // true beside an available provider, so the panel has nothing down and the targets
+        // are empty (`sample_snapshot` publishes no hung target).
+        let mut loss = sample_snapshot();
+        loss.providers.insert("Hung window detector".into(), true);
+        loss.providers.insert(TOKEN.into(), true);
+        assert!(loss.hung.is_empty(), "the loss cause publishes no target");
+        assert_eq!(
+            hang_loss_cause(&loss.providers).as_deref(),
+            Some(TOKEN),
+            "the panel draws the named token string"
+        );
+        let normal = sample_snapshot();
+        let healthy = render(&normal);
+        assert_eq!(
+            healthy.hash_hex(),
+            GOLDEN_PROVIDER_STATUS_HEALTHY,
+            "the normal-state availability surface is byte-stable"
+        );
+        assert_eq!(
+            hang_loss_cause(&normal.providers),
+            None,
+            "the normal record carries no token: `OK` stays 'no timeout observed'"
+        );
+        let frame = render(&loss);
+        assert_ne!(
+            frame.hash_hex(),
+            healthy.hash_hex(),
+            "the named cause must change the surface"
+        );
+        let loss_band = band(&frame);
+        assert!(
+            loss_band.iter().any(|&pixel| pixel),
+            "the row-35 label band is blank for the loss cause"
+        );
+        assert_ne!(
+            loss_band,
+            band(&healthy),
+            "the loss cause must replace the healthy `OK` band"
+        );
+
+        // Distinct from every other unavailable label on this surface.
+        let mut down = sample_snapshot();
+        down.providers.insert("hwinfo".into(), false);
+        assert_eq!(
+            hang_loss_cause(&down.providers),
+            None,
+            "a plain provider failure carries no token"
+        );
+        assert_ne!(
+            band(&render(&down)),
+            loss_band,
+            "the token is distinct from the counted `N DOWN` label"
+        );
+        let mut device = sample_snapshot();
+        device.device_status = DeviceStatus::Absent;
+        assert_ne!(
+            band(&render(&device)),
+            loss_band,
+            "the token is distinct from the RC-5 device label"
+        );
+        let mut device_with_token = device.clone();
+        device_with_token
+            .providers
+            .insert("Hung window detector".into(), true);
+        device_with_token.providers.insert(TOKEN.into(), true);
+        assert_eq!(
+            band(&render(&device_with_token)),
+            band(&render(&device)),
+            "RC-5 device state keeps precedence over the loss cause"
+        );
+
+        // Legibility under the panel's own fit discipline: the token is 21 chars, so
+        // 4*21-1 = 83 px (font.rs L96-103), and a four-slot interior is 39/40 px.
+        assert_eq!(
+            fit_text(TOKEN, 83, 1),
+            TOKEN,
+            "the full token draws in an 83-px surface"
+        );
+        assert_eq!(
+            fit_text(TOKEN, 39, 1),
+            "probe-i...",
+            "shortcut: the four-slot 39-px width truncates the drawn token, so the count is not legible there"
+        );
+        assert_eq!(
+            fit_text(TOKEN, 159, 1),
+            TOKEN,
+            "the full-width surface (159 px) always draws the token whole"
+        );
     }
 
     #[test]

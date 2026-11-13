@@ -15,6 +15,7 @@ use crate::model::{
 use crate::providers::{ccd, clock, cpu, hang, memory};
 use crate::render::renderer::{OverlayOptions, Renderer, View};
 use crate::slots::Manager;
+use crate::telemetry::PROBE_INDETERMINATE;
 use crate::ui::{Ui, UiEvent};
 
 pub struct RunOptions {
@@ -280,6 +281,10 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
         };
         if telemetry.generation != telemetry_generation {
             snapshot.providers.remove("Hung window detector");
+            // WO-QA-03 (F-b) wiring: a stale publication drops its loss-cause label too.
+            snapshot
+                .providers
+                .retain(|name, _| !name.starts_with(PROBE_INDETERMINATE));
         }
 
         if let Some(audit) = hang_owner.bind(&slots, &mut hang_hold) {
@@ -2212,6 +2217,47 @@ mod tests {
             ),
             hang::HoldCommand::None
         ));
+    }
+
+    /// WO-QA-03 (TC-4 follow-up F-b): the app-side half of the chain — the loss-cause
+    /// label is display-only. A token entry on the provider-health record never stands in
+    /// for the provider's availability and never carries a target, so the panel gains the
+    /// named cause while the termination chain sees exactly what it saw before.
+    #[test]
+    fn the_loss_cause_label_carries_no_availability_and_no_target() {
+        let loss = crate::telemetry::Update {
+            generation: 1,
+            providers: vec![
+                ("Hung window detector".into(), false),
+                ("probe-indeterminate-3".into(), true),
+            ],
+            ..Default::default()
+        };
+        let (targets, available) = current_hang_publication(&loss, 1);
+        assert!(targets.is_empty(), "the loss cause publishes no target");
+        assert!(
+            !available,
+            "the token entry is not the provider's availability"
+        );
+        let (targets, available) = current_hang_publication(&loss, 2);
+        assert!(
+            targets.is_empty() && !available,
+            "a stale publication drops the provider and its label together"
+        );
+
+        let healthy = crate::telemetry::Update {
+            generation: 1,
+            providers: vec![
+                ("Hung window detector".into(), true),
+                ("probe-indeterminate-3".into(), true),
+            ],
+            ..Default::default()
+        };
+        let (targets, available) = current_hang_publication(&healthy, 1);
+        assert!(
+            targets.is_empty() && available,
+            "an indeterminate cycle is available with zero targets"
+        );
     }
 
     fn ec4_target(pid: u32) -> crate::model::HungTarget {
