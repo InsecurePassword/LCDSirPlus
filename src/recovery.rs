@@ -1,5 +1,8 @@
 //! One-shot recovery of a previously working physical LCD connection.
 //! The append-only journal is both the audit log and the durable restart budget.
+//! RC-2: the controller also tracks worker liveness (connected-physical vs. the
+//! health publication) and heals a silent worker with one named cause plus one
+//! reconnect wake; it never touches the worker thread.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -25,12 +28,19 @@ use windows::Win32::System::Threading::{
     EVENT_MODIFY_STATE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
 };
 
-use crate::backends::{BackendKind, LossCause};
+use crate::backends::{BackendKind, BackendState, LossCause};
 
 const PARENT_ENV: &str = "LCDSIRPLUS_CONNECTION_RECOVERY_PARENT";
 const READY_TIMEOUT_MS: u32 = 10_000;
 const GRACE: Duration = Duration::from_secs(30);
 const MAX_JOURNAL_BYTES: u64 = 8192;
+
+/// Shipped default of `logitech_reconnect_max` (`config.rs` L271; parsed at
+/// `parser.rs` L376-L377; validated `>= logitech_reconnect` and `<= 600 s` at
+/// `config.rs` L493-L497). Fallback liveness basis only, for a `Recovery`
+/// loaded outside the app (tests, diagnostics); `Recovery::start` derives the
+/// real value from the resolved config. No new config keys exist.
+const DEFAULT_RECONNECT_MAX: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Handoff {
@@ -221,16 +231,31 @@ pub struct Recovery {
     interrupted: bool,
     worker_timed_out: bool,
     awaiting_reconnect: bool,
+    /// RC-2: when the worker last claimed a physical connection and still owes
+    /// its one `PhysicalHealthy` for that device cycle; cleared by health, by
+    /// any disconnect/absent/discovering publication, and by a reconnect cycle.
+    liveness_since: Option<Instant>,
+    /// RC-2 one-shot: the stall wake for the current connection segment has
+    /// been spent; only fresh health re-arms it (repeat-rejection).
+    stall_actioned: bool,
+    /// RC-2 liveness deadline: exceeds the capped reconnect ladder
+    /// (`reconnect_max`) by `GRACE`, so a worker in legitimate backoff,
+    /// Disconnected, Absent, or mid-reconnect is never read as stalled.
+    stall_deadline: Duration,
 }
 
 impl Recovery {
-    pub fn start(handoff: Handoff) -> Self {
+    pub fn start(handoff: Handoff, reconnect_max: Duration) -> Self {
         let mut recovery = Self::load(
             journal_path(),
             handoff == Handoff::Verified,
             std::process::id(),
             Instant::now(),
         );
+        // RC-2: the liveness deadline is derived from the capped reconnect
+        // ladder the worker already uses, plus `GRACE`, so the worker always
+        // gets a full ladder cycle (and its own grace) before a stall counts.
+        recovery.stall_deadline = reconnect_max + GRACE;
         if handoff == Handoff::Failed {
             if recovery
                 .journal
@@ -286,6 +311,9 @@ impl Recovery {
             interrupted: false,
             worker_timed_out: false,
             awaiting_reconnect: false,
+            liveness_since: None,
+            stall_actioned: false,
+            stall_deadline: DEFAULT_RECONNECT_MAX + GRACE,
         }
     }
 
@@ -296,6 +324,10 @@ impl Recovery {
         self.previously_connected = true;
         self.lost_since = None;
         self.last_cause = None;
+        // RC-2: health for this device cycle has arrived, so the liveness clock
+        // stops; fresh health is the only thing that re-arms the one-shot wake.
+        self.liveness_since = None;
+        self.stall_actioned = false;
         if self.logitech_result.is_some() {
             self.permit.cancel();
         }
@@ -317,15 +349,34 @@ impl Recovery {
         }
     }
 
+    /// RC-2 liveness bookkeeping, driven by the app-side backend drain for every
+    /// published state. A physical worker that claims `Connected` owes exactly
+    /// one `PhysicalHealthy` for that device cycle; while it is in backoff,
+    /// `Disconnected`, `Absent`, `Discovering` or shutdown, health is
+    /// legitimately absent and nothing may count as a stall.
+    pub fn note_liveness(&mut self, now: Instant, state: &BackendState) {
+        self.liveness_since = match state {
+            BackendState::Connected {
+                kind: BackendKind::Hid | BackendKind::Sdk,
+            } => Some(now),
+            _ => None,
+        };
+    }
+
     pub fn reconnect_started(&mut self) {
         // The single backend worker queues this before health from its new device.
         self.awaiting_reconnect = false;
+        // The wake owns the rebuild: no device is claimed yet, so the liveness
+        // clock restarts at the worker's next `Connected`.
+        self.liveness_since = None;
     }
 
     pub fn suspend(&mut self) {
         self.permit.cancel();
         self.previously_connected = false;
         self.lost_since = None;
+        self.liveness_since = None;
+        self.stall_actioned = false;
         if self.logitech_result.is_some() {
             self.interrupted = true;
             return;
@@ -405,8 +456,24 @@ impl Recovery {
         }
     }
 
+    /// RC-2: is a claimed physical connection silent past the liveness deadline?
+    /// Suppressed while a reconnect is already awaited (the wake owns the
+    /// rebuild) and while the one-shot for this segment is spent. Frames keep
+    /// being submitted throughout: this tick runs in the dashboard loop that
+    /// submits them, so the submit path is provably alive while health is not.
+    fn stall_due(&self, now: Instant) -> bool {
+        !self.awaiting_reconnect
+            && !self.stall_actioned
+            && self
+                .liveness_since
+                .is_some_and(|since| now.saturating_duration_since(since) >= self.stall_deadline)
+    }
+
     /// Called only by the responsive dashboard loop. True requests normal app shutdown.
     pub fn tick(&mut self, now: Instant, enabled: bool, request_reconnect: impl FnOnce()) -> bool {
+        // The app-side wake may be spent once per tick: by the successful
+        // Logitech restart below, or by the RC-2 stall heal, never by both.
+        let mut wake = Some(request_reconnect);
         if !enabled {
             self.suspend();
         }
@@ -429,7 +496,9 @@ impl Recovery {
                             self.previously_connected = false;
                             self.lost_since = None;
                             self.awaiting_reconnect = true;
-                            request_reconnect();
+                            if let Some(wake) = wake.take() {
+                                wake();
+                            }
                             // Grace begins after the retry request, not before LCore restarts.
                             self.waiting_since = Instant::now();
                         } else if self.previously_connected && self.lost_since.is_none() {
@@ -459,6 +528,29 @@ impl Recovery {
         }
         if !enabled {
             return false;
+        }
+        if self.stall_due(now) {
+            // RC-2 one-shot self-heal: the worker holds a claimed physical
+            // device, keeps consuming submitted frames, and publishes no
+            // health. Name the stall with the RC-1 vocabulary (it rides in the
+            // detail of the next legitimate journal event) and ask the worker
+            // to rebuild its own device exactly once through the existing
+            // app-side wake. No thread kill, no join escalation, no restart
+            // loop: `TerminateThread` is the original's measured weakness and
+            // stays out of this port; the worker owns the device lifecycle.
+            self.stall_actioned = true;
+            self.last_cause = Some(LossCause::WorkerStalled);
+            if self.previously_connected {
+                self.lost_since.get_or_insert(now);
+            }
+            crate::log_warn!(
+                "backend worker stalled: physical connection published no health within {:.0?}; loss-cause={}; one reconnect requested; no thread action",
+                self.stall_deadline,
+                LossCause::WorkerStalled.short()
+            );
+            if let Some(wake) = wake.take() {
+                wake();
+            }
         }
         let due = self.due(now);
         if due.is_some() && crate::backends::sdk::recovery_blocked() {
@@ -1227,6 +1319,132 @@ mod tests {
         assert_eq!(recovery.journal.as_ref().unwrap().stage, Stage::Finished);
         assert!(recovery.previously_connected);
         assert_eq!(recovery.due(grace_start + GRACE * 10), None);
+    }
+
+    // RC-2 seams: injected silence on the health path while the submit path
+    // keeps running (the dashboard loop calls `tick` as it submits frames),
+    // driven entirely by injected `Instant` values. No sleeps, no threads.
+    fn claim(recovery: &mut Recovery, now: Instant, kind: BackendKind) {
+        recovery.note_liveness(now, &BackendState::Connected { kind });
+    }
+
+    #[test]
+    fn injected_worker_silence_journals_one_stall_cause_and_requests_exactly_one_reconnect() {
+        let root = TestDir::new();
+        let now = Instant::now();
+        let mut recovery = Recovery::load(root.journal(), false, 1, now);
+        recovery.healthy(BackendKind::Sdk);
+        claim(&mut recovery, now, BackendKind::Sdk);
+        let deadline = now + recovery.stall_deadline;
+        assert!(
+            deadline > now + DEFAULT_RECONNECT_MAX,
+            "the liveness deadline must exceed the capped reconnect ladder"
+        );
+        let mut wakes = 0;
+        assert!(
+            !recovery.tick(deadline - Duration::from_millis(1), true, || {
+                panic!("no wake before the liveness deadline")
+            })
+        );
+        assert!(!recovery.tick(deadline, true, || wakes += 1));
+        assert_eq!(wakes, 1, "exactly one reconnect wake for a stalled worker");
+        assert_eq!(recovery.last_cause, Some(LossCause::WorkerStalled));
+        assert!(recovery.stall_actioned, "one-shot per segment");
+        assert_eq!(recovery.lost_since, Some(deadline), "the stall is a loss");
+        // The named cause reaches the append-only journal in the detail of the
+        // next legitimate recovery event (RC-1 mechanism, no new event types).
+        assert!(recovery.restart_application(|| Ok(42)));
+        let text = std::fs::read_to_string(root.journal()).unwrap();
+        assert_eq!(
+            text.matches("worker-stalled").count(),
+            1,
+            "the stall cause is journaled exactly once"
+        );
+        assert!(text.contains("loss-cause=worker-stalled"));
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("application-attempt\t"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn second_consecutive_stall_without_health_takes_no_further_action() {
+        let root = TestDir::new();
+        let now = Instant::now();
+        let mut recovery = Recovery::load(root.journal(), false, 1, now);
+        recovery.healthy(BackendKind::Sdk);
+        claim(&mut recovery, now, BackendKind::Sdk);
+        let deadline = now + recovery.stall_deadline;
+        let mut wakes = 0;
+        assert!(!recovery.tick(deadline, true, || wakes += 1));
+        assert_eq!(wakes, 1);
+        // Second consecutive stall in the same segment, still no health: the
+        // one-shot is spent and the wake seam panics on a repeat. Offsets stay
+        // inside `GRACE` of the stall so the tick never reaches the app-restart
+        // stage, which would enumerate real HID devices.
+        for offset in [Duration::from_secs(1), GRACE / 2] {
+            assert!(!recovery.tick(deadline + offset, true, || {
+                panic!("a stalled worker is never woken twice without health")
+            }));
+        }
+        assert_eq!(
+            recovery.last_cause,
+            Some(LossCause::WorkerStalled),
+            "the named cause is retained, not swallowed"
+        );
+        assert!(recovery.restart_application(|| Ok(42)));
+        assert!(!recovery.restart_application(|| panic!("application restarted twice")));
+        let text = std::fs::read_to_string(root.journal()).unwrap();
+        assert_eq!(
+            text.matches("worker-stalled").count(),
+            1,
+            "repeat stalls add no further journal causes"
+        );
+    }
+
+    #[test]
+    fn the_stall_wake_is_suppressed_during_backoff_absent_and_an_awaited_reconnect() {
+        let root = TestDir::new();
+        let now = Instant::now();
+        let mut recovery = Recovery::load(root.journal(), false, 1, now);
+        claim(&mut recovery, now, BackendKind::Hid);
+        for state in [
+            BackendState::Disconnected {
+                cause: LossCause::OpenFailed { code: 0 },
+                reason: "injected backoff".into(),
+            },
+            BackendState::Absent {
+                reason: "injected ladder terminal".into(),
+            },
+            BackendState::Discovering,
+            BackendState::Connected {
+                kind: BackendKind::Virtual,
+            },
+            BackendState::ShutDown,
+        ] {
+            recovery.note_liveness(now + Duration::from_secs(1), &state);
+            assert!(!recovery.tick(now + recovery.stall_deadline * 2, true, || {
+                panic!("health is legitimately absent here, so nothing is stalled")
+            }));
+        }
+        // A reconnect wake that is already in flight owns the rebuild.
+        claim(&mut recovery, now, BackendKind::Sdk);
+        recovery.awaiting_reconnect = true;
+        assert!(!recovery.tick(now + recovery.stall_deadline, true, || {
+            panic!("no second wake while a reconnect is awaited")
+        }));
+        // The worker's own cycle start re-baselines the clock at its next claim.
+        recovery.reconnect_started();
+        assert!(!recovery.tick(now + recovery.stall_deadline * 2, true, || {
+            panic!("no wake before the worker claims a device again")
+        }));
+        let arm = now + recovery.stall_deadline;
+        claim(&mut recovery, arm, BackendKind::Sdk);
+        let mut wakes = 0;
+        assert!(!recovery.tick(now + recovery.stall_deadline * 2, true, || wakes += 1));
+        assert_eq!(wakes, 1, "a fresh claim after the wake is watchable again");
     }
 
     const FIXTURE_MODE: &str = "LCDSIRPLUS_TEST_HANDOFF_MODE";

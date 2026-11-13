@@ -47,19 +47,28 @@ impl BackendKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LossCause {
     DeviceAbsent,
-    OpenFailed { code: u32 },
+    OpenFailed {
+        code: u32,
+    },
     CallTimeout,
     CircuitOpen,
-    TransferIncomplete { code: u32 },
+    TransferIncomplete {
+        code: u32,
+    },
     OwnerConflict,
     ProbeFail,
     ShutdownRequested,
+    /// RC-2 producer: the recovery controller, not a transport site. The worker
+    /// claimed a physical connection and stopped publishing health while frames
+    /// kept flowing, past the liveness deadline. One-shot per stage; the named
+    /// cause replaces a thread kill (the original's measured weakness).
+    WorkerStalled,
 }
 
 impl LossCause {
     /// All causes producers may emit; used by the label-whitelist test.
     #[cfg(test)]
-    pub fn all() -> [LossCause; 8] {
+    pub fn all() -> [LossCause; 9] {
         [
             LossCause::DeviceAbsent,
             LossCause::OpenFailed { code: 0 },
@@ -69,6 +78,7 @@ impl LossCause {
             LossCause::OwnerConflict,
             LossCause::ProbeFail,
             LossCause::ShutdownRequested,
+            LossCause::WorkerStalled,
         ]
     }
 
@@ -83,6 +93,7 @@ impl LossCause {
             Self::OwnerConflict => "owner-conflict".to_string(),
             Self::ProbeFail => "probe-fail".to_string(),
             Self::ShutdownRequested => "shutdown-requested".to_string(),
+            Self::WorkerStalled => "worker-stalled".to_string(),
         }
     }
 }
@@ -1084,8 +1095,8 @@ mod tests {
             .collect();
         assert_eq!(
             unique.len(),
-            8,
-            "the cause vocabulary carries eight distinct names"
+            9,
+            "the cause vocabulary carries nine distinct names"
         );
         for label in &labels {
             assert!(label.len() <= 30, "journal codes stay short: {label}");
@@ -1094,6 +1105,10 @@ mod tests {
                 "{label}"
             );
         }
+        assert!(
+            labels.contains(&"worker-stalled".to_string()),
+            "RC-2 names the stalled worker, it is never swallowed"
+        );
     }
 
     // RC-6 seams: the ladder terminal is exercised against injected open/probe

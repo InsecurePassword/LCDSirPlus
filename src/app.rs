@@ -121,7 +121,8 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
     }
     crate::log_info!("LCDSirPlus {} starting", env!("CARGO_PKG_VERSION"));
     crate::log_info!("configuration: {}", cfg.path);
-    let mut recovery = crate::recovery::Recovery::start(opts.recovery_handoff);
+    let mut recovery =
+        crate::recovery::Recovery::start(opts.recovery_handoff, cfg.logitech_reconnect_max);
     let startup_executable = crate::runtime::canonical_executable().ok();
     let mut startup_synced = None;
     sync_startup_if_needed(
@@ -309,50 +310,55 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
         // Backend messages (non-blocking drain).
         while let Ok(message) = backend.msg_rx.try_recv() {
             match message {
-                Message::State(state) => match state {
-                    BackendState::Connected { kind } => {
-                        crate::log_info!("backend connected: {}", kind.name());
-                        backend_state = BackendState::Connected { kind };
-                        if !opts.preview_always
-                            && cfg.preview_mode == "auto"
-                            && !cfg.start_minimized
-                        {
-                            ui.set_preview_auto_visible(!matches!(
-                                kind,
-                                BackendKind::Hid | BackendKind::Sdk
-                            ));
+                Message::State(state) => {
+                    // RC-2: the drain is the controller's only view of worker
+                    // liveness, so every published state is stamped here.
+                    recovery.note_liveness(now, &state);
+                    match state {
+                        BackendState::Connected { kind } => {
+                            crate::log_info!("backend connected: {}", kind.name());
+                            backend_state = BackendState::Connected { kind };
+                            if !opts.preview_always
+                                && cfg.preview_mode == "auto"
+                                && !cfg.start_minimized
+                            {
+                                ui.set_preview_auto_visible(!matches!(
+                                    kind,
+                                    BackendKind::Hid | BackendKind::Sdk
+                                ));
+                            }
                         }
-                    }
-                    BackendState::Disconnected { cause, reason } => {
-                        recovery.disconnected(now, cause);
-                        crate::log_warn!("backend disconnected: {}", reason);
-                        backend_state = BackendState::Disconnected { cause, reason };
-                        if !opts.preview_always
-                            && cfg.preview_mode == "auto"
-                            && !cfg.start_minimized
-                        {
-                            ui.set_preview_auto_visible(true);
+                        BackendState::Disconnected { cause, reason } => {
+                            recovery.disconnected(now, cause);
+                            crate::log_warn!("backend disconnected: {}", reason);
+                            backend_state = BackendState::Disconnected { cause, reason };
+                            if !opts.preview_always
+                                && cfg.preview_mode == "auto"
+                                && !cfg.start_minimized
+                            {
+                                ui.set_preview_auto_visible(true);
+                            }
                         }
-                    }
-                    BackendState::Absent { reason } => {
-                        // Ladder terminal: the preview policy stays consistent
-                        // with `Disconnected`, so the panel is never blanked.
-                        recovery.disconnected(now, LossCause::DeviceAbsent);
-                        crate::log_warn!("backend absent: {}", reason);
-                        backend_state = BackendState::Absent { reason };
-                        if !opts.preview_always
-                            && cfg.preview_mode == "auto"
-                            && !cfg.start_minimized
-                        {
-                            ui.set_preview_auto_visible(true);
+                        BackendState::Absent { reason } => {
+                            // Ladder terminal: the preview policy stays consistent
+                            // with `Disconnected`, so the panel is never blanked.
+                            recovery.disconnected(now, LossCause::DeviceAbsent);
+                            crate::log_warn!("backend absent: {}", reason);
+                            backend_state = BackendState::Absent { reason };
+                            if !opts.preview_always
+                                && cfg.preview_mode == "auto"
+                                && !cfg.start_minimized
+                            {
+                                ui.set_preview_auto_visible(true);
+                            }
                         }
+                        BackendState::Discovering => {
+                            recovery.disconnected(now, LossCause::DeviceAbsent);
+                            backend_state = BackendState::Discovering;
+                        }
+                        BackendState::ShutDown => backend_state = BackendState::ShutDown,
                     }
-                    BackendState::Discovering => {
-                        recovery.disconnected(now, LossCause::DeviceAbsent);
-                        backend_state = BackendState::Discovering;
-                    }
-                    BackendState::ShutDown => backend_state = BackendState::ShutDown,
-                },
+                }
                 Message::Buttons(events) => {
                     for event in events {
                         let command =
