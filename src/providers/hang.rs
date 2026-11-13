@@ -196,6 +196,10 @@ impl From<&Config> for Policy {
 struct Press {
     source: &'static str,
     started: Instant,
+    /// EC-7: the stamp of the transition that bound this press, so a re-emitted
+    /// transition of the same physical press is not bound as a second press
+    /// (0 = unstamped, the pre-EC-7 shape, whose behavior is unchanged).
+    stamp: u64,
     backward: bool,
     bound: Option<(usize, HungTarget, Policy)>,
     canceled: bool,
@@ -416,7 +420,15 @@ impl HoldState {
         }
         if event.down {
             if let Some(existing) = &self.presses[event.index] {
-                if existing.source != event.source || existing.canceled || existing.resolved {
+                // EC-7: a re-emitted transition of the press that is already bound
+                // carries that press's own stamp, so it is one physical press and is
+                // not re-bound (which would re-arm the hold budget). Unstamped
+                // events (0) keep the shipped duplicate-down behavior.
+                if existing.source != event.source
+                    || existing.canceled
+                    || existing.resolved
+                    || (event.stamp != 0 && existing.stamp == event.stamp)
+                {
                     return HoldCommand::None;
                 }
             }
@@ -435,6 +447,7 @@ impl HoldState {
             self.presses[event.index] = Some(Press {
                 source: event.source,
                 started: event.at,
+                stamp: event.stamp,
                 backward: event.backward,
                 bound,
                 canceled: false,
@@ -2112,6 +2125,7 @@ fn action_smoke(negative: bool) -> Result<u32, String> {
             canceled: false,
             at: started,
             source: "action-smoke",
+            stamp: 0,
         },
         &cfg,
         std::slice::from_ref(&target),
@@ -2127,6 +2141,7 @@ fn action_smoke(negative: bool) -> Result<u32, String> {
                 canceled: false,
                 at: started + Duration::from_millis(100),
                 source: "action-smoke",
+                stamp: 0,
             },
             &cfg,
             std::slice::from_ref(&target),
@@ -2146,6 +2161,7 @@ fn action_smoke(negative: bool) -> Result<u32, String> {
                 canceled: false,
                 at: restarted,
                 source: "action-smoke",
+                stamp: 0,
             },
             &cfg,
             std::slice::from_ref(&target),
@@ -2164,6 +2180,7 @@ fn action_smoke(negative: bool) -> Result<u32, String> {
                 canceled: false,
                 at: restarted + cfg.hang_hold,
                 source: "action-smoke",
+                stamp: 0,
             },
             &cfg,
             std::slice::from_ref(&target),
@@ -2208,6 +2225,7 @@ fn action_smoke(negative: bool) -> Result<u32, String> {
                 canceled: false,
                 at: started + cfg.hang_hold,
                 source: "action-smoke",
+                stamp: 0,
             },
             &cfg,
             std::slice::from_ref(&target),
@@ -2794,6 +2812,26 @@ mod tests {
             canceled: false,
             at,
             source,
+            stamp: 0,
+        }
+    }
+
+    /// EC-7: the same event shape with an explicit transition stamp.
+    fn button_stamped(
+        index: usize,
+        down: bool,
+        at: Instant,
+        source: &'static str,
+        stamp: u64,
+    ) -> Event {
+        Event {
+            index,
+            down,
+            backward: false,
+            canceled: false,
+            at,
+            source,
+            stamp,
         }
     }
 
@@ -3296,6 +3334,82 @@ mod tests {
         let bare = target(1, 10, 20, r"C:\Games\game.exe");
         assert_eq!(bare.publish_generation, 0);
         assert!(bare.publish_time.is_none());
+    }
+
+    #[test]
+    fn ec7_same_stamp_reemission_binds_one_press_and_never_rearms_the_hold() {
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        let item = published(target(1, 10, 20, r"C:\Games\game.exe"), 1);
+        let items = vec![item.clone()];
+        let started = Instant::now();
+        // One physical press: the stamp of its down transition is recorded at bind.
+        let mut hold = HoldState::default();
+        assert!(matches!(
+            hold.event(
+                button_stamped(2, true, started, "hid", 7),
+                &cfg,
+                &items,
+                true
+            ),
+            HoldCommand::None
+        ));
+        assert!(hold.presses[2]
+            .as_ref()
+            .is_some_and(|press| press.bound.is_some() && press.stamp == 7));
+        // The same transition re-emitted late (same stamp) is not a second press and
+        // does not move the bound press's start, so the terminate budget stays intact.
+        assert!(matches!(
+            hold.event(
+                button_stamped(2, true, started + cfg.hang_hold, "hid", 7),
+                &cfg,
+                &items,
+                true
+            ),
+            HoldCommand::None
+        ));
+        assert_eq!(
+            hold.presses.iter().flatten().count(),
+            1,
+            "one bound press per physical press"
+        );
+        assert_eq!(
+            hold.presses[2].as_ref().unwrap().started,
+            started,
+            "a same-stamp re-emission must not re-arm the hold"
+        );
+        assert!(matches!(
+            hold.tick(
+                started + cfg.hang_hold,
+                &cfg,
+                std::slice::from_ref(&item),
+                true
+            ),
+            HoldCommand::Terminate(bound) if bound == item
+        ));
+        // The gate is stamp-specific: a distinct stamp is a new physical press, so the
+        // shipped duplicate-down restart behavior is unchanged.
+        let mut fresh = HoldState::default();
+        fresh.event(
+            button_stamped(2, true, started, "hid", 7),
+            &cfg,
+            &items,
+            true,
+        );
+        let second = started + Duration::from_millis(200);
+        fresh.event(
+            button_stamped(2, true, second, "hid", 8),
+            &cfg,
+            &items,
+            true,
+        );
+        assert_eq!(
+            fresh.presses[2].as_ref().unwrap().started,
+            second,
+            "a distinct stamp re-binds as a new press"
+        );
     }
 
     struct FakeActionApi {

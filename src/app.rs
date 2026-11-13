@@ -2142,6 +2142,7 @@ mod tests {
                 canceled: false,
                 at: started,
                 source: "test",
+                stamp: 0,
             },
             &cfg,
             targets,
@@ -2169,6 +2170,7 @@ mod tests {
                 canceled: false,
                 at: started,
                 source: "test",
+                stamp: 0,
             },
             &cfg,
             targets,
@@ -2187,6 +2189,7 @@ mod tests {
                     canceled: false,
                     at: started + cfg.hang_hold,
                     source: "test",
+                    stamp: 0,
                 },
                 &cfg,
                 targets,
@@ -2220,6 +2223,7 @@ mod tests {
             canceled: false,
             at,
             source: "test",
+            stamp: 0,
         }
     }
 
