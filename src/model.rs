@@ -340,7 +340,7 @@ pub struct Alert {
     pub acknowledged: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct HungTarget {
     pub hwnd: usize,
     pub pid: u32,
@@ -348,7 +348,28 @@ pub struct HungTarget {
     pub image_path: String,
     pub process_name: String,
     pub title: String,
+    /// TC-1 freshness stamp: the monotonic publish generation of the detector
+    /// publication that carried this target; `0` = unstamped, never actionable.
+    pub publish_generation: u64,
+    /// Monotonic publish time of that publication; `None` = unstamped.
+    pub publish_time: Option<Instant>,
 }
+
+impl PartialEq for HungTarget {
+    /// Identity/display equality only: the publish stamp is freshness metadata, so
+    /// the press-binding continuity checks and the action-boundary revalidation
+    /// keep their pre-TC-1 identity meaning across republishes.
+    fn eq(&self, other: &Self) -> bool {
+        self.hwnd == other.hwnd
+            && self.pid == other.pid
+            && self.creation_time == other.creation_time
+            && self.image_path == other.image_path
+            && self.process_name == other.process_name
+            && self.title == other.title
+    }
+}
+
+impl Eq for HungTarget {}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AcState {

@@ -37,6 +37,30 @@ const POLL_BUDGET: Duration = Duration::from_secs(5);
 const MAX_WINDOWS: usize = 4096;
 const MAX_TITLE_CHARS: usize = 256;
 
+/// TC-1 (P2 §2 TC-1): the bound a press-bind places on the publication that
+/// carries a bound target is `bound_policy.interval + PUBLISH_AGE_TOLERANCE`,
+/// measured on the monotonic clock. The interval is the probe interval in force
+/// at bind time; this is the ONE stated tolerance.
+///
+/// Derivation — the tolerance is one publish cycle:
+/// * `Cadence::poll_due` starts a publish no earlier than `hang_probe_interval_ms`
+///   after the previous publish *start*, so a cadence step costs one interval.
+/// * Producing the publication costs up to the bounded enumeration/probe budget
+///   `POLL_BUDGET` (5 s: deadline in `enumerate_and_probe`, per-window clamp and
+///   budget-exhaustion abort in `enumerate_callback`), and the publish stamp is
+///   taken when the publish completes, so a legitimate publication lags the
+///   schedule by exactly that budget in the worst case.
+/// * One publish cycle = interval (cadence) + `POLL_BUDGET` (worst-case
+///   production of one cycle), hence `PUBLISH_AGE_TOLERANCE = POLL_BUDGET`.
+///
+/// Consequence (P2 tradeoffs): a publication older than one whole cycle means the
+/// detector skipped a cycle (stall, or a publish that exhausted its budget), so
+/// the kill identity is no longer bounded; the press is refused with the audited
+/// `canceled-continuity` outcome, never silently. `hang_probe_interval_ms` spans
+/// 250..60000, so the bound is nearly free at short intervals and loose in
+/// absolute time at 60000 (65 s), which is what the opt-in config range implies.
+const PUBLISH_AGE_TOLERANCE: Duration = POLL_BUDGET;
+
 #[derive(Clone, Debug, Default)]
 pub struct Update {
     pub generation: u64,
@@ -157,7 +181,14 @@ impl HoldState {
                     || !policy.active()
                     || &policy != bound_policy
                     || (self.owner_resolved && self.owner != Some(button))
-                    || targets.get(*index) != Some(target))
+                    || targets.get(*index) != Some(target)
+                    || !target_in_current_generation(target, targets)
+                    || !publication_within_bind_bound(
+                        target,
+                        bound_policy,
+                        targets,
+                        Instant::now(),
+                    ))
             {
                 press.canceled = true;
                 return Some(Audit {
@@ -336,6 +367,8 @@ impl HoldState {
             || &policy != bound_policy
             || owner != Some(button)
             || targets.get(*index) != Some(target)
+            || !target_in_current_generation(target, targets)
+            || !publication_within_bind_bound(target, bound_policy, targets, now)
         {
             press.canceled = true;
             return HoldCommand::Audit(Audit {
@@ -366,6 +399,54 @@ impl Policy {
     fn active(&self) -> bool {
         self.enabled && !self.safe_mode
     }
+}
+
+/// TC-1 stamping: every target of a publication carries the detector's monotonic
+/// publish generation and the monotonic time of that publish. Driver
+/// B53-06/B53-17: the shipped app zeroes its target global every pass, so its
+/// kill identity is at most one render tick old; the counterpart bounds the
+/// identity to the newest publication instead, and the two gates below measure it.
+fn stamp_publish(targets: Vec<HungTarget>, generation: u64) -> Vec<HungTarget> {
+    let published_at = Instant::now();
+    targets
+        .into_iter()
+        .map(|mut target| {
+            target.publish_generation = generation;
+            target.publish_time = Some(published_at);
+            target
+        })
+        .collect()
+}
+
+/// TC-1 action bound: the bound identity must be present in the CURRENT publish
+/// generation, and that generation must be *stated* (non-zero, stamped by the
+/// detector) and never older than the generation the press bound. Presence keeps
+/// the pre-TC-1 identity meaning, so this clause can only add a refusal.
+fn target_in_current_generation(bound: &HungTarget, targets: &[HungTarget]) -> bool {
+    bound.publish_generation != 0
+        && targets.iter().any(|live| {
+            live == bound
+                && live.publish_generation != 0
+                && live.publish_generation >= bound.publish_generation
+        })
+}
+
+/// TC-1 press-bind bound: the publication that carries the bound identity is at
+/// most `interval + PUBLISH_AGE_TOLERANCE` old, where `interval` is the probe
+/// interval in force at bind time (`bound_policy`).
+fn publication_within_bind_bound(
+    bound: &HungTarget,
+    bound_policy: &Policy,
+    targets: &[HungTarget],
+    now: Instant,
+) -> bool {
+    targets.iter().any(|live| {
+        live == bound
+            && live.publish_time.is_some_and(|published_at| {
+                now.saturating_duration_since(published_at)
+                    <= bound_policy.interval + PUBLISH_AGE_TOLERANCE
+            })
+    })
 }
 
 impl From<&HungTarget> for Identity {
@@ -532,6 +613,7 @@ fn worker(
     let mut published_available = None;
     let mut published_targets = None;
     let mut current_generation = 0;
+    let mut publish_generation = 0u64;
     while !shutdown.load(Ordering::Relaxed) {
         let (request_generation, cfg) = current_request(&config, &generation);
         if request_generation != current_generation {
@@ -628,17 +710,23 @@ fn worker(
             continue;
         }
         let update = match result {
-            Ok(observations) => Update {
-                generation: request_generation,
-                targets: tracker.update(
-                    started.elapsed(),
-                    observations,
-                    policy.failures,
-                    policy.minimum,
-                ),
-                available: true,
-                error: None,
-            },
+            Ok(observations) => {
+                publish_generation += 1;
+                Update {
+                    generation: request_generation,
+                    targets: stamp_publish(
+                        tracker.update(
+                            started.elapsed(),
+                            observations,
+                            policy.failures,
+                            policy.minimum,
+                        ),
+                        publish_generation,
+                    ),
+                    available: true,
+                    error: None,
+                }
+            }
             Err(error) => {
                 tracker.clear();
                 Update {
@@ -806,6 +894,7 @@ unsafe fn describe_candidate(
         image_path,
         process_name,
         title,
+        ..Default::default()
     })
 }
 
@@ -1114,6 +1203,7 @@ unsafe fn action_window(hwnd: HWND) -> Result<HungTarget, ActionOutcome> {
         image_path,
         process_name,
         title,
+        ..Default::default()
     })
 }
 
@@ -1735,7 +1825,16 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             title: format!("target {pid}"),
+            ..Default::default()
         }
+    }
+
+    /// TC-1: a target as the detector publishes it — stated publish generation and
+    /// a monotonic publish time (fresh by the bind bound).
+    fn published(mut target: HungTarget, generation: u64) -> HungTarget {
+        target.publish_generation = generation;
+        target.publish_time = Some(Instant::now());
+        target
     }
 
     fn failed(target: HungTarget) -> Observation {
@@ -2060,7 +2159,7 @@ mod tests {
             hang_enabled: true,
             ..Config::default()
         };
-        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let item = published(target(1, 10, 20, r"C:\Games\game.exe"), 1);
         let started = Instant::now();
         let mut hold = HoldState::default();
         assert!(matches!(
@@ -2246,7 +2345,7 @@ mod tests {
             hang_enabled: true,
             ..Config::default()
         };
-        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let item = published(target(1, 10, 20, r"C:\Games\game.exe"), 1);
         let items = vec![item.clone()];
         let started = Instant::now();
         let mut hold = HoldState::default();
@@ -2301,8 +2400,8 @@ mod tests {
             hang_enabled: true,
             ..Config::default()
         };
-        let a = target(1, 10, 20, r"C:\Games\a.exe");
-        let b = target(2, 11, 21, r"C:\Games\b.exe");
+        let a = published(target(1, 10, 20, r"C:\Games\a.exe"), 1);
+        let b = published(target(2, 11, 21, r"C:\Games\b.exe"), 1);
         let started = Instant::now();
         for mutation in 0..7 {
             let mut hold = HoldState::default();
@@ -2366,7 +2465,7 @@ mod tests {
             hang_enabled: true,
             ..Config::default()
         };
-        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let item = published(target(1, 10, 20, r"C:\Games\game.exe"), 1);
         for owner in 0..4 {
             let started = Instant::now();
             let mut hold = HoldState::default();
@@ -2415,6 +2514,144 @@ mod tests {
             ),
             HoldCommand::Audit(_)
         ));
+    }
+
+    #[test]
+    fn stale_publication_refuses_the_bind_as_canceled_continuity() {
+        // TC-1 acceptance (1): a publication older than the probe interval in force
+        // at bind time plus PUBLISH_AGE_TOLERANCE cancels the press with the audited
+        // canceled-continuity outcome — at the continuity pass and at the action
+        // tick — and no Terminate command is emitted.
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        let mut stale = target(1, 10, 20, r"C:\Games\game.exe");
+        stale.publish_generation = 1;
+        stale.publish_time = Some(
+            Instant::now()
+                - (cfg.hang_probe_interval + PUBLISH_AGE_TOLERANCE + Duration::from_secs(1)),
+        );
+        let items = vec![stale.clone()];
+        let started = Instant::now();
+
+        let mut hold = HoldState::default();
+        hold.set_owner(Some(2));
+        hold.event(button(2, true, started, "hid"), &cfg, &items, true);
+        assert!(hold.presses[2]
+            .as_ref()
+            .is_some_and(|press| press.bound.is_some()));
+        let audit = hold
+            .reconcile(&cfg, &items, true)
+            .expect("the stale publication cancels the bind");
+        assert_eq!(audit.outcome, "canceled-continuity");
+        assert_eq!(audit.target, stale);
+        assert_eq!(audit.target.publish_generation, 1);
+
+        let mut ticked = HoldState::default();
+        ticked.set_owner(Some(2));
+        ticked.event(button(2, true, started, "hid"), &cfg, &items, true);
+        assert!(matches!(
+            ticked.tick(started + cfg.hang_hold, &cfg, &items, true),
+            HoldCommand::Audit(Audit {
+                outcome: "canceled-continuity",
+                ..
+            })
+        ));
+        assert!(!matches!(
+            ticked.tick(started + cfg.hang_hold, &cfg, &items, true),
+            HoldCommand::Terminate(_)
+        ));
+        assert_eq!(
+            ticked.progress(started + cfg.hang_hold, &cfg),
+            0.0,
+            "the refused press is cancelled, never armed for a second action"
+        );
+    }
+
+    #[test]
+    fn unstated_generation_publication_refuses_the_action_as_canceled_continuity() {
+        // TC-1 action bound: a publication with a fresh publish time and no stated
+        // (non-zero) publish generation is not a current generation, so the press
+        // is refused. This isolates the generation clause from the age clause.
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        let mut unstated = target(1, 10, 20, r"C:\Games\game.exe");
+        unstated.publish_generation = 0;
+        unstated.publish_time = Some(Instant::now());
+        let items = vec![unstated.clone()];
+        let started = Instant::now();
+        let mut hold = HoldState::default();
+        hold.set_owner(Some(2));
+        hold.event(button(2, true, started, "hid"), &cfg, &items, true);
+        assert!(matches!(
+            hold.tick(started + cfg.hang_hold, &cfg, &items, true),
+            HoldCommand::Audit(Audit {
+                outcome: "canceled-continuity",
+                ..
+            })
+        ));
+        assert!(hold.presses[2]
+            .as_ref()
+            .is_some_and(|press| press.canceled && !press.resolved));
+    }
+
+    #[test]
+    fn republished_identity_stays_bound_until_the_action() {
+        // TC-1 must not fight the publish cadence: the same identity republished at
+        // a newer generation (fresh stamp) is the current generation for a press
+        // bound at an older one, so the hold still reaches its action.
+        let cfg = Config {
+            hang_enabled: true,
+            hang_probe_interval: Duration::from_millis(250),
+            ..Config::default()
+        };
+        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let older = published(item.clone(), 1);
+        let latest = published(item, 9);
+        let started = Instant::now();
+        let mut hold = HoldState::default();
+        hold.set_owner(Some(2));
+        hold.event(
+            button(2, true, started, "hid"),
+            &cfg,
+            std::slice::from_ref(&older),
+            true,
+        );
+        assert!(matches!(
+            hold.tick(
+                started + Duration::from_millis(200),
+                &cfg,
+                std::slice::from_ref(&older),
+                true
+            ),
+            HoldCommand::None
+        ));
+        assert!(matches!(
+            hold.tick(
+                started + cfg.hang_hold,
+                &cfg,
+                std::slice::from_ref(&latest),
+                true
+            ),
+            HoldCommand::Terminate(bound) if bound == older
+        ));
+    }
+
+    #[test]
+    fn published_targets_carry_their_publish_generation_and_time() {
+        // TC-1 stamping at the publish boundary: every published target states its
+        // generation and monotonic publish time; a bare target is unstamped, so the
+        // new gates are fail-closed.
+        let stamped = stamp_publish(vec![target(1, 10, 20, r"C:\Games\game.exe")], 7);
+        assert_eq!(stamped[0].publish_generation, 7);
+        let published_at = stamped[0].publish_time.expect("publish time");
+        assert!(Instant::now() >= published_at);
+        let bare = target(1, 10, 20, r"C:\Games\game.exe");
+        assert_eq!(bare.publish_generation, 0);
+        assert!(bare.publish_time.is_none());
     }
 
     struct FakeActionApi {

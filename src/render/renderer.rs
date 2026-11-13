@@ -3515,6 +3515,7 @@ mod tests {
             image_path: r"c:\games\game.exe".into(),
             process_name: "game.exe".into(),
             title: "Game".into(),
+            ..Default::default()
         });
         normal.alerts.push(Alert {
             severity: 2,

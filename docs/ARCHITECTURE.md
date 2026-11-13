@@ -183,7 +183,11 @@ cannot terminate a process.
 
 Button-down binds the exact displayed identity. Hold state cancels on release,
 recovery, identity or selection change, device loss, source failure, settings
-change, disable, or safe mode. The action boundary repeats visibility, timeout,
+change, disable, or safe mode. A bind also requires a fresh publication: the
+bound target's publish age must not exceed the probe interval in force at bind
+time plus one bounded publish cycle, and the action boundary requires the
+target in the current publication generation; stale publications cancel as
+continuity refusals. The action boundary repeats visibility, timeout,
 path, exclusion, and process-identity checks before requesting termination with
 only query, synchronize, and terminate rights. Late holds are refused.
 

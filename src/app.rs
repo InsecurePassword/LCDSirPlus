@@ -1906,6 +1906,7 @@ mod tests {
                 image_path: r"C:\Games\game.exe".into(),
                 process_name: "game.exe".into(),
                 title: "Game".into(),
+                ..Default::default()
             }),
             &mut slots,
             &cfg,
@@ -2100,6 +2101,9 @@ mod tests {
             image_path: r"C:\Games\game.exe".into(),
             process_name: "game.exe".into(),
             title: "Game".into(),
+            // TC-1: the current publication states its generation and publish time.
+            publish_generation: 1,
+            publish_time: Some(Instant::now()),
         };
         let stale = crate::telemetry::Update {
             generation: 1,
@@ -2183,6 +2187,11 @@ mod tests {
             image_path: r"C:\Games\game.exe".into(),
             process_name: "game.exe".into(),
             title: "Game".into(),
+            // TC-1: the EC-4 parity scripts pin owner/audit ordering over 4.2 s of
+            // synthetic tick time, not target freshness, so the publication stamp
+            // stays ahead of that whole script (interval 2 s + tolerance 5 s = 7 s).
+            publish_generation: 1,
+            publish_time: Some(Instant::now() + Duration::from_secs(3600)),
         }
     }
 

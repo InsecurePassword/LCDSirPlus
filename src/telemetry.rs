@@ -1866,6 +1866,7 @@ mod tests {
             image_path: "old.exe".into(),
             process_name: "old.exe".into(),
             title: "old".into(),
+            ..Default::default()
         };
         worker.apply_presentmon_update(
             presentmon::Update {
