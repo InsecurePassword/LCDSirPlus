@@ -35,6 +35,11 @@ const PARENT_ENV: &str = "LCDSIRPLUS_CONNECTION_RECOVERY_PARENT";
 const READY_TIMEOUT_MS: u32 = 10_000;
 const GRACE: Duration = Duration::from_secs(30);
 const MAX_JOURNAL_BYTES: u64 = 8192;
+/// RC-4 R-1: the shortest legal durable line — `finished` (8) + tab + 10-digit
+/// timestamp + tab + an empty detail + newline = 21 bytes. A file whose length
+/// plus this minimum exceeds the cap can hold no further line at all, so it is
+/// permanently full; that is the rule the cap flag is derived from.
+const MIN_JOURNAL_LINE: u64 = 21;
 
 /// Shipped default of `logitech_reconnect_max` (`config.rs` L271; parsed at
 /// `parser.rs` L376-L377; validated `>= logitech_reconnect` and `<= 600 s` at
@@ -125,6 +130,17 @@ fn transition(stage: Stage, event: &str, detail: &str) -> Result<Stage, String> 
 struct Journal {
     path: PathBuf,
     stage: Stage,
+    /// RC-4: the named `connection recovery log is full` condition. The
+    /// pre-write cap gate sets it beside the `Err` that carries the name, so it
+    /// survives the fail-closed jump to `Finished` and reaches the device
+    /// surface instead of passing silently. It is never read back out of the
+    /// file: `load` derives it from the durable length and `record` derives it
+    /// from the length each accepted append leaves behind, both by
+    /// `length + MIN_JOURNAL_LINE > MAX_JOURNAL_BYTES`. The guarded file CAN
+    /// still grow — the load path's own fail-closed line fits whenever any line
+    /// fits — so this remaining-room rule, not the gate alone, is what makes
+    /// the condition visible in every process.
+    full: bool,
 }
 
 impl Journal {
@@ -146,6 +162,7 @@ impl Journal {
         let mut journal = Self {
             path,
             stage: Stage::Fresh,
+            full: false,
         };
         let mut file = match journal.open(false) {
             Ok(file) => file,
@@ -160,6 +177,14 @@ impl Journal {
         if text.is_empty() || text.len() as u64 > MAX_JOURNAL_BYTES || !text.ends_with('\n') {
             return Err("incomplete connection recovery log; automatic recovery disabled".into());
         }
+        // RC-4 R-1: the cap condition is DERIVED from the durable bytes, never
+        // read from them, so a journal that can hold no further line names
+        // itself in every process and not only in the one whose pre-write gate
+        // fired. `length + MIN_JOURNAL_LINE > cap` is by definition "no legal
+        // line fits": the append-only file CAN still grow (the load path's own
+        // fail-closed line fits while any line fits), so the gate alone can
+        // never make the condition visible after a restart.
+        journal.full = text.len() as u64 + MIN_JOURNAL_LINE > MAX_JOURNAL_BYTES;
         for line in text.lines() {
             let parts: Vec<_> = line.splitn(3, '\t').collect();
             if parts.len() != 3 || parts[1].parse::<u64>().is_err() {
@@ -207,18 +232,26 @@ impl Journal {
         let result = (|| {
             let mut file = self.open(self.stage == Stage::Fresh)?;
             if file.metadata()?.len() + line.len() as u64 > MAX_JOURNAL_BYTES {
+                self.full = true;
                 return Err(std::io::Error::other("connection recovery log is full"));
             }
             file.write_all(line.as_bytes())?;
-            file.sync_all()
+            file.sync_all()?;
+            file.metadata().map(|metadata| metadata.len())
         })();
-        if let Err(error) = result {
-            self.stage = Stage::Finished;
-            return Err(format!(
-                "connection recovery log write failed; no further actions: {error}"
-            ));
-        }
+        let len_after = match result {
+            Ok(len_after) => len_after,
+            Err(error) => {
+                self.stage = Stage::Finished;
+                return Err(format!(
+                    "connection recovery log write failed; no further actions: {error}"
+                ));
+            }
+        };
         self.stage = next;
+        // RC-4 R-1: the append that filled the last byte publishes the named
+        // condition in its OWN process, from the length it left behind.
+        self.full |= len_after + MIN_JOURNAL_LINE > MAX_JOURNAL_BYTES;
         crate::log_info!("connection recovery: {event}: {detail}");
         Ok(())
     }
@@ -389,21 +422,38 @@ impl Recovery {
         self.liveness_since = None;
     }
 
+    /// RC-4 read-only exposure of the named cap condition for the display
+    /// surface: true once the 8192-byte pre-write gate has fired in this
+    /// process, or once the durable bytes leave room for no legal line at all
+    /// (the R-1 derivation, at load and after every accepted append). Reads
+    /// journal state only; it never mutates stage, permit, or journal.
+    fn journal_full(&self) -> bool {
+        self.journal.as_ref().is_some_and(|journal| journal.full)
+    }
+
     /// RC-5 label exposure for the human-facing surface: (d) a recovery action
     /// failed (named cause), else (c) the one restart allowance is spent and the
-    /// journal is `Finished`, so there is no further automatic action. Reads
-    /// permit/stage/cause state only; it never mutates stage, permit, or journal.
+    /// journal is `Finished`, so there is no further automatic action. RC-4: the
+    /// cap-reached outcome joins (c) — "allowance exhausted / log full" is the
+    /// same named terminal outcome, so a full journal never reads as a healthy
+    /// silent pass. R-1 is what makes that claim true of a fresh process as
+    /// well: `Journal::load` and every accepted append derive the condition
+    /// from the bytes in the file (see `MIN_JOURNAL_LINE`) instead of waiting
+    /// for a gate that only the refusing process ever reaches. Reads
+    /// permit/stage/cause/cap state only; it never mutates stage, permit, or
+    /// journal.
     pub fn display_status(&self) -> DeviceStatus {
         if let Some(cause) = self.recovery_failure {
             return DeviceStatus::RecoveryFailed {
                 code: cause.short(),
             };
         }
-        if self.permit.spent()
-            && self
-                .journal
-                .as_ref()
-                .is_some_and(|journal| journal.stage == Stage::Finished)
+        if self.journal_full()
+            || (self.permit.spent()
+                && self
+                    .journal
+                    .as_ref()
+                    .is_some_and(|journal| journal.stage == Stage::Finished))
         {
             return DeviceStatus::AllowanceConsumed;
         }
@@ -1459,6 +1509,360 @@ mod tests {
         assert!(
             !root.journal().exists(),
             "rejected events must not create journal history"
+        );
+    }
+
+    /// RC-4 acceptance (1)+(ii): a journal that reaches the 8192-byte cap at
+    /// record time publishes its OWN named outcome — the
+    /// `connection recovery log is full` cause on the log surface, carried by the
+    /// accepted (c) allowance-exhausted label on the device surface (zero new
+    /// labels, zero new `DeviceStatus` arms) — and fails closed: `Finished`, the
+    /// file untouched at the cap, and no further action ever.
+    #[test]
+    fn journal_at_cap_publishes_the_named_outcome_and_fails_closed() {
+        let root = TestDir::new();
+        let now = Instant::now();
+        let mut recovery = Recovery::load(root.journal(), false, 1, now);
+        // The legal ladder, then the accepted `logitech-wait-timeout` repeat,
+        // every line a real durable append, until the pre-write cap gate fires.
+        assert!(recovery.record("application-attempt", &"a".repeat(500)));
+        assert!(recovery.record("application-launched", "42"));
+        assert!(recovery.record("application-resumed", "relaunched"));
+        assert!(recovery.record("logitech-attempt", "one restart"));
+        let filler = "t".repeat(500);
+        let mut appended = 0;
+        while recovery.record("logitech-wait-timeout", &filler) {
+            appended += 1;
+        }
+        assert!(appended > 0, "the ladder keeps appending to the cap");
+        // The cap gate named its own condition and it survived the fail-closed
+        // transition to `Finished`.
+        assert!(
+            recovery.journal_full(),
+            "the cap gate must set the named condition"
+        );
+        assert_eq!(
+            recovery.journal.as_ref().unwrap().stage,
+            Stage::Finished,
+            "the cap fails closed"
+        );
+        // The named cause on the log surface: the very string the cap path hands
+        // to `log_error!` through `Recovery::record`, proven at the gate and
+        // still firing after a reload, so the file is permanently full.
+        let mut reloaded = Journal::load(root.journal()).unwrap();
+        let error = reloaded
+            .record("logitech-wait-timeout", &filler)
+            .expect_err("the cap survives a reload");
+        assert!(
+            error.contains("connection recovery log is full"),
+            "the cap must name its own cause: {error}"
+        );
+        assert!(error.contains("no further actions"));
+        // The named outcome on the device surface.
+        assert_eq!(
+            recovery.display_status(),
+            DeviceStatus::AllowanceConsumed,
+            "a full journal must never publish a silent pass"
+        );
+        assert_eq!(
+            recovery.display_status().label(),
+            DeviceStatus::LABEL_ALLOWANCE
+        );
+        // No further action, and the journal is never rewritten.
+        let durable = std::fs::read(root.journal()).unwrap();
+        assert!(
+            durable.len() as u64 <= MAX_JOURNAL_BYTES,
+            "the cap is never exceeded"
+        );
+        assert_eq!(recovery.due(now + GRACE * 10), None);
+        assert!(
+            !recovery.restart_application(|| panic!("a full journal must not launch")),
+            "no launch after the cap"
+        );
+        assert!(!recovery.record("logitech-wait-timeout", &filler));
+        assert!(!recovery.tick(now + GRACE * 10, true, || panic!(
+            "a full journal must not request a reconnect"
+        )));
+        assert_eq!(std::fs::read(root.journal()).unwrap(), durable);
+        drop(recovery);
+        // Across a restart the named outcome survives: the load path's own
+        // fail-closed record hits the same cap gate, so the flag is re-derived
+        // there (never durable in the file, which is never rewritten).
+        let later = Recovery::load(root.journal(), false, 99, now);
+        assert!(
+            later.journal_full(),
+            "a restart must re-name the cap at the same gate"
+        );
+        assert_eq!(later.journal.as_ref().unwrap().stage, Stage::Finished);
+        assert_eq!(
+            later.display_status(),
+            DeviceStatus::AllowanceConsumed,
+            "the named outcome is published in the next process too"
+        );
+        assert_eq!(later.due(now + GRACE * 10), None);
+        assert_eq!(std::fs::read(root.journal()).unwrap(), durable);
+    }
+
+    /// RC-4 R-1 (audit §6 F-1, state S5): when the refused line is long, the
+    /// cap fires at a durable length in the 21-byte window [8030, 8050], so the
+    /// restart's own load-path fail-closed `finished` line (142 B) still fits.
+    /// The guarded file therefore DOES grow after the cap event, landing at
+    /// 8172..8192 where no legal line ever fits again. Every fresh process must
+    /// name that permanent fullness as (c), never publish a healthy silent pass.
+    #[test]
+    fn permanently_full_journal_names_itself_after_a_restart() {
+        let root = TestDir::new();
+        let now = Instant::now();
+
+        // Process A: the legal ladder (532+35+42+40 = 649), 13 accepted
+        // `logitech-wait-timeout` repeats (13*534), then a 449-byte
+        // `logitech-result` line: 649 + 6942 + 449 = 8040, inside the window,
+        // durable stage `LogitechResult` (not `Finished`). Every byte is a real
+        // durable append through the one writer, `Journal::record`; the fixture
+        // is built on `Journal` (no `Drop`) so no process-exit line is appended.
+        let mut writer = Journal::load(root.journal()).unwrap();
+        writer
+            .record("application-attempt", &"a".repeat(500))
+            .unwrap();
+        writer.record("application-launched", "42").unwrap();
+        writer.record("application-resumed", "relaunched").unwrap();
+        writer.record("logitech-attempt", "one restart").unwrap();
+        for _ in 0..13 {
+            writer
+                .record("logitech-wait-timeout", &"t".repeat(500))
+                .unwrap();
+        }
+        writer.record("logitech-result", &"r".repeat(421)).unwrap();
+        assert_eq!(writer.stage, Stage::LogitechResult);
+        drop(writer);
+
+        let before = std::fs::metadata(root.journal()).unwrap().len();
+        assert!(
+            (8030..=8050).contains(&before),
+            "the fixture must land the durable length in the 21-byte S5 window, got {before}"
+        );
+
+        // Process B (restart): the load path's own 142-byte fail-closed line
+        // fits (8040 + 142 = 8182 <= 8192), so the file grows; 8182 + 21 = 8203
+        // > 8192 means no legal line ever fits again. The permit is fresh, so
+        // only the cap derivation can publish (c).
+        let restarted = Recovery::load(root.journal(), true, 99, now);
+        let after = std::fs::metadata(root.journal()).unwrap().len();
+        assert_eq!(
+            after - before,
+            142,
+            "the growth is exactly the load path's fail-closed line"
+        );
+        assert!(
+            after as u64 <= MAX_JOURNAL_BYTES,
+            "the 8192-byte cap is respected"
+        );
+        assert!(
+            after as u64 + 21 > MAX_JOURNAL_BYTES,
+            "the journal is permanently full: no 21-byte-minimum line fits"
+        );
+        assert_eq!(
+            restarted.journal.as_ref().unwrap().stage,
+            Stage::Finished,
+            "the load path fails closed"
+        );
+        assert!(
+            !restarted.permit.spent(),
+            "(c) here must come from the cap, not from a spent allowance"
+        );
+        assert!(
+            restarted.journal_full(),
+            "the process that filled the last byte must derive the cap"
+        );
+        assert_eq!(
+            restarted.display_status(),
+            DeviceStatus::AllowanceConsumed,
+            "a permanently full journal must name itself after a restart"
+        );
+        assert_eq!(
+            restarted.display_status().label(),
+            DeviceStatus::LABEL_ALLOWANCE
+        );
+        assert_eq!(restarted.due(now + GRACE * 10), None);
+        drop(restarted);
+
+        // Every later process (S6): the load derivation names it, and the file
+        // is never rewritten.
+        let settled = std::fs::read(root.journal()).unwrap();
+        let later = Recovery::load(root.journal(), true, 99, now);
+        assert!(
+            later.journal_full(),
+            "a later process names the same condition at load"
+        );
+        assert_eq!(
+            later.display_status(),
+            DeviceStatus::AllowanceConsumed,
+            "the named outcome is published in every process after the restart"
+        );
+        assert_eq!(
+            std::fs::read(root.journal()).unwrap(),
+            settled,
+            "no new write site: a full journal records nothing at load"
+        );
+    }
+
+    /// RC-4 R-1 disclosure (audit §6 S3, F-6): the load-time rule is a
+    /// remaining-room rule, so a complete durable-`Finished` journal of 8172
+    /// bytes or more names "log full" at load (literally true: no legal line
+    /// fits). One byte shorter, 8171, it can still take a 21-byte line, and the
+    /// accepted RC-5 silent-pass shape is unchanged.
+    #[test]
+    fn a_finished_journal_names_log_full_only_once_no_line_fits() {
+        let root = TestDir::new();
+        let now = Instant::now();
+
+        // Durable `Finished` at 8171 B: 649 + 14*534 = 8125, plus a 46-byte
+        // `finished` line. 8171 + 21 = 8192 is not over the cap, so a legal
+        // line still fits and the journal is not full.
+        let mut ladder = Journal::load(root.journal()).unwrap();
+        ladder
+            .record("application-attempt", &"a".repeat(500))
+            .unwrap();
+        ladder.record("application-launched", "42").unwrap();
+        ladder.record("application-resumed", "relaunched").unwrap();
+        ladder.record("logitech-attempt", "one restart").unwrap();
+        for _ in 0..14 {
+            ladder
+                .record("logitech-wait-timeout", &"t".repeat(500))
+                .unwrap();
+        }
+        ladder.record("finished", &"f".repeat(25)).unwrap();
+        assert_eq!(ladder.stage, Stage::Finished);
+        drop(ladder);
+
+        let roomy = std::fs::metadata(root.journal()).unwrap().len();
+        assert_eq!(roomy, 8171, "one 21-byte line must still fit");
+        let open = Recovery::load(root.journal(), true, 99, now);
+        assert_eq!(open.journal.as_ref().unwrap().stage, Stage::Finished);
+        assert!(
+            !open.journal_full(),
+            "8171 + 21 = 8192: the cap is not reached"
+        );
+        assert_eq!(
+            open.display_status(),
+            DeviceStatus::Healthy,
+            "a complete journal with room left keeps the accepted RC-5 shape"
+        );
+        drop(open);
+        assert_eq!(
+            std::fs::metadata(root.journal()).unwrap().len(),
+            roomy,
+            "a complete journal records nothing at load"
+        );
+
+        // Same ladder, 36-byte detail: 8125 + 57 = 8182 >= 8172, so no legal
+        // line ever fits again and the fresh process names the cap.
+        std::fs::remove_file(root.journal()).unwrap();
+        let mut filled = Journal::load(root.journal()).unwrap();
+        filled
+            .record("application-attempt", &"a".repeat(500))
+            .unwrap();
+        filled.record("application-launched", "42").unwrap();
+        filled.record("application-resumed", "relaunched").unwrap();
+        filled.record("logitech-attempt", "one restart").unwrap();
+        for _ in 0..14 {
+            filled
+                .record("logitech-wait-timeout", &"t".repeat(500))
+                .unwrap();
+        }
+        filled.record("finished", &"f".repeat(36)).unwrap();
+        assert_eq!(filled.stage, Stage::Finished);
+        drop(filled);
+
+        let complete = std::fs::metadata(root.journal()).unwrap().len();
+        assert!(
+            (8172..=8192).contains(&complete),
+            "the fixture must land a complete journal at a permanently full length, got {complete}"
+        );
+        let durable = std::fs::read(root.journal()).unwrap();
+        let restarted = Recovery::load(root.journal(), true, 99, now);
+        assert_eq!(restarted.journal.as_ref().unwrap().stage, Stage::Finished);
+        assert!(
+            restarted.journal_full(),
+            "a durable-Finished journal with no room left names the cap at load"
+        );
+        assert_eq!(
+            restarted.display_status(),
+            DeviceStatus::AllowanceConsumed,
+            "S3 at >= 8172 B is disclosed: the journal is literally full, so the label is published"
+        );
+        assert_eq!(
+            std::fs::read(root.journal()).unwrap(),
+            durable,
+            "no new write site: a complete journal is never rewritten"
+        );
+    }
+
+    /// RC-4 (d): a long RC-1 cause detail is clamped to 500 characters BEFORE
+    /// the line is built, so the cap arithmetic runs on the clamped size, the
+    /// detail never breaks the durable three-field shape, and the cause rides in
+    /// the accepted `application-attempt` detail with zero new journal event
+    /// types.
+    #[test]
+    fn long_rc1_cause_detail_is_clamped_before_the_cap_and_adds_no_event_type() {
+        const EVENTS: [&str; 7] = [
+            "application-attempt",
+            "application-launched",
+            "application-resumed",
+            "logitech-attempt",
+            "logitech-result",
+            "logitech-wait-timeout",
+            "finished",
+        ];
+        let root = TestDir::new();
+        let mut journal = Journal::load(root.journal()).unwrap();
+        // A hostile RC-1 detail: > 10,000 characters carrying tabs and newlines.
+        let cause = format!(
+            "loss-cause=worker-stalled {}",
+            "nested\tfield\n".repeat(800)
+        );
+        assert!(cause.chars().count() > 10_000, "the raw cause is huge");
+        assert!(journal.record("application-attempt", &cause).is_ok());
+        journal.record("application-launched", "42").unwrap();
+        journal.record("application-resumed", &cause).unwrap();
+        journal.record("logitech-attempt", &cause).unwrap();
+        let text = std::fs::read_to_string(root.journal()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4);
+        for line in &lines {
+            let parts: Vec<&str> = line.splitn(3, '\t').collect();
+            assert_eq!(parts.len(), 3, "the clamp neutralises tabs/newlines");
+            assert!(
+                parts[2].chars().count() <= 500,
+                "the clamp runs before the line is built: {}",
+                parts[2].len()
+            );
+            assert!(EVENTS.contains(&parts[0]), "no new journal event type");
+        }
+        assert_eq!(lines[0].split('\t').next().unwrap(), "application-attempt");
+        assert!(
+            lines[0].contains("loss-cause=worker-stalled"),
+            "the RC-1 cause channel is preserved"
+        );
+        // The cap arithmetic saw the clamped bytes: filling to the cap with the
+        // same cause lands within ONE clamped line of 8192. An unclamped cause
+        // (12,034-byte line) could never satisfy this.
+        let mut accepted = 0;
+        while journal.record("logitech-wait-timeout", &cause).is_ok() {
+            accepted += 1;
+        }
+        assert!(accepted > 0, "clamped lines keep fitting");
+        let len = std::fs::metadata(root.journal()).unwrap().len();
+        let clamped_line = "logitech-wait-timeout".len() as u64 + 1 + 10 + 1 + 500 + 1;
+        assert!(len <= MAX_JOURNAL_BYTES, "the cap is never exceeded");
+        assert!(
+            len + clamped_line > MAX_JOURNAL_BYTES,
+            "the gate fired on the CLAMPED line size, not the raw cause"
+        );
+        // The clamped detail never breaks the durable shape: the file replays.
+        assert_eq!(
+            Journal::load(root.journal()).unwrap().stage,
+            Stage::LogitechAttempt
         );
     }
 
