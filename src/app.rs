@@ -159,7 +159,10 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
     let mut renderer = Renderer::new();
     let mut slots = Manager::new(&cfg, [0; 4]);
     let mut hang_hold = hang::HoldState::default();
-    hang_hold.set_owner(proc_hang_owner(&slots));
+    // EC-4: the startup bind marks the owner resolved; later binds happen only
+    // when the slot configuration changes.
+    let mut hang_owner = HangOwner::default();
+    let _ = hang_owner.bind(&slots, &mut hang_hold);
     let mut alerts = crate::alerts::Manager::default();
     let mut bottleneck = BottleneckDetector::default();
 
@@ -222,7 +225,8 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                         renderer = Renderer::new();
                         discord_runtime.update_config(&cfg);
                         slots.apply(&cfg);
-                        if let Some(audit) = hang_hold.set_owner(proc_hang_owner(&slots)) {
+                        hang_owner.invalidate();
+                        if let Some(audit) = hang_owner.bind(&slots, &mut hang_hold) {
                             log_hang_audit(&audit);
                         }
                         watcher.replace(&files);
@@ -278,7 +282,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
             snapshot.providers.remove("Hung window detector");
         }
 
-        if let Some(audit) = hang_hold.set_owner(proc_hang_owner(&slots)) {
+        if let Some(audit) = hang_owner.bind(&slots, &mut hang_hold) {
             log_hang_audit(&audit);
         }
         if let Some(audit) = hang_hold.reconcile(&cfg, published_hung, hang_provider_available) {
@@ -398,7 +402,8 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                         let command =
                             hang_hold.event(event, &cfg, published_hung, hang_provider_available);
                         apply_hold_command(command, &mut slots, &cfg, &mut alerts, &mut snapshot);
-                        if let Some(audit) = hang_hold.set_owner(proc_hang_owner(&slots)) {
+                        hang_owner.invalidate();
+                        if let Some(audit) = hang_owner.bind(&slots, &mut hang_hold) {
                             log_hang_audit(&audit);
                         }
                     }
@@ -418,7 +423,8 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                     }
                     let delta: i64 = if backward { -1 } else { 1 };
                     slots.cycle(slot, delta);
-                    if let Some(audit) = hang_hold.set_owner(proc_hang_owner(&slots)) {
+                    hang_owner.invalidate();
+                    if let Some(audit) = hang_owner.bind(&slots, &mut hang_hold) {
                         log_hang_audit(&audit);
                     }
                     crate::log_debug!("preview slot {} cycled", slot);
@@ -440,7 +446,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
             running = false;
         }
 
-        if let Some(audit) = hang_hold.set_owner(proc_hang_owner(&slots)) {
+        if let Some(audit) = hang_owner.bind(&slots, &mut hang_hold) {
             log_hang_audit(&audit);
         }
         if let Some(audit) = hang_hold.reconcile(&cfg, published_hung, hang_provider_available) {
@@ -448,6 +454,9 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
         }
         let command = hang_hold.tick(now, &cfg, published_hung, hang_provider_available);
         apply_hold_command(command, &mut slots, &cfg, &mut alerts, &mut snapshot);
+        // EC-4: the command can cycle a slot, so the owner is stale until the
+        // next iteration's bind site.
+        hang_owner.invalidate();
 
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -461,6 +470,45 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
 
 fn proc_hang_owner(slots: &Manager) -> Option<usize> {
     (0..4).find(|&slot| slots.current(slot).eq_ignore_ascii_case("PROC_HANG"))
+}
+
+/// EC-4: the PROC_HANG owner is a pure function of the slot selections, so it is
+/// resolved once per slot-configuration change (slot cycle/apply, config reload)
+/// instead of at every loop iteration. `hang::HoldState::set_owner` emits its
+/// `canceled-slot-owner` audit on a real owner change by cancelling the press
+/// bound to the old owner, so this cache is not a second dedup layer: it only
+/// removes the per-tick owner scan.
+#[derive(Default)]
+struct HangOwner {
+    /// `None` = the slot selections changed since the last resolution.
+    cached: Option<Option<usize>>,
+    /// EC-4 seam: number of owner resolutions, i.e. of `proc_hang_owner` scans.
+    /// Read only by the EC-4 tests; production never observes it.
+    #[cfg(test)]
+    resolutions: u64,
+}
+
+impl HangOwner {
+    /// Mark the owner stale. Call after every mutation of the slot selections.
+    fn invalidate(&mut self) {
+        self.cached = None;
+    }
+
+    /// Bind the owner at a slot-owner site: scan and call `set_owner` only when
+    /// the slot configuration changed since the last bind, so a steady tick does
+    /// no scan and no `set_owner` call.
+    fn bind(&mut self, slots: &Manager, hold: &mut hang::HoldState) -> Option<hang::Audit> {
+        if self.cached.is_some() {
+            return None;
+        }
+        let owner = proc_hang_owner(slots);
+        self.cached = Some(owner);
+        #[cfg(test)]
+        {
+            self.resolutions += 1;
+        }
+        hold.set_owner(owner)
+    }
 }
 
 /// EC-3: the telemetry providers a displayed module reads. Names must match
@@ -2125,6 +2173,538 @@ mod tests {
             ),
             hang::HoldCommand::None
         ));
+    }
+
+    fn ec4_target(pid: u32) -> crate::model::HungTarget {
+        crate::model::HungTarget {
+            hwnd: 1,
+            pid,
+            creation_time: 3,
+            image_path: r"C:\Games\game.exe".into(),
+            process_name: "game.exe".into(),
+            title: "Game".into(),
+        }
+    }
+
+    fn ec4_press(index: usize, down: bool, at: Instant) -> crate::input::Event {
+        crate::input::Event {
+            index,
+            down,
+            backward: false,
+            canceled: false,
+            at,
+            source: "test",
+        }
+    }
+
+    fn ec4_cfg() -> Config {
+        Config {
+            hang_enabled: true,
+            ..Config::default()
+        }
+    }
+
+    /// EC-4 acceptance (1): a steady slot configuration resolves the owner once.
+    /// The render-tick sites neither scan nor reach `set_owner`, so no audit fires.
+    #[test]
+    fn ec4_owner_cache_resolves_once_across_render_ticks() {
+        let cfg = ec4_cfg();
+        let slots = Manager::new(&cfg, [0; 4]);
+        assert_eq!(proc_hang_owner(&slots), Some(2), "default owner is slot 2");
+        let mut cache = HangOwner::default();
+        let mut hold = hang::HoldState::default();
+        let mut audits = 0;
+        for _ in 0..100 {
+            if cache.bind(&slots, &mut hold).is_some() {
+                audits += 1;
+            }
+        }
+        assert_eq!(audits, 0, "no set_owner audit across 100 unchanged ticks");
+        assert_eq!(
+            cache.resolutions, 1,
+            "the O(slots) owner scan runs once, not at every tick site"
+        );
+    }
+
+    /// EC-4 acceptance (2): moving PROC_HANG between slots yields exactly one
+    /// `canceled-slot-owner` audit, by cycle and by reload, and nothing while the
+    /// slots stay put.
+    #[test]
+    fn ec4_owner_cache_slot_move_emits_exactly_one_canceled_owner_audit() {
+        let cfg = ec4_cfg();
+        let target = ec4_target(2);
+        let targets = std::slice::from_ref(&target);
+        let started = Instant::now();
+        let mut slots = Manager::new(&cfg, [0; 4]);
+        let mut cache = HangOwner::default();
+        let mut hold = hang::HoldState::default();
+        assert!(cache.bind(&slots, &mut hold).is_none(), "startup bind");
+        hold.event(ec4_press(2, true, started), &cfg, targets, true);
+        // M4: cycling slot 2 moves PROC_HANG away, so the owner disappears.
+        slots.cycle(2, 1);
+        cache.invalidate();
+        let audit = cache
+            .bind(&slots, &mut hold)
+            .expect("one canceled-slot-owner audit on the cycle move");
+        assert_eq!(audit.outcome, "canceled-slot-owner");
+        assert_eq!(audit.target.pid, 2);
+        for _ in 0..50 {
+            assert!(
+                cache.bind(&slots, &mut hold).is_none(),
+                "unchanged slots emit nothing"
+            );
+        }
+        assert_eq!(cache.resolutions, 2, "startup + one cycle scan");
+        // The press is retired, then PROC_HANG cycles back onto slot 2.
+        assert!(matches!(
+            hold.event(
+                ec4_press(2, false, started + cfg.hang_hold),
+                &cfg,
+                targets,
+                true
+            ),
+            hang::HoldCommand::Audit(_)
+        ));
+        slots.cycle(2, -1);
+        cache.invalidate();
+        assert!(
+            cache.bind(&slots, &mut hold).is_none(),
+            "owner restored with no press to cancel"
+        );
+        // M2: a reload that moves PROC_HANG from slot 2 to slot 0 cancels the live
+        // press with its own audit; the owner site adds nothing, because
+        // `cancel_reload` already cancelled the press (pre-EC-4 identical).
+        hold.event(ec4_press(2, true, started), &cfg, targets, true);
+        assert!(
+            hold.cancel_reload()
+                .is_some_and(|audit| audit.outcome == "canceled-config-reload"),
+            "reload cancels the live press"
+        );
+        let mut moved = ec4_cfg();
+        moved.slots[0] = vec!["PROC_HANG".into(), "FPS_CURRENT".into()];
+        moved.slots[2] = vec!["DISK_IO".into(), "GPU_TEMP".into()];
+        slots.apply(&moved);
+        cache.invalidate();
+        assert!(
+            cache.bind(&slots, &mut hold).is_none(),
+            "the reload owner site adds no audit"
+        );
+        assert_eq!(proc_hang_owner(&slots), Some(0), "owner moved to slot 0");
+        assert_eq!(
+            cache.resolutions, 4,
+            "startup + cycle + restore + reload scans"
+        );
+        // The cancelled press retires, a new press binds on the reloaded owner,
+        // and moving PROC_HANG off slot 0 cancels it exactly once (M4).
+        assert!(matches!(
+            hold.event(
+                ec4_press(2, false, started + cfg.hang_hold),
+                &cfg,
+                targets,
+                true
+            ),
+            hang::HoldCommand::Audit(_)
+        ));
+        hold.event(
+            ec4_press(0, true, started + cfg.hang_hold),
+            &moved,
+            targets,
+            true,
+        );
+        slots.cycle(0, 1);
+        cache.invalidate();
+        let audit = cache
+            .bind(&slots, &mut hold)
+            .expect("exactly one canceled-slot-owner audit on the move");
+        assert_eq!(audit.outcome, "canceled-slot-owner");
+        assert_eq!(audit.target.pid, 2);
+        for _ in 0..50 {
+            assert!(
+                cache.bind(&slots, &mut hold).is_none(),
+                "unchanged slots emit nothing"
+            );
+        }
+        assert_eq!(cache.resolutions, 5, "one scan per configuration change");
+    }
+
+    /// EC-4 acceptance (3): the config-reload path keeps its semantics, and the
+    /// EC-3 consumer input keeps reading the live slot modules.
+    #[test]
+    fn ec4_owner_cache_config_reload_semantics_preserved() {
+        let cfg = ec4_cfg();
+        let target = ec4_target(7);
+        let targets = std::slice::from_ref(&target);
+        let started = Instant::now();
+        let mut slots = Manager::new(&cfg, [0; 4]);
+        let mut cache = HangOwner::default();
+        let mut hold = hang::HoldState::default();
+        assert!(cache.bind(&slots, &mut hold).is_none(), "startup bind");
+        hold.event(ec4_press(2, true, started), &cfg, targets, true);
+        // Reload with an unchanged slot list: the reload audit only, no owner audit.
+        assert!(
+            hold.cancel_reload()
+                .is_some_and(|audit| audit.outcome == "canceled-config-reload"),
+            "reload cancels the live press"
+        );
+        slots.apply(&cfg);
+        cache.invalidate();
+        assert!(
+            cache.bind(&slots, &mut hold).is_none(),
+            "an unchanged owner must not emit an owner audit"
+        );
+        assert_eq!(cache.resolutions, 2, "startup + the reload scan");
+        // EC-3: the consumer-bit input is still the slot modules, not the cache.
+        let mut snapshot = Snapshot::default();
+        snapshot.bottleneck.state = crate::model::BottleneckState::None;
+        snapshot.bottleneck.freshness = Freshness::Current;
+        assert_eq!(
+            effective_slot_modules(&slots, &snapshot, &cfg)[2],
+            "DISK_IO",
+            "the dynamic fall-through is unchanged by the owner cache"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        Tick(u64),
+        CycleUi {
+            slot: usize,
+            delta: i64,
+        },
+        Button {
+            index: usize,
+            down: bool,
+            at_ms: u64,
+        },
+        SetSlotModules {
+            slot: usize,
+            modules: &'static [&'static str],
+        },
+        SafeMode(bool),
+        Reload,
+    }
+
+    fn ec4_audit_line(audit: &hang::Audit) -> String {
+        format!("{}:{}", audit.outcome, audit.target.pid)
+    }
+
+    /// One visit to a slot-owner site: count it, run the driver's owner action,
+    /// and record the audit it emits (if any).
+    fn ec4_site<SITE>(
+        out: &mut Vec<String>,
+        sites: &mut u64,
+        site: &mut SITE,
+        slots: &mut Manager,
+        hold: &mut hang::HoldState,
+    ) where
+        SITE: FnMut(&Manager, &mut hang::HoldState) -> Option<hang::Audit>,
+    {
+        *sites += 1;
+        if let Some(audit) = site(slots, hold) {
+            out.push(ec4_audit_line(&audit));
+        }
+    }
+
+    fn ec4_record_command(
+        out: &mut Vec<String>,
+        command: hang::HoldCommand,
+        slots: &mut Manager,
+        cfg: &Config,
+        alerts: &mut crate::alerts::Manager,
+        snapshot: &mut Snapshot,
+    ) {
+        match &command {
+            hang::HoldCommand::None => {}
+            hang::HoldCommand::Cycle { index, backward } => {
+                out.push(format!("cycle:{index}:{backward}"))
+            }
+            hang::HoldCommand::Terminate(target) => out.push(format!("terminate:{}", target.pid)),
+            hang::HoldCommand::Audit(audit) => {
+                out.push(format!("cmd-audit:{}", ec4_audit_line(audit)))
+            }
+        }
+        // The injectable terminator keeps the probe away from any real process.
+        apply_hold_command_with(command, slots, cfg, alerts, snapshot, |_, _| {
+            hang::ActionOutcome::Success
+        });
+    }
+
+    /// EC-4 parity driver: replays the run loop's slot-owner site order for a
+    /// script. `SITE` runs at every former `hang_hold.set_owner(proc_hang_owner
+    /// (&slots))` call and `CHANGED` right after every slot-selection mutation, so
+    /// the legacy (rescan at every site) and EC-4 (cached) drivers differ only by
+    /// the cache. The site order mirrors `run()`: startup bind; per iteration the
+    /// top-of-loop site + `reconcile`, the end-of-loop site + `reconcile` +
+    /// `tick` command; per button event the command, the site; per UI cycle the
+    /// cycle (the alert-ack path cycles nothing and reaches no site) + the site;
+    /// per reload `cancel_reload`, `slots.apply`, the site.
+    fn ec4_drive_sites<CHANGED, SITE>(
+        script: &[Step],
+        cfg: &mut Config,
+        slots: &mut Manager,
+        hold: &mut hang::HoldState,
+        targets: &[crate::model::HungTarget],
+        mut changed: CHANGED,
+        mut site: SITE,
+    ) -> (Vec<String>, u64)
+    where
+        CHANGED: FnMut(),
+        SITE: FnMut(&Manager, &mut hang::HoldState) -> Option<hang::Audit>,
+    {
+        let mut out = Vec::new();
+        let mut sites = 0;
+        let mut alerts = crate::alerts::Manager::default();
+        let mut snapshot = Snapshot {
+            gpu_temp: Metric::valid(91.0, SystemTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let started = Instant::now();
+        alerts.evaluate(&mut snapshot, cfg, started);
+        // app.rs startup bind.
+        ec4_site(&mut out, &mut sites, &mut site, slots, hold);
+        for step in script {
+            match *step {
+                Step::Tick(i) => {
+                    let now = started + Duration::from_millis(100 * i);
+                    // app.rs top-of-loop site, then alerts and reconcile.
+                    ec4_site(&mut out, &mut sites, &mut site, slots, hold);
+                    alerts.evaluate(&mut snapshot, cfg, now);
+                    if let Some(audit) = hold.reconcile(cfg, targets, true) {
+                        out.push(ec4_audit_line(&audit));
+                    }
+                    // app.rs end-of-loop site, reconcile, then the tick command.
+                    ec4_site(&mut out, &mut sites, &mut site, slots, hold);
+                    if let Some(audit) = hold.reconcile(cfg, targets, true) {
+                        out.push(ec4_audit_line(&audit));
+                    }
+                    let command = hold.tick(now, cfg, targets, true);
+                    ec4_record_command(&mut out, command, slots, cfg, &mut alerts, &mut snapshot);
+                    // The command can cycle a slot (app.rs end-of-loop apply).
+                    changed();
+                }
+                Step::CycleUi { slot, delta } => {
+                    // The alert-ack branch cycles nothing and reaches no site.
+                    if slot == 3 && alerts.acknowledge_highest(&mut snapshot) {
+                        out.push("ack".to_string());
+                        continue;
+                    }
+                    slots.cycle(slot, delta);
+                    changed();
+                    ec4_site(&mut out, &mut sites, &mut site, slots, hold);
+                }
+                Step::Button { index, down, at_ms } => {
+                    let command = hold.event(
+                        ec4_press(index, down, started + Duration::from_millis(at_ms)),
+                        cfg,
+                        targets,
+                        true,
+                    );
+                    ec4_record_command(&mut out, command, slots, cfg, &mut alerts, &mut snapshot);
+                    changed();
+                    ec4_site(&mut out, &mut sites, &mut site, slots, hold);
+                }
+                Step::SetSlotModules { slot, modules } => {
+                    cfg.slots[slot] = modules.iter().map(|module| module.to_string()).collect();
+                }
+                Step::SafeMode(on) => cfg.safe_mode = on,
+                Step::Reload => {
+                    if let Some(audit) = hold.cancel_reload() {
+                        out.push(ec4_audit_line(&audit));
+                    }
+                    slots.apply(cfg);
+                    changed();
+                    ec4_site(&mut out, &mut sites, &mut site, slots, hold);
+                }
+            }
+        }
+        (out, sites)
+    }
+
+    /// EC-4 acceptance (4): audit-fire parity. One scripted sequence (render
+    /// ticks, slot cycles, presses/releases, config reload, safe-mode toggles,
+    /// alert ack, terminate window) is replayed through the pre-EC-4 site order
+    /// (owner rescanned at every site) and the EC-4 order (owner resolved once per
+    /// slot-configuration change); the recorded audit stream must be identical,
+    /// and the EC-4 run must scan far fewer times than it visits sites.
+    #[test]
+    fn ec4_owner_audit_fire_parity_with_pre_cache_sites() {
+        const HANG_ON_ZERO: [&str; 2] = ["PROC_HANG", "FPS_CURRENT"];
+        const HANG_OFF_TWO: [&str; 2] = ["DISK_IO", "GPU_TEMP"];
+        let script = [
+            Step::Tick(1),
+            Step::Tick(2),
+            Step::Button {
+                index: 1,
+                down: true,
+                at_ms: 250,
+            },
+            // A press that is not bound to the owner releases as a slot cycle (M3).
+            Step::Button {
+                index: 1,
+                down: false,
+                at_ms: 280,
+            },
+            Step::Button {
+                index: 2,
+                down: true,
+                at_ms: 300,
+            },
+            Step::Tick(3),
+            Step::Tick(4),
+            Step::CycleUi { slot: 2, delta: 1 },
+            Step::Tick(5),
+            Step::CycleUi { slot: 2, delta: -1 },
+            Step::Button {
+                index: 2,
+                down: false,
+                at_ms: 900,
+            },
+            Step::Button {
+                index: 2,
+                down: true,
+                at_ms: 1000,
+            },
+            Step::SetSlotModules {
+                slot: 0,
+                modules: &HANG_ON_ZERO,
+            },
+            Step::SetSlotModules {
+                slot: 2,
+                modules: &HANG_OFF_TWO,
+            },
+            Step::Reload,
+            Step::Button {
+                index: 2,
+                down: false,
+                at_ms: 1100,
+            },
+            Step::Tick(11),
+            Step::Button {
+                index: 0,
+                down: true,
+                at_ms: 1200,
+            },
+            Step::SafeMode(true),
+            Step::Tick(13),
+            Step::SafeMode(false),
+            Step::Tick(14),
+            Step::CycleUi { slot: 3, delta: 1 },
+            Step::Tick(15),
+            Step::Button {
+                index: 0,
+                down: false,
+                at_ms: 1600,
+            },
+            Step::Button {
+                index: 0,
+                down: true,
+                at_ms: 1700,
+            },
+            Step::Tick(20),
+            Step::Tick(38),
+            Step::Button {
+                index: 0,
+                down: false,
+                at_ms: 3900,
+            },
+            Step::Tick(40),
+            Step::CycleUi { slot: 0, delta: 1 },
+            Step::Tick(41),
+            Step::CycleUi { slot: 0, delta: -1 },
+            Step::Tick(42),
+        ];
+        let target = ec4_target(2);
+        let targets = std::slice::from_ref(&target);
+
+        // Pre-EC-4 shape: every site rescans the owner and calls set_owner.
+        let mut legacy_cfg = ec4_cfg();
+        let mut legacy_slots = Manager::new(&legacy_cfg, [0; 4]);
+        let mut legacy_hold = hang::HoldState::default();
+        let mut legacy_mutations = 0;
+        let (legacy, legacy_sites) = ec4_drive_sites(
+            &script,
+            &mut legacy_cfg,
+            &mut legacy_slots,
+            &mut legacy_hold,
+            targets,
+            || legacy_mutations += 1,
+            |slots, hold| hold.set_owner(proc_hang_owner(slots)),
+        );
+
+        // EC-4 shape: the owner is resolved once per slot-configuration change.
+        let mut cfg = ec4_cfg();
+        let mut slots = Manager::new(&cfg, [0; 4]);
+        let mut hold = hang::HoldState::default();
+        let mut cached_mutations = 0;
+        // The mutation hook marks the cache stale; the owner site consumes that
+        // mark, exactly as the run loop pairs invalidate() with bind().
+        let cache = std::cell::RefCell::new(HangOwner::default());
+        let stale = std::cell::Cell::new(false);
+        let (cached, cached_sites) = ec4_drive_sites(
+            &script,
+            &mut cfg,
+            &mut slots,
+            &mut hold,
+            targets,
+            || {
+                cached_mutations += 1;
+                stale.set(true);
+            },
+            |slots, hold| {
+                if stale.get() {
+                    stale.set(false);
+                    cache.borrow_mut().invalidate();
+                }
+                cache.borrow_mut().bind(slots, hold)
+            },
+        );
+
+        assert_eq!(cached_sites, legacy_sites, "same site order");
+        assert_eq!(
+            cached, legacy,
+            "audit-fire parity: {cached:?} vs {legacy:?}"
+        );
+        assert_eq!(cached_mutations, legacy_mutations, "same mutations");
+        // The script must be load-bearing, not an empty equality.
+        assert!(
+            legacy
+                .iter()
+                .any(|line| line.starts_with("canceled-slot-owner")),
+            "owner moves must happen: {legacy:?}"
+        );
+        assert!(
+            legacy
+                .iter()
+                .any(|line| line.starts_with("canceled-config-reload")),
+            "the reload must cancel a live press: {legacy:?}"
+        );
+        assert!(
+            legacy.iter().any(|line| line.starts_with("cycle:")),
+            "a slot cycle command must run: {legacy:?}"
+        );
+        assert!(
+            legacy.iter().any(|line| line.starts_with("terminate:")),
+            "the hold must reach the terminate window: {legacy:?}"
+        );
+        assert!(
+            legacy.iter().any(|line| line.starts_with("cmd-audit:")),
+            "release audits must fire: {legacy:?}"
+        );
+        // EC-4 scan win on this script: 21 owner scans cover the 29 mutation
+        // hooks (consecutive mutations between two sites coalesce) plus the
+        // startup bind, while the pre-EC-4 shape scans at all 44 owner sites.
+        // The steady-tick case is pinned by
+        // ec4_owner_cache_resolves_once_across_render_ticks.
+        assert_eq!(
+            cache.borrow().resolutions,
+            21,
+            "one scan per slot-configuration change, never per tick site"
+        );
+        assert!(
+            cache.borrow().resolutions < cached_sites,
+            "{} scans over {cached_sites} owner sites",
+            cache.borrow().resolutions
+        );
     }
 
     #[test]
