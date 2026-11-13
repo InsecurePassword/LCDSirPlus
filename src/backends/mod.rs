@@ -16,6 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+
 use crate::config::Config;
 use crate::input::{ButtonTracker, Event};
 #[cfg(test)]
@@ -188,18 +191,56 @@ pub struct Backend {
 }
 
 type Pixels = Box<[u8; crate::model::WIDTH * crate::model::HEIGHT]>;
+/// A frame's whole pixel content by value, so the EC-1 identity cache is one
+/// resident buffer inside the queue instead of a per-frame allocation.
+type FrameBytes = [u8; crate::model::WIDTH * crate::model::HEIGHT];
 
 struct CommandQueue {
     latest: Mutex<Option<Pixels>>,
+    /// EC-1 identity cache: the content of the last frame accepted into
+    /// `latest` since the last device-visible change. A submission carrying
+    /// byte-identical content is skipped (no enqueue, no wake): the panel
+    /// already shows that frame, so the pack + device write + queue work is
+    /// what disappears. Identity is over the pre-transform pixels;
+    /// orientation/invert are fixed for the life of a `Backend`, so identical
+    /// input cannot produce different device output, and a config change
+    /// spawns a fresh queue (empty cache). Invalidated on `request_reconnect`
+    /// (spec: non-optional, the device may reset out of band), on the blanking
+    /// device closes after a submit/poll loss, and structurally on
+    /// reconfigure/stop, which spawn a brand-new queue.
+    last_accepted: Mutex<Option<FrameBytes>>,
     shutdown: AtomicBool,
     reconnect: AtomicBool,
     wake: SyncSender<()>,
+    /// EC-1 acceptance seam: counts the wake attempts issued by frame
+    /// submission, per queue, so a suppressed frame shows up as a zero.
+    #[cfg(test)]
+    wake_sends: AtomicUsize,
 }
 
 impl CommandQueue {
     fn submit(&self, pixels: Pixels) {
+        {
+            let mut last = self.last_accepted.lock().unwrap();
+            if last.as_ref() == Some(&*pixels) {
+                // Intended display retention, not an error path: no state
+                // message, no slot write and no wake happen here.
+                return;
+            }
+            *last = Some(*pixels);
+        }
         *self.latest.lock().unwrap() = Some(pixels);
+        #[cfg(test)]
+        self.wake_sends.fetch_add(1, Ordering::SeqCst);
         let _ = self.wake.try_send(());
+    }
+
+    /// EC-1: forget the cached visible content so the next submission is
+    /// enqueued even when it is identical. Required wherever the panel stops
+    /// showing the cached frame (a blanking close) or the connection is
+    /// rebuilt (reconnect, reconfigure).
+    fn invalidate_identity(&self) {
+        *self.last_accepted.lock().unwrap() = None;
     }
 
     fn take_latest(&self) -> Option<Pixels> {
@@ -216,6 +257,9 @@ impl CommandQueue {
     }
 
     fn request_reconnect(&self) {
+        // The rebuild can reset the device out of band, so the cached frame is
+        // no longer known-visible: the next frame goes out even if identical.
+        self.invalidate_identity();
         self.reconnect.store(true, Ordering::Release);
         let _ = self.wake.try_send(());
     }
@@ -229,9 +273,12 @@ impl Backend {
         let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
         let commands = Arc::new(CommandQueue {
             latest: Mutex::new(None),
+            last_accepted: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             reconnect: AtomicBool::new(false),
             wake: wake_tx,
+            #[cfg(test)]
+            wake_sends: AtomicUsize::new(0),
         });
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         let reconnect = cfg.logitech_reconnect;
@@ -682,6 +729,9 @@ fn physical_worker(
                                     if let Err(close_error) = device.close(true) {
                                         error = append_close_failure(error, &close_error);
                                     }
+                                    // EC-1: the frame never became visible and the
+                                    // close blanked the panel: drop the cached content.
+                                    commands.invalidate_identity();
                                     let _ = msg_tx.send(disconnect(&error));
                                     let _ = msg_tx.send(Message::Buttons(
                                         tracker.disconnect(Instant::now(), active_kind.name()),
@@ -723,6 +773,9 @@ fn physical_worker(
                             if let Err(close_error) = device.close(true) {
                                 error = append_close_failure(error, &close_error);
                             }
+                            // EC-1: the blanking close erased the cached visible
+                            // frame, so the next submitted frame goes out.
+                            commands.invalidate_identity();
                             let _ = msg_tx.send(disconnect(&error));
                             let _ = msg_tx.send(Message::Buttons(
                                 tracker.disconnect(Instant::now(), active_kind.name()),
@@ -838,9 +891,11 @@ mod tests {
         (
             Arc::new(CommandQueue {
                 latest: Mutex::new(None),
+                last_accepted: Mutex::new(None),
                 shutdown: AtomicBool::new(false),
                 reconnect: AtomicBool::new(false),
                 wake,
+                wake_sends: AtomicUsize::new(0),
             }),
             receiver,
         )
@@ -915,6 +970,152 @@ mod tests {
         assert_eq!(backend.commands.take_latest().unwrap()[0], 7);
         backend.shutdown();
         assert!(!result.unwrap(), "retry, not shutdown");
+    }
+
+    // EC-1 seams: the identity gate is exercised on the queue's own wake
+    // counter, so a suppressed frame is observable as a zero, with no device
+    // path involved.
+    #[test]
+    fn identical_frame_content_skips_enqueue_and_wake() {
+        let (queue, wake) = command_queue();
+        queue.submit(pixels(1));
+        assert_eq!(
+            queue.wake_sends.load(Ordering::SeqCst),
+            1,
+            "the first submission enqueues and wakes"
+        );
+        assert_eq!(wake.try_recv(), Ok(()));
+        assert_eq!(
+            queue.take_latest().unwrap()[0],
+            1,
+            "the first submission sits in the single slot"
+        );
+
+        queue.submit(pixels(1));
+        assert_eq!(
+            queue.wake_sends.load(Ordering::SeqCst),
+            1,
+            "an identical frame performs zero wake sends"
+        );
+        assert!(
+            queue.take_latest().is_none(),
+            "an identical frame performs zero enqueue"
+        );
+        assert!(wake.try_recv().is_err(), "no wake token was produced");
+
+        let mut changed = pixels(1);
+        changed[changed.len() - 1] = 2;
+        queue.submit(changed);
+        assert_eq!(
+            queue.wake_sends.load(Ordering::SeqCst),
+            2,
+            "a last-byte difference enqueues and wakes"
+        );
+        let queued = queue.take_latest().unwrap();
+        assert_eq!(
+            queued[0], 1,
+            "the changed frame is the cached one plus the last byte"
+        );
+        assert_eq!(queued[queued.len() - 1], 2);
+    }
+
+    #[test]
+    fn reconnect_request_invalidates_the_identity_cache_so_the_identical_frame_is_sent() {
+        let (queue, wake) = command_queue();
+        queue.submit(pixels(5));
+        assert_eq!(
+            queue.take_latest().unwrap()[0],
+            5,
+            "the worker takes the frame"
+        );
+        queue.submit(pixels(5));
+        assert_eq!(queue.wake_sends.load(Ordering::SeqCst), 1);
+        assert!(
+            queue.take_latest().is_none(),
+            "the repeat stays suppressed until the connection is rebuilt"
+        );
+
+        queue.request_reconnect();
+        assert!(queue.reconnect.load(Ordering::Acquire));
+        assert_eq!(wake.try_recv(), Ok(()), "the reconnect wake stays live");
+        queue.submit(pixels(5));
+        assert_eq!(
+            queue.wake_sends.load(Ordering::SeqCst),
+            2,
+            "after request_reconnect the identical frame enqueues and wakes"
+        );
+        assert_eq!(
+            queue.take_latest().unwrap()[0],
+            5,
+            "the identical frame is sent again after the reconnect"
+        );
+    }
+
+    #[test]
+    fn a_blanking_device_loss_sends_the_identical_frame() {
+        // The worker calls this invalidation on both blanking closes: after a
+        // device submit loss and after a poll loss (`device.close(true)`), so
+        // content the panel lost is never withheld by the cache.
+        let (queue, wake) = command_queue();
+        queue.submit(pixels(6));
+        queue.submit(pixels(6));
+        assert_eq!(
+            queue.wake_sends.load(Ordering::SeqCst),
+            1,
+            "the repeat is suppressed while the panel shows it"
+        );
+
+        queue.invalidate_identity();
+        queue.submit(pixels(6));
+        assert_eq!(
+            queue.wake_sends.load(Ordering::SeqCst),
+            2,
+            "the invalidated cache sends the identical frame"
+        );
+        assert_eq!(queue.take_latest().unwrap()[0], 6);
+        assert_eq!(wake.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn reconfigure_spawns_a_fresh_identity_cache_which_sends_the_identical_frame() {
+        // Acceptance (5): an orientation/invert change goes through
+        // `Backend::reconfigure`, which stops the worker and spawns a brand-new
+        // `CommandQueue`, so the identity cache starts empty and the first
+        // frame after the change is enqueued and wakes the worker.
+        let base = Config {
+            logitech_button_poll: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let rotated = Config {
+            logitech_orientation: "rotate_180".into(),
+            logitech_invert: true,
+            ..Default::default()
+        };
+        let mut backend = Backend::spawn(BackendKind::Virtual, &base);
+        let mut frame = Frame::new();
+        frame.set(3, 4, true);
+        assert_ne!(
+            transform_frame(&frame.pixels, "normal", false),
+            transform_frame(&frame.pixels, "rotate_180", true),
+            "the config change is visible device work"
+        );
+
+        backend.submit(&frame);
+        backend.submit(&frame);
+        assert_eq!(
+            backend.commands.wake_sends.load(Ordering::SeqCst),
+            1,
+            "within one backend the identical repeat is suppressed"
+        );
+
+        backend.reconfigure(BackendKind::Virtual, &rotated);
+        backend.submit(&frame);
+        assert_eq!(
+            backend.commands.wake_sends.load(Ordering::SeqCst),
+            1,
+            "the reconfigured backend's fresh cache sends the identical frame"
+        );
+        backend.shutdown();
     }
 
     #[test]
