@@ -428,6 +428,11 @@ fn transform_frame(
 enum PhysicalDevice {
     Hid(hid::HidDevice),
     Sdk(sdk::SdkDevice),
+    /// F-2 test seam: a scripted stand-in for a physical device, so the worker's
+    /// two blanking device-loss sites and their EC-1 invalidations are testable
+    /// without hardware. Compiles out of every non-test build.
+    #[cfg(test)]
+    Scripted(ScriptedDevice),
 }
 
 impl PhysicalDevice {
@@ -435,6 +440,8 @@ impl PhysicalDevice {
         match self {
             Self::Hid(_) => BackendKind::Hid,
             Self::Sdk(_) => BackendKind::Sdk,
+            #[cfg(test)]
+            Self::Scripted(_) => BackendKind::Hid,
         }
     }
 
@@ -450,6 +457,8 @@ impl PhysicalDevice {
                 device.submit(bytes.clone())?;
                 Ok(bytes)
             }
+            #[cfg(test)]
+            Self::Scripted(device) => device.submit(frame),
         }
     }
 
@@ -476,6 +485,8 @@ impl PhysicalDevice {
                     ))
                 }
             }
+            #[cfg(test)]
+            Self::Scripted(device) => device.poll(timeout),
         }
     }
 
@@ -487,7 +498,79 @@ impl PhysicalDevice {
                 Ok(())
             }
             Self::Sdk(device) => device.close(blank),
+            #[cfg(test)]
+            Self::Scripted(device) => device.close(blank),
         }
+    }
+}
+
+/// F-2 test seam: a scripted physical device for the worker loss-site tests, in
+/// the `ScriptedAliveness` fake style of `sdk.rs`. The scenario travels through
+/// the existing `open(kind, friendly_name)` seam string, and every scripted
+/// action is appended to `SCRIPT_EVENTS`, so each test reads the device-visible
+/// history of its own scenario only (the suite runs tests in parallel).
+#[cfg(test)]
+struct ScriptedDevice {
+    scenario: &'static str,
+    session: usize,
+}
+
+/// F-2 scenario: session 1 fails the frame submit; every later call succeeds.
+#[cfg(test)]
+const SCRIPT_SUBMIT_LOSS: &str = "scripted-submit-loss";
+/// F-2 scenario: session 1 writes a frame, then the button poll fails; every
+/// later call succeeds.
+#[cfg(test)]
+const SCRIPT_POLL_LOSS: &str = "scripted-poll-loss";
+
+/// Scripted device history: `(scenario, event, session, device key)`. Events:
+/// `open`, `write`, `submit-fail`, `poll-fail`, `close-blank`. The `write` key is
+/// the packed report the device received, so a test can name the exact frame.
+#[cfg(test)]
+type ScriptEvent = (&'static str, &'static str, usize, Vec<u8>);
+#[cfg(test)]
+type ScriptEventView = (&'static str, usize, Vec<u8>);
+#[cfg(test)]
+static SCRIPT_EVENTS: Mutex<Vec<ScriptEvent>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+impl ScriptedDevice {
+    fn record(&self, event: &'static str, key: Vec<u8>) {
+        SCRIPT_EVENTS
+            .lock()
+            .unwrap()
+            .push((self.scenario, event, self.session, key));
+    }
+
+    fn submit(&self, frame: &crate::render::Frame) -> Result<Vec<u8>, LossError> {
+        if self.scenario == SCRIPT_SUBMIT_LOSS && self.session == 1 {
+            self.record("submit-fail", Vec::new());
+            return Err(LossError::new(
+                LossCause::TransferIncomplete { code: 991 },
+                "injected submit loss".into(),
+            ));
+        }
+        let report = pack_report(frame).to_vec();
+        self.record("write", report.clone());
+        Ok(report)
+    }
+
+    fn poll(&self, _timeout: Duration) -> Result<Option<[bool; 4]>, LossError> {
+        if self.scenario == SCRIPT_POLL_LOSS && self.session == 1 {
+            self.record("poll-fail", Vec::new());
+            return Err(LossError::new(
+                LossCause::CallTimeout,
+                "injected poll loss".into(),
+            ));
+        }
+        Ok(None)
+    }
+
+    fn close(&self, blank: bool) -> Result<(), LossError> {
+        if blank {
+            self.record("close-blank", Vec::new());
+        }
+        Ok(())
     }
 }
 
@@ -550,6 +633,13 @@ fn device_candidates_present(kind: BackendKind) -> bool {
 }
 
 fn ownership_changed(device: &PhysicalDevice) -> Result<bool, LossError> {
+    // The scripted seam has no owner to enumerate: the real probe reads live
+    // LCore.exe state, which would route the worker to the ownership site instead
+    // of the device-loss site a scripted test is driving.
+    #[cfg(test)]
+    if let PhysicalDevice::Scripted(_) = device {
+        return Ok(false);
+    }
     let present = sdk::lcore()
         .map_err(|reason| LossError::new(LossCause::ProbeFail, reason))?
         .is_some();
@@ -1076,6 +1166,188 @@ mod tests {
         assert_eq!(wake.try_recv(), Ok(()));
     }
 
+    // F-2 seams: the worker's two blanking device-loss sites call
+    // `invalidate_identity` right after the blanking `close(true)` and before the
+    // disconnect publication. The scripted device injects those losses, so each
+    // site's call is load-bearing in its own test: removing one fails that test.
+    fn open_scripted(_kind: BackendKind, friendly_name: &str) -> Result<PhysicalDevice, LossError> {
+        let scenario = if friendly_name == SCRIPT_SUBMIT_LOSS {
+            SCRIPT_SUBMIT_LOSS
+        } else if friendly_name == SCRIPT_POLL_LOSS {
+            SCRIPT_POLL_LOSS
+        } else {
+            panic!("unknown scripted scenario: {friendly_name}");
+        };
+        let session = {
+            let mut events = SCRIPT_EVENTS.lock().unwrap();
+            let session = events
+                .iter()
+                .filter(|event| event.0 == scenario && event.1 == "open")
+                .count()
+                + 1;
+            events.push((scenario, "open", session, Vec::new()));
+            session
+        };
+        Ok(PhysicalDevice::Scripted(ScriptedDevice {
+            scenario,
+            session,
+        }))
+    }
+
+    fn script_events(scenario: &str) -> Vec<ScriptEventView> {
+        SCRIPT_EVENTS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.0 == scenario)
+            .map(|event| (event.1, event.2, event.3.clone()))
+            .collect()
+    }
+
+    /// Drain the publication stream for a bounded settle window, counting the
+    /// health reports: each new device session reports at most one.
+    fn settle(rx: std::sync::mpsc::Receiver<Message>) -> usize {
+        let mut healthy = 0;
+        while let Ok(message) = rx.recv_timeout(Duration::from_millis(300)) {
+            if matches!(message, Message::PhysicalHealthy(_)) {
+                healthy += 1;
+            }
+        }
+        healthy
+    }
+
+    /// Start the worker on a scripted device, send one frame, and wait for the
+    /// injected loss to publish its disconnect. The disconnect is sent by the same
+    /// worker thread that ran the site's `invalidate_identity`, so observing it
+    /// proves the invalidation already happened when the test resubmits.
+    fn run_scripted_loss(
+        scenario: &'static str,
+        value: u8,
+        want: LossCause,
+    ) -> (
+        Arc<CommandQueue>,
+        std::sync::mpsc::Receiver<Message>,
+        JoinHandle<()>,
+    ) {
+        let base = Duration::from_millis(1);
+        let (commands, wake) = command_queue();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_commands = Arc::clone(&commands);
+        let thread = std::thread::spawn(move || {
+            physical_worker(
+                BackendKind::Hid,
+                &worker_commands,
+                &wake,
+                &tx,
+                base,
+                base,
+                base,
+                base,
+                "normal".into(),
+                false,
+                scenario.to_string(),
+                open_scripted,
+                probe_never,
+            );
+        });
+        commands.submit(pixels(value));
+        let budget = Instant::now() + Duration::from_secs(10);
+        let (cause, reason) = loop {
+            let left = budget.saturating_duration_since(Instant::now());
+            assert!(
+                !left.is_zero(),
+                "{scenario}: the injected loss never published"
+            );
+            if let Ok(Message::State(BackendState::Disconnected { cause, reason })) =
+                rx.recv_timeout(left)
+            {
+                break (cause, reason);
+            }
+        };
+        assert_eq!(cause, want, "{scenario}: the loss site names its own cause");
+        assert!(reason.contains("injected "), "{scenario}: {reason}");
+        (commands, rx, thread)
+    }
+
+    #[test]
+    fn a_submit_device_loss_invalidates_identity_so_the_identical_frame_returns_after_reopen() {
+        // Loss site 1 (baseline mod.rs:734): a failed frame submit blanked the
+        // panel and the frame never became visible, so the cache must forget it
+        // and the app's next identical frame must reach the reopened device.
+        let (commands, rx, thread) = run_scripted_loss(
+            SCRIPT_SUBMIT_LOSS,
+            6,
+            LossCause::TransferIncomplete { code: 991 },
+        );
+        commands.submit(pixels(6));
+        assert_eq!(
+            commands.wake_sends.load(Ordering::SeqCst),
+            2,
+            "the invalidated cache enqueues and wakes the identical frame"
+        );
+
+        let key = transform_frame(&pixels(6), "normal", false).to_vec();
+        let want_events: Vec<ScriptEventView> = vec![
+            ("open", 1, Vec::new()),
+            ("submit-fail", 1, Vec::new()),
+            ("close-blank", 1, Vec::new()),
+            ("open", 2, Vec::new()),
+            ("write", 2, key),
+        ];
+        assert_eq!(settle(rx), 1, "the reopened session reports health once");
+        assert_eq!(
+            script_events(SCRIPT_SUBMIT_LOSS),
+            want_events,
+            "the identical frame is written exactly once on the reopened device"
+        );
+
+        commands.shutdown();
+        thread.join().unwrap();
+        assert_eq!(
+            script_events(SCRIPT_SUBMIT_LOSS).len(),
+            want_events.len() + 1,
+            "the shutdown close ran on the live session"
+        );
+    }
+
+    #[test]
+    fn a_poll_device_loss_invalidates_identity_so_the_identical_frame_returns_after_reopen() {
+        // Loss site 2 (baseline mod.rs:778): a failed button poll blanked the panel
+        // after the frame was visible, so the cache must forget it and the app's
+        // next identical frame must be enqueued for the reopened device.
+        let (commands, rx, thread) = run_scripted_loss(SCRIPT_POLL_LOSS, 7, LossCause::CallTimeout);
+        commands.submit(pixels(7));
+        assert_eq!(
+            commands.wake_sends.load(Ordering::SeqCst),
+            2,
+            "the invalidated cache enqueues and wakes the identical frame"
+        );
+
+        let key = transform_frame(&pixels(7), "normal", false).to_vec();
+        let want_events: Vec<ScriptEventView> = vec![
+            ("open", 1, Vec::new()),
+            ("write", 1, key.clone()),
+            ("poll-fail", 1, Vec::new()),
+            ("close-blank", 1, Vec::new()),
+            ("open", 2, Vec::new()),
+            ("write", 2, key),
+        ];
+        assert_eq!(settle(rx), 1, "the reopened session reports health once");
+        assert_eq!(
+            script_events(SCRIPT_POLL_LOSS),
+            want_events,
+            "the identical frame is written exactly once on the reopened device"
+        );
+
+        commands.shutdown();
+        thread.join().unwrap();
+        assert_eq!(
+            script_events(SCRIPT_POLL_LOSS).len(),
+            want_events.len() + 1,
+            "the shutdown close ran on the live session"
+        );
+    }
+
     #[test]
     fn reconfigure_spawns_a_fresh_identity_cache_which_sends_the_identical_frame() {
         // Acceptance (5): an orientation/invert change goes through
@@ -1108,14 +1380,56 @@ mod tests {
             "within one backend the identical repeat is suppressed"
         );
 
+        let before = Arc::clone(&backend.commands);
         backend.reconfigure(BackendKind::Virtual, &rotated);
+        // F-1: pin the fresh-queue intent. The send counter is per queue, so a
+        // reused queue carrying a stale cache would read the same 1; the queue
+        // identity is what makes the test sensitive to the mechanism.
+        assert!(
+            !Arc::ptr_eq(&before, &backend.commands),
+            "reconfigure replaces the queue, so the identity cache starts empty"
+        );
         backend.submit(&frame);
         assert_eq!(
             backend.commands.wake_sends.load(Ordering::SeqCst),
             1,
-            "the reconfigured backend's fresh cache sends the identical frame"
+            "the reconfigured backend's fresh cache sends the identical frame exactly once"
+        );
+        assert_eq!(
+            before.wake_sends.load(Ordering::SeqCst),
+            1,
+            "the retired queue sent it exactly once and takes nothing after reconfigure"
         );
         backend.shutdown();
+    }
+
+    #[test]
+    fn a_stale_identity_cache_reuse_reads_the_same_send_counter_as_a_fresh_queue() {
+        // F-1: why acceptance-(5) asserts queue identity and not only the send
+        // counter. This queue stands for a `reconfigure` that reuses the retired
+        // queue: its cache is stale, so the identical frame is suppressed and the
+        // counter reads 1 — the same number the fresh queue reads when it sends
+        // the frame. Only `!Arc::ptr_eq` separates the two cases.
+        let (queue, wake) = command_queue();
+        queue.submit(pixels(1));
+        assert_eq!(wake.try_recv(), Ok(()));
+        assert_eq!(
+            queue.take_latest().unwrap()[0],
+            1,
+            "the worker takes the frame"
+        );
+
+        queue.submit(pixels(1));
+        assert_eq!(
+            queue.wake_sends.load(Ordering::SeqCst),
+            1,
+            "a stale-cache reuse reads the same one send a fresh queue reports"
+        );
+        assert!(
+            queue.take_latest().is_none(),
+            "the stale cache withholds the frame a fresh queue would send"
+        );
+        assert!(wake.try_recv().is_err(), "and produces no second wake");
     }
 
     #[test]
