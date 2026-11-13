@@ -195,8 +195,79 @@ type Pixels = Box<[u8; crate::model::WIDTH * crate::model::HEIGHT]>;
 /// resident buffer inside the queue instead of a per-frame allocation.
 type FrameBytes = [u8; crate::model::WIDTH * crate::model::HEIGHT];
 
+/// EC-2 test seam: bounded event ledger for the buffer-exclusivity proof.
+/// Events: (`new`|`fill`|`read`|`release`, queue address, buffer address,
+/// first content byte). The producer records `new`/`fill` at spare pop and
+/// fill, the worker records `read` at the transform site and `release` at the
+/// spare push, so all three recorders share one mutex and the per-buffer
+/// interleaving (fill only after release, no read between) is decidable.
+/// Compiles out of every non-test build.
+#[cfg(test)]
+static EXCL_EVENTS: Mutex<Vec<(&'static str, usize, usize, u8)>> = Mutex::new(Vec::new());
+
+/// The exclusivity test registers its queue address here, so the ledger sees
+/// only that queue and cannot be diluted by the parallel suite.
+#[cfg(test)]
+static WATCH_EXCL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Exclusivity tests take the ledger in use (compare_exchange) for their whole
+/// lifetime, so a retired queue's teardown releases can never interleave with
+/// the next test whose queue lands on the recycled address.
+#[cfg(test)]
+static EXCL_IN_USE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Take the ledger for one exclusivity scenario: reset gate, watch and events.
+/// Panics if another exclusivity scenario is live (they must not overlap:
+/// the allocator recycles queue and buffer addresses between tests).
+#[cfg(test)]
+fn excl_begin(queue_addr: usize) {
+    assert!(
+        EXCL_IN_USE
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok(),
+        "two exclusivity scenarios raced for the ledger"
+    );
+    EXCL_EVENTS.lock().unwrap().clear();
+    WATCH_EXCL.store(queue_addr, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn excl_end() {
+    WATCH_EXCL.store(0, Ordering::SeqCst);
+    EXCL_IN_USE.store(false, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn excl_record(kind: &'static str, queue: &CommandQueue, pixels: &Pixels) {
+    let queue_addr = std::ptr::from_ref(queue) as usize;
+    if queue_addr != WATCH_EXCL.load(Ordering::SeqCst) {
+        return;
+    }
+    let mut events = EXCL_EVENTS.lock().unwrap();
+    if events.len() < 8192 {
+        // The buffer key is the HEAP address of the pixel allocation (stable
+        // for the buffer's life), not the stack address of the Box handle,
+        // which moves with every owner.
+        events.push((
+            kind,
+            queue_addr,
+            std::ptr::from_ref(&**pixels) as usize,
+            pixels[0],
+        ));
+    }
+}
+
 struct CommandQueue {
     latest: Mutex<Option<Pixels>>,
+    /// EC-2 steady-state reuse: the frame-buffer free list. The producer fills
+    /// a recycled `Box` popped here (the allocation survives; only its bytes are
+    /// rewritten); the worker pushes a buffer here once it has finished reading
+    /// it (after transform, pack and device submit). A buffer in the replay
+    /// store is never in this list — the replay owner holds it exclusively
+    /// while held. After warm-up (the first two frames) the frame path pops
+    /// more often than it allocates, so steady ticks allocate zero pixel
+    /// buffers; latest-wins overwrites recycle the displaced slot buffer here.
+    spare: Mutex<Vec<Pixels>>,
     /// EC-1 identity cache: the content of the last frame accepted into
     /// `latest` since the last device-visible change. A submission carrying
     /// byte-identical content is skipped (no enqueue, no wake): the panel
@@ -219,20 +290,53 @@ struct CommandQueue {
 }
 
 impl CommandQueue {
-    fn submit(&self, pixels: Pixels) {
+    fn submit(&self, pixels: &FrameBytes) {
         {
             let mut last = self.last_accepted.lock().unwrap();
-            if last.as_ref() == Some(&*pixels) {
+            if last.as_ref() == Some(pixels) {
                 // Intended display retention, not an error path: no state
-                // message, no slot write and no wake happen here.
+                // message, no slot write, no buffer rotation and no wake
+                // happen here (EC-2: a skipped frame never pops or fills a
+                // buffer, so the ping-pong rotation cannot disturb newest-wins).
                 return;
             }
             *last = Some(*pixels);
         }
-        *self.latest.lock().unwrap() = Some(pixels);
+        let mut buffer = match self.spare.lock().unwrap().pop() {
+            Some(buffer) => buffer,
+            None => {
+                let fresh = Box::new([0u8; crate::model::WIDTH * crate::model::HEIGHT]);
+                #[cfg(test)]
+                excl_record("new", self, &fresh);
+                fresh
+            }
+        };
+        buffer.copy_from_slice(pixels);
+        #[cfg(test)]
+        excl_record("fill", self, &buffer);
+        let displaced = self.latest.lock().unwrap().replace(buffer);
+        if let Some(old) = displaced {
+            // Latest-wins overwrite: the displaced buffer was never taken, so
+            // the producer still owns it and recycles it, not drops it.
+            self.release(old);
+        }
         #[cfg(test)]
         self.wake_sends.fetch_add(1, Ordering::SeqCst);
         let _ = self.wake.try_send(());
+    }
+
+    /// EC-2 "buffer free" signal: the worker calls this once it has finished
+    /// reading the buffer (transform, key pack and device submit are done), so
+    /// the producer only refills a buffer after the worker released it.
+    fn release(&self, pixels: Pixels) {
+        #[cfg(test)]
+        excl_record("release", self, &pixels);
+        self.spare.lock().unwrap().push(pixels);
+    }
+
+    #[cfg(test)]
+    fn record_read(&self, pixels: &Pixels) {
+        excl_record("read", self, pixels);
     }
 
     /// EC-1: forget the cached visible content so the next submission is
@@ -273,6 +377,7 @@ impl Backend {
         let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
         let commands = Arc::new(CommandQueue {
             latest: Mutex::new(None),
+            spare: Mutex::new(Vec::with_capacity(4)),
             last_accepted: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             reconnect: AtomicBool::new(false),
@@ -315,9 +420,7 @@ impl Backend {
     }
 
     pub fn submit(&self, frame: &crate::render::Frame) {
-        let mut boxed = Box::new([0u8; crate::model::WIDTH * crate::model::HEIGHT]);
-        boxed.copy_from_slice(&frame.pixels);
-        self.commands.submit(boxed);
+        self.commands.submit(&frame.pixels);
     }
 
     /// Wake backoff and reacquire the device, without resetting SDK quarantine.
@@ -453,9 +556,11 @@ impl PhysicalDevice {
                 Ok(report.to_vec())
             }
             Self::Sdk(device) => {
-                let bytes = frame.logitech_bytes();
-                device.submit(bytes.clone())?;
-                Ok(bytes)
+                // EC-2: the payload bytes ride the device-session's reusable
+                // buffer inside `submit_frame`; the returned key Vec is the
+                // disclosed per-accepted-frame `last_sent` residual.
+                device.submit_frame(frame)?;
+                Ok(frame.logitech_bytes())
             }
             #[cfg(test)]
             Self::Scripted(device) => device.submit(frame),
@@ -522,6 +627,15 @@ const SCRIPT_SUBMIT_LOSS: &str = "scripted-submit-loss";
 /// later call succeeds.
 #[cfg(test)]
 const SCRIPT_POLL_LOSS: &str = "scripted-poll-loss";
+/// EC-2 scenario: the device consumes frames with zero recording allocations,
+/// so the counting allocator sees only the frame path (queue slot + keys).
+#[cfg(test)]
+const SCRIPT_QUIET: &str = "scripted-quiet-ticks";
+/// EC-2 scenario: the device holds each frame ~15 ms while consuming it, so a
+/// producer that refills before the release signal lands its write inside the
+/// worker's read window and the exclusivity ledger catches it.
+#[cfg(test)]
+const SCRIPT_EXCL: &str = "scripted-excl-window";
 
 /// Scripted device history: `(scenario, event, session, device key)`. Events:
 /// `open`, `write`, `submit-fail`, `poll-fail`, `close-blank`. The `write` key is
@@ -532,6 +646,12 @@ type ScriptEvent = (&'static str, &'static str, usize, Vec<u8>);
 type ScriptEventView = (&'static str, usize, Vec<u8>);
 #[cfg(test)]
 static SCRIPT_EVENTS: Mutex<Vec<ScriptEvent>> = Mutex::new(Vec::new());
+/// EC-2 counters: device-side frame consumption per scripted scenario, so the
+/// counter and exclusivity tests can wait for their own worker progress.
+#[cfg(test)]
+static QUIET_READS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static EXCL_READS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
 impl ScriptedDevice {
@@ -549,6 +669,19 @@ impl ScriptedDevice {
                 LossCause::TransferIncomplete { code: 991 },
                 "injected submit loss".into(),
             ));
+        }
+        if self.scenario == SCRIPT_QUIET {
+            // Register this worker thread with the counting harness so the
+            // frame-path allocations it performs are inside the measured
+            // window; foreign parallel tests are not.
+            alloc_count::watch_thread();
+            QUIET_READS.fetch_add(1, Ordering::SeqCst);
+            return Ok(Vec::new());
+        }
+        if self.scenario == SCRIPT_EXCL {
+            EXCL_READS.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(15));
+            return Ok(Vec::new());
         }
         let report = pack_report(frame).to_vec();
         self.record("write", report.clone());
@@ -655,7 +788,11 @@ fn ownership_conflict(kind: BackendKind, lcore_present: bool) -> bool {
 
 fn next_frame(commands: &CommandQueue, replay: &mut Option<Pixels>) -> Option<Pixels> {
     if let Some(newest) = commands.take_latest() {
-        *replay = None;
+        if let Some(stale) = replay.take() {
+            // The replay store's buffer was never taken by a device: the
+            // worker is done with it, so it returns to reuse (EC-2).
+            commands.release(stale);
+        }
         Some(newest)
     } else {
         replay.take()
@@ -802,6 +939,8 @@ fn physical_worker(
                     }
 
                     if let Some(pixels) = pixels {
+                        #[cfg(test)]
+                        commands.record_read(&pixels);
                         let frame = transform_pixels(&pixels, &orientation, invert);
                         let key = match active_kind {
                             BackendKind::Hid => pack_report(&frame).to_vec(),
@@ -812,7 +951,12 @@ fn physical_worker(
                             match device.submit(&frame) {
                                 Ok(sent) => {
                                     last_sent = Some(sent);
-                                    current = Some(pixels);
+                                    if let Some(old) = current.replace(pixels) {
+                                        // Transform, key pack and device submit
+                                        // are done: the old frame's buffer is
+                                        // free for producer reuse (EC-2).
+                                        commands.release(old);
+                                    }
                                 }
                                 Err(mut error) => {
                                     replay = Some(pixels);
@@ -834,7 +978,11 @@ fn physical_worker(
                                 }
                             }
                         } else {
-                            current = Some(pixels);
+                            if let Some(old) = current.replace(pixels) {
+                                // Key-equal frame: the buffer was read for
+                                // transform and pack, never submitted; now free.
+                                commands.release(old);
+                            }
                         }
                     }
 
@@ -940,7 +1088,11 @@ fn virtual_fallback_loop(
         kind: BackendKind::Virtual,
     }));
     while !commands.is_shutdown() {
-        let _ = commands.take_latest();
+        if let Some(frame) = commands.take_latest() {
+            // EC-2: the virtual device reads nothing, so a taken frame is free
+            // for producer reuse the moment it leaves the slot.
+            commands.release(frame);
+        }
         if wake_rx.recv_timeout(Duration::from_millis(100)).is_err() && commands.is_shutdown() {
             return;
         }
@@ -970,6 +1122,142 @@ pub fn resolve_kind(config_backend: &str) -> BackendKind {
     }
 }
 
+/// EC-2 acceptance (1) harness: a counting `GlobalAlloc` that passes through to
+/// `System` and buckets every allocation (`alloc`, `alloc_zeroed`, `realloc`)
+/// by layout length. Frame-path classes: 6880 = pixel buffers (queue-slot
+/// `Box` + SDK session payload) and 992 = the HID report key Vec; lengths up
+/// to 256 are the fixed per-send metadata (mpsc reply-channel nodes); the rest
+/// is "other". Counters are plain statics, so the instrumentation allocates
+/// nothing. `GlobalAlloc` is an `unsafe` trait (the only reason the harness
+/// mentions `unsafe`); it compiles for `cfg(test)` only — the production frame
+/// path and its zero-unsafe rule are untouched.
+#[cfg(test)]
+pub mod alloc_count {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub const PIXELS: usize = crate::model::WIDTH * crate::model::HEIGHT;
+    pub const HID_REPORT: usize = super::g13::G13_OUTPUT_REPORT_LENGTH;
+
+    static N_PIXEL: AtomicUsize = AtomicUsize::new(0);
+    static N_KEY: AtomicUsize = AtomicUsize::new(0);
+    static N_METADATA: AtomicUsize = AtomicUsize::new(0);
+    static N_OTHER: AtomicUsize = AtomicUsize::new(0);
+    static N_TOTAL: AtomicUsize = AtomicUsize::new(0);
+    static N_FOREIGN: AtomicUsize = AtomicUsize::new(0);
+
+    /// The suite runs tests in parallel, and other tests allocate the same
+    /// 6880-byte class, so counting is gated on a small set of watched thread
+    /// ids: a frame-path test registers its producer thread, and the scripted
+    /// device / recording owner register their worker thread on first
+    /// execute. Everything else lands in the foreign bucket, untouched by the
+    /// window asserts.
+    static WATCHED: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
+
+    fn thread_id() -> usize {
+        // SAFETY (test harness only): GetCurrentThreadId reads this thread's
+        // own id; no allocation, so it is safe to call inside the allocator.
+        unsafe { windows::Win32::System::Threading::GetCurrentThreadId() as usize }
+    }
+
+    pub fn watch_thread() {
+        let id = thread_id();
+        if WATCHED.iter().any(|slot| slot.load(Ordering::SeqCst) == id) {
+            return;
+        }
+        for slot in &WATCHED {
+            if slot
+                .compare_exchange(0, id, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    fn watched() -> bool {
+        let id = thread_id();
+        WATCHED.iter().any(|slot| slot.load(Ordering::SeqCst) == id)
+    }
+
+    pub fn foreign() -> usize {
+        N_FOREIGN.load(Ordering::SeqCst)
+    }
+
+    /// (pixel 6880, key 992, metadata <=256, other, total)
+    pub type Counts = (usize, usize, usize, usize, usize);
+
+    fn bump(len: usize) {
+        if !watched() {
+            N_FOREIGN.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        N_TOTAL.fetch_add(1, Ordering::Relaxed);
+        match len {
+            PIXELS => N_PIXEL.fetch_add(1, Ordering::Relaxed),
+            HID_REPORT => N_KEY.fetch_add(1, Ordering::Relaxed),
+            0..=256 => N_METADATA.fetch_add(1, Ordering::Relaxed),
+            _ => N_OTHER.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    pub fn reset() {
+        for counter in [
+            &N_PIXEL,
+            &N_KEY,
+            &N_METADATA,
+            &N_OTHER,
+            &N_TOTAL,
+            &N_FOREIGN,
+        ] {
+            counter.store(0, Ordering::SeqCst);
+        }
+    }
+
+    pub fn snapshot() -> Counts {
+        (
+            N_PIXEL.load(Ordering::SeqCst),
+            N_KEY.load(Ordering::SeqCst),
+            N_METADATA.load(Ordering::SeqCst),
+            N_OTHER.load(Ordering::SeqCst),
+            N_TOTAL.load(Ordering::SeqCst),
+        )
+    }
+
+    pub fn subtract(after: Counts, before: Counts) -> Counts {
+        (
+            after.0 - before.0,
+            after.1 - before.1,
+            after.2 - before.2,
+            after.3 - before.3,
+            after.4 - before.4,
+        )
+    }
+
+    pub struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            bump(layout.size());
+            System.alloc(layout)
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            bump(layout.size());
+            System.alloc_zeroed(layout)
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            bump(new_size);
+            System.realloc(ptr, layout, new_size)
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            System.dealloc(ptr, layout)
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,6 +1269,7 @@ mod tests {
         (
             Arc::new(CommandQueue {
                 latest: Mutex::new(None),
+                spare: Mutex::new(Vec::with_capacity(4)),
                 last_accepted: Mutex::new(None),
                 shutdown: AtomicBool::new(false),
                 reconnect: AtomicBool::new(false),
@@ -998,15 +1287,15 @@ mod tests {
     #[test]
     fn command_queue_retains_only_latest_frame_and_shutdown_is_reliable() {
         let (queue, wake) = command_queue();
-        queue.submit(pixels(1));
-        queue.submit(pixels(2));
-        queue.submit(pixels(3));
+        queue.submit(&pixels(1));
+        queue.submit(&pixels(2));
+        queue.submit(&pixels(3));
         assert_eq!(wake.try_recv(), Ok(()));
         assert!(wake.try_recv().is_err(), "wake channel is bounded to one");
         assert_eq!(queue.take_latest().unwrap()[0], 3);
         assert!(queue.take_latest().is_none());
 
-        queue.submit(pixels(4));
+        queue.submit(&pixels(4));
         queue.shutdown();
         assert!(
             queue.is_shutdown(),
@@ -1017,9 +1306,9 @@ mod tests {
     #[test]
     fn backoff_retains_one_newest_frame_for_one_reconnect_replay() {
         let (queue, wake) = command_queue();
-        queue.submit(pixels(1));
-        queue.submit(pixels(2));
-        queue.submit(pixels(3));
+        queue.submit(&pixels(1));
+        queue.submit(&pixels(2));
+        queue.submit(&pixels(3));
         assert!(!sleep_interruptible(
             &queue,
             &wake,
@@ -1049,7 +1338,7 @@ mod tests {
             thread: Some(thread),
         };
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        backend.commands.submit(pixels(7));
+        backend.commands.submit(&pixels(7));
         assert!(
             done_rx.recv_timeout(Duration::from_millis(150)).is_err(),
             "ordinary frame wakes must not bypass backoff"
@@ -1068,7 +1357,7 @@ mod tests {
     #[test]
     fn identical_frame_content_skips_enqueue_and_wake() {
         let (queue, wake) = command_queue();
-        queue.submit(pixels(1));
+        queue.submit(&pixels(1));
         assert_eq!(
             queue.wake_sends.load(Ordering::SeqCst),
             1,
@@ -1081,7 +1370,7 @@ mod tests {
             "the first submission sits in the single slot"
         );
 
-        queue.submit(pixels(1));
+        queue.submit(&pixels(1));
         assert_eq!(
             queue.wake_sends.load(Ordering::SeqCst),
             1,
@@ -1095,7 +1384,7 @@ mod tests {
 
         let mut changed = pixels(1);
         changed[changed.len() - 1] = 2;
-        queue.submit(changed);
+        queue.submit(&changed);
         assert_eq!(
             queue.wake_sends.load(Ordering::SeqCst),
             2,
@@ -1112,13 +1401,13 @@ mod tests {
     #[test]
     fn reconnect_request_invalidates_the_identity_cache_so_the_identical_frame_is_sent() {
         let (queue, wake) = command_queue();
-        queue.submit(pixels(5));
+        queue.submit(&pixels(5));
         assert_eq!(
             queue.take_latest().unwrap()[0],
             5,
             "the worker takes the frame"
         );
-        queue.submit(pixels(5));
+        queue.submit(&pixels(5));
         assert_eq!(queue.wake_sends.load(Ordering::SeqCst), 1);
         assert!(
             queue.take_latest().is_none(),
@@ -1128,7 +1417,7 @@ mod tests {
         queue.request_reconnect();
         assert!(queue.reconnect.load(Ordering::Acquire));
         assert_eq!(wake.try_recv(), Ok(()), "the reconnect wake stays live");
-        queue.submit(pixels(5));
+        queue.submit(&pixels(5));
         assert_eq!(
             queue.wake_sends.load(Ordering::SeqCst),
             2,
@@ -1147,8 +1436,8 @@ mod tests {
         // device submit loss and after a poll loss (`device.close(true)`), so
         // content the panel lost is never withheld by the cache.
         let (queue, wake) = command_queue();
-        queue.submit(pixels(6));
-        queue.submit(pixels(6));
+        queue.submit(&pixels(6));
+        queue.submit(&pixels(6));
         assert_eq!(
             queue.wake_sends.load(Ordering::SeqCst),
             1,
@@ -1156,7 +1445,7 @@ mod tests {
         );
 
         queue.invalidate_identity();
-        queue.submit(pixels(6));
+        queue.submit(&pixels(6));
         assert_eq!(
             queue.wake_sends.load(Ordering::SeqCst),
             2,
@@ -1175,6 +1464,10 @@ mod tests {
             SCRIPT_SUBMIT_LOSS
         } else if friendly_name == SCRIPT_POLL_LOSS {
             SCRIPT_POLL_LOSS
+        } else if friendly_name == SCRIPT_QUIET {
+            SCRIPT_QUIET
+        } else if friendly_name == SCRIPT_EXCL {
+            SCRIPT_EXCL
         } else {
             panic!("unknown scripted scenario: {friendly_name}");
         };
@@ -1250,7 +1543,7 @@ mod tests {
                 probe_never,
             );
         });
-        commands.submit(pixels(value));
+        commands.submit(&pixels(value));
         let budget = Instant::now() + Duration::from_secs(10);
         let (cause, reason) = loop {
             let left = budget.saturating_duration_since(Instant::now());
@@ -1279,7 +1572,7 @@ mod tests {
             6,
             LossCause::TransferIncomplete { code: 991 },
         );
-        commands.submit(pixels(6));
+        commands.submit(&pixels(6));
         assert_eq!(
             commands.wake_sends.load(Ordering::SeqCst),
             2,
@@ -1316,7 +1609,7 @@ mod tests {
         // after the frame was visible, so the cache must forget it and the app's
         // next identical frame must be enqueued for the reopened device.
         let (commands, rx, thread) = run_scripted_loss(SCRIPT_POLL_LOSS, 7, LossCause::CallTimeout);
-        commands.submit(pixels(7));
+        commands.submit(&pixels(7));
         assert_eq!(
             commands.wake_sends.load(Ordering::SeqCst),
             2,
@@ -1411,7 +1704,7 @@ mod tests {
         // counter reads 1 — the same number the fresh queue reads when it sends
         // the frame. Only `!Arc::ptr_eq` separates the two cases.
         let (queue, wake) = command_queue();
-        queue.submit(pixels(1));
+        queue.submit(&pixels(1));
         assert_eq!(wake.try_recv(), Ok(()));
         assert_eq!(
             queue.take_latest().unwrap()[0],
@@ -1419,7 +1712,7 @@ mod tests {
             "the worker takes the frame"
         );
 
-        queue.submit(pixels(1));
+        queue.submit(&pixels(1));
         assert_eq!(
             queue.wake_sends.load(Ordering::SeqCst),
             1,
@@ -1508,8 +1801,8 @@ mod tests {
     fn newest_pending_frame_replaces_stale_transition_replay() {
         let (queue, _) = command_queue();
         let mut replay = Some(pixels(1));
-        queue.submit(pixels(2));
-        queue.submit(pixels(3));
+        queue.submit(&pixels(2));
+        queue.submit(&pixels(3));
         assert_eq!(next_frame(&queue, &mut replay).unwrap()[0], 3);
         assert!(replay.is_none());
         assert!(next_frame(&queue, &mut replay).is_none());
@@ -1699,7 +1992,7 @@ mod tests {
 
         // (2) Submitting while Absent keeps preview behavior: the frame stays
         // newest for replay, nothing panics, and the state is not republished.
-        commands.submit(pixels(9));
+        commands.submit(&pixels(9));
         let mut extra_absent = 0usize;
         let mut extra_disconnects = 0usize;
         while let Ok(message) = rx.recv_timeout(Duration::from_millis(300)) {
@@ -1727,7 +2020,7 @@ mod tests {
 
         // (3) A candidate appearance resumes opens within one wake.
         CANDIDATES.store(true, Ordering::SeqCst);
-        commands.submit(pixels(10));
+        commands.submit(&pixels(10));
         let mut discovering = false;
         let reopened = loop {
             let left = remaining();
@@ -1882,5 +2175,249 @@ mod tests {
 
         commands.shutdown();
         thread.join().unwrap();
+    }
+
+    // EC-2 seams: the counting allocator (alloc_count) measures the frame path,
+    // and the exclusivity ledger (EXCL_EVENTS) decides, per buffer address,
+    // whether the producer only ever refills buffers the worker released.
+    fn uniform(value: u8) -> [u8; crate::model::WIDTH * crate::model::HEIGHT] {
+        [value; crate::model::WIDTH * crate::model::HEIGHT]
+    }
+
+    fn wait_for_reads(counter: &AtomicUsize, want: usize) {
+        let budget = Instant::now() + Duration::from_secs(10);
+        while counter.load(Ordering::SeqCst) < want {
+            assert!(
+                Instant::now() < budget,
+                "the scripted device never consumed frame {want}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn steady_frame_path_allocates_no_pixel_buffers_after_warm_up() {
+        // Acceptance (1) at the queue-slot boundary: after the two warm-up
+        // frames, 8 NEW-content ticks allocate zero 6880-byte pixel buffers
+        // (Box ping-pong), and 8 SKIPPED (identical, EC-1-suppressed) ticks
+        // allocate nothing at all. The disclosed residuals on new-content
+        // ticks are the per-accepted-frame 992-byte HID key Vec (EC-1
+        // last_sent), the per-send test-instrumentation pushes, and fixed
+        // per-send metadata; every one of these is counted, not assumed.
+        crate::backends::alloc_count::watch_thread();
+        let (commands, wake) = command_queue();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let worker_commands = Arc::clone(&commands);
+        let base = Duration::from_millis(1);
+        let thread = std::thread::spawn(move || {
+            physical_worker(
+                BackendKind::Hid,
+                &worker_commands,
+                &wake,
+                &tx,
+                base,
+                base,
+                base,
+                base,
+                "normal".into(),
+                false,
+                SCRIPT_QUIET.to_string(),
+                open_scripted,
+                probe_never,
+            );
+        });
+
+        crate::backends::alloc_count::reset();
+        let warm = crate::backends::alloc_count::snapshot();
+        commands.submit(&uniform(1));
+        wait_for_reads(&QUIET_READS, 1);
+        commands.submit(&uniform(2));
+        wait_for_reads(&QUIET_READS, 2);
+        let warm =
+            crate::backends::alloc_count::subtract(crate::backends::alloc_count::snapshot(), warm);
+
+        let mut new = crate::backends::alloc_count::Counts::default();
+        for tick in 0..8u8 {
+            let before = crate::backends::alloc_count::snapshot();
+            commands.submit(&uniform(3 + tick));
+            wait_for_reads(&QUIET_READS, 3 + tick as usize);
+            new = crate::backends::alloc_count::subtract(
+                crate::backends::alloc_count::snapshot(),
+                before,
+            );
+            assert_eq!(
+                new.0, 0,
+                "steady new-content tick {}: zero 6880-byte frame-path allocations (pixel class), measured: {new:?}",
+                3 + tick
+            );
+            assert!(
+                new.1 >= 1,
+                "tick {}: the disclosed 992-byte key Vec residual must be visible, not faked away",
+                3 + tick
+            );
+        }
+        // One settle window before measuring skips: std's bounded channel
+        // materializes a per-thread blocking node on the worker's first idle
+        // timed recv. That one-shot is counted in `settle` below and
+        // disclosed; the eight measured skip windows stay allocation-free.
+        let settle = crate::backends::alloc_count::snapshot();
+        std::thread::sleep(Duration::from_millis(6));
+        let settle = crate::backends::alloc_count::subtract(
+            crate::backends::alloc_count::snapshot(),
+            settle,
+        );
+        let mut skipped = (0usize, 0usize, 0usize, 0usize, 0usize);
+        for _ in 0..8 {
+            let before = crate::backends::alloc_count::snapshot();
+            commands.submit(&uniform(10));
+            std::thread::sleep(Duration::from_millis(3));
+            let d = crate::backends::alloc_count::subtract(
+                crate::backends::alloc_count::snapshot(),
+                before,
+            );
+            assert_eq!(
+                d.4, 0,
+                "steady skipped tick: zero heap allocations at all, measured: {d:?}"
+            );
+            skipped = (
+                skipped.0 + d.0,
+                skipped.1 + d.1,
+                skipped.2 + d.2,
+                skipped.3 + d.3,
+                skipped.4 + d.4,
+            );
+        }
+        println!(
+            "WO-A1-02 EC-2 queue-slot measured (pixel 6880, key 992, metadata <=256, other, total): warm2={warm:?} newtick8(last)={new:?} settle6ms={settle:?} skipped8sum={skipped:?} foreign_parallel={}",
+            crate::backends::alloc_count::foreign()
+        );
+        assert_eq!(commands.wake_sends.load(Ordering::SeqCst), 10);
+
+        commands.shutdown();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn queue_slot_buffer_exclusivity_producer_writes_only_released_buffers() {
+        // Acceptance (3): the scripted device holds each frame ~15 ms while
+        // consuming it; the producer submits every ~3 ms, so any
+        // refill-before-release write lands inside the worker's read window
+        // and breaks the per-buffer state machine below. Mirrors the
+        // owner_serializes_submit_poll_close_and_shutdown shape: scripted
+        // device + counters, exclusivity asserted from measured events.
+        EXCL_READS.store(0, Ordering::SeqCst);
+        let (commands, wake) = command_queue();
+        let queue_addr = std::ptr::from_ref(&*commands) as usize;
+        excl_begin(queue_addr);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let worker_commands = Arc::clone(&commands);
+        let base = Duration::from_millis(1);
+        let thread = std::thread::spawn(move || {
+            physical_worker(
+                BackendKind::Hid,
+                &worker_commands,
+                &wake,
+                &tx,
+                base,
+                base,
+                base,
+                base,
+                "normal".into(),
+                false,
+                SCRIPT_EXCL.to_string(),
+                open_scripted,
+                probe_never,
+            );
+        });
+
+        for value in 1..=60u8 {
+            commands.submit(&uniform(value));
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        commands.shutdown();
+        thread.join().unwrap();
+        excl_end();
+
+        let events: Vec<_> = EXCL_EVENTS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.1 == queue_addr)
+            .map(|event| (event.0, event.2, event.3))
+            .collect();
+        let mut state: std::collections::HashMap<usize, (&str, u8)> =
+            std::collections::HashMap::new();
+        let mut reuse_fills = 0usize;
+        let mut reads = 0usize;
+        let mut violations: Vec<String> = Vec::new();
+        for (kind, buffer, content) in events.clone() {
+            match kind {
+                "new" => {
+                    assert!(
+                        state.insert(buffer, (kind, 0)).is_none(),
+                        "the same buffer address was boxed twice in one queue"
+                    );
+                }
+                "fill" => {
+                    let prev = state.get(&buffer).map(|entry| entry.0);
+                    match prev {
+                        Some("new") => {}
+                        Some("release") => reuse_fills += 1,
+                        other => {
+                            let history: Vec<_> = events
+                                .iter()
+                                .filter(|event| event.1 == buffer)
+                                .map(|event| (event.0, event.2))
+                                .collect();
+                            violations.push(format!(
+                                "producer refilled a buffer after {other:?} (history: {history:?})"
+                            ));
+                        }
+                    }
+                    state.insert(buffer, ("fill", content));
+                }
+                "read" => {
+                    reads += 1;
+                    match state.get(&buffer).copied() {
+                        Some(entry) if entry.0 == "fill" || entry.0 == "read" => {
+                            assert_eq!(
+                                entry.1, content,
+                                "the worker read content {content} after a fill of {}: producer and worker overlapped on one buffer",
+                                entry.1
+                            );
+                        }
+                        other => panic!("read of a buffer in state {other:?}"),
+                    }
+                    state.insert(buffer, ("read", content));
+                }
+                "release" => {
+                    let prev = state.get(&buffer).map(|entry| entry.0);
+                    match prev {
+                        Some("fill") | Some("read") => {}
+                        Some("release") => {
+                            panic!("double release: the same buffer entered the spare list twice")
+                        }
+                        Some("new") => panic!("release of a buffer the producer never filled"),
+                        _ => panic!("release of an unknown buffer"),
+                    }
+                    state.insert(buffer, ("release", 0));
+                }
+                other => unreachable!("unknown exclusivity event {other}"),
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "EC-2 exclusivity violated: {}",
+            violations.join("; ")
+        );
+        assert!(
+            reads >= 10,
+            "the worker consumed {reads} frames; the scenario must exercise the read path"
+        );
+        assert!(
+            reuse_fills >= 4,
+            "the ping-pong must recycle released buffers; fills-after-release counted {reuse_fills}"
+        );
+        println!("WO-A1-02 EC-2 exclusivity measured: reads={reads} reuse_fills={reuse_fills} buffers={}", state.len());
     }
 }

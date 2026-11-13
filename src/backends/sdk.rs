@@ -14,6 +14,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use windows::core::{PCSTR, PCWSTR, PWSTR};
@@ -1229,7 +1230,15 @@ enum Request {
 
 enum Reply {
     Unit,
-    Poll { connected: bool, buttons: [bool; 4] },
+    /// EC-2: on a successful submit the owner hands the payload buffer back to
+    /// the session producer, so the same buffer is refilled per send. The
+    /// buffer is free exactly at the reply: the owner serialized the native
+    /// call and cannot read it any more.
+    SubmitDone(Vec<u8>),
+    Poll {
+        connected: bool,
+        buttons: [bool; 4],
+    },
     Error(String),
 }
 
@@ -1240,6 +1249,14 @@ struct Envelope {
 
 pub struct SdkDevice {
     requests: Option<SyncSender<Envelope>>,
+    /// EC-2: the session-owned submit payload. A single producer (the backend
+    /// worker thread) fills it and moves it into the request; the owner thread
+    /// executes against the moved buffer and returns it, so there is NO
+    /// cross-thread sharing: at every instant one thread owns the buffer, and
+    /// the producer refills only after the release reply. A timed-out request
+    /// keeps its buffer inside the envelope (quarantine rule intact); the next
+    /// send starts from a fresh Vec (cold path).
+    payload: Mutex<Option<Vec<u8>>>,
 }
 
 impl SdkDevice {
@@ -1297,6 +1314,7 @@ impl SdkDevice {
             Ok(()) => {
                 let device = Self {
                     requests: Some(requests),
+                    payload: Mutex::new(None),
                 };
                 let deadline = Instant::now() + Duration::from_secs(5);
                 loop {
@@ -1368,9 +1386,54 @@ impl SdkDevice {
         })
     }
 
+    /// EC-2: take the session payload buffer for one send. The caller clears
+    /// first, then reserves, so a recycled buffer (len == capacity) never
+    /// re-grows: the cold path (first send, or a send whose buffer was
+    /// quarantined by a timeout) starts from a fresh Vec and reserves.
+    fn take_payload(&self) -> Vec<u8> {
+        self.payload.lock().unwrap().take().unwrap_or_default()
+    }
+
+    fn return_payload(&self, payload: Vec<u8>) {
+        *self.payload.lock().unwrap() = Some(payload);
+    }
+
+    /// EC-2: the frame-boundary submit. The payload bytes are written into the
+    /// session's reusable buffer (the same 0->0, nonzero->255 rule as
+    /// `Frame::logitech_bytes`, straight into the reserved capacity), sent, and
+    /// the buffer returns with the owner's release reply: steady sends allocate
+    /// no payload.
+    pub fn submit_frame(&self, frame: &crate::render::Frame) -> Result<(), LossError> {
+        let mut payload = self.take_payload();
+        payload.clear();
+        payload.reserve(PIXELS);
+        payload.extend(
+            frame
+                .pixels
+                .iter()
+                .map(|&value| if value != 0 { 255 } else { 0 }),
+        );
+        self.submit_payload(payload)
+    }
+
+    /// Vec-shaped public surface (the hardware-test transport calls it with an
+    /// owned report): the bytes are copied into the reusable payload, so a
+    /// steady send allocates no payload either.
     pub fn submit(&self, pixels: Vec<u8>) -> Result<(), LossError> {
-        match self.call(Request::Submit(pixels))? {
+        let mut payload = self.take_payload();
+        payload.clear();
+        payload.reserve(pixels.len());
+        payload.extend_from_slice(&pixels);
+        self.submit_payload(payload)
+    }
+
+    fn submit_payload(&self, payload: Vec<u8>) -> Result<(), LossError> {
+        match self.call(Request::Submit(payload))? {
             Reply::Unit => Ok(()),
+            Reply::SubmitDone(released) => {
+                self.return_payload(released);
+                Ok(())
+            }
             Reply::Error(error) => Err(LossError::new(
                 LossCause::TransferIncomplete { code: 0 },
                 error,
@@ -1386,7 +1449,7 @@ impl SdkDevice {
         match self.call(Request::Poll)? {
             Reply::Poll { connected, buttons } => Ok((connected, buttons)),
             Reply::Error(error) => Err(LossError::new(LossCause::ProbeFail, error)),
-            Reply::Unit => Err(LossError::new(
+            Reply::Unit | Reply::SubmitDone(_) => Err(LossError::new(
                 LossCause::ProbeFail,
                 "unexpected Logitech SDK poll reply".into(),
             )),
@@ -1402,7 +1465,7 @@ impl SdkDevice {
                 LossCause::TransferIncomplete { code: 0 },
                 error,
             )),
-            Reply::Poll { .. } => Err(LossError::new(
+            Reply::Poll { .. } | Reply::SubmitDone(_) => Err(LossError::new(
                 LossCause::ProbeFail,
                 "unexpected Logitech SDK close reply".into(),
             )),
@@ -1422,12 +1485,19 @@ fn owner_loop(mut runtime: Box<dyn Runtime>, requests: Receiver<Envelope>) {
     let mut shut_down = false;
     while let Ok(envelope) = requests.recv() {
         let close = matches!(envelope.request, Request::Close { .. });
-        let reply = runtime.execute(&envelope.request);
+        let mut reply = runtime.execute(&envelope.request);
         if close {
             runtime.shutdown();
             shut_down = true;
             let _ = envelope.reply.send(reply);
             break;
+        }
+        if matches!(reply, Reply::Unit) {
+            if let Request::Submit(payload) = envelope.request {
+                // EC-2: the native call is complete; release the payload
+                // buffer to the session producer with the reply.
+                reply = Reply::SubmitDone(payload);
+            }
         }
         let _ = envelope.reply.send(reply);
     }
@@ -1864,6 +1934,7 @@ mod tests {
         let thread = std::thread::spawn(move || owner_loop(Box::new(Slow), receiver));
         let mut device = SdkDevice {
             requests: Some(requests),
+            payload: Mutex::new(None),
         };
         let error = device
             .call_timeout(Request::Submit(vec![0; PIXELS]), Duration::from_millis(1))
@@ -1912,5 +1983,188 @@ mod tests {
         assert!(circuit_open() && claim_sdk_owner().is_err());
         thread.join().unwrap();
         CIRCUIT_OPEN.store(false, Ordering::Release);
+    }
+
+    // EC-2 seams: the payload boundary is measured with the same counting
+    // allocator as the queue boundary (crate::backends::alloc_count), and the
+    // scripted owner records (payload pointer, lit pixel index, single-lit)
+    // per execute, so buffer reuse and exclusivity are observed, not assumed.
+    use std::sync::atomic::AtomicUsize;
+
+    type PayloadObservation = (usize, usize, bool);
+
+    struct Recording {
+        observed: Arc<Mutex<Vec<PayloadObservation>>>,
+        submits: Arc<AtomicUsize>,
+        first_read_ms: u64,
+    }
+
+    impl Recording {
+        fn new(first_read_ms: u64) -> Self {
+            Self {
+                observed: Arc::new(Mutex::new(Vec::new())),
+                submits: Arc::new(AtomicUsize::new(0)),
+                first_read_ms,
+            }
+        }
+    }
+
+    impl Runtime for Recording {
+        fn execute(&mut self, request: &Request) -> Reply {
+            // Register the owner thread with the counting harness (first call),
+            // so the measured window covers exactly producer + owner.
+            crate::backends::alloc_count::watch_thread();
+            match request {
+                Request::Submit(frame) => {
+                    if self.submits.fetch_add(1, Ordering::SeqCst) == 0 && self.first_read_ms > 0 {
+                        // The scripted "owner is reading this buffer" window.
+                        std::thread::sleep(Duration::from_millis(self.first_read_ms));
+                    }
+                    let lit = frame.iter().position(|&b| b == 255).unwrap_or(usize::MAX);
+                    let single = frame.iter().filter(|b| **b == 255).count() == 1;
+                    self.observed
+                        .lock()
+                        .unwrap()
+                        .push((frame.as_ptr() as usize, lit, single));
+                    Reply::Unit
+                }
+                Request::Poll => Reply::Poll {
+                    connected: true,
+                    buttons: [false; 4],
+                },
+                Request::Close { .. } => Reply::Unit,
+            }
+        }
+        fn shutdown(&mut self) {}
+    }
+
+    fn lit_frame(index: usize) -> crate::render::Frame {
+        let mut frame = crate::render::Frame::new();
+        frame.pixels[index] = 1;
+        frame
+    }
+
+    #[test]
+    fn sdk_payload_buffer_is_reused_per_send_after_warm_up() {
+        // Acceptance (1) at the SDK owner boundary: after the first send has
+        // created the session payload, steady sends allocate zero 6880-byte
+        // pixel buffers and the owner observes one stable payload pointer
+        // (measured reuse). The disclosed residual is the fixed per-send
+        // metadata (the reply sync_channel node), counted, not assumed.
+        let recorder = Recording::new(0);
+        let observed = Arc::clone(&recorder.observed);
+        let submits = Arc::clone(&recorder.submits);
+        let (tx, rx) = mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || owner_loop(Box::new(recorder), rx));
+        let mut device = SdkDevice {
+            requests: Some(tx),
+            payload: Mutex::new(None),
+        };
+
+        crate::backends::alloc_count::watch_thread();
+        crate::backends::alloc_count::reset();
+        let mut warm = crate::backends::alloc_count::Counts::default();
+        for index in 0..2 {
+            let before = crate::backends::alloc_count::snapshot();
+            device.submit_frame(&lit_frame(index)).unwrap();
+            warm = crate::backends::alloc_count::subtract(
+                crate::backends::alloc_count::snapshot(),
+                before,
+            );
+            assert_eq!(warm.1, 0, "the SDK boundary allocates no HID key class");
+        }
+        for index in 2..12 {
+            let before = crate::backends::alloc_count::snapshot();
+            device.submit_frame(&lit_frame(index)).unwrap();
+            let steady = crate::backends::alloc_count::subtract(
+                crate::backends::alloc_count::snapshot(),
+                before,
+            );
+            assert_eq!(
+                steady.0, 0,
+                "steady SDK send {index}: zero 6880-byte payload allocations, measured: {steady:?}"
+            );
+        }
+        let observed = observed.lock().unwrap().clone();
+        assert_eq!(observed.len(), 12);
+        assert!(
+            observed.iter().all(|entry| entry.2),
+            "every execute saw exactly one lit pixel: the payload fill is intact"
+        );
+        let first_ptr = observed[0].0;
+        assert_eq!(
+            observed[1..]
+                .iter()
+                .filter(|entry| entry.0 == first_ptr)
+                .count(),
+            11,
+            "the owner observed one stable payload pointer across sends: reuse, measured"
+        );
+        let lit_indices: Vec<usize> = observed.iter().map(|entry| entry.1).collect();
+        assert_eq!(
+            lit_indices,
+            (0..12).collect::<Vec<_>>(),
+            "content order matches send order"
+        );
+        println!(
+            "WO-A1-02 EC-2 sdk-payload measured: warm2={warm:?} (per-send metadata counted), sends=12, distinct_ptrs={}",
+            observed
+                .iter()
+                .map(|entry| entry.0)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        );
+        assert_eq!(submits.load(Ordering::SeqCst), 12);
+        drop(device.requests.take().unwrap());
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn sdk_payload_exclusivity_no_fill_during_owner_read() {
+        // Acceptance (3) shape at the SDK payload boundary (mirrors
+        // owner_serializes_submit_poll_close_and_shutdown: scripted runtime +
+        // counters): the owner reads frame 0's buffer for 20 ms; the producer
+        // of frame 1 fills inside that window. Under the move-and-release
+        // protocol the second send runs on its own buffer, so the first
+        // observation stays 0 and the order is [0, 1]. Under a shared-buffer
+        // protocol (the mutation probe) the second fill lands inside the
+        // first read and the first observation flips to 1.
+        let recorder = Recording::new(20);
+        let observed = Arc::clone(&recorder.observed);
+        let submits = Arc::clone(&recorder.submits);
+        let (tx, rx) = mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || owner_loop(Box::new(recorder), rx));
+        let mut device = SdkDevice {
+            requests: Some(tx),
+            payload: Mutex::new(None),
+        };
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| device.submit_frame(&lit_frame(0)));
+            std::thread::sleep(Duration::from_millis(5));
+            scope.spawn(|| device.submit_frame(&lit_frame(1)));
+        });
+        let observed = observed.lock().unwrap().clone();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(
+            submits.load(Ordering::SeqCst),
+            2,
+            "counters: the owner ran both executes"
+        );
+        assert_eq!(
+            observed[0].1, 0,
+            "the first execute read frame 0's content: the second send's fill never wrote a buffer the owner may read"
+        );
+        assert_eq!(
+            observed[1].1, 1,
+            "the second execute read frame 1's content"
+        );
+        assert!(observed[0].2 && observed[1].2, "no torn reads");
+        println!(
+            "WO-A1-02 EC-2 sdk exclusivity measured: payload ptrs = [0x{:x}, 0x{:x}] (distinct => no buffer shared during the read window)",
+            observed[0].0, observed[1].0
+        );
+        drop(device.requests.take().unwrap());
+        thread.join().unwrap();
     }
 }
