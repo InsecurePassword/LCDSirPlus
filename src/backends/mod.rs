@@ -1131,10 +1131,25 @@ pub fn resolve_kind(config_backend: &str) -> BackendKind {
 /// nothing. `GlobalAlloc` is an `unsafe` trait (the only reason the harness
 /// mentions `unsafe`); it compiles for `cfg(test)` only — the production frame
 /// path and its zero-unsafe rule are untouched.
+///
+/// WO-QA-01 (known issue F-1): the counters measure ONE armed window at a time.
+/// [`window`] arms a window for the calling thread and returns a `Watch` guard;
+/// [`watch_thread`] attaches a frame-path worker thread to the window that is
+/// armed right now. Only threads attached to the armed cohort are counted — every
+/// other allocation in the process lands in the foreign bucket — and dropping the
+/// guard releases the cohort's slots (release-clear). The pre-fix harness counted
+/// every thread that had EVER registered: the 8 `WATCHED` slots were never cleared
+/// (`WO-B-03-FIX-AUDIT` F-1 — one libtest worker that ran an alloc test stayed
+/// watched for the whole process, so each window measured the idle-path
+/// allocations of every other test's worker; `WO-A1-06-FIX-AUDIT` N-C measured
+/// `(0, 0, 1, 0, 1)` on the skipped-tick assert). The single-window claim also
+/// serializes the alloc tests instead of letting parallel tests share global
+/// counters, which is what made the family load-sensitive.
 #[cfg(test)]
 pub mod alloc_count {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     pub const PIXELS: usize = crate::model::WIDTH * crate::model::HEIGHT;
     pub const HID_REPORT: usize = super::g13::G13_OUTPUT_REPORT_LENGTH;
@@ -1146,13 +1161,18 @@ pub mod alloc_count {
     static N_TOTAL: AtomicUsize = AtomicUsize::new(0);
     static N_FOREIGN: AtomicUsize = AtomicUsize::new(0);
 
-    /// The suite runs tests in parallel, and other tests allocate the same
-    /// 6880-byte class, so counting is gated on a small set of watched thread
-    /// ids: a frame-path test registers its producer thread, and the scripted
-    /// device / recording owner register their worker thread on first
-    /// execute. Everything else lands in the foreign bucket, untouched by the
-    /// window asserts.
+    /// Threads attached to the armed window: `WATCHED[i]` is the thread id
+    /// (0 = free slot), `COHORT[i]` the cohort of the window that registered it.
+    /// A cohort is one armed window; [`Watch`]'s `drop` returns the cohort's slots
+    /// to the free pool, so a thread that once ran an alloc test is NOT watched
+    /// for the rest of the process (the pre-fix leak F-1 names).
     static WATCHED: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
+    static COHORT: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
+    /// The cohort id of the one armed window (0 = none armed), and the allocator
+    /// of cohort ids. Cohort ids are monotonic so a stale slot can never join a
+    /// later window.
+    static ARMED: AtomicUsize = AtomicUsize::new(0);
+    static NEXT_COHORT: AtomicUsize = AtomicUsize::new(1);
 
     fn thread_id() -> usize {
         // SAFETY (test harness only): GetCurrentThreadId reads this thread's
@@ -1160,24 +1180,98 @@ pub mod alloc_count {
         unsafe { windows::Win32::System::Threading::GetCurrentThreadId() as usize }
     }
 
-    pub fn watch_thread() {
+    /// Attach the calling thread to `cohort`; true when a slot holds it. Claiming
+    /// the slot and stamping its cohort are two atomic steps: in the gap the
+    /// thread is uncounted (foreign), never miscounted into another cohort.
+    fn attach(cohort: usize) -> bool {
         let id = thread_id();
-        if WATCHED.iter().any(|slot| slot.load(Ordering::SeqCst) == id) {
-            return;
+        for (slot, owned) in WATCHED.iter().zip(COHORT.iter()) {
+            if slot.load(Ordering::SeqCst) == id && owned.load(Ordering::SeqCst) == cohort {
+                return true;
+            }
         }
-        for slot in &WATCHED {
+        for (slot, owned) in WATCHED.iter().zip(COHORT.iter()) {
             if slot
                 .compare_exchange(0, id, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                return;
+                owned.store(cohort, Ordering::SeqCst);
+                return true;
             }
+        }
+        false
+    }
+
+    /// The thread filter (acceptance (1)): the calling thread is inside the armed
+    /// window, i.e. it is the arming test thread or a worker it registered.
+    fn in_window() -> bool {
+        let cohort = ARMED.load(Ordering::SeqCst);
+        if cohort == 0 {
+            return false;
+        }
+        let id = thread_id();
+        WATCHED.iter().zip(COHORT.iter()).any(|(slot, owned)| {
+            slot.load(Ordering::SeqCst) == id && owned.load(Ordering::SeqCst) == cohort
+        })
+    }
+
+    /// Register the calling thread with the window armed right now (the scripted
+    /// frame-path worker and the SDK recording owner call this on their first
+    /// execute). A no-op while no window is armed: registering then would occupy a
+    /// slot of a window that never measures it, which is the leak vector.
+    pub fn watch_thread() {
+        let cohort = ARMED.load(Ordering::SeqCst);
+        if cohort != 0 {
+            attach(cohort);
         }
     }
 
-    fn watched() -> bool {
-        let id = thread_id();
-        WATCHED.iter().any(|slot| slot.load(Ordering::SeqCst) == id)
+    /// A guarded measurement window. Dropping it is the release-clear: every slot
+    /// attached to the cohort goes back to the pool and the counters are zeroed.
+    pub struct Watch {
+        cohort: usize,
+    }
+
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            for (slot, owned) in WATCHED.iter().zip(COHORT.iter()) {
+                if owned.load(Ordering::SeqCst) == self.cohort {
+                    owned.store(0, Ordering::SeqCst);
+                    slot.store(0, Ordering::SeqCst);
+                }
+            }
+            ARMED.store(0, Ordering::SeqCst);
+            reset();
+        }
+    }
+
+    /// Arm a measurement window on the calling thread and zero the counters.
+    /// One window is armed per process; a second concurrent arm yields until the
+    /// first guard drops, and a 10 s armed window panics loudly (no silent hang).
+    /// shortcut: one window per process, so the alloc tests serialize on their
+    /// ~ms windows; upgrade to per-cohort counters if a third window appears.
+    pub fn window() -> Watch {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let cohort = NEXT_COHORT.load(Ordering::SeqCst);
+            if ARMED
+                .compare_exchange(0, cohort, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                NEXT_COHORT.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    attach(cohort),
+                    "the armed window's own thread found no free WATCHED slot"
+                );
+                reset();
+                return Watch { cohort };
+            }
+            assert!(
+                Instant::now() < deadline,
+                "an alloc measurement window stayed armed for 10 s"
+            );
+            std::thread::yield_now();
+        }
     }
 
     pub fn foreign() -> usize {
@@ -1188,7 +1282,11 @@ pub mod alloc_count {
     pub type Counts = (usize, usize, usize, usize, usize);
 
     fn bump(len: usize) {
-        if !watched() {
+        // The thread filter: only a thread attached to the armed cohort is counted.
+        // Probe (i) of WO-QA-01 acceptance (1) removes this gate and the
+        // `alloc_window_ignores_allocations_of_other_threads_under_load` test fails,
+        // so the window's measurement scope is load-bearing.
+        if !in_window() {
             N_FOREIGN.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -2204,6 +2302,10 @@ mod tests {
         // ticks are the per-accepted-frame 992-byte HID key Vec (EC-1
         // last_sent), the per-send test-instrumentation pushes, and fixed
         // per-send metadata; every one of these is counted, not assumed.
+        // WO-QA-01 (F-1): the measurement window is armed on this test thread and
+        // released by the guard's drop; the scripted worker joins this window at its
+        // first quiet submit, so the window measures producer + worker and nobody else.
+        let _window = crate::backends::alloc_count::window();
         crate::backends::alloc_count::watch_thread();
         let (commands, wake) = command_queue();
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -2295,6 +2397,102 @@ mod tests {
 
         commands.shutdown();
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn alloc_window_ignores_allocations_of_other_threads_under_load() {
+        // WO-QA-01 (A), acceptance (1): the armed window measures its OWN threads
+        // only. Four threads allocate every measured class (6880 pixel, 992 key,
+        // <=256 metadata) continuously across the armed window; every one of them
+        // must land in the foreign bucket and the window must read exactly zero.
+        // Probe (i) — deleting the thread filter in `bump` — fails this test, so the
+        // filter is load-bearing, not decorative. The load threads are spawned
+        // BEFORE the window is armed, so even the spawn bookkeeping allocations
+        // (metadata class, the EC-2-disclosed instrumentation pattern) are outside
+        // the measured window; the armed thread itself allocates nothing inside it.
+        static RUNNING: AtomicUsize = AtomicUsize::new(0);
+        static STOP: AtomicBool = AtomicBool::new(false);
+        RUNNING.store(0, Ordering::SeqCst);
+        STOP.store(false, Ordering::SeqCst);
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            handles.push(std::thread::spawn(|| {
+                RUNNING.fetch_add(1, Ordering::SeqCst);
+                while !STOP.load(Ordering::SeqCst) {
+                    let pixel = vec![7u8; crate::backends::alloc_count::PIXELS];
+                    let key = vec![9u8; crate::backends::alloc_count::HID_REPORT];
+                    // A Box, not a vec!: the point is the 64-byte heap allocation in the
+                    // metadata class, and clippy's array suggestion would move it to the
+                    // stack and un-measure the class.
+                    let metadata: Box<[u8; 64]> = Box::new([1u8; 64]);
+                    std::hint::black_box(pixel[0] + key[0] + metadata[0]);
+                }
+            }));
+        }
+        while RUNNING.load(Ordering::SeqCst) < 4 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let foreign_before = crate::backends::alloc_count::foreign();
+        let _window = crate::backends::alloc_count::window();
+        let before = crate::backends::alloc_count::snapshot();
+        std::thread::sleep(Duration::from_millis(30));
+        let d = crate::backends::alloc_count::subtract(
+            crate::backends::alloc_count::snapshot(),
+            before,
+        );
+        STOP.store(true, Ordering::SeqCst);
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let foreign_after = crate::backends::alloc_count::foreign();
+        assert_eq!(
+            d.4, 0,
+            "the armed window measured allocations made by other threads: {d:?}"
+        );
+        assert_eq!(
+            d.0, 0,
+            "the 6880-byte class is not contaminated by cross-thread loads: {d:?}"
+        );
+        assert!(
+            foreign_after > foreign_before,
+            "the load threads' allocations must be counted as foreign, not lost: before={foreign_before} after={foreign_after}"
+        );
+    }
+
+    #[test]
+    fn alloc_window_slots_are_released_when_the_watch_closes() {
+        // WO-QA-01 (A), acceptance (1)(ii): closing a window releases its WATCHED
+        // slots, so slots cannot leak across runs. Twelve windows (each with one
+        // registered worker thread) exceed the 8-slot pool; a thirteenth window on a
+        // fresh thread must still register and measure its own 6880-byte allocation.
+        // Probe (ii) — deleting the slot release from `Watch::drop` — exhausts the
+        // pool and this test fails, so the release-clear is load-bearing.
+        for _ in 0..12 {
+            let window = crate::backends::alloc_count::window();
+            std::thread::spawn(|| {
+                crate::backends::alloc_count::watch_thread();
+                std::hint::black_box(vec![7u8; crate::backends::alloc_count::PIXELS]);
+            })
+            .join()
+            .unwrap();
+            drop(window);
+        }
+        let measured = std::thread::spawn(|| {
+            let _window = crate::backends::alloc_count::window();
+            let before = crate::backends::alloc_count::snapshot();
+            std::hint::black_box(vec![7u8; crate::backends::alloc_count::PIXELS]);
+            crate::backends::alloc_count::subtract(crate::backends::alloc_count::snapshot(), before)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            measured.0, 1,
+            "the 13th window still measures its own pixel-class allocation, so the 12 earlier slots were released, not leaked: {measured:?}"
+        );
+        assert_eq!(
+            measured.4, 1,
+            "the released-slot window measures exactly that one allocation: {measured:?}"
+        );
     }
 
     #[test]

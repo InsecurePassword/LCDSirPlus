@@ -2350,6 +2350,21 @@ mod tests {
         target
     }
 
+    /// WO-QA-01 (known issue F-2): the same publication with a DRIVEN publish time.
+    /// `publish_time` is the seam the shipped TC-1 stale test already injects (it sets
+    /// `stale.publish_time = Some(Instant::now() - (interval + PUBLISH_AGE_TOLERANCE
+    /// plus one second))`), and `tick` evaluates `publication_within_bind_bound`
+    /// against the virtual `now` the caller passes, so a test that stamps its
+    /// publications on the same virtual timeline measures virtual age and has NO
+    /// real-time headroom to lose. `stamp_publish` (the production stamper, real
+    /// `Instant::now()`) is untouched; `reconcile`'s real-`Instant::now()` bound is
+    /// deliberately not on the driven path.
+    fn published_at(mut target: HungTarget, generation: u64, published_at: Instant) -> HungTarget {
+        target.publish_generation = generation;
+        target.publish_time = Some(published_at);
+        target
+    }
+
     fn failed(target: HungTarget) -> Observation {
         Observation {
             target,
@@ -4126,24 +4141,38 @@ mod tests {
         // ONCE in the new generation and refused again inside it.
         // Probe P4b (prune call removed) fails the `is_empty` assert; probe P4c
         // (`contains` dedup removed) fails the `len == 1` assert.
+        //
+        // WO-QA-01 (known issue F-2): the timeline is DRIVEN. Every gate on this path
+        // reads the virtual `now` the test passes (`tick`'s parameter, `press_to_action`'s
+        // `at`), so the publications carry injected publish times on the same virtual
+        // timeline (the `publish_time` seam, `published_at` above). The 20 s probe
+        // interval (T1's legal config, 250..60000 ms) bounds the bind at
+        // `interval + PUBLISH_AGE_TOLERANCE` = 25 s, and the re-publish sits 40 s of
+        // VIRTUAL time after the first publication — far outside the 5 s of real
+        // headroom the pre-fix body relied on, which is what made it load-sensitive
+        // (WO-B-03-FIX-AUDIT F-2; the seam-removal probe, stamping `Instant::now()`
+        // instead, fails the re-arm assert at once). Zero sleeps, zero real-time terms.
         let cfg = Config {
             hang_enabled: true,
+            hang_probe_interval: Duration::from_secs(20),
             ..Config::default()
         };
+        let base = Instant::now();
+        let republished = base + Duration::from_secs(40);
         let stale = vec![
-            published(target(1, 10, 20, r"C:\Games\game.exe"), 5),
-            published(target(2, 20, 30, r"C:\Games\other.exe"), 5),
+            published_at(target(1, 10, 20, r"C:\Games\game.exe"), 5, base),
+            published_at(target(2, 20, 30, r"C:\Games\other.exe"), 5, base),
         ];
         let fresh = vec![
-            published(target(1, 10, 20, r"C:\Games\game.exe"), 6),
-            published(target(2, 20, 30, r"C:\Games\other.exe"), 6),
+            published_at(target(1, 10, 20, r"C:\Games\game.exe"), 6, republished),
+            published_at(target(2, 20, 30, r"C:\Games\other.exe"), 6, republished),
         ];
-        let started = Instant::now();
+        let first_press = base + Duration::from_secs(20);
         let mut hold = HoldState::default();
         hold.set_owner(Some(2));
 
         assert_eq!(
-            press_to_action(&mut hold, &cfg, &stale, started),
+            press_to_action(&mut hold, &cfg, &stale, first_press),
             Some(0),
             "A acts in generation 5"
         );
@@ -4156,7 +4185,7 @@ mod tests {
         );
         hold.hung_index = 1;
         assert_eq!(
-            press_to_action(&mut hold, &cfg, &stale, started),
+            press_to_action(&mut hold, &cfg, &stale, first_press),
             Some(1),
             "B acts in generation 5"
         );
@@ -4166,7 +4195,7 @@ mod tests {
         // Re-publish at generation 6 re-arms A and prunes the generation-5 marks.
         hold.hung_index = 0;
         assert_eq!(
-            press_to_action(&mut hold, &cfg, &fresh, started),
+            press_to_action(&mut hold, &cfg, &fresh, republished),
             Some(0),
             "A is re-armed by the re-publish (no permanent lockout)"
         );
@@ -4178,7 +4207,7 @@ mod tests {
         // A times out again in generation 6: marked, and the repeat press is refused.
         hold.report_action(&fresh[0], ActionOutcome::WaitTimeout);
         assert_eq!(
-            press_to_action(&mut hold, &cfg, &fresh, started),
+            press_to_action(&mut hold, &cfg, &fresh, republished),
             None,
             "the re-armed A terminates once, not twice, in generation 6"
         );
@@ -4186,7 +4215,7 @@ mod tests {
         // B re-arms by the same re-publish, and is likewise once-only in generation 6.
         hold.hung_index = 1;
         assert_eq!(
-            press_to_action(&mut hold, &cfg, &fresh, started),
+            press_to_action(&mut hold, &cfg, &fresh, republished),
             Some(1),
             "B is re-armed by the same re-publish"
         );
@@ -4197,9 +4226,54 @@ mod tests {
             "both generation-6 marks are live (neither evicts the other)"
         );
         assert_eq!(
-            press_to_action(&mut hold, &cfg, &fresh, started),
+            press_to_action(&mut hold, &cfg, &fresh, republished),
             None,
             "the re-armed B terminates once, not twice, in generation 6"
+        );
+    }
+
+    #[test]
+    fn the_driven_time_rearm_needs_no_real_time_headroom() {
+        // WO-QA-01 (B), acceptance (2): the bounded-runtime proof. The driven sequence
+        // (press one probe cycle after the publish, re-publish two cycles later, re-arm
+        // inside the new generation) needs NO real clock at all: it runs in
+        // microseconds, so the pre-fix 5 s of real headroom is gone, not padded. The
+        // outcome asserts pin the sequence itself, so the bound cannot be met by
+        // measuring an empty run.
+        let cfg = Config {
+            hang_enabled: true,
+            hang_probe_interval: Duration::from_secs(20),
+            ..Config::default()
+        };
+        let started = Instant::now();
+        let republished = started + Duration::from_secs(40);
+        let stale = vec![published_at(
+            target(1, 10, 20, r"C:\Games\game.exe"),
+            5,
+            started,
+        )];
+        let fresh = vec![published_at(
+            target(1, 10, 20, r"C:\Games\game.exe"),
+            6,
+            republished,
+        )];
+        let mut hold = HoldState::default();
+        hold.set_owner(Some(2));
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &stale, started + Duration::from_secs(20)),
+            Some(0),
+            "the driven generation-5 press acts"
+        );
+        hold.report_action(&stale[0], ActionOutcome::WaitTimeout);
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &fresh, republished),
+            Some(0),
+            "the driven re-publish re-arms with no real time elapsed"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the driven sequence must need no real 5 s headroom, measured: {elapsed:?}"
         );
     }
 

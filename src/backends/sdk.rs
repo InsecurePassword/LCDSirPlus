@@ -1997,6 +1997,10 @@ mod tests {
         observed: Arc<Mutex<Vec<PayloadObservation>>>,
         submits: Arc<AtomicUsize>,
         first_read_ms: u64,
+        /// WO-QA-01: only the instance the alloc-window test drives registers its
+        /// owner thread with the counting harness, so a parallel SDK test's owner
+        /// thread can never join a foreign measurement window.
+        measured: bool,
     }
 
     impl Recording {
@@ -2005,6 +2009,15 @@ mod tests {
                 observed: Arc::new(Mutex::new(Vec::new())),
                 submits: Arc::new(AtomicUsize::new(0)),
                 first_read_ms,
+                measured: false,
+            }
+        }
+
+        /// The SDK payload alloc-window driver: registers its owner thread.
+        fn measured(first_read_ms: u64) -> Self {
+            Self {
+                measured: true,
+                ..Self::new(first_read_ms)
             }
         }
     }
@@ -2012,8 +2025,11 @@ mod tests {
     impl Runtime for Recording {
         fn execute(&mut self, request: &Request) -> Reply {
             // Register the owner thread with the counting harness (first call),
-            // so the measured window covers exactly producer + owner.
-            crate::backends::alloc_count::watch_thread();
+            // so the measured window covers exactly producer + owner. WO-QA-01 gates
+            // this to the measured instance (see the field doc).
+            if self.measured {
+                crate::backends::alloc_count::watch_thread();
+            }
             match request {
                 Request::Submit(frame) => {
                     if self.submits.fetch_add(1, Ordering::SeqCst) == 0 && self.first_read_ms > 0 {
@@ -2051,7 +2067,7 @@ mod tests {
         // pixel buffers and the owner observes one stable payload pointer
         // (measured reuse). The disclosed residual is the fixed per-send
         // metadata (the reply sync_channel node), counted, not assumed.
-        let recorder = Recording::new(0);
+        let recorder = Recording::measured(0);
         let observed = Arc::clone(&recorder.observed);
         let submits = Arc::clone(&recorder.submits);
         let (tx, rx) = mpsc::sync_channel(1);
@@ -2061,6 +2077,9 @@ mod tests {
             payload: Mutex::new(None),
         };
 
+        // WO-QA-01 (F-1): arm the window on this test thread; the recording owner
+        // joins it at its first execute, and the guard's drop releases the slots.
+        let _window = crate::backends::alloc_count::window();
         crate::backends::alloc_count::watch_thread();
         crate::backends::alloc_count::reset();
         let mut warm = crate::backends::alloc_count::Counts::default();
