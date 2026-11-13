@@ -401,7 +401,14 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                     for event in events {
                         let command =
                             hang_hold.event(event, &cfg, published_hung, hang_provider_available);
-                        apply_hold_command(command, &mut slots, &cfg, &mut alerts, &mut snapshot);
+                        apply_hold_command(
+                            command,
+                            &mut hang_hold,
+                            &mut slots,
+                            &cfg,
+                            &mut alerts,
+                            &mut snapshot,
+                        );
                         hang_owner.invalidate();
                         if let Some(audit) = hang_owner.bind(&slots, &mut hang_hold) {
                             log_hang_audit(&audit);
@@ -453,7 +460,14 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
             log_hang_audit(&audit);
         }
         let command = hang_hold.tick(now, &cfg, published_hung, hang_provider_available);
-        apply_hold_command(command, &mut slots, &cfg, &mut alerts, &mut snapshot);
+        apply_hold_command(
+            command,
+            &mut hang_hold,
+            &mut slots,
+            &cfg,
+            &mut alerts,
+            &mut snapshot,
+        );
         // EC-4: the command can cycle a slot, so the owner is stale until the
         // next iteration's bind site.
         hang_owner.invalidate();
@@ -1198,16 +1212,14 @@ fn invalidate_telemetry_publication(
 }
 
 fn log_hang_audit(audit: &hang::Audit) {
-    crate::log_warn!(
-        "hung action pid={} process={} outcome={}",
-        audit.target.pid,
-        audit.target.process_name,
-        audit.outcome
-    );
+    // TC-3 (P2 §2 TC-3): the line text (exit-code classification included) is
+    // rendered by the provider, where the classification is produced.
+    crate::log_warn!("{}", audit.line());
 }
 
 fn apply_hold_command(
     command: hang::HoldCommand,
+    hold: &mut hang::HoldState,
     slots: &mut Manager,
     cfg: &Config,
     alerts: &mut crate::alerts::Manager,
@@ -1215,6 +1227,7 @@ fn apply_hold_command(
 ) {
     apply_hold_command_with(
         command,
+        hold,
         slots,
         cfg,
         alerts,
@@ -1225,13 +1238,14 @@ fn apply_hold_command(
 
 fn apply_hold_command_with<F>(
     command: hang::HoldCommand,
+    hold: &mut hang::HoldState,
     slots: &mut Manager,
     cfg: &Config,
     alerts: &mut crate::alerts::Manager,
     snapshot: &mut Snapshot,
     terminate: F,
 ) where
-    F: FnOnce(&crate::model::HungTarget, &Config) -> hang::ActionOutcome,
+    F: FnOnce(&crate::model::HungTarget, &Config) -> hang::ActionReport,
 {
     match command {
         hang::HoldCommand::None => {}
@@ -1246,21 +1260,20 @@ fn apply_hold_command_with<F>(
         hang::HoldCommand::Audit(audit) => log_hang_audit(&audit),
         hang::HoldCommand::Terminate(target) => {
             if cfg.safe_mode {
-                log_hang_audit(&hang::Audit {
-                    target,
-                    outcome: "refused-safe-mode",
-                });
+                log_hang_audit(&hang::Audit::raised(target, "refused-safe-mode"));
                 return;
             }
+            log_hang_audit(&hang::Audit::raised(target.clone(), "attempted"));
+            let report = terminate(&target, cfg);
             log_hang_audit(&hang::Audit {
                 target: target.clone(),
-                outcome: "attempted",
+                outcome: report.outcome.label(),
+                exit: report.exit,
             });
-            let outcome = terminate(&target, cfg);
-            log_hang_audit(&hang::Audit {
-                target,
-                outcome: outcome.label(),
-            });
+            // TC-3 (P2 §2 TC-3): a `wait-timeout` is terminal for the published
+            // identity this press acted on; the provider owns the rule, the app only
+            // reports what its own action returned.
+            hold.report_action(&target, report.outcome);
         }
     }
 }
@@ -1865,19 +1878,21 @@ mod tests {
         };
         alerts.evaluate(&mut snapshot, &cfg, Instant::now());
         let kills = Cell::new(0);
+        let mut hold = hang::HoldState::default();
 
         apply_hold_command_with(
             hang::HoldCommand::Cycle {
                 index: 0,
                 backward: false,
             },
+            &mut hold,
             &mut slots,
             &cfg,
             &mut alerts,
             &mut snapshot,
             |_, _| {
                 kills.set(kills.get() + 1);
-                hang::ActionOutcome::Success
+                hang::ActionReport::bare(hang::ActionOutcome::Success)
             },
         );
         assert_eq!(slots.current(0), "CPU_TEMP");
@@ -1887,13 +1902,14 @@ mod tests {
                 index: 3,
                 backward: false,
             },
+            &mut hold,
             &mut slots,
             &cfg,
             &mut alerts,
             &mut snapshot,
             |_, _| {
                 kills.set(kills.get() + 1);
-                hang::ActionOutcome::Success
+                hang::ActionReport::bare(hang::ActionOutcome::Success)
             },
         );
         assert!(snapshot.alerts[0].acknowledged);
@@ -1908,13 +1924,14 @@ mod tests {
                 title: "Game".into(),
                 ..Default::default()
             }),
+            &mut hold,
             &mut slots,
             &cfg,
             &mut alerts,
             &mut snapshot,
             |_, _| {
                 kills.set(kills.get() + 1);
-                hang::ActionOutcome::Success
+                hang::ActionReport::bare(hang::ActionOutcome::Success)
             },
         );
         assert_eq!(kills.get(), 0);
@@ -2417,6 +2434,7 @@ mod tests {
     fn ec4_record_command(
         out: &mut Vec<String>,
         command: hang::HoldCommand,
+        hold: &mut hang::HoldState,
         slots: &mut Manager,
         cfg: &Config,
         alerts: &mut crate::alerts::Manager,
@@ -2433,8 +2451,8 @@ mod tests {
             }
         }
         // The injectable terminator keeps the probe away from any real process.
-        apply_hold_command_with(command, slots, cfg, alerts, snapshot, |_, _| {
-            hang::ActionOutcome::Success
+        apply_hold_command_with(command, hold, slots, cfg, alerts, snapshot, |_, _| {
+            hang::ActionReport::bare(hang::ActionOutcome::Success)
         });
     }
 
@@ -2487,7 +2505,15 @@ mod tests {
                         out.push(ec4_audit_line(&audit));
                     }
                     let command = hold.tick(now, cfg, targets, true);
-                    ec4_record_command(&mut out, command, slots, cfg, &mut alerts, &mut snapshot);
+                    ec4_record_command(
+                        &mut out,
+                        command,
+                        hold,
+                        slots,
+                        cfg,
+                        &mut alerts,
+                        &mut snapshot,
+                    );
                     // The command can cycle a slot (app.rs end-of-loop apply).
                     changed();
                 }
@@ -2508,7 +2534,15 @@ mod tests {
                         targets,
                         true,
                     );
-                    ec4_record_command(&mut out, command, slots, cfg, &mut alerts, &mut snapshot);
+                    ec4_record_command(
+                        &mut out,
+                        command,
+                        hold,
+                        slots,
+                        cfg,
+                        &mut alerts,
+                        &mut snapshot,
+                    );
                     changed();
                     ec4_site(&mut out, &mut sites, &mut site, slots, hold);
                 }
