@@ -86,12 +86,73 @@ const PUBLISH_AGE_TOLERANCE: Duration = POLL_BUDGET;
 /// `the_terminal_set_evicts_the_oldest_mark_at_capacity`.
 const MAX_TERMINAL_MARKS: usize = MAX_WINDOWS;
 
+/// TC-4 (P2 §2 TC-4): the named publication token for a probe result the detector
+/// cannot evaluate — `ProbeResult::Indeterminate`, the class `classify_probe_result`
+/// gives every failed `WM_NULL` probe that is NOT a documented `ERROR_TIMEOUT`.
+///
+/// The token is the single formatting site [`probe_indeterminate_reason`] in the
+/// RC-1/EC-6 named-cause discipline (the RC-1 precedent is
+/// `LossCause::TransferIncomplete` -> `format!("transfer-incomplete({code})")`,
+/// `src/backends/mod.rs` L95), with the count as payload: `probe-indeterminate-<N>`.
+///
+/// Driver (ACCEPTED b54-16 loss-vs-failure separation + B53-10/B53-11): the shipped
+/// app's single detector (`IsHungAppWindow`) gives ONE undifferentiated signal, and the
+/// counterpart absorbed this class silently (`Timeout | Indeterminate => {}`). The token
+/// separates "probes lost their ability to evaluate" from "no timeout observed".
+///
+/// Distinctness (anti-masking): no token = the cycle saw no not-evaluable probe;
+/// hard enumeration/budget/limit failures keep their own `Update::error` classes;
+/// a token NEVER turns into a target (see [`record_probe_result`]).
+const PROBE_INDETERMINATE: &str = "probe-indeterminate";
+
+/// TC-4: the ONE site that renders the token, so the vocabulary cannot drift.
+/// `None` = the publication has nothing of this class to report.
+fn probe_indeterminate_reason(count: usize) -> Option<String> {
+    (count != 0).then(|| format!("{PROBE_INDETERMINATE}-{count}"))
+}
+
+/// TC-4: one publish cycle's probe bookkeeping, built fresh inside
+/// [`enumerate_and_probe`]. Because the record is created per cycle, a cycle's
+/// not-evaluable count cannot leak into the next publication; the worker-side reset
+/// rule is stated again in [`publish_indeterminate`].
+///
+/// Bounded by the existing caps, no new budget: one window is probed at most once per
+/// cycle (`enumerate_callback` runs once per top-level window) and one cycle visits at
+/// most `MAX_WINDOWS` windows before `limit_exceeded` aborts the whole publication
+/// (`enumerate_callback` L1007-1011 + `enumerate_and_probe` L994-995 => ZERO targets),
+/// so `indeterminate <= MAX_WINDOWS` (4096) always — the same derivation family as
+/// `MAX_TERMINAL_MARKS`.
+#[derive(Clone, Debug, Default)]
+struct ProbeCycle {
+    /// Eligibility input for the `Tracker`: only documented timeouts with a confirmed
+    /// identity, exactly as before TC-4.
+    observations: Vec<Observation>,
+    /// The per-window-per-cycle count of `Indeterminate` probes (information only).
+    indeterminate: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Update {
     pub generation: u64,
     pub targets: Vec<HungTarget>,
     pub available: bool,
     pub error: Option<&'static str>,
+    /// TC-4 (P2 §2 TC-4): how many probes of the cycle that produced this publication
+    /// returned `Indeterminate`. Purely additive: these probes never enter the
+    /// eligibility math, so this number is never a target and never a failure, and a
+    /// non-zero count publishes [`Update::availability_reason`] beside ZERO targets.
+    /// The field is the machine-readable half of the signal; `0` is the default.
+    pub probe_indeterminate: usize,
+}
+
+impl Update {
+    /// TC-4: the named availability reason this publication carries, i.e.
+    /// `probe-indeterminate-<N>` when the cycle lost probes it could not evaluate, and
+    /// `None` when it did not — which is how "no timeout observed" stays distinguishable
+    /// from "N not-evaluable probes".
+    pub fn availability_reason(&self) -> Option<String> {
+        probe_indeterminate_reason(self.probe_indeterminate)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -770,6 +831,9 @@ fn worker(
     let mut disabled_published = false;
     let mut published_available = None;
     let mut published_targets = None;
+    // TC-4: the not-evaluable count of the CURRENTLY published cycle. Written only
+    // through `publish_indeterminate`, which replaces it per cycle (never accumulates).
+    let mut published_indeterminate = 0usize;
     let mut current_generation = 0;
     let mut publish_generation = 0u64;
     while !shutdown.load(Ordering::Relaxed) {
@@ -806,6 +870,7 @@ fn worker(
                     targets: Vec::new(),
                     available: policy.active(),
                     error: None,
+                    ..Default::default()
                 })
                 .is_err()
             {
@@ -824,6 +889,7 @@ fn worker(
                     targets: Vec::new(),
                     available: false,
                     error: None,
+                    ..Default::default()
                 })
                 .is_err()
             } {
@@ -860,6 +926,7 @@ fn worker(
                     targets: Vec::new(),
                     available: latest_policy.active(),
                     error: None,
+                    ..Default::default()
                 })
                 .is_err()
             {
@@ -868,14 +935,16 @@ fn worker(
             continue;
         }
         let update = match result {
-            Ok(observations) => {
+            Ok(cycle) => {
                 publish_generation += 1;
+                let probe_indeterminate =
+                    publish_indeterminate(&cycle, &mut published_indeterminate);
                 Update {
                     generation: request_generation,
                     targets: stamp_publish(
                         tracker.update(
                             started.elapsed(),
-                            observations,
+                            cycle.observations,
                             policy.failures,
                             policy.minimum,
                         ),
@@ -883,15 +952,22 @@ fn worker(
                     ),
                     available: true,
                     error: None,
+                    probe_indeterminate,
                 }
             }
             Err(error) => {
                 tracker.clear();
+                // An aborted cycle (budget, enumeration, limit) has no publication, so
+                // the same reset rule publishes NO count — a stale number cannot ride on
+                // the zero-target failure update either.
+                let probe_indeterminate =
+                    publish_indeterminate(&ProbeCycle::default(), &mut published_indeterminate);
                 Update {
                     generation: request_generation,
                     targets: Vec::new(),
                     available: false,
                     error: Some(error),
+                    probe_indeterminate,
                 }
             }
         };
@@ -901,6 +977,12 @@ fn worker(
             update.available,
             update.targets.len(),
         );
+        if let Some(reason) = update.availability_reason() {
+            // TC-4 (P2 §2 TC-4): the named loss cause is audited once per publish
+            // cycle — bounded and never silent, the same discipline as the TC-2
+            // acceptance-refusal log in `enumerate_and_probe`.
+            crate::log_warn!("hung-window detector {reason}");
+        }
         if tx.send(update).is_err() {
             return;
         }
@@ -933,7 +1015,9 @@ struct EnumerationContext {
     only_pid: Option<u32>,
     timeout: Duration,
     deadline: Instant,
-    observations: Vec<Observation>,
+    /// TC-4: this cycle's probe bookkeeping — the eligible observations AND the
+    /// per-window-per-cycle count of not-evaluable probes. Fresh per cycle.
+    cycle: ProbeCycle,
     visited: usize,
     stopped: bool,
     limit_exceeded: bool,
@@ -944,7 +1028,7 @@ fn enumerate_and_probe(
     timeout: Duration,
     ignore: &[String],
     only_pid: Option<u32>,
-) -> Result<Vec<Observation>, &'static str> {
+) -> Result<ProbeCycle, &'static str> {
     let windows_dir = windows_directory()?;
     let mut ignored = ignored_names(ignore);
     ignored.insert("lcdsirplus.exe".into());
@@ -957,7 +1041,7 @@ fn enumerate_and_probe(
         only_pid,
         timeout,
         deadline: Instant::now() + POLL_BUDGET,
-        observations: Vec::new(),
+        cycle: ProbeCycle::default(),
         visited: 0,
         stopped: false,
         limit_exceeded: false,
@@ -994,7 +1078,7 @@ fn enumerate_and_probe(
     if context.limit_exceeded {
         return Err("hung-window enumeration limit exceeded");
     }
-    Ok(context.observations)
+    Ok(context.cycle)
 }
 
 unsafe extern "system" fn enumerate_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -1022,19 +1106,13 @@ unsafe extern "system" fn enumerate_callback(hwnd: HWND, lparam: LPARAM) -> BOOL
     };
     let remaining = context.deadline.saturating_duration_since(Instant::now());
     let probe_timeout = context.timeout.min(remaining).max(Duration::from_millis(1));
-    match probe(hwnd, probe_timeout) {
-        ProbeResult::Responsive => context.observations.push(Observation {
-            target,
-            responsive: true,
-        }),
-        ProbeResult::Timeout if identity_still_matches(hwnd, &target) => {
-            context.observations.push(Observation {
-                target,
-                responsive: false,
-            });
-        }
-        ProbeResult::Timeout | ProbeResult::Indeterminate => {}
-    }
+    let result = probe(hwnd, probe_timeout);
+    // The post-probe identity cross-check runs ONLY for a documented timeout, exactly
+    // as the old guard arm did (short-circuit), so no extra Win32 call is added on the
+    // responsive path and the eligibility semantics cannot change.
+    let identity_confirmed =
+        result == ProbeResult::Timeout && identity_still_matches(hwnd, &target);
+    record_probe_result(result, identity_confirmed, target, &mut context.cycle);
     BOOL(1)
 }
 
@@ -1161,6 +1239,55 @@ fn classify_probe_result(succeeded: bool, error: WIN32_ERROR) -> ProbeResult {
     } else {
         ProbeResult::Indeterminate
     }
+}
+
+/// TC-4 (P2 §2 TC-4): the disposition of ONE probe result inside the current publish
+/// cycle. The eligibility arms keep their exact pre-TC-4 semantics — the class pinned by
+/// `probe_classification_counts_only_documented_timeout`:
+/// * `Responsive` -> a responsive observation (as before);
+/// * `Timeout` ONLY with a confirmed identity (`identity_confirmed`, the same
+///   `identity_still_matches` cross-check the guard arm ran) -> the ONLY path that can
+///   make a target;
+/// * `Timeout` without it -> nothing (as before);
+/// * `Indeterminate` -> NOTHING for eligibility: it never becomes an `Observation`, so it
+///   never reaches the `Tracker`, the failure counters, or a published target. It is
+///   counted here, per window per cycle, which is the whole TC-4 change: the old
+///   absorption site `Timeout | Indeterminate => {}` becomes a named loss cause
+///   (b54-16 loss-vs-failure, B53-10/B53-11 single undifferentiated detector).
+///
+/// Bounded: at most one result per visited window, and one cycle visits at most
+/// `MAX_WINDOWS` windows before the publication is aborted, so
+/// `cycle.indeterminate <= MAX_WINDOWS` (derivation on [`ProbeCycle`]).
+fn record_probe_result(
+    result: ProbeResult,
+    identity_confirmed: bool,
+    target: HungTarget,
+    cycle: &mut ProbeCycle,
+) {
+    match result {
+        ProbeResult::Responsive => cycle.observations.push(Observation {
+            target,
+            responsive: true,
+        }),
+        ProbeResult::Timeout if identity_confirmed => cycle.observations.push(Observation {
+            target,
+            responsive: false,
+        }),
+        ProbeResult::Timeout => {}
+        ProbeResult::Indeterminate => cycle.indeterminate += 1,
+    }
+}
+
+/// TC-4: publish one cycle's not-evaluable count. The count of the published cycle
+/// REPLACES the previous one (assignment, never accumulation), so a stale count can
+/// never leak into a new publication — including the zero-target publications of an
+/// aborted cycle, which pass a default [`ProbeCycle`].
+///
+/// Derivation stays the [`ProbeCycle`] bound: the value assigned here is at most
+/// `MAX_WINDOWS` per publication, and the worker holds exactly one such number.
+fn publish_indeterminate(cycle: &ProbeCycle, published: &mut usize) -> usize {
+    *published = cycle.indeterminate;
+    *published
 }
 
 unsafe fn identity_still_matches(hwnd: HWND, expected: &HungTarget) -> bool {
@@ -1823,10 +1950,10 @@ fn detect_harness(pid: u32) -> Result<HungTarget, String> {
     let mut last_error = None;
     while started.elapsed() < Duration::from_secs(5) {
         match enumerate_and_probe(Duration::from_millis(100), &[], Some(pid)) {
-            Ok(observations) => {
+            Ok(cycle) => {
                 let targets = tracker.update(
                     started.elapsed(),
-                    observations,
+                    cycle.observations,
                     2,
                     Duration::from_millis(300),
                 );
@@ -1856,12 +1983,12 @@ fn detect_harness_with_policy(pid: u32, policy: &Policy) -> Result<HungTarget, S
             std::thread::sleep(TICK);
             continue;
         }
-        let observations =
+        let cycle =
             enumerate_and_probe(policy.timeout, &policy.ignore, None).map_err(str::to_string)?;
         if let Some(target) = tracker
             .update(
                 started.elapsed(),
-                observations,
+                cycle.observations,
                 policy.failures,
                 policy.minimum,
             )
@@ -2314,6 +2441,207 @@ mod tests {
         assert_eq!(
             classify_probe_result(true, ERROR_TIMEOUT),
             ProbeResult::Responsive
+        );
+    }
+
+    /// TC-4 helper: run one synthetic publish cycle through the real counting seam.
+    /// A `Timeout` is given a confirmed identity (the arm the eligibility math
+    /// requires); every other class runs with the identity cross-check unconfirmed.
+    /// No Win32 handle, window, probe, process query or termination is involved.
+    fn probe_cycle(results: &[ProbeResult], target: &HungTarget) -> ProbeCycle {
+        let mut cycle = ProbeCycle::default();
+        for &result in results {
+            record_probe_result(
+                result,
+                result == ProbeResult::Timeout,
+                target.clone(),
+                &mut cycle,
+            );
+        }
+        cycle
+    }
+
+    /// TC-4 helper: the publication the worker builds from one cycle.
+    fn publication(cycle: &ProbeCycle, published: &mut usize, generation: u64) -> Update {
+        let mut tracker = Tracker::default();
+        Update {
+            generation,
+            targets: stamp_publish(
+                tracker.update(
+                    Duration::ZERO,
+                    cycle.observations.clone(),
+                    1,
+                    Duration::ZERO,
+                ),
+                generation,
+            ),
+            available: true,
+            error: None,
+            probe_indeterminate: publish_indeterminate(cycle, published),
+        }
+    }
+
+    #[test]
+    fn not_evaluable_probes_publish_a_named_loss_cause_and_no_target() {
+        // TC-4 acceptance (1): injecting `Indeterminate` probe results publishes the
+        // named `probe-indeterminate` reason with ZERO targets.
+        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let cycle = probe_cycle(&[ProbeResult::Indeterminate; 3], &item);
+        assert_eq!(cycle.indeterminate, 3, "one count per window per cycle");
+        assert!(
+            cycle.observations.is_empty(),
+            "a not-evaluable probe never enters eligibility"
+        );
+
+        let mut published = 0usize;
+        let update = publication(&cycle, &mut published, 1);
+        assert_eq!(update.targets.len(), 0);
+        assert_eq!(update.probe_indeterminate, 3);
+        assert_eq!(
+            update.availability_reason().as_deref(),
+            Some("probe-indeterminate-3")
+        );
+        assert!(update.error.is_none(), "a loss cause is not a hard failure");
+    }
+
+    #[test]
+    fn indeterminate_never_counts_toward_a_target() {
+        // TC-4 ban: the eligibility math is only documented `Timeout` + confirmed
+        // identity (the class pinned by
+        // `probe_classification_counts_only_documented_timeout`, which stays byte-identical
+        // and green). A window that only ever answers `Indeterminate` gets no record, no
+        // failure credit and no target, in a cycle that also contains a real timeout.
+        let hung = target(1, 10, 20, r"C:\Games\game.exe");
+        let lost = target(2, 20, 30, r"C:\Games\lost.exe");
+        let fine = target(3, 30, 40, r"C:\Games\fine.exe");
+        let mut cycle = ProbeCycle::default();
+        record_probe_result(ProbeResult::Timeout, true, hung.clone(), &mut cycle);
+        for _ in 0..3 {
+            record_probe_result(ProbeResult::Indeterminate, false, lost.clone(), &mut cycle);
+        }
+        record_probe_result(ProbeResult::Responsive, false, fine.clone(), &mut cycle);
+        assert_eq!(cycle.indeterminate, 3);
+
+        let mut published = 0usize;
+        let update = publication(&cycle, &mut published, 1);
+        assert_eq!(
+            update.targets,
+            vec![hung],
+            "only the documented timeout became a target"
+        );
+        assert_eq!(update.probe_indeterminate, 3);
+        assert_eq!(
+            update.availability_reason().as_deref(),
+            Some("probe-indeterminate-3")
+        );
+
+        // The indeterminate identity never reaches the `Tracker` records at all.
+        let mut tracker = Tracker::default();
+        tracker.update(Duration::ZERO, cycle.observations, 1, Duration::ZERO);
+        assert!(!tracker.records.contains_key(&Identity::from(&lost)));
+        assert!(tracker
+            .records
+            .contains_key(&Identity::from(&update.targets[0])));
+        assert!(!tracker.records.contains_key(&Identity::from(&fine)));
+    }
+
+    #[test]
+    fn the_not_evaluable_count_resets_every_publish_cycle() {
+        // TC-4 acceptance (5): counters reset each cycle, so a stale count can never
+        // leak into a new publication (including an aborted cycle's zero-target one).
+        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let mut published = 0usize;
+
+        let lost = probe_cycle(&[ProbeResult::Indeterminate; 3], &item);
+        assert_eq!(publish_indeterminate(&lost, &mut published), 3);
+        assert_eq!(published, 3);
+
+        // The next cycle saw no not-evaluable probe: it publishes 0 / no token.
+        let quiet = probe_cycle(&[ProbeResult::Responsive], &item);
+        assert_eq!(publish_indeterminate(&quiet, &mut published), 0);
+        assert_eq!(published, 0);
+        let update = publication(&quiet, &mut published, 2);
+        assert_eq!(update.probe_indeterminate, 0);
+        assert_eq!(
+            update.availability_reason(),
+            None,
+            "the previous cycle's count did not leak"
+        );
+
+        // An aborted cycle (budget/limit/enumeration failure) publishes no count either.
+        assert_eq!(
+            publish_indeterminate(&ProbeCycle::default(), &mut published),
+            0
+        );
+    }
+
+    #[test]
+    fn the_loss_cause_token_is_distinct_from_every_other_publication_signal() {
+        // TC-4 anti-masking: "no timeout observed" (no token) and "N not-evaluable
+        // probes" (token) are distinguishable, and the token is not a hard-failure class.
+        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let mut published = 0usize;
+
+        let quiet = publication(&probe_cycle(&[], &item), &mut published, 1);
+        assert_eq!(
+            quiet.availability_reason(),
+            None,
+            "a cycle that observed nothing not-evaluable carries no token"
+        );
+
+        let lost = publication(
+            &probe_cycle(&[ProbeResult::Indeterminate; 2], &item),
+            &mut published,
+            2,
+        );
+        assert_eq!(
+            lost.availability_reason().as_deref(),
+            Some("probe-indeterminate-2")
+        );
+        assert!(
+            lost.targets.is_empty(),
+            "the named loss cause never publishes a target"
+        );
+
+        let failed = Update {
+            generation: 3,
+            error: Some("hung-window poll budget exceeded"),
+            ..Default::default()
+        };
+        assert_eq!(
+            failed.availability_reason(),
+            None,
+            "a hard failure keeps its own named class"
+        );
+        for message in [
+            "window enumeration failed",
+            "hung-window poll budget exceeded",
+            "hung-window enumeration limit exceeded",
+        ] {
+            assert!(
+                !message.contains(PROBE_INDETERMINATE),
+                "{message} must not absorb the loss-cause token"
+            );
+        }
+    }
+
+    #[test]
+    fn the_not_evaluable_count_is_bounded_by_the_enumeration_cap() {
+        // TC-4 boundedness: one count per visited window, and the existing enumeration
+        // cap bounds the cycle. `enumerate_callback` aborts the WHOLE publication when a
+        // cycle visits more than `MAX_WINDOWS` windows (`limit_exceeded` -> `Err` -> ZERO
+        // targets), so the counter of a PUBLISHED cycle is at most `MAX_WINDOWS` — the
+        // same derivation as `MAX_TERMINAL_MARKS` (no new budget invented).
+        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let cycle = probe_cycle(&[ProbeResult::Indeterminate; MAX_WINDOWS], &item);
+        assert_eq!(cycle.indeterminate, MAX_WINDOWS);
+        assert_eq!(cycle.observations.len(), 0);
+        assert_eq!(
+            probe_indeterminate_reason(cycle.indeterminate)
+                .unwrap()
+                .strip_prefix(PROBE_INDETERMINATE)
+                .unwrap(),
+            format!("-{MAX_WINDOWS}")
         );
     }
 

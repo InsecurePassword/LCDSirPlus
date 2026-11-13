@@ -1887,6 +1887,7 @@ mod tests {
                 available: true,
                 targets: vec![target.clone()],
                 error: None,
+                ..Default::default()
             },
             2,
         );
@@ -1911,6 +1912,7 @@ mod tests {
                 available: true,
                 targets: vec![target],
                 error: None,
+                ..Default::default()
             },
             2,
         );
