@@ -141,6 +141,7 @@ function Invoke-ReproducibleBuild {
     $info.FileName = $cargoPath
     $info.WorkingDirectory = $Root
     $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
     foreach ($argument in @('build', '--release', '--locked', '--offline')) { $info.ArgumentList.Add($argument) }

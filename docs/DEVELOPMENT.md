@@ -33,12 +33,18 @@ cargo build --release
 cargo fmt --check
 cargo clippy --all-targets
 cargo test --release --locked
-pwsh -NoProfile -File .\scripts\Test.ps1
+pwsh -NoProfile -NonInteractive -WindowStyle Hidden -File .\scripts\Test.ps1
 ```
 
 `scripts/Test.ps1` checks PowerShell syntax, dependency notices, product
 identity, module documentation order, formatting, zero Clippy warnings, tests,
 release build, public commands, virtual G13 output, and process lifecycle.
+Every process the gate launches appears with a hidden window: syntax-check
+children run `-WindowStyle Hidden -NonInteractive`, and the GUI lifecycle smoke
+launches under a smoke configuration with `preview_mode never` and
+`start_minimized 1`, so automation shows no desktop window. The
+invalid-configuration smoke is the one exception: its native startup-error
+dialog is the assertion.
 `-ReleaseOnly` stops after release tests and does not package.
 
 Public scripts expose PowerShell help. From the repository root, inspect the

@@ -3,7 +3,7 @@
 Runs the repository build, test, documentation, and smoke-test gates.
 
 .DESCRIPTION
-Checks PowerShell, Rust, documentation, and product behavior with the pinned toolchain. Commands update Rust build outputs under target/; temporary fixtures are removed. The default run also creates the release executable and configuration in target/release and runs Windows CLI and GUI smoke tests, but not physical hardware acceptance.
+Checks PowerShell, Rust, documentation, and product behavior with the pinned toolchain. Commands update Rust build outputs under target/; temporary fixtures are removed. The default run also creates the release executable and configuration in target/release and runs Windows CLI and GUI smoke tests, but not physical hardware acceptance. Every process this script launches runs hidden: syntax-check children use -WindowStyle Hidden -NonInteractive, and the GUI smoke launches use a smoke configuration with preview_mode never and start_minimized 1 so no desktop window appears; the invalid-configuration smoke is exempt because its native startup-error dialog is the assertion.
 
 .PARAMETER ReleaseOnly
 Stops after formatting, lint, and release-mode test gates, skipping the final application build and Windows CLI and GUI smoke tests.
@@ -116,12 +116,12 @@ $parse = '$tokens=$null; $errors=$null; [Management.Automation.Language.Parser]:
 $allScripts = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1' -File | ForEach-Object { $_.Name } | Sort-Object)
 foreach ($script in $allScripts) {
     $env:LCDSIRPLUS_PARSE_FILE = Join-Path $PSScriptRoot $script
-    & (Get-Command pwsh).Source -NoProfile -Command $parse
+    & (Get-Command pwsh).Source -NoProfile -NonInteractive -WindowStyle Hidden -Command $parse
     if ($LASTEXITCODE -ne 0) { throw "pwsh syntax failed: $script" }
 }
 foreach ($script in @('Acquire-InnoSetup.ps1')) {
     $env:LCDSIRPLUS_PARSE_FILE = Join-Path $PSScriptRoot $script
-    & (Get-Command powershell.exe).Source -NoProfile -Command $parse
+    & (Get-Command powershell.exe).Source -NoProfile -NonInteractive -WindowStyle Hidden -Command $parse
     if ($LASTEXITCODE -ne 0) { throw "Windows PowerShell 5.1 syntax failed: $script" }
 }
 Remove-Item Env:\LCDSIRPLUS_PARSE_FILE -ErrorAction SilentlyContinue
@@ -416,6 +416,7 @@ $lifecycleRoot = Join-Path ([IO.Path]::GetTempPath()) ('LCDSirPlus-lifecycle-' +
 $lifecycleExe = Join-Path $lifecycleRoot 'LCDSirPlus.exe'
 Copy-Item -LiteralPath $exe -Destination $lifecycleExe
 $testConfig = [IO.File]::ReadAllText($builtConfig)
+# Smoke config keeps the preview hidden so automation shows no desktop window.
 $testConfig = [Text.RegularExpressions.Regex]::Replace($testConfig, '(?m)^preview_mode\s+\S+', 'preview_mode            never')
 $testConfig = [Text.RegularExpressions.Regex]::Replace($testConfig, '(?m)^start_minimized\s+\S+', 'start_minimized         1')
 $testConfig = [Text.RegularExpressions.Regex]::Replace($testConfig, '(?m)^safe_mode\s+\S+', 'safe_mode               1')
@@ -423,7 +424,7 @@ $testConfig = [Text.RegularExpressions.Regex]::Replace($testConfig, '(?m)^safe_m
 $process = $null
 $window = [IntPtr]::Zero
 try {
-    $process = Start-Process -FilePath $lifecycleExe -WorkingDirectory $lifecycleRoot -PassThru
+    $process = Start-Process -FilePath $lifecycleExe -WorkingDirectory $lifecycleRoot -WindowStyle Hidden -PassThru
     $window = Wait-NativeWindow $process 'LCDSIRPLUS_PREVIEW'
     if ($window -eq [IntPtr]::Zero) { throw 'no-argument launch did not remain alive with its tray window' }
     if ([LCDSirPlus.NativeWindow]::ConsoleProcesses() -contains [uint32]$process.Id) { throw 'no-argument launch attached to the parent console' }
@@ -448,7 +449,7 @@ Copy-Item -LiteralPath $exe -Destination $errorExe
 $process = $null
 $dialog = [IntPtr]::Zero
 try {
-    $process = Start-Process -FilePath $errorExe -WorkingDirectory $errorRoot -PassThru
+    $process = Start-Process -FilePath $errorExe -WorkingDirectory $errorRoot -WindowStyle Hidden -PassThru
     $dialog = Wait-NativeWindow $process '#32770'
     if ($dialog -eq [IntPtr]::Zero -or [LCDSirPlus.NativeWindow]::Text($dialog) -cne 'LCDSirPlus startup error') { throw 'invalid no-argument launch did not show its native startup error' }
     if ([LCDSirPlus.NativeWindow]::ConsoleProcesses() -contains [uint32]$process.Id) { throw 'invalid no-argument launch attached to the parent console' }

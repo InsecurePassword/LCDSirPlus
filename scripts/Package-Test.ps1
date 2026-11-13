@@ -583,7 +583,7 @@ function Get-UninstallRegistration {
 
 function Invoke-QualificationProcess {
     param([string]$FilePath, [string[]]$Arguments, [string]$Label = 'qualification process')
-    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -Wait -PassThru
+    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -Wait -PassThru -WindowStyle Hidden
     try {
         Write-Host ("{0}: exit {1}" -f $Label, $process.ExitCode)
         return $process.ExitCode

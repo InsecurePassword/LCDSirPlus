@@ -144,7 +144,7 @@ if ($VerifyOnly -or $ExtractVerified) {
     $succeeded = $false
     try {
         $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/CURRENTUSER', '/PORTABLE=1', ('/DIR="' + $output + '"'))
-        $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
+        $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
         try {
             if ($process.ExitCode -ne 0) { throw "Inno Setup portable extraction failed with exit code $($process.ExitCode)" }
         }
