@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 
 use windows::core::{PCSTR, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, FreeLibrary, ERROR_ACCESS_DENIED, ERROR_NO_MORE_FILES, GENERIC_READ,
-    GENERIC_WRITE, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, FreeLibrary, GetLastError, SetLastError, BOOL, ERROR_ACCESS_DENIED,
+    ERROR_NO_MORE_FILES, ERROR_SUCCESS, ERROR_TIMEOUT, GENERIC_READ, GENERIC_WRITE, HANDLE, HWND,
+    LPARAM, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetDriveTypeW, GetFileInformationByHandle, GetFileVersionInfoSizeW,
@@ -45,6 +46,10 @@ use windows::Win32::System::Threading::{
 use windows::Win32::System::WindowsProgramming::DRIVE_FIXED;
 use windows::Win32::UI::Shell::{
     FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetWindowThreadProcessId, IsWindowVisible, SendMessageTimeoutW, SMTO_ABORTIFHUNG,
+    SMTO_ERRORONEXIT, WM_NULL,
 };
 
 use super::{LossCause, LossError};
@@ -192,12 +197,171 @@ pub fn lcore() -> Result<Option<LCore>, String> {
     }
 }
 
+/// RC-3 probe bound: ONE bounded read-only send against the discovered LCore
+/// identity. Finite by construction (never `INFINITE`); same scale as the
+/// existing 500 ms survival check, far inside the 5 s exit bound.
+const ALIVENESS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Bounded read-only probe outcome; classification pattern is the shipped
+/// hung-window probe in `providers/hang.rs` (WM_NULL-class send, finite
+/// timeout, `SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT`, last-error split).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Aliveness {
+    /// The window answered within the bound: its thread pump is alive.
+    Responsive,
+    /// The send timed out: the window exists and its pump is not responding.
+    Unresponsive,
+    /// No probeable window, or the send failed for a non-timeout reason.
+    Indeterminate,
+}
+
+/// The single classification that governs the one guarded restart (RC-3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LcoreClass {
+    /// (c) The discovered LCore identity is absent.
+    Absent,
+    /// (a) Present and responsive: skip.
+    Responsive,
+    /// (b) Present with a probeable window whose pump is unresponsive: proceed
+    /// to the existing terminate+relaunch sequence.
+    Unresponsive,
+    /// Present but unprobeable (no visible top-level window, enumeration
+    /// failure, or non-timeout send failure): explicit named fallback, never
+    /// a silent proceed.
+    ProbeFail,
+}
+
+impl LcoreClass {
+    /// Journal-safe label riding the existing `logitech-result` detail on the
+    /// accepted RC-1 channel; no new journal event types exist.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Absent => "device-absent",
+            Self::Responsive => "responsive",
+            Self::Unresponsive => "unresponsive",
+            Self::ProbeFail => "probe-fail",
+        }
+    }
+
+    /// The named skip for every non-proceeding class; `None` is the one class
+    /// that proceeds. A skip is always named (anti-masking).
+    fn skip(self) -> Option<String> {
+        let reason = match self {
+            Self::Absent => "LCore.exe is not running",
+            Self::Responsive => "LCore.exe is responsive",
+            Self::ProbeFail => "LCore.exe has no probeable window",
+            Self::Unresponsive => return None,
+        };
+        Some(format!(
+            "{reason}; Logitech restart skipped ({})",
+            self.label()
+        ))
+    }
+}
+
+/// One classification from presence + probe outcome: exactly one decision.
+fn classify_lcore(present: bool, aliveness: Aliveness) -> LcoreClass {
+    if !present {
+        return LcoreClass::Absent;
+    }
+    match aliveness {
+        Aliveness::Responsive => LcoreClass::Responsive,
+        Aliveness::Unresponsive => LcoreClass::Unresponsive,
+        Aliveness::Indeterminate => LcoreClass::ProbeFail,
+    }
+}
+
+/// Probe seam: unit tests classify synthetic window states through an injected
+/// implementation, so a real LCore process is never touched by tests. The
+/// production wiring is `NativeAliveness`.
+trait AlivenessApi {
+    /// One visible top-level window owned by `pid`, chosen deterministically.
+    fn visible_window_for(&mut self, pid: u32) -> Option<usize>;
+
+    /// ONE bounded read-only WM_NULL-class send; requests no action from the
+    /// target and never blocks past `timeout`.
+    fn probe_window(&mut self, hwnd: usize, timeout: Duration) -> Aliveness;
+}
+
+/// One enumeration + one bounded send: no ladder, no repeats (the app's
+/// 30x100 ms relaunch ladder is not ported).
+fn probe_aliveness(api: &mut impl AlivenessApi, pid: u32) -> Aliveness {
+    let Some(hwnd) = api.visible_window_for(pid) else {
+        return Aliveness::Indeterminate;
+    };
+    api.probe_window(hwnd, ALIVENESS_PROBE_TIMEOUT)
+}
+
+#[derive(Default)]
+struct WindowPick {
+    pid: u32,
+    hwnd: Option<usize>,
+}
+
+unsafe extern "system" fn pick_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let pick = &mut *(lparam.0 as *mut WindowPick);
+    if !IsWindowVisible(hwnd).as_bool() {
+        return BOOL(1);
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    let value = hwnd.0 as usize;
+    if pid == pick.pid && pick.hwnd.is_none_or(|current| value < current) {
+        pick.hwnd = Some(value);
+    }
+    BOOL(1)
+}
+
+struct NativeAliveness;
+
+impl AlivenessApi for NativeAliveness {
+    fn visible_window_for(&mut self, pid: u32) -> Option<usize> {
+        let mut pick = WindowPick { pid, hwnd: None };
+        unsafe {
+            // Enumeration failure leaves no window: the caller classifies it
+            // `Indeterminate` and journals the named `probe-fail` fallback.
+            let _ = EnumWindows(
+                Some(pick_window),
+                LPARAM((&mut pick as *mut WindowPick) as isize),
+            );
+        }
+        pick.hwnd
+    }
+
+    fn probe_window(&mut self, hwnd: usize, timeout: Duration) -> Aliveness {
+        let timeout_ms = timeout.as_millis().clamp(1, u32::MAX as u128) as u32;
+        unsafe {
+            SetLastError(ERROR_SUCCESS);
+            let result = SendMessageTimeoutW(
+                HWND(hwnd as *mut _),
+                WM_NULL,
+                WPARAM(0),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+                timeout_ms,
+                None,
+            );
+            if result.0 != 0 {
+                Aliveness::Responsive
+            } else if GetLastError() == ERROR_TIMEOUT {
+                Aliveness::Unresponsive
+            } else {
+                Aliveness::Indeterminate
+            }
+        }
+    }
+}
+
 /// One identity-bound restart. Called off the dashboard thread, never elevated.
 pub fn restart_lcore(
     permit: &crate::recovery::RestartPermit,
     deadline: Instant,
 ) -> Result<(), String> {
-    let owner = lcore()?.ok_or("LCore.exe is not running; Logitech restart skipped")?;
+    let owner = lcore()?.ok_or_else(|| {
+        LcoreClass::Absent
+            .skip()
+            .expect("the absent class is always a named skip")
+    })?;
     unsafe {
         let process = OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
@@ -236,6 +400,14 @@ pub fn restart_lcore(
                 .is_some_and(|current| current.pid == owner.pid && current.path == owner.path)
             {
                 return Err("LCore.exe discovery changed before restart; restart skipped".into());
+            }
+            // RC-3: one bounded read-only aliveness classification of the
+            // re-pinned identity, before the one-shot permit is consumed. Only
+            // (b) present-and-pump-unresponsive proceeds; (a) and the
+            // unprobeable fallback return named skips (anti-masking).
+            let class = classify_lcore(true, probe_aliveness(&mut NativeAliveness, owner.pid));
+            if let Some(skip) = class.skip() {
+                return Err(skip);
             }
             permit.commit(deadline)?;
             TerminateProcess(process, 0)
@@ -1419,6 +1591,171 @@ mod tests {
             Path::new(r"C:\Program FilesX\Logitech"),
             Path::new(r"C:\Program Files")
         ));
+    }
+
+    /// Synthetic window states behind the RC-3 probe seam: no real LCore is
+    /// ever enumerated, sent to, opened, terminated or relaunched by tests.
+    struct ScriptedAliveness {
+        windows: Vec<usize>,
+        outcome: Aliveness,
+        enumerations: usize,
+        sends: Vec<(usize, Duration)>,
+    }
+
+    impl ScriptedAliveness {
+        fn new(windows: Vec<usize>, outcome: Aliveness) -> Self {
+            Self {
+                windows,
+                outcome,
+                enumerations: 0,
+                sends: Vec::new(),
+            }
+        }
+    }
+
+    impl AlivenessApi for ScriptedAliveness {
+        fn visible_window_for(&mut self, _pid: u32) -> Option<usize> {
+            self.enumerations += 1;
+            self.windows.iter().copied().min()
+        }
+
+        fn probe_window(&mut self, hwnd: usize, timeout: Duration) -> Aliveness {
+            self.sends.push((hwnd, timeout));
+            self.outcome
+        }
+    }
+
+    #[test]
+    fn absent_lcore_is_named_device_absent_and_the_probe_never_starts() {
+        // Presence dominates the classification: an absent service is (c)
+        // whatever the probe would have said, so the restart returns at the
+        // existing discovery gate, before any send, permit.commit, terminate.
+        for aliveness in [
+            Aliveness::Responsive,
+            Aliveness::Unresponsive,
+            Aliveness::Indeterminate,
+        ] {
+            assert_eq!(classify_lcore(false, aliveness), LcoreClass::Absent);
+        }
+        let class = LcoreClass::Absent;
+        assert_eq!(class.label(), LossCause::DeviceAbsent.short());
+        let skip = class.skip().expect("absent is a named skip");
+        assert!(skip.contains(LossCause::DeviceAbsent.short().as_str()));
+        assert!(skip.contains("Logitech restart skipped"));
+        // A service with no probeable window performs zero sends and zero
+        // terminate calls: the probe is attempted once, never repeated.
+        let mut api = ScriptedAliveness::new(Vec::new(), Aliveness::Indeterminate);
+        assert_eq!(probe_aliveness(&mut api, 4242), Aliveness::Indeterminate);
+        assert_eq!((api.enumerations, api.sends.len()), (1, 0));
+    }
+
+    #[test]
+    fn responsive_lcore_skips_with_the_responsive_label_and_terminates_nothing() {
+        let mut api = ScriptedAliveness::new(vec![7, 3, 9], Aliveness::Responsive);
+        let class = classify_lcore(true, probe_aliveness(&mut api, 4242));
+        assert_eq!(class, LcoreClass::Responsive);
+        let skip = class.skip().expect("responsive is a named skip");
+        assert!(skip.contains("responsive"));
+        assert!(skip.contains("Logitech restart skipped"));
+        assert_eq!(api.enumerations, 1, "one enumeration, no ladder");
+        assert_eq!(api.sends.len(), 1, "ONE probe total");
+        assert_eq!(api.sends[0].0, 3, "deterministic lowest-window pick");
+    }
+
+    #[test]
+    fn unresponsive_lcore_proceeds_once_to_the_existing_restart_sequence() {
+        let mut api = ScriptedAliveness::new(vec![3], Aliveness::Unresponsive);
+        let class = classify_lcore(true, probe_aliveness(&mut api, 4242));
+        assert_eq!(class, LcoreClass::Unresponsive);
+        assert!(
+            class.skip().is_none(),
+            "(b) is the only class that proceeds"
+        );
+        assert_eq!(api.enumerations, 1);
+        assert_eq!(api.sends.len(), 1, "one probe, then one decision");
+        // Proceeding falls through to the byte-identical `permit.commit` +
+        // terminate + 5 s bound + relaunch + 500 ms survival sequence, so the
+        // CAS permit is consumed exactly once per restart (the RC-1 permit
+        // single-winner tests in recovery.rs keep that assertion green).
+    }
+
+    #[test]
+    fn no_probeable_window_uses_the_named_probe_fail_fallback_not_a_silent_proceed() {
+        let mut api = ScriptedAliveness::new(Vec::new(), Aliveness::Responsive);
+        let class = classify_lcore(true, probe_aliveness(&mut api, 4242));
+        assert_eq!(class, LcoreClass::ProbeFail);
+        assert_eq!(class.label(), LossCause::ProbeFail.short());
+        let skip = class.skip().expect("the fallback is named");
+        assert!(skip.contains(LossCause::ProbeFail.short().as_str()));
+        assert!(skip.contains("Logitech restart skipped"));
+        assert_eq!((api.enumerations, api.sends.len()), (1, 0));
+    }
+
+    #[test]
+    fn indeterminate_send_falls_back_to_the_named_probe_fail_label() {
+        let mut api = ScriptedAliveness::new(vec![5], Aliveness::Indeterminate);
+        assert_eq!(
+            classify_lcore(true, probe_aliveness(&mut api, 4242)),
+            LcoreClass::ProbeFail
+        );
+        assert_eq!(api.sends.len(), 1, "one bounded send, no repeat");
+    }
+
+    #[test]
+    fn probe_bound_is_documented_and_finite_never_infinite() {
+        let mut api = ScriptedAliveness::new(vec![5], Aliveness::Responsive);
+        probe_aliveness(&mut api, 4242);
+        assert_eq!(api.sends[0].1, ALIVENESS_PROBE_TIMEOUT);
+        assert_eq!(ALIVENESS_PROBE_TIMEOUT, Duration::from_millis(500));
+        assert!(
+            ALIVENESS_PROBE_TIMEOUT.as_millis() < u32::MAX as u128,
+            "the send bound is finite, never INFINITE"
+        );
+        assert!(
+            ALIVENESS_PROBE_TIMEOUT < Duration::from_secs(5),
+            "the probe stays inside the existing 5 s exit bound scale"
+        );
+    }
+
+    #[test]
+    fn rc3_labels_ride_journal_detail_and_never_become_event_names() {
+        for class in [
+            LcoreClass::Absent,
+            LcoreClass::Responsive,
+            LcoreClass::Unresponsive,
+            LcoreClass::ProbeFail,
+        ] {
+            let label = class.label();
+            assert!(label.len() <= 32, "the detail clamp stays bounded: {label}");
+            for event in [
+                "healthy",
+                "finished",
+                "disconnected",
+                "logitech-attempt",
+                "logitech-result",
+                "application-attempt",
+            ] {
+                assert_ne!(label, event, "labels ride detail, never an event name");
+            }
+        }
+    }
+
+    #[test]
+    fn every_skip_names_its_label_and_only_unresponsive_proceeds() {
+        for class in [
+            LcoreClass::Absent,
+            LcoreClass::Responsive,
+            LcoreClass::ProbeFail,
+        ] {
+            let skip = class.skip().unwrap_or_default();
+            assert!(!skip.is_empty(), "no silent skip: {class:?}");
+            assert!(
+                skip.contains(class.label()),
+                "the skip names its own label: {skip}"
+            );
+            assert!(skip.contains("Logitech restart skipped"));
+        }
+        assert!(LcoreClass::Unresponsive.skip().is_none());
     }
 
     #[test]
