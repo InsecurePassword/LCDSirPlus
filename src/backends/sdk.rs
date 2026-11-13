@@ -1931,7 +1931,27 @@ mod tests {
     fn unreturning_owner_opens_the_circuit_without_borrowed_data() {
         CIRCUIT_OPEN.store(false, Ordering::Release);
         let (requests, receiver) = mpsc::sync_channel(1);
-        let thread = std::thread::spawn(move || owner_loop(Box::new(Slow), receiver));
+        // WO-QA-04 driven time: the owner's stall is a gate, not wall clock.
+        // The worker announces the moment it enters the native call, then
+        // blocks until this test releases it, so the owner's reply is provably
+        // absent for the whole 1 ms bound: a stretched 1 ms timer can no
+        // longer expire after the reply lands (the recorded `sdk.rs:1942:14`
+        // mechanism). The release is sent after the assertions, so the late
+        // completion still lands after the circuit opened - the scenario's
+        // point. The enqueue lives inside production `call_timeout`, so the
+        // announcement is consumed here, right before the release.
+        let (running_tx, running_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            owner_loop(
+                Box::new(Unreturning {
+                    inner: Slow,
+                    running: running_tx,
+                    release: release_rx,
+                }),
+                receiver,
+            )
+        });
         let mut device = SdkDevice {
             requests: Some(requests),
             payload: Mutex::new(None),
@@ -1942,9 +1962,46 @@ mod tests {
             .unwrap();
         assert_eq!(error.cause, LossCause::CallTimeout);
         assert!(error.detail.contains("timed out") && circuit_open());
+        // The release can only reach the gate once the owner is inside the
+        // native call, so the bound's expiry is never a race.
+        running_rx.recv_timeout(DRIVEN_HANDSHAKE_BUDGET).expect(
+            "the gated owner is inside the native call, so the caller's bound cannot be beaten",
+        );
+        release_tx
+            .try_send(())
+            .expect("the gated owner accepted the release");
         device.requests.take();
         thread.join().unwrap();
         CIRCUIT_OPEN.store(false, Ordering::Release);
+    }
+
+    /// WO-QA-04: `Slow`'s 30 ms wall-clock stall made into a gate. The gated
+    /// owner announces on entering the native call and hands back `Slow`'s
+    /// reply only when the test releases it, so the caller's 1 ms
+    /// `call_timeout` bound expires with the reply provably absent, in every
+    /// scheduling interleaving. `Slow`'s behavior stays verbatim behind the
+    /// gate, so the late completion lands after the circuit opened.
+    struct Unreturning {
+        inner: Slow,
+        running: SyncSender<()>,
+        release: Receiver<()>,
+    }
+
+    impl Runtime for Unreturning {
+        fn execute(&mut self, request: &Request) -> Reply {
+            if matches!(request, Request::Submit(_)) {
+                self.running
+                    .try_send(())
+                    .expect("the gated owner announced itself before stalling");
+                self.release
+                    .recv_timeout(DRIVEN_HANDSHAKE_BUDGET)
+                    .expect("the gated owner was released by the test");
+            }
+            self.inner.execute(request)
+        }
+        fn shutdown(&mut self) {
+            self.inner.shutdown()
+        }
     }
 
     #[test]
