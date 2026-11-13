@@ -14,6 +14,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::UpdateWindow;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::SystemInformation::GetWindowsDirectoryW;
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
@@ -769,6 +770,9 @@ struct EnumerationContext {
     ignored: HashSet<String>,
     windows_dir: String,
     self_pid: u32,
+    /// TC-2: the session of this process, computed once per publish cycle; `Err` =
+    /// the session query failed, which refuses every candidate fail-closed.
+    self_session: Result<u32, ()>,
     only_pid: Option<u32>,
     timeout: Duration,
     deadline: Instant,
@@ -776,6 +780,7 @@ struct EnumerationContext {
     visited: usize,
     stopped: bool,
     limit_exceeded: bool,
+    refusals: AcceptanceCounters,
 }
 
 fn enumerate_and_probe(
@@ -786,10 +791,12 @@ fn enumerate_and_probe(
     let windows_dir = windows_directory()?;
     let mut ignored = ignored_names(ignore);
     ignored.insert("lcdsirplus.exe".into());
+    let self_pid = unsafe { GetCurrentProcessId() };
     let mut context = EnumerationContext {
         ignored,
         windows_dir,
-        self_pid: unsafe { GetCurrentProcessId() },
+        self_pid,
+        self_session: session_of(self_pid),
         only_pid,
         timeout,
         deadline: Instant::now() + POLL_BUDGET,
@@ -797,6 +804,7 @@ fn enumerate_and_probe(
         visited: 0,
         stopped: false,
         limit_exceeded: false,
+        refusals: AcceptanceCounters::default(),
     };
     let result = unsafe {
         EnumWindows(
@@ -804,6 +812,22 @@ fn enumerate_and_probe(
             LPARAM((&mut context as *mut EnumerationContext) as isize),
         )
     };
+    if context.refusals.cross_session != 0 {
+        // TC-2: acceptance-side refusals are audited once per cycle (bounded, never
+        // silent), using the same named vocabulary as the action outcomes.
+        crate::log_warn!(
+            "hung-window detector {}={}",
+            ActionOutcome::CrossSession.label(),
+            context.refusals.cross_session
+        );
+    }
+    if context.refusals.session_unknown != 0 {
+        crate::log_warn!(
+            "hung-window detector {}={}",
+            ActionOutcome::SessionUnknown.label(),
+            context.refusals.session_unknown
+        );
+    }
     if result.is_err() && !context.stopped {
         return Err("window enumeration failed");
     }
@@ -831,9 +855,11 @@ unsafe extern "system" fn enumerate_callback(hwnd: HWND, lparam: LPARAM) -> BOOL
     let Some(target) = describe_candidate(
         hwnd,
         context.self_pid,
+        context.self_session,
         context.only_pid,
         &context.ignored,
         &context.windows_dir,
+        &mut context.refusals,
     ) else {
         return BOOL(1);
     };
@@ -858,9 +884,11 @@ unsafe extern "system" fn enumerate_callback(hwnd: HWND, lparam: LPARAM) -> BOOL
 unsafe fn describe_candidate(
     hwnd: HWND,
     self_pid: u32,
+    self_session: Result<u32, ()>,
     only_pid: Option<u32>,
     ignored: &HashSet<String>,
     windows_dir: &str,
+    refusals: &mut AcceptanceCounters,
 ) -> Option<HungTarget> {
     if !IsWindowVisible(hwnd).as_bool() {
         return None;
@@ -883,6 +911,20 @@ unsafe fn describe_candidate(
     if pid == 0 || pid == self_pid || only_pid.is_some_and(|expected| expected != pid) {
         return None;
     }
+    // TC-2 (P2 §2 TC-2): session identity is checked immediately after the pid floor
+    // (which stays the first gate, §3 item 1), so a cross-session candidate never enters
+    // the publication and a failed session query is refused fail-closed.
+    match session_gate(session_of(pid), self_session) {
+        SessionGate::Same => {}
+        SessionGate::Cross => {
+            refusals.cross_session += 1;
+            return None;
+        }
+        SessionGate::Unknown => {
+            refusals.session_unknown += 1;
+            return None;
+        }
+    }
     let (creation_time, image_path, process_name) = query_identity(pid).ok()?;
     if excluded(&process_name, &image_path, ignored, windows_dir) {
         return None;
@@ -896,6 +938,47 @@ unsafe fn describe_candidate(
         title,
         ..Default::default()
     })
+}
+
+/// TC-2 (P2 §2 TC-2): session of a process id, mirroring the `src/backends/sdk.rs`
+/// restart-path pair check. No handle is opened and no rights are requested.
+fn session_of(pid: u32) -> Result<u32, ()> {
+    let mut session = 0u32;
+    unsafe { ProcessIdToSessionId(pid, &mut session) }
+        .map(|_| session)
+        .map_err(|_| ())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionGate {
+    /// Target shares this process's session: candidate stays eligible.
+    Same,
+    /// Foreign session: non-actionable (P2 TC-2 tradeoff), audited by name.
+    Cross,
+    /// A `ProcessIdToSessionId` query failed: refused fail-closed, never proceed.
+    Unknown,
+}
+
+fn session_gate(target: Result<u32, ()>, current: Result<u32, ()>) -> SessionGate {
+    // One precondition per edge: target query ok? current query ok? sessions equal?
+    let Ok(target) = target else {
+        return SessionGate::Unknown;
+    };
+    let Ok(current) = current else {
+        return SessionGate::Unknown;
+    };
+    if target == current {
+        SessionGate::Same
+    } else {
+        SessionGate::Cross
+    }
+}
+
+/// Per-cycle acceptance refusals, reported once by `enumerate_and_probe`.
+#[derive(Clone, Copy, Debug, Default)]
+struct AcceptanceCounters {
+    cross_session: usize,
+    session_unknown: usize,
 }
 
 unsafe fn probe(hwnd: HWND, timeout: Duration) -> ProbeResult {
@@ -1076,6 +1159,11 @@ pub enum ActionOutcome {
     Recovered,
     IdentityMismatch,
     AccessDenied,
+    /// TC-2 (P2 §2 TC-2): the target lives in another session; named refusal raised
+    /// before the target is opened, so the `AccessDenied` class stays reachable.
+    CrossSession,
+    /// TC-2 (P2 §2 TC-2): a session query failed; refused fail-closed, never proceed.
+    SessionUnknown,
     TerminateFailure,
     WaitTimeout,
 }
@@ -1088,6 +1176,8 @@ impl ActionOutcome {
             Self::Recovered => "recovered",
             Self::IdentityMismatch => "identity-mismatch",
             Self::AccessDenied => "access-denied",
+            Self::CrossSession => "refused-cross-session",
+            Self::SessionUnknown => "refused-session-unknown",
             Self::TerminateFailure => "terminate-failure",
             Self::WaitTimeout => "wait-timeout",
         }
@@ -1106,6 +1196,7 @@ trait ActionApi {
     fn window(&mut self, hwnd: usize) -> Result<HungTarget, ActionOutcome>;
     fn probe(&mut self, hwnd: usize, timeout: Duration) -> ProbeResult;
     fn open(&mut self, pid: u32) -> Result<Self::Process, ActionOutcome>;
+    fn session(&mut self, pid: u32) -> Result<u32, ActionOutcome>;
     fn process_identity(&mut self, process: &Self::Process)
         -> Result<(u64, String), ActionOutcome>;
     fn terminate(&mut self, process: &Self::Process) -> Result<(), ActionOutcome>;
@@ -1146,6 +1237,10 @@ impl ActionApi for NativeActionApi {
                     ActionOutcome::Refused
                 }
             })
+    }
+
+    fn session(&mut self, pid: u32) -> Result<u32, ActionOutcome> {
+        session_of(pid).map_err(|_| ActionOutcome::SessionUnknown)
     }
 
     fn process_identity(
@@ -1264,6 +1359,22 @@ fn terminate_bound_target_with<A: ActionApi>(
         Ok(current) if validate_window(&current) == ActionOutcome::Success => {}
         Ok(current) => return validate_window(&current),
         Err(outcome) => return outcome,
+    }
+
+    // TC-2 (P2 §2 TC-2): the session pair (the `src/backends/sdk.rs` restart precedent) is
+    // resolved BEFORE the target is opened, so a foreign-session refusal can never be
+    // absorbed by the open site's AccessDenied class (§3 item 6); each refusal edge below
+    // carries exactly one precondition.
+    let current_session = match api.session(self_pid) {
+        Ok(session) => session,
+        Err(outcome) => return outcome,
+    };
+    let target_session = match api.session(target.pid) {
+        Ok(session) => session,
+        Err(outcome) => return outcome,
+    };
+    if target_session != current_session {
+        return ActionOutcome::CrossSession;
     }
 
     let process = match api.open(target.pid) {
@@ -2658,10 +2769,13 @@ mod tests {
         target: HungTarget,
         windows: Vec<Result<HungTarget, ActionOutcome>>,
         probes: Vec<ProbeResult>,
+        self_session: Result<u32, ActionOutcome>,
+        target_session: Result<u32, ActionOutcome>,
         open: Result<(), ActionOutcome>,
         identity: Result<(u64, String), ActionOutcome>,
         terminate: Result<(), ActionOutcome>,
         wait: ActionWait,
+        open_calls: usize,
         terminate_calls: usize,
     }
 
@@ -2672,9 +2786,12 @@ mod tests {
                 target,
                 windows: Vec::new(),
                 probes: vec![ProbeResult::Timeout, ProbeResult::Timeout],
+                self_session: Ok(1),
+                target_session: Ok(1),
                 open: Ok(()),
                 terminate: Ok(()),
                 wait: ActionWait::Signaled,
+                open_calls: 0,
                 terminate_calls: 0,
             }
         }
@@ -2696,7 +2813,16 @@ mod tests {
         }
 
         fn open(&mut self, _pid: u32) -> Result<Self::Process, ActionOutcome> {
+            self.open_calls += 1;
             self.open
+        }
+
+        fn session(&mut self, pid: u32) -> Result<u32, ActionOutcome> {
+            if pid == self.target.pid {
+                self.target_session
+            } else {
+                self.self_session
+            }
         }
 
         fn process_identity(
@@ -2751,6 +2877,12 @@ mod tests {
         let mut api = FakeActionApi::valid(expected.clone());
         api.open = Err(ActionOutcome::AccessDenied);
         cases.push((api, ActionOutcome::AccessDenied));
+        // TC-2 (P2 §2 TC-2 acceptance (2)): the cross-session refusal joins the adversarial
+        // set; every case above keeps its exact class, AccessDenied included, so the new
+        // gate cannot absorb the privilege class.
+        let mut api = FakeActionApi::valid(expected.clone());
+        api.target_session = Ok(2);
+        cases.push((api, ActionOutcome::CrossSession));
         let mut api = FakeActionApi::valid(expected.clone());
         api.identity = Ok((21, expected.image_path.clone()));
         cases.push((api, ActionOutcome::IdentityMismatch));
@@ -2814,6 +2946,85 @@ mod tests {
         assert_eq!(
             terminate_bound_target_with(&mut api, &windows_target, &cfg),
             ActionOutcome::Refused
+        );
+        assert_eq!(api.terminate_calls, 0);
+    }
+
+    #[test]
+    fn acceptance_gate_refuses_cross_session_and_query_failure() {
+        // TC-2 acceptance site (P2 §2 TC-2): same session stays eligible, a foreign session
+        // is refused by name, and ANY session-query failure is fail-closed (never proceed).
+        assert_eq!(session_gate(Ok(1), Ok(1)), SessionGate::Same);
+        assert_eq!(session_gate(Ok(2), Ok(1)), SessionGate::Cross);
+        assert_eq!(session_gate(Ok(1), Ok(2)), SessionGate::Cross);
+        assert_eq!(session_gate(Err(()), Ok(1)), SessionGate::Unknown);
+        assert_eq!(session_gate(Ok(1), Err(())), SessionGate::Unknown);
+        assert_eq!(session_gate(Err(()), Err(())), SessionGate::Unknown);
+        // The named vocabulary that rides the audit plumbing (log_hang_audit / detector line).
+        assert_eq!(ActionOutcome::CrossSession.label(), "refused-cross-session");
+        assert_eq!(
+            ActionOutcome::SessionUnknown.label(),
+            "refused-session-unknown"
+        );
+    }
+
+    #[test]
+    fn action_refuses_cross_session_before_open() {
+        // TC-2 acceptance (1): a target in another session yields the named outcome,
+        // OpenProcess is never reached (so AccessDenied cannot absorb it) and
+        // TerminateProcess is never called.
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        let expected = target(1, 10, 20, r"C:\Games\game.exe");
+        let mut api = FakeActionApi::valid(expected.clone());
+        api.target_session = Ok(2);
+        assert_eq!(
+            terminate_bound_target_with(&mut api, &expected, &cfg),
+            ActionOutcome::CrossSession
+        );
+        assert_eq!(
+            api.open_calls, 0,
+            "the session gate runs before OpenProcess"
+        );
+        assert_eq!(
+            api.terminate_calls, 0,
+            "a refused target is never terminated"
+        );
+    }
+
+    #[test]
+    fn action_refuses_when_the_session_query_fails() {
+        // TC-2 acceptance (5): a session query failure is a named audited outcome and is
+        // fail-closed — the action never proceeds to open or terminate.
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        let expected = target(1, 10, 20, r"C:\Games\game.exe");
+        let mut api = FakeActionApi::valid(expected.clone());
+        api.target_session = Err(ActionOutcome::SessionUnknown);
+        assert_eq!(
+            terminate_bound_target_with(&mut api, &expected, &cfg),
+            ActionOutcome::SessionUnknown,
+            "a failed target-session query is a named fail-closed outcome"
+        );
+        assert_eq!(
+            api.open_calls, 0,
+            "a failed query never proceeds to OpenProcess"
+        );
+        assert_eq!(api.terminate_calls, 0);
+
+        let mut api = FakeActionApi::valid(expected.clone());
+        api.self_session = Err(ActionOutcome::SessionUnknown);
+        assert_eq!(
+            terminate_bound_target_with(&mut api, &expected, &cfg),
+            ActionOutcome::SessionUnknown
+        );
+        assert_eq!(
+            api.open_calls, 0,
+            "a failed query never proceeds to OpenProcess"
         );
         assert_eq!(api.terminate_calls, 0);
     }
