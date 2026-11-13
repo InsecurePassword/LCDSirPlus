@@ -123,7 +123,10 @@ The CPU bar, the CPU load graph, history, the bottleneck peak input, and the Cac
 Frequency split all consume that one derivation; no surface derives a CPU percentage on
 its own. Decision 2026-11-13 (EC-5): the shipped LCDSirReal app displays kernel+user
 busy-time deltas from its own sampler, and this product intentionally displays
-total-minus-idle.
+total-minus-idle. The Cache and Frequency split publishes `Metric::invalid()` when the
+per-logical-processor sample is empty, so the split path shares the CPU bar's
+invalid-on-no-data discipline: a failed Nt-query reads as unavailable there too, never as a
+current 0% bar.
 
 HWiNFO access is read-only shared memory with exact original-label pairs.
 LibreHardwareMonitor is user-managed and restricted to loopback HTTP. Exact

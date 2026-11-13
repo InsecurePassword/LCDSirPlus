@@ -1014,8 +1014,8 @@ fn build_snapshot(
         date_text: clock.date,
         date_short_text: clock.date_short,
         time_text: clock.time,
-        cpu_cache_load: Metric::valid(cache_load, now),
-        cpu_freq_load: Metric::valid(freq_load, now),
+        cpu_cache_load: cpu_split_metric(!per_lp.is_empty(), cache_load, now),
+        cpu_freq_load: cpu_split_metric(!per_lp.is_empty(), freq_load, now),
         headset: if cfg.safe_mode {
             Default::default()
         } else {
@@ -1209,6 +1209,21 @@ fn invalidate_telemetry_publication(
         ..Default::default()
     };
     *snapshot = Snapshot::default();
+}
+
+/// F-EC5-a parity: the CCD Cache/Frequency split carries the same no-data
+/// discipline as the CPU bar. With per-logical-processor samples the aggregate
+/// value passes through untouched as `Metric::valid(value, now)`; with none
+/// (Nt-query failure or decode rejection -> empty `per_lp`) the Metric is
+/// `Metric::invalid()`, so the renderer draws its unavailable placeholder
+/// instead of a current 0% bar. No new mechanism: `Metric::invalid()` is the
+/// one the CPU-bar path already uses (`canonical_percent_metric`).
+fn cpu_split_metric(has_data: bool, value: f64, now: SystemTime) -> Metric {
+    if has_data {
+        Metric::valid(value, now)
+    } else {
+        Metric::invalid()
+    }
 }
 
 fn log_hang_audit(audit: &hang::Audit) {
@@ -3064,5 +3079,94 @@ mod tests {
             "the crossing is caught within one full-cadence sample"
         );
         assert_eq!(snapshot.alerts[0].severity, 3);
+    }
+
+    /// F-EC5-a fix (WO-A1-06-FIX), the audit-recommended assertion shape: an
+    /// empty `per_lp` (Nt-query/decode failure) makes the Cache/Frequency split
+    /// invalid, never a current 0% bar.
+    #[test]
+    fn ec5_split_is_invalid_when_per_lp_is_empty() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(11);
+        let cache = cpu_split_metric(false, cpu::aggregate(&[], 0xffff), now);
+        let freq = cpu_split_metric(false, cpu::aggregate(&[], 0xf0f0), now);
+        assert!(!cache.valid, "empty per_lp must not publish a Cache value");
+        assert!(
+            !freq.valid,
+            "empty per_lp must not publish a Frequency value"
+        );
+        assert!(
+            !cache.stale && !freq.stale,
+            "no data is unavailable, not stale"
+        );
+        assert_eq!(cache.updated, None);
+        assert_eq!(freq.updated, None);
+    }
+
+    /// Normal (non-empty `per_lp`) data must not move at all: the aggregate
+    /// result passes through unclamped as a current valid Metric, and the first
+    /// sample's genuine zero delta stays valid.
+    #[test]
+    fn ec5_split_keeps_the_aggregate_values_on_normal_per_lp() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(11);
+        let per_lp = [10.0, 20.0, 30.0, 40.0];
+        let cache = cpu_split_metric(true, cpu::aggregate(&per_lp, 0b0011), now);
+        let freq = cpu_split_metric(true, cpu::aggregate(&per_lp, 0b1100), now);
+        assert!(cache.valid && freq.valid, "sampled data stays valid");
+        assert!(
+            !cache.stale && !freq.stale,
+            "sampled data is current, not stale"
+        );
+        assert_eq!(cache.updated, Some(now));
+        assert_eq!(freq.updated, Some(now));
+        assert_eq!(cache.value, 15.0, "mean of the cache-mask members");
+        assert_eq!(freq.value, 35.0, "mean of the frequency-mask members");
+        let over = cpu_split_metric(true, cpu::aggregate(&[120.0, 140.0], 0b0011), now);
+        assert_eq!(
+            over.value, 130.0,
+            "a normal reading passes through unclamped"
+        );
+    }
+
+    /// Snapshot-level parity through the existing `build_snapshot` test infra:
+    /// the split is valid exactly when the provider produced per-LP data.
+    /// `update()` emptiness is host-deterministic (it depends only on
+    /// `nt_query()`, the Nt status and `decode_samples`), so a fresh provider
+    /// predicts the emptiness of the sample the snapshot builder walked.
+    #[test]
+    fn ec5_snapshot_split_validity_tracks_per_lp_data_presence() {
+        let cfg = Config {
+            safe_mode: true,
+            ccd_source: "manual".into(),
+            ccd_cache_processors: Some(vec![0]),
+            ccd_frequency_processors: Some(vec![1]),
+            ..Config::default()
+        };
+        let topology = resolve_ccd_topology(&cfg);
+        assert!(topology.dual, "manual lists build the dual split");
+        let mut cpu = cpu::CpuLoadProvider::new();
+        let mut bottleneck = BottleneckDetector::default();
+        let snapshot = build_snapshot(
+            &cfg,
+            &topology,
+            &mut cpu,
+            &crate::telemetry::Update::default(),
+            &DiscordState::default(),
+            &mut bottleneck,
+        );
+        let has_data = !cpu::CpuLoadProvider::new().update().is_empty();
+        assert_eq!(
+            snapshot.cpu_cache_load.valid, has_data,
+            "the Cache split's validity must follow per_lp presence"
+        );
+        assert_eq!(
+            snapshot.cpu_freq_load.valid, has_data,
+            "the Frequency split's validity must follow per_lp presence"
+        );
+        if has_data {
+            assert_eq!(
+                snapshot.cpu_cache_load.value, 0.0,
+                "a first sample is a real zero delta, so it stays valid"
+            );
+        }
     }
 }
