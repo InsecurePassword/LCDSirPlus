@@ -2518,29 +2518,68 @@ mod tests {
                 code: "worker-stalled".to_string(),
             },
         ];
+        // F-1: the whole-frame `pixels.any()` blanking check was trivially true,
+        // because the `STATUS` header on row 27 is drawn unconditionally
+        // (renderer.rs:1928). The human-facing surface is the row-35 label band
+        // (glyph rows 35..=39 at scale 1), so assert that band instead: it must
+        // carry lit pixels in every state, must replace the healthy
+        // provider-summary band (taken from the pinned healthy frame), and must
+        // differ per state. The band is the slot interiors only, so the layout-1
+        // slot dividers (`v_line` on columns 39/79/119, rows 26..=42,
+        // renderer.rs:182-184) cannot satisfy it, and rows start at 35 so the
+        // row-25 rule cannot either.
+        let band = |frame: &Frame| -> Vec<bool> {
+            let mut pixels = Vec::new();
+            for (left, right) in [(0, 38), (40, 78), (80, 118), (120, 159)] {
+                for y in 35..=39 {
+                    for x in left..=right {
+                        pixels.push(frame.get(x, y));
+                    }
+                }
+            }
+            pixels
+        };
+        let healthy = render(&sample_snapshot());
+        assert_eq!(
+            healthy.hash_hex(),
+            GOLDEN_PROVIDER_STATUS_HEALTHY,
+            "healthy provider summary changed"
+        );
+        let healthy_band = band(&healthy);
+        assert!(
+            healthy_band.iter().any(|&pixel| pixel),
+            "the pinned healthy frame must light the row-35 band"
+        );
         let frames: Vec<Frame> = statuses
             .iter()
             .map(|status| {
                 let mut snapshot = sample_snapshot();
                 snapshot.device_status = status.clone();
-                let frame = render(&snapshot);
-                assert!(
-                    frame.pixels.iter().any(|&pixel| pixel != 0),
-                    "panel blanked for {status:?}"
-                );
-                frame
+                render(&snapshot)
             })
             .collect();
+        for (status, frame) in statuses.iter().zip(frames.iter()) {
+            let label_band = band(frame);
+            assert!(
+                label_band.iter().any(|&pixel| pixel),
+                "the row-35 label band is blank for {status:?}"
+            );
+            assert_ne!(
+                label_band, healthy_band,
+                "the row-35 band must replace the healthy summary for {status:?}"
+            );
+        }
+        let bands: Vec<Vec<bool>> = frames.iter().map(band).collect();
+        for (index, left) in bands.iter().enumerate() {
+            for right in bands[index + 1..].iter() {
+                assert!(!left.eq(right), "the four labels must differ in row 35");
+            }
+        }
         for (index, left) in frames.iter().enumerate() {
             for right in frames[index + 1..].iter() {
                 assert!(!left.equal(right), "the four states must render distinctly");
             }
         }
-        assert_eq!(
-            render(&sample_snapshot()).hash_hex(),
-            GOLDEN_PROVIDER_STATUS_HEALTHY,
-            "healthy provider summary changed"
-        );
     }
 
     #[test]

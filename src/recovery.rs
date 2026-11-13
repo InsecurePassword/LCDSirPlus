@@ -337,6 +337,11 @@ impl Recovery {
         self.previously_connected = true;
         self.lost_since = None;
         self.last_cause = None;
+        // RC-5 F-2: a working device outranks a past recovery failure, so the
+        // named (d) label clears on the same real-health gate as the loss cause.
+        // (c) `NO RETRY` is untouched: it is driven by the spent permit and the
+        // `Finished` journal, i.e. allowance state, not a sticky failure.
+        self.recovery_failure = None;
         // RC-2: health for this device cycle has arrived, so the liveness clock
         // stops; fresh health is the only thing that re-arms the one-shot wake.
         self.liveness_since = None;
@@ -1099,6 +1104,171 @@ mod tests {
             .label()
             .contains("injected access denied"));
         drop(replacement);
+    }
+
+    /// RC-5 F-2: a working device outranks a past recovery action failure, so
+    /// the named (d) label is cleared by the same real-health gate that clears
+    /// `last_cause`/`lost_since`; mid-reconnect and virtual kinds never qualify.
+    #[test]
+    fn recovery_failure_label_clears_on_real_health_only() {
+        let root = TestDir::new();
+        let now = Instant::now();
+        let mut recovery = Recovery::load(root.journal(), false, 1, now);
+        recovery.disconnected(now, LossCause::ProbeFail);
+        assert!(!recovery.restart_application(|| Err("injected launch failure".into())));
+        assert_eq!(
+            recovery.display_status(),
+            DeviceStatus::RecoveryFailed {
+                code: "probe-fail".to_string()
+            },
+            "the failed recovery action publishes (d) first"
+        );
+
+        // A virtual device is not a physical connection, so its health must not
+        // erase the recorded failure.
+        recovery.healthy(BackendKind::Virtual);
+        assert_eq!(
+            recovery.display_status(),
+            DeviceStatus::RecoveryFailed {
+                code: "probe-fail".to_string()
+            },
+            "virtual health must not clear (d)"
+        );
+
+        // While a reconnect is awaited, health is not yet confirmed for this
+        // device cycle, so the gate must not clear (d) either.
+        recovery.awaiting_reconnect = true;
+        recovery.healthy(BackendKind::Hid);
+        assert_eq!(
+            recovery.display_status(),
+            DeviceStatus::RecoveryFailed {
+                code: "probe-fail".to_string()
+            },
+            "health during a reconnect must not clear (d)"
+        );
+        recovery.awaiting_reconnect = false;
+
+        // Genuine physical health clears (d): the panel returns to the
+        // transient/healthy arms. The permit was never taken in this cycle, so
+        // (c) is not published either.
+        recovery.healthy(BackendKind::Hid);
+        assert_eq!(
+            recovery.display_status(),
+            DeviceStatus::Healthy,
+            "a working device must not keep reporting a past recovery failure"
+        );
+        drop(recovery);
+    }
+
+    /// RC-5 F-2: (c) is allowance state, not a sticky failure — the spent
+    /// permit plus the `Finished` journal keep `NO RETRY` published through
+    /// health, and health hands over from (d) to (c) without touching either.
+    #[test]
+    fn allowance_consumed_label_is_not_cleared_by_health() {
+        let root = TestDir::new();
+        let now = Instant::now();
+        let mut first = Recovery::load(root.journal(), false, 1, now);
+        assert!(first.restart_application(|| Ok(42)));
+        drop(first);
+
+        let mut replacement = Recovery::load(root.journal(), true, 42, now);
+        replacement.disconnected(now, LossCause::CallTimeout);
+        replacement.previously_connected = true;
+        replacement.lost_since = Some(now);
+        assert!(replacement.record("logitech-attempt", "restart Logitech Gaming Software once"));
+        replacement.permit.commit(now + GRACE).unwrap();
+        // Inject a failed worker result; never touch a real Logitech process.
+        let (sender, receiver) = mpsc::sync_channel(1);
+        replacement.logitech_result = Some(receiver);
+        sender.send(Err("injected access denied".into())).unwrap();
+        assert!(!replacement.tick(now + GRACE / 2, true, || {}));
+        // (d) outranks (c) while the failure is recorded.
+        assert_eq!(
+            replacement.display_status(),
+            DeviceStatus::RecoveryFailed {
+                code: "call-timeout".to_string()
+            }
+        );
+
+        // Exhaustion tick: the journal reaches `Finished` with the permit spent.
+        assert!(!replacement.tick(now + GRACE * 4, true, || {
+            panic!("no action after exhaustion")
+        }));
+        assert_eq!(replacement.journal.as_ref().unwrap().stage, Stage::Finished);
+        assert_eq!(
+            replacement.display_status(),
+            DeviceStatus::RecoveryFailed {
+                code: "call-timeout".to_string()
+            },
+            "(d) still outranks (c) once the cycle finishes"
+        );
+
+        // Health clears (d) only: the spent allowance and the `Finished` journal
+        // are untouched, so (c) keeps publishing.
+        replacement.healthy(BackendKind::Hid);
+        assert!(
+            replacement.permit.spent(),
+            "health must not un-spend the permit"
+        );
+        assert_eq!(
+            replacement.journal.as_ref().unwrap().stage,
+            Stage::Finished,
+            "health must not move the journal off `Finished`"
+        );
+        assert_eq!(
+            replacement.display_status(),
+            DeviceStatus::AllowanceConsumed,
+            "NO RETRY is allowance state: health must not clear it"
+        );
+        assert_eq!(replacement.display_status().label(), "NO RETRY");
+        drop(replacement);
+    }
+
+    /// RC-5 F-2: clearing (d) on health does not disable the recorder. A
+    /// repeated action inside the finished cycle is rejected by the journal
+    /// machine, so no (d) appears for a blocked action; the next recovery cycle
+    /// (a fresh journal) records a new action failure as (d) again.
+    #[test]
+    fn action_failure_is_recorded_again_after_health_cleared_the_label() {
+        let root = TestDir::new();
+        let now = Instant::now();
+        let mut recovery = Recovery::load(root.journal(), false, 1, now);
+        recovery.disconnected(now, LossCause::ProbeFail);
+        assert!(!recovery.restart_application(|| Err("injected launch failure".into())));
+        assert_eq!(
+            recovery.display_status(),
+            DeviceStatus::RecoveryFailed {
+                code: "probe-fail".to_string()
+            }
+        );
+        recovery.healthy(BackendKind::Hid);
+        assert_eq!(recovery.display_status(), DeviceStatus::Healthy);
+
+        // This cycle's journal is `Finished`: the repeat action is rejected by
+        // the stage machine before it runs, so (d) is not republished.
+        recovery.disconnected(now, LossCause::CallTimeout);
+        assert!(!recovery.restart_application(|| Err("injected repeat launch failure".into())));
+        assert_eq!(
+            recovery.display_status(),
+            DeviceStatus::Healthy,
+            "a journal-blocked action must not publish (d)"
+        );
+        drop(recovery);
+
+        // A fresh recovery cycle records its own action failure as (d), named by
+        // that cycle's loss cause.
+        std::fs::remove_file(root.journal()).unwrap();
+        let mut next = Recovery::load(root.journal(), false, 1, now);
+        next.disconnected(now, LossCause::CallTimeout);
+        assert!(!next.restart_application(|| Err("injected launch failure".into())));
+        assert_eq!(
+            next.display_status(),
+            DeviceStatus::RecoveryFailed {
+                code: "call-timeout".to_string()
+            },
+            "a fresh cycle re-records (d) after the cleared one"
+        );
+        drop(next);
     }
 
     #[test]
