@@ -174,6 +174,13 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
     // named exactly once on the log.
     let mut published_status = DeviceStatus::Healthy;
     let process_epoch = Instant::now();
+    // EC-3: seed the consumer set before the first tick so the panel's own
+    // modules keep their providers at full cadence from the start.
+    telemetry_runtime.set_consumers(provider_consumer_bits(
+        &effective_slot_modules(&slots, &snapshot, &cfg),
+        &cfg,
+        preview_surface_active(opts.preview_always, &cfg, &backend_state),
+    ));
 
     while running {
         let now = Instant::now();
@@ -292,8 +299,21 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
 
         if now.duration_since(last_render) >= cfg.render_interval {
             last_render = now;
+            let slot_modules = effective_slot_modules(&slots, &snapshot, &cfg);
+            // EC-3: publish the consumer set alongside the modules the panel
+            // shows, so a quiescent provider returns to full cadence on the
+            // next scheduled tick when a consumer reappears.
+            // F-2: the Arc<AtomicU64> behind set_consumers is stored/loaded
+            // Relaxed on purpose: the bitmask is a self-contained word with no
+            // payload published alongside it, so no Acquire/Release pairing is
+            // required, and a one-tick-stale read only delays a cadence decision.
+            telemetry_runtime.set_consumers(provider_consumer_bits(
+                &slot_modules,
+                &cfg,
+                preview_surface_active(opts.preview_always, &cfg, &backend_state),
+            ));
             let view = View {
-                slot_modules: effective_slot_modules(&slots, &snapshot, &cfg),
+                slot_modules,
                 hung_index: hang_hold.hung_index,
                 hung_detail: hang_hold.hung_detail,
                 hung_hold: hang_hold.progress(now, &cfg),
@@ -441,6 +461,76 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
 
 fn proc_hang_owner(slots: &Manager) -> Option<usize> {
     (0..4).find(|&slot| slots.current(slot).eq_ignore_ascii_case("PROC_HANG"))
+}
+
+/// EC-3: the telemetry providers a displayed module reads. Names must match
+/// `telemetry::GATED_PROVIDERS`; providers outside that list (controller, audio,
+/// net, presentmon, hang, network probe) are never gated, so listing them is a
+/// no-op. Unknown module names consume nothing: they render N/A.
+fn module_provider_consumers(module: &str) -> &'static [&'static str] {
+    match module.to_ascii_uppercase().as_str() {
+        "HEADSET_BATTERY" => &["headset"],
+        "CPU_TEMP" | "CPU_TEMP_GRAPH" => &["hwinfo", "lhm"],
+        "GPU_TEMP" | "GPU_TEMP_GRAPH" => &["gpu", "lhm"],
+        "THERMALS" => &["hwinfo", "lhm", "gpu"],
+        "GPU_LOAD" | "GPU_LOAD_GRAPH" | "VRAM_USAGE" => &["gpu"],
+        "BOTTLENECK" => &["gpu", "performance"],
+        "POWER_LIMIT" => &["hwinfo", "lhm"],
+        "CPU_GPU_POWER" => &["hwinfo", "lhm", "gpu"],
+        "VRM_TEMP" | "CHIPSET_TEMP" | "MOTHERBOARD_TEMP" | "CPU_FAN" | "PUMP_RPM" => &["lhm"],
+        "DISK_IO" | "DISK_IO_GRAPH" | "HARD_FAULTS" => &["performance"],
+        "CONNECTIONS" => &["connections"],
+        "SYSTEM_BATTERY" => &["system battery"],
+        // Availability and alert surfaces read every gated provider.
+        "PROVIDER_STATUS" | "ALERTS" => &crate::telemetry::GATED_PROVIDERS,
+        _ => &[],
+    }
+}
+
+/// EC-3: the gated providers the fixed main-display bars read. Layout 1
+/// (`main_display 1`, the shipped default in `config.rs`) is the `dashboard`
+/// default arm in `src/render/renderer.rs` L215-232, which draws the `GPU ` and
+/// `VRAM` metric bars from `MetricKey::GPUUtilization`/`VRAMUtilization`; layout
+/// 2 is `main_display_2` L270-287 with the same two bars. Both are drawn in
+/// every frame of those layouts and only the native `gpu` provider emits those
+/// keys, so layouts 1 and 2 consume `gpu` whatever the slots and alerts show;
+/// layout 3 (`main_display_3` L312-356) draws CPU/RAM/NET bars only, so it
+/// consumes no gated provider.
+fn main_display_provider_consumers(main_display: i32) -> &'static [&'static str] {
+    match main_display {
+        3 => &[],
+        _ => &["gpu"],
+    }
+}
+
+/// EC-3: which gated providers have a consumer right now. Union of the fixed
+/// main-display bars, the displayed slot modules, the enabled alert categories,
+/// and the preview surface (a visible preview is a snapshot consumer of
+/// everything, so gating never applies while a human is watching). Event-driven:
+/// computed with the slot modules, not per tick.
+fn provider_consumer_bits(modules: &[String; 4], cfg: &Config, preview_active: bool) -> u64 {
+    if preview_active {
+        return crate::telemetry::ALL_CONSUMERS;
+    }
+    let mut bits = 0u64;
+    for provider in main_display_provider_consumers(cfg.main_display) {
+        bits |= crate::telemetry::consumer_bit(provider);
+    }
+    for module in modules {
+        for provider in module_provider_consumers(module) {
+            bits |= crate::telemetry::consumer_bit(provider);
+        }
+    }
+    for provider in crate::alerts::enabled_category_providers(cfg) {
+        bits |= crate::telemetry::consumer_bit(provider);
+    }
+    bits
+}
+
+/// EC-3 consumer surface: the preview window shows the same slots, so treat it as
+/// a consumer of every gated provider whenever the preview policy keeps it visible.
+fn preview_surface_active(preview_always: bool, cfg: &Config, state: &BackendState) -> bool {
+    preview_always || preview_for_backend(cfg, state)
 }
 
 fn effective_slot_modules(slots: &Manager, snapshot: &Snapshot, cfg: &Config) -> [String; 4] {
@@ -2133,5 +2223,219 @@ mod tests {
         assert!(snapshot.providers.is_empty());
         assert!(telemetry.extended_readings.is_empty());
         assert!(telemetry.providers.is_empty());
+    }
+
+    fn slots_showing(modules: [&str; 4]) -> [String; 4] {
+        modules.map(String::from)
+    }
+
+    #[test]
+    fn consumer_set_covers_slots_alerts_and_the_preview_surface() {
+        let idle = slots_showing(["CLOCK", "CLEAR", "CLOCK", "CLOCK"]);
+        // main_display 3 draws no fixed GPU/VRAM bar, so this table pins the
+        // slot/alert/preview contribution alone; the fixed-bar rule is covered
+        // by `fixed_main_display_gpu_bars_keep_the_gpu_provider_consumed`.
+        let quiescent = Config {
+            main_display: 3,
+            temperature_warning_enabled: false,
+            memory_warning_enabled: false,
+            headset_enabled: false,
+            ..Config::default()
+        };
+        assert_eq!(
+            provider_consumer_bits(&idle, &quiescent, false),
+            0,
+            "no slot, alert or snapshot consumer => every gated provider quiescent"
+        );
+
+        let disk = slots_showing(["CLOCK", "DISK_IO", "CLOCK", "CLOCK"]);
+        assert_eq!(
+            provider_consumer_bits(&disk, &quiescent, false),
+            crate::telemetry::consumer_bit("performance"),
+            "DISK_IO consumes the performance provider"
+        );
+        let temps = slots_showing(["CPU_TEMP", "GPU_TEMP", "THERMALS", "CLOCK"]);
+        assert_eq!(
+            provider_consumer_bits(&temps, &quiescent, false),
+            crate::telemetry::consumer_bit("hwinfo")
+                | crate::telemetry::consumer_bit("lhm")
+                | crate::telemetry::consumer_bit("gpu"),
+            "temperature modules consume their sensor providers"
+        );
+        let status = slots_showing(["PROVIDER_STATUS", "CLOCK", "CLOCK", "CLOCK"]);
+        assert_eq!(
+            provider_consumer_bits(&status, &quiescent, false),
+            crate::telemetry::ALL_CONSUMERS,
+            "the availability surface consumes every gated provider"
+        );
+
+        let temperature_alerts = Config {
+            main_display: 3,
+            temperature_warning_enabled: true,
+            memory_warning_enabled: false,
+            headset_enabled: false,
+            ..Config::default()
+        };
+        assert_eq!(
+            provider_consumer_bits(&idle, &temperature_alerts, false),
+            crate::telemetry::consumer_bit("hwinfo")
+                | crate::telemetry::consumer_bit("lhm")
+                | crate::telemetry::consumer_bit("gpu"),
+            "an enabled alert category keeps its providers at full cadence"
+        );
+        assert_eq!(
+            provider_consumer_bits(&idle, &temperature_alerts, true),
+            crate::telemetry::ALL_CONSUMERS,
+            "a visible preview is a snapshot consumer of everything"
+        );
+        let headset_alerts = Config {
+            main_display: 3,
+            temperature_warning_enabled: false,
+            memory_warning_enabled: false,
+            headset_enabled: true,
+            safe_mode: false,
+            ..Config::default()
+        };
+        assert_eq!(
+            provider_consumer_bits(&idle, &headset_alerts, false),
+            crate::telemetry::consumer_bit("headset")
+        );
+        let safe = Config {
+            safe_mode: true,
+            ..headset_alerts
+        };
+        assert_eq!(provider_consumer_bits(&idle, &safe, false), 0);
+        assert!(
+            preview_surface_active(
+                false,
+                &Config::default(),
+                &crate::backends::BackendState::Discovering
+            ),
+            "the auto policy shows the preview before a device is connected"
+        );
+    }
+
+    #[test]
+    fn fixed_main_display_gpu_bars_keep_the_gpu_provider_consumed() {
+        // F-1: the reachable quiescent panel - layout 1 (the shipped default),
+        // idle slots, temperature/memory warnings off, headset off, and a
+        // connected panel so the auto preview hides. The fixed GPU/VRAM bars
+        // (renderer.rs layout 1 = `dashboard` default arm L215-232, layout 2 =
+        // `main_display_2` L270-287) read `MetricKey::GPUUtilization`/
+        // `VRAMUtilization` every frame, and only the native gpu provider emits
+        // those keys, so the panel the user is watching is a gpu consumer and the
+        // gate must not apply. Layout 3 (`main_display_3` L312-356) draws only
+        // CPU/RAM/NET bars, so it must not set the gpu bit (no over-coverage of
+        // the EC-3 saving).
+        let idle = slots_showing(["CLOCK", "CLEAR", "CLOCK", "CLOCK"]);
+        let quiescent = |main_display| Config {
+            main_display,
+            temperature_warning_enabled: false,
+            memory_warning_enabled: false,
+            headset_enabled: false,
+            ..Config::default()
+        };
+        let gpu_bit = crate::telemetry::consumer_bit("gpu");
+        assert_ne!(gpu_bit, 0, "gpu is a gated provider");
+        assert!(
+            !preview_surface_active(
+                false,
+                &quiescent(1),
+                &BackendState::Connected {
+                    kind: BackendKind::Hid
+                }
+            ),
+            "a connected panel hides the auto preview: the F-1 scenario is reachable"
+        );
+        for main_display in [1, 2] {
+            let cfg = quiescent(main_display);
+            let bits = provider_consumer_bits(&idle, &cfg, false);
+            assert_eq!(
+                bits, gpu_bit,
+                "layout {main_display} consumes gpu through its fixed bars and nothing else"
+            );
+            assert_eq!(
+                crate::telemetry::sampling_interval(&cfg, bits, "gpu", cfg.telemetry_interval),
+                cfg.telemetry_interval,
+                "the visible GPU/VRAM bars keep the configured gpu cadence"
+            );
+        }
+        let cfg = quiescent(3);
+        let bits = provider_consumer_bits(&idle, &cfg, false);
+        assert_eq!(
+            bits & gpu_bit,
+            0,
+            "layout 3 draws no GPU/VRAM bar, so gpu stays gated"
+        );
+        assert!(
+            crate::telemetry::sampling_interval(&cfg, bits, "gpu", cfg.telemetry_interval)
+                > cfg.telemetry_interval,
+            "layout 3 keeps the EC-3 quiescence saving"
+        );
+    }
+
+    #[test]
+    fn alert_relevant_gated_provider_keeps_full_cadence_and_catches_the_crossing() {
+        // GPU temperature alerts are enabled while no displayed module reads GPU
+        // data: the consumer set must keep the gpu provider consumed, otherwise
+        // quiescence would slow the crossing beyond the configured cadence.
+        let cfg = Config {
+            slots: [
+                vec!["CLOCK".into()],
+                vec!["CLOCK".into()],
+                vec!["CLOCK".into()],
+                vec!["CLOCK".into()],
+            ],
+            temperature_warning_enabled: true,
+            memory_warning_enabled: false,
+            headset_enabled: false,
+            gpu_temp_warning: 85.0,
+            gpu_temp_critical: 90.0,
+            ..Config::default()
+        };
+        let modules =
+            effective_slot_modules(&Manager::new(&cfg, [0; 4]), &Snapshot::default(), &cfg);
+        let bits = provider_consumer_bits(&modules, &cfg, false);
+        for provider in ["hwinfo", "lhm", "gpu"] {
+            assert_ne!(
+                bits & crate::telemetry::consumer_bit(provider),
+                0,
+                "{provider} stays consumed for the enabled temperature alert"
+            );
+            assert_eq!(
+                crate::telemetry::sampling_interval(&cfg, bits, provider, cfg.telemetry_interval),
+                cfg.telemetry_interval,
+                "{provider} keeps the full cadence while the alert is enabled"
+            );
+        }
+        let gated = crate::telemetry::sampling_interval(&cfg, 0, "gpu", cfg.telemetry_interval);
+        assert!(
+            gated > cfg.telemetry_interval,
+            "gating is what this consumer set prevents"
+        );
+
+        // Episode-scoped crossing: sampled at full cadence, the alert appears in
+        // the same telemetry window in which the value crosses the threshold.
+        let mut manager = crate::alerts::Manager::default();
+        let mut snapshot = Snapshot::default();
+        let base = Instant::now();
+        let crossing = Duration::from_secs(5);
+        let mut caught = None;
+        let mut elapsed = Duration::ZERO;
+        while elapsed <= crossing + cfg.telemetry_interval * 2 {
+            let value = if elapsed >= crossing { 95.0 } else { 40.0 };
+            snapshot.gpu_temp = Metric::valid(value, SystemTime::now());
+            manager.evaluate(&mut snapshot, &cfg, base + elapsed);
+            if snapshot.alerts.iter().any(|alert| alert.id == "gpu-temp") {
+                caught.get_or_insert(elapsed);
+            }
+            elapsed += cfg.telemetry_interval;
+        }
+        let caught = caught.expect("threshold crossing must produce the alert");
+        assert!(
+            caught >= crossing && caught <= crossing + cfg.telemetry_interval,
+            "the crossing is caught within one full-cadence sample"
+        );
+        assert_eq!(snapshot.alerts[0].severity, 3);
     }
 }

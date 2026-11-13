@@ -50,6 +50,7 @@ pub struct Telemetry {
     pub updates: LatestUpdates,
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
+    consumers: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
@@ -72,6 +73,13 @@ impl Telemetry {
 
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+
+    /// EC-3: publish which gated providers have consumers right now (bit per
+    /// `GATED_PROVIDERS` entry). Event-driven, from the app's render path; the
+    /// scheduler reads it at most once per tick.
+    pub fn set_consumers(&self, consumers: u64) {
+        self.consumers.store(consumers, Ordering::Relaxed);
     }
 }
 
@@ -135,6 +143,7 @@ fn latest_channel() -> (LatestSender, LatestUpdates) {
 struct Worker {
     config: Arc<RwLock<Config>>,
     config_generation: Arc<AtomicU64>,
+    consumers: Arc<AtomicU64>,
     tx: LatestSender,
     slow_rx: mpsc::Receiver<SlowEvent>,
     update: Update,
@@ -199,6 +208,65 @@ fn stale(last_success: Option<Instant>, stale_after: Duration, now: Instant) -> 
     last_success
         .map(|last| now.duration_since(last) > stale_after)
         .unwrap_or(false)
+}
+
+/// EC-3: providers whose sampling the scheduler gates to a bounded keep-alive
+/// interval while no consumer reads them. Every entry has an existing staleness
+/// bound, and the keep-alive is derived from that same bound, so publication
+/// keeps using the unchanged staleness rules: a gated provider never publishes a
+/// "looks-fresh" value it did not just sample.
+pub const GATED_PROVIDERS: [&str; 7] = [
+    "headset",
+    "lhm",
+    "gpu",
+    "hwinfo",
+    "performance",
+    "connections",
+    "system battery",
+];
+
+/// Bit for one gated provider; `0` for provider names the scheduler never gates.
+pub fn consumer_bit(provider: &str) -> u64 {
+    GATED_PROVIDERS
+        .iter()
+        .position(|name| *name == provider)
+        .map_or(0, |index| 1 << index)
+}
+
+/// Every gated provider consumed (full cadence for all of them).
+pub const ALL_CONSUMERS: u64 = (1 << GATED_PROVIDERS.len()) - 1;
+
+fn gpu_stale_after(cfg: &Config) -> Duration {
+    cfg.telemetry_interval
+        .saturating_mul(3)
+        .max(Duration::from_secs(3))
+}
+
+/// Keep-alive bound of a gated provider: its own existing stale-after interval.
+/// `None` means the provider has no staleness rule and is therefore never gated.
+fn keep_alive_interval(cfg: &Config, provider: &str) -> Option<Duration> {
+    let bound = match provider {
+        "headset" => cfg.headset_stale_after,
+        "lhm" => cfg.lhm_stale_after,
+        "gpu" => gpu_stale_after(cfg),
+        "hwinfo" => cfg.hwinfo_stale_after,
+        "performance" | "connections" => EXTENDED_STALE,
+        "system battery" => BATTERY_STALE,
+        _ => return None,
+    };
+    Some(bound.max(Duration::from_millis(1)))
+}
+
+/// EC-3 sampling gate. A consumed provider keeps the cadence the caller already
+/// used (the exact pre-EC-3 expression); with no consumer it samples at the
+/// keep-alive bound, and a rejoining consumer restores full cadence on the next
+/// scheduled tick because `due` is re-evaluated with the full interval.
+pub fn sampling_interval(cfg: &Config, consumers: u64, provider: &str, full: Duration) -> Duration {
+    let bit = consumer_bit(provider);
+    if bit != 0 && consumers & bit == 0 {
+        return keep_alive_interval(cfg, provider).unwrap_or(full).max(full);
+    }
+    full
 }
 
 fn enabled(cfg: &Config, provider: &str) -> bool {
@@ -437,9 +505,10 @@ impl Worker {
         self.poll_controller(&cfg, now);
         self.poll_audio(&cfg, now);
         self.poll_network(&cfg, now);
-        self.poll_performance(now);
-        self.poll_connections(now);
-        self.poll_battery(now);
+        let consumers = self.consumers.load(Ordering::Relaxed);
+        self.poll_performance(&cfg, consumers, now);
+        self.poll_connections(&cfg, consumers, now);
+        self.poll_battery(&cfg, consumers, now);
         self.apply_freshness(&cfg, now);
         self.rebuild_extended_readings(&cfg);
         self.update.generation = generation;
@@ -757,8 +826,9 @@ impl Worker {
         }
     }
 
-    fn poll_performance(&mut self, now: Instant) {
-        if !due(self.performance_attempt, EXTENDED_POLL, now) {
+    fn poll_performance(&mut self, cfg: &Config, consumers: u64, now: Instant) {
+        let interval = sampling_interval(cfg, consumers, "performance", EXTENDED_POLL);
+        if !due(self.performance_attempt, interval, now) {
             return;
         }
         self.performance_attempt = Some(now);
@@ -798,8 +868,9 @@ impl Worker {
         }
     }
 
-    fn poll_connections(&mut self, now: Instant) {
-        if !due(self.connections_attempt, EXTENDED_POLL, now) {
+    fn poll_connections(&mut self, cfg: &Config, consumers: u64, now: Instant) {
+        let interval = sampling_interval(cfg, consumers, "connections", EXTENDED_POLL);
+        if !due(self.connections_attempt, interval, now) {
             return;
         }
         self.connections_attempt = Some(now);
@@ -822,8 +893,9 @@ impl Worker {
         }
     }
 
-    fn poll_battery(&mut self, now: Instant) {
-        if !due(self.battery_attempt, BATTERY_POLL, now) {
+    fn poll_battery(&mut self, cfg: &Config, consumers: u64, now: Instant) {
+        let interval = sampling_interval(cfg, consumers, "system battery", BATTERY_POLL);
+        if !due(self.battery_attempt, interval, now) {
             return;
         }
         self.battery_attempt = Some(now);
@@ -880,11 +952,7 @@ impl Worker {
         }
 
         if enabled(cfg, "gpu") {
-            let stale_after = cfg
-                .telemetry_interval
-                .saturating_mul(3)
-                .max(Duration::from_secs(3));
-            let gpu_stale = stale(self.gpu_success, stale_after, now);
+            let gpu_stale = stale(self.gpu_success, gpu_stale_after(cfg), now);
             for reading in &mut self.update.gpu_readings {
                 if gpu_stale {
                     reading.freshness = Freshness::Stale;
@@ -1055,6 +1123,7 @@ impl Worker {
 fn spawn_headset(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
+    consumers: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     tx: mpsc::SyncSender<SlowEvent>,
 ) -> std::thread::JoinHandle<()> {
@@ -1068,7 +1137,13 @@ fn spawn_headset(
                     last_attempt = None;
                 } else {
                     let now = Instant::now();
-                    if due(last_attempt, cfg.headset_poll, now) {
+                    let interval = sampling_interval(
+                        &cfg,
+                        consumers.load(Ordering::Relaxed),
+                        "headset",
+                        cfg.headset_poll,
+                    );
+                    if due(last_attempt, interval, now) {
                         last_attempt = Some(now);
                         if !send_slow(
                             &tx,
@@ -1090,6 +1165,7 @@ fn spawn_headset(
 fn spawn_lhm(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
+    consumers: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     temps_need_refresh: Arc<AtomicBool>,
     tx: mpsc::SyncSender<SlowEvent>,
@@ -1103,12 +1179,14 @@ fn spawn_lhm(
                 if let Some(url) = lhm_url(&cfg) {
                     let now = Instant::now();
                     let settled_interval = (cfg.lhm_stale_after / 2).max(cfg.lhm_interval);
+                    let full = if cfg.lhm_mode == "on" || temps_need_refresh.load(Ordering::Relaxed)
+                    {
+                        cfg.lhm_interval
+                    } else {
+                        settled_interval
+                    };
                     let interval =
-                        if cfg.lhm_mode == "on" || temps_need_refresh.load(Ordering::Relaxed) {
-                            cfg.lhm_interval
-                        } else {
-                            settled_interval
-                        };
+                        sampling_interval(&cfg, consumers.load(Ordering::Relaxed), "lhm", full);
                     if due(last_attempt, interval, now) {
                         last_attempt = Some(now);
                         let result = lhm::sample_extended(
@@ -1133,6 +1211,7 @@ fn spawn_lhm(
 fn spawn_hwinfo(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
+    consumers: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     tx: mpsc::SyncSender<SlowEvent>,
 ) -> std::thread::JoinHandle<()> {
@@ -1144,7 +1223,13 @@ fn spawn_hwinfo(
                 let (generation, cfg) = current_request(&config, &generation);
                 if enabled(&cfg, "hwinfo") {
                     let now = Instant::now();
-                    if due(last_attempt, EXTENDED_POLL, now) {
+                    let interval = sampling_interval(
+                        &cfg,
+                        consumers.load(Ordering::Relaxed),
+                        "hwinfo",
+                        EXTENDED_POLL,
+                    );
+                    if due(last_attempt, interval, now) {
                         last_attempt = Some(now);
                         let selectors = hwinfo_selectors(&cfg);
                         let result = hwinfo::sample(&selectors, cfg.hwinfo_stale_after);
@@ -1350,6 +1435,7 @@ fn derive_fan_percent(
 fn spawn_gpu(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
+    consumers: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     tx: mpsc::SyncSender<SlowEvent>,
 ) -> std::thread::JoinHandle<()> {
@@ -1362,7 +1448,13 @@ fn spawn_gpu(
                 let (generation, cfg) = current_request(&config, &generation);
                 if enabled(&cfg, "gpu") {
                     let now = Instant::now();
-                    if due(last_attempt, cfg.telemetry_interval, now) {
+                    let interval = sampling_interval(
+                        &cfg,
+                        consumers.load(Ordering::Relaxed),
+                        "gpu",
+                        cfg.telemetry_interval,
+                    );
+                    if due(last_attempt, interval, now) {
                         last_attempt = Some(now);
                         if !send_slow(
                             &tx,
@@ -1385,6 +1477,7 @@ fn spawn_gpu(
 pub fn spawn(cfg: &Config) -> Telemetry {
     let config = Arc::new(RwLock::new(cfg.clone()));
     let generation = Arc::new(AtomicU64::new(1));
+    let consumers = Arc::new(AtomicU64::new(ALL_CONSUMERS));
     let shutdown = Arc::new(AtomicBool::new(false));
     let temps_need_refresh = Arc::new(AtomicBool::new(true));
     let (tx, rx) = latest_channel();
@@ -1392,12 +1485,14 @@ pub fn spawn(cfg: &Config) -> Telemetry {
     let mut threads = vec![spawn_headset(
         Arc::clone(&config),
         Arc::clone(&generation),
+        Arc::clone(&consumers),
         Arc::clone(&shutdown),
         slow_tx.clone(),
     )];
     threads.push(spawn_lhm(
         Arc::clone(&config),
         Arc::clone(&generation),
+        Arc::clone(&consumers),
         Arc::clone(&shutdown),
         Arc::clone(&temps_need_refresh),
         slow_tx.clone(),
@@ -1405,12 +1500,14 @@ pub fn spawn(cfg: &Config) -> Telemetry {
     threads.push(spawn_gpu(
         Arc::clone(&config),
         Arc::clone(&generation),
+        Arc::clone(&consumers),
         Arc::clone(&shutdown),
         slow_tx.clone(),
     ));
     threads.push(spawn_hwinfo(
         Arc::clone(&config),
         Arc::clone(&generation),
+        Arc::clone(&consumers),
         Arc::clone(&shutdown),
         slow_tx.clone(),
     ));
@@ -1434,6 +1531,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
     let worker = Worker {
         config: Arc::clone(&config),
         config_generation: Arc::clone(&generation),
+        consumers: Arc::clone(&consumers),
         tx,
         slow_rx,
         update: Update::default(),
@@ -1494,6 +1592,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
         updates: rx,
         config,
         generation,
+        consumers,
         shutdown,
         threads,
     }
@@ -1615,6 +1714,7 @@ mod tests {
             updates,
             config: Arc::clone(&shared),
             generation: Arc::clone(&generation),
+            consumers: Arc::new(AtomicU64::new(ALL_CONSUMERS)),
             shutdown: Arc::new(AtomicBool::new(false)),
             threads: Vec::new(),
         };
@@ -1641,6 +1741,7 @@ mod tests {
         Worker {
             config,
             config_generation: generation,
+            consumers: Arc::new(AtomicU64::new(ALL_CONSUMERS)),
             tx,
             slow_rx,
             update: Update {
@@ -2230,5 +2331,327 @@ mod tests {
         assert_eq!(worker.hwinfo_cpu_temp.updated, Some(at));
         assert_eq!(worker.hwinfo_readings[0].freshness, Freshness::Stale);
         assert_eq!(worker.hwinfo_readings[0].sampled_at, Some(at));
+    }
+
+    /// Mirrors a scheduler loop's sample decisions over an injected clock, using
+    /// the same `due`/`sampling_interval` pair the provider loops and worker poll
+    /// sites call. `rejoin` flips the provider's consumer bit at that elapsed time.
+    fn scheduled_samples(
+        cfg: &Config,
+        consumers: u64,
+        provider: &str,
+        full: Duration,
+        horizon: Duration,
+        rejoin: Option<Duration>,
+    ) -> Vec<Instant> {
+        let base = Instant::now();
+        let mut consumers = consumers;
+        let mut last = None;
+        let mut samples = Vec::new();
+        let mut elapsed = Duration::ZERO;
+        while elapsed <= horizon {
+            if rejoin.is_some_and(|at| elapsed >= at) {
+                consumers |= consumer_bit(provider);
+            }
+            let interval = sampling_interval(cfg, consumers, provider, full);
+            if due(last, interval, base + elapsed) {
+                last = Some(base + elapsed);
+                samples.push(base + elapsed);
+            }
+            elapsed += TICK;
+        }
+        samples
+    }
+
+    #[test]
+    fn gated_provider_sampling_uses_keep_alive_bound_not_full_cadence() {
+        let cfg = Config::default();
+        let horizon = Duration::from_secs(300);
+        for (provider, full) in [
+            ("headset", cfg.headset_poll),
+            ("lhm", cfg.lhm_interval),
+            ("gpu", cfg.telemetry_interval),
+            ("hwinfo", EXTENDED_POLL),
+            ("performance", EXTENDED_POLL),
+            ("connections", EXTENDED_POLL),
+            ("system battery", BATTERY_POLL),
+        ] {
+            let keep_alive = keep_alive_interval(&cfg, provider).expect("gated provider bound");
+            let gated = scheduled_samples(&cfg, 0, provider, full, horizon, None);
+            let consumed = scheduled_samples(&cfg, ALL_CONSUMERS, provider, full, horizon, None);
+            assert_eq!(
+                gated.len(),
+                (horizon.as_millis() / keep_alive.as_millis()) as usize + 1,
+                "{provider} must sample at the keep-alive bound"
+            );
+            assert_eq!(
+                consumed.len(),
+                (horizon.as_millis() / full.as_millis()) as usize + 1,
+                "{provider} keeps the configured cadence while consumed"
+            );
+            assert!(
+                gated.len() < consumed.len(),
+                "{provider}: keep-alive cadence must be slower than full cadence"
+            );
+        }
+    }
+
+    #[test]
+    fn consumer_rejoin_restores_full_cadence_on_the_next_scheduled_tick() {
+        let cfg = Config::default();
+        let full = cfg.headset_poll;
+        let rejoin = Duration::from_secs(30);
+        let samples = scheduled_samples(
+            &cfg,
+            0,
+            "headset",
+            full,
+            Duration::from_secs(120),
+            Some(rejoin),
+        );
+        // Gated: sample at 0. The rejoin at 30s reopens the gate, and the last
+        // sample is already older than the full cadence, so 30s samples at once;
+        // every later gap is exactly the configured cadence.
+        assert_eq!(samples.len(), 8, "0, 30, 45, 60, 75, 90, 105, 120 seconds");
+        assert_eq!(samples[1], samples[0] + rejoin, "rejoin samples next tick");
+        for pair in samples[2..].windows(2) {
+            assert_eq!(pair[1] - pair[0], full, "full cadence resumes after rejoin");
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct PublishedFlags {
+        gpu_temp_valid: bool,
+        gpu_temp_stale: bool,
+        provider_available: bool,
+    }
+
+    /// Record/replay harness: an injected provider input sequence (the first
+    /// `healthy_samples` results succeed, the rest fail) is scheduled by the
+    /// given rule and pushed through the real publish path. `pre_ec3` selects the
+    /// pre-EC-3 interval expression so the two recordings are comparable.
+    fn published_flag_record(
+        cfg: &Config,
+        consumers: u64,
+        pre_ec3: bool,
+        healthy_samples: usize,
+        horizon: Duration,
+    ) -> Vec<PublishedFlags> {
+        let mut worker = test_worker(cfg.clone());
+        let base = Instant::now();
+        let mut last_attempt = None;
+        let mut samples = 0usize;
+        let mut record = Vec::new();
+        let mut elapsed = Duration::ZERO;
+        while elapsed <= horizon {
+            let now = base + elapsed;
+            let full = cfg.telemetry_interval;
+            let interval = if pre_ec3 {
+                full
+            } else {
+                sampling_interval(cfg, consumers, "gpu", full)
+            };
+            if due(last_attempt, interval, now) {
+                last_attempt = Some(now);
+                let result = if samples < healthy_samples {
+                    samples += 1;
+                    Ok(gpu::Sample {
+                        backend: "test".into(),
+                        readings: Vec::new(),
+                        temperature: Metric::valid(70.0, SystemTime::UNIX_EPOCH),
+                        power_w: None,
+                        sampled_at: SystemTime::UNIX_EPOCH,
+                    })
+                } else {
+                    Err("injected provider input sequence exhausted".into())
+                };
+                worker.apply_gpu(result, now);
+            }
+            worker.apply_freshness(cfg, now);
+            record.push(PublishedFlags {
+                gpu_temp_valid: worker.update.gpu_temp.valid,
+                gpu_temp_stale: worker.update.gpu_temp.stale,
+                provider_available: worker
+                    .update
+                    .providers
+                    .iter()
+                    .find(|(name, _)| name == "gpu")
+                    .is_some_and(|(_, ok)| *ok),
+            });
+            elapsed += TICK;
+        }
+        record
+    }
+
+    #[test]
+    fn consumer_present_publishing_is_parity_with_pre_ec3_cadence() {
+        // Anti-masking proof, part 1: with a consumer present the gate is inert,
+        // so every published stale/valid/availability flag for the same injected
+        // input sequence is identical to the pre-EC-3 scheduler behavior.
+        let cfg = Config::default();
+        let horizon = Duration::from_secs(20);
+        for healthy in [0, 1, 12, usize::MAX] {
+            let pre_ec3 = published_flag_record(&cfg, 0, true, healthy, horizon);
+            let consumed = published_flag_record(&cfg, ALL_CONSUMERS, false, healthy, horizon);
+            assert_eq!(
+                pre_ec3, consumed,
+                "parity broken for gpu publishing (healthy samples: {healthy})"
+            );
+        }
+        // The record is not vacuous: a dying provider does go stale and stops
+        // claiming availability, while a live provider never reports stale.
+        let dying = published_flag_record(&cfg, 0, true, 1, horizon);
+        assert!(dying.iter().any(|flags| flags.gpu_temp_stale));
+        assert!(dying.iter().any(|flags| !flags.provider_available));
+        let live = published_flag_record(&cfg, 0, true, usize::MAX, horizon);
+        assert!(live
+            .iter()
+            .all(|flags| flags.gpu_temp_valid && !flags.gpu_temp_stale));
+        // Gated publishing follows the same rules: at the keep-alive bound (the
+        // provider's own stale-after interval) the published value is genuinely
+        // current, so gating can never produce a stale-behaving "looks fresh" flag.
+        let gated = published_flag_record(&cfg, 0, false, usize::MAX, horizon);
+        assert!(gated
+            .iter()
+            .all(|flags| flags.gpu_temp_valid && !flags.gpu_temp_stale));
+    }
+
+    #[test]
+    fn gated_provider_publishes_stale_at_the_existing_boundary_never_looks_fresh() {
+        // Anti-masking proof, part 2: gated sampling keeps a published value
+        // genuinely current (the keep-alive bound IS the provider's own
+        // stale-after interval); when sampling stops, the UNCHANGED staleness
+        // rule flips it to stale at the same boundary, never to "looks fresh".
+        let cfg = Config::default();
+        assert_eq!(
+            keep_alive_interval(&cfg, "headset").unwrap(),
+            cfg.headset_stale_after,
+            "keep-alive is derived from the existing stale-after bound"
+        );
+        let mut worker = test_worker(cfg.clone());
+        let base = Instant::now();
+        worker.apply_headset(
+            Ok(headset::Status {
+                online: true,
+                percent: 55,
+                ..Default::default()
+            }),
+            base,
+        );
+        worker.apply_freshness(&cfg, base + cfg.headset_stale_after);
+        assert!(
+            !worker.update.headset.stale,
+            "the existing rule keeps the exclusive stale-after boundary"
+        );
+        worker.apply_freshness(
+            &cfg,
+            base + cfg.headset_stale_after + Duration::from_millis(1),
+        );
+        assert!(
+            worker.update.headset.stale,
+            "a gated provider publishes the stale flag, not a fresh-looking value"
+        );
+        assert!(worker.update.headset.present);
+        assert_eq!(
+            worker
+                .update
+                .providers
+                .iter()
+                .find(|(name, _)| name == "headset")
+                .map(|(_, ok)| *ok),
+            Some(true),
+            "availability publication is unchanged by gating"
+        );
+    }
+
+    #[test]
+    fn every_gated_provider_has_a_positive_keep_alive_and_none_is_fully_gated() {
+        let cfg = Config::default();
+        let bounds = [
+            ("headset", cfg.headset_stale_after),
+            ("lhm", cfg.lhm_stale_after),
+            ("gpu", gpu_stale_after(&cfg)),
+            ("hwinfo", cfg.hwinfo_stale_after),
+            ("performance", EXTENDED_STALE),
+            ("connections", EXTENDED_STALE),
+            ("system battery", BATTERY_STALE),
+        ];
+        assert_eq!(GATED_PROVIDERS.len(), bounds.len());
+        for (provider, bound) in bounds {
+            assert_eq!(
+                keep_alive_interval(&cfg, provider),
+                Some(bound),
+                "{provider} keep-alive must equal its existing staleness bound"
+            );
+            let full = Duration::from_millis(1);
+            let gated = sampling_interval(&cfg, 0, provider, full);
+            assert!(gated > Duration::ZERO, "{provider} must never be gated off");
+            assert!(
+                gated >= full,
+                "{provider} gating never outruns the configured cadence"
+            );
+            assert_eq!(
+                sampling_interval(&cfg, ALL_CONSUMERS, provider, full),
+                full,
+                "{provider} keeps the configured cadence while consumed"
+            );
+        }
+        for provider in [
+            "controller",
+            "audio",
+            "net",
+            "network probe",
+            "presentmon",
+            "hang",
+        ] {
+            assert_eq!(
+                consumer_bit(provider),
+                0,
+                "{provider} has no staleness rule in this scheduler, so it is not gated"
+            );
+            assert_eq!(
+                sampling_interval(&cfg, 0, provider, EXTENDED_POLL),
+                EXTENDED_POLL
+            );
+        }
+    }
+
+    #[test]
+    fn consumer_set_publication_is_visible_to_the_scheduler() {
+        let shared = Arc::new(RwLock::new(Config::default()));
+        let (_tx, updates) = latest_channel();
+        let telemetry = Telemetry {
+            updates,
+            config: shared,
+            generation: Arc::new(AtomicU64::new(1)),
+            consumers: Arc::new(AtomicU64::new(ALL_CONSUMERS)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            threads: Vec::new(),
+        };
+        let consumers = Arc::clone(&telemetry.consumers);
+        let gated = consumer_bit("headset") | consumer_bit("performance");
+        telemetry.set_consumers(gated);
+        assert_eq!(consumers.load(Ordering::Relaxed), gated);
+        let cfg = Config::default();
+        assert_eq!(
+            sampling_interval(
+                &cfg,
+                consumers.load(Ordering::Relaxed),
+                "headset",
+                cfg.headset_poll
+            ),
+            cfg.headset_poll
+        );
+        assert_eq!(
+            sampling_interval(
+                &cfg,
+                consumers.load(Ordering::Relaxed),
+                "lhm",
+                cfg.lhm_interval
+            ),
+            keep_alive_interval(&cfg, "lhm")
+                .unwrap()
+                .max(cfg.lhm_interval)
+        );
     }
 }

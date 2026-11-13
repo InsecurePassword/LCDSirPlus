@@ -18,6 +18,24 @@ struct Episode {
     recovery_started: Option<Instant>,
 }
 
+/// EC-3: providers the enabled alert categories consume, so the sampling gate
+/// keeps alert-relevant providers at full cadence and an alert can never lose a
+/// threshold crossing to quiescence.
+pub fn enabled_category_providers(cfg: &Config) -> Vec<&'static str> {
+    let mut providers = Vec::new();
+    if cfg.temperature_warning_enabled {
+        providers.extend(["hwinfo", "lhm", "gpu"]);
+    }
+    if cfg.memory_warning_enabled {
+        // VRAM utilization comes from the native GPU provider.
+        providers.push("gpu");
+    }
+    if cfg.headset_enabled && !cfg.safe_mode {
+        providers.push("headset");
+    }
+    providers
+}
+
 impl Manager {
     pub fn clear_disabled_categories(&mut self, cfg: &Config) {
         self.seen.retain(|id, _| match id.as_str() {
@@ -258,6 +276,34 @@ mod tests {
             .collect();
         ids.sort_unstable();
         assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn enabled_category_providers_tracks_the_configured_categories() {
+        let all = Config::default();
+        let mut providers = enabled_category_providers(&all);
+        providers.sort_unstable();
+        providers.dedup();
+        assert_eq!(providers, ["gpu", "headset", "hwinfo", "lhm"]);
+        let quiescent = Config {
+            temperature_warning_enabled: false,
+            memory_warning_enabled: false,
+            headset_enabled: false,
+            ..Config::default()
+        };
+        assert!(enabled_category_providers(&quiescent).is_empty());
+        let vram_only = Config {
+            temperature_warning_enabled: false,
+            memory_warning_enabled: true,
+            headset_enabled: false,
+            ..Config::default()
+        };
+        assert_eq!(enabled_category_providers(&vram_only), vec!["gpu"]);
+        let safe = Config {
+            safe_mode: true,
+            ..Config::default()
+        };
+        assert!(!enabled_category_providers(&safe).contains(&"headset"));
     }
 
     #[test]
