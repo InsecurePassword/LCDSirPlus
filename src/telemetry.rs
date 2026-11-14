@@ -2066,6 +2066,69 @@ mod tests {
         );
     }
 
+    /// WO-DOCS-F4 (EC-8 pattern: `providers/mod.rs::tests::ec8_docs_checklist_names_every_provider`
+    /// L30, EC-5 precedent `providers/cpu.rs::ec5_docs_name_the_single_derivation_and_family`
+    /// L216): the user manual must keep the shipped probe-indeterminate loss-cause vocabulary —
+    /// the on-panel label per slot band, the full-cause template, the count's silence about the
+    /// targets the same cycle publishes, the discrimination from `DOWN` and from a hung target,
+    /// and the display precedence exactly as
+    /// `render::renderer::provider_slot` implements it (device state > `N DOWN` > token > `OK`,
+    /// L1934-1958). Vocabulary drift in the manual reddens this test.
+    #[test]
+    fn the_manual_names_the_probe_indeterminate_loss_cause() {
+        const MANUAL: &str = include_str!("../docs/INSTRUCTION-MANUAL.md");
+        assert!(
+            MANUAL.contains("`probe-indeterminate-<N>`"),
+            "the manual must template the full loss cause as `probe-indeterminate-<N>`"
+        );
+        assert!(
+            MANUAL.contains("`probe-i...`"),
+            "the manual must name the widest-slot label `probe-i...` of the four-slot panel"
+        );
+        assert!(
+            MANUAL.contains("the first three slots show `probe-...`"),
+            "the manual must name the narrow-slot label `probe-...` (38 px slot interiors)"
+        );
+        assert!(
+            MANUAL.contains("lost checks never become a hung target, so the row names the loss"),
+            "the manual must state the exact invariant: the lost checks never become a target"
+        );
+        assert!(
+            MANUAL.contains("nothing about whether a hung target was published"),
+            "the manual must keep the count silent about a published hung target"
+        );
+        assert!(
+            MANUAL.contains("never means a hung target, and it never means `DOWN`"),
+            "the manual must distinguish the token from `DOWN` and from a hung target"
+        );
+        assert!(
+            MANUAL.contains(
+                "device state first, then `N DOWN`, then `probe-indeterminate-<N>`, then `OK`"
+            ),
+            "the manual must pin the display precedence in the provider_slot arm order (renderer.rs L1934-1958)"
+        );
+    }
+
+    /// WO-DOCS-F4: the manual keeps the agreed terminal-mark wording of the repeated-press
+    /// suppression VERBATIM as fixed by WO-B-03-FIX-AUDIT F-4, plus the TC-3 re-arm rule
+    /// (a fresh publication re-arms). Wording drift reddens this test.
+    #[test]
+    fn the_manual_names_the_terminal_mark_scope() {
+        const MANUAL: &str = include_str!("../docs/INSTRUCTION-MANUAL.md");
+        assert!(
+            MANUAL.contains(
+                "identities whose last action on the current publish generation reached `wait-timeout`"
+            ),
+            "the manual must state the agreed terminal-mark scope verbatim"
+        );
+        assert!(
+            MANUAL.contains(
+                "The window becomes pressable again when a new check cycle republishes it."
+            ),
+            "the manual must state the re-arm on a fresh publication"
+        );
+    }
+
     #[test]
     fn safe_mode_clears_expansion_and_rebaselines() {
         let mut worker = test_worker(Config::default());

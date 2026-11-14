@@ -455,6 +455,21 @@ Safe mode reports only its healthy safe-mode state, so the button option shows
 `OK`. Add `PROVIDER_STATUS` to any slot if you want this summary; during normal
 use, `DOWN` can reflect intentionally unused sources as described above.
 
+When the hung-window feature is enabled (`hang_enabled 1`, test users only; keep
+`hang_enabled 0` as noted below), a check cycle that could not evaluate its probes
+replaces the `OK` label with the named cause `probe-indeterminate-<N>`. `N` is the
+number of window checks that could not be evaluated during this update cycle; the
+lost checks never become a hung target, so the row names the loss instead of
+silently reading `OK`. The count reports only the checks the cycle lost: it says
+nothing about whether a hung target was published, and the label shows only when
+the slot has nothing more important to show.
+The label never means a hung target, and it never means `DOWN`, which counts
+unavailable data sources. The row shows only the highest-priority cause:
+device state first, then `N DOWN`, then `probe-indeterminate-<N>`, then `OK`. In
+a four-slot row the first three slots show `probe-...` and
+the last shows `probe-i...`; the full cause `probe-indeterminate-<N>` is in the
+normal log.
+
 An inactive `PROC_HANG` or `BOTTLENECK` selection temporarily shows the next
 eligible option without changing the stored selection. Neither option is used
 as the other's temporary replacement. If no eligible option is available, the
@@ -548,6 +563,11 @@ safe mode does not silently authorize or remove credentials.
 Do not enable the hung-window action in this release. Its physical behavior has
 not been release-tested, and there is no supported end-user test. It can
 terminate a program and lose unsaved work. Keep `hang_enabled 0`.
+
+When the action is enabled for a controlled test, a terminate attempt that reaches
+the bounded completion timeout suppresses a repeated press on the same window: the
+press is refused for identities whose last action on the current publish generation reached `wait-timeout`.
+The window becomes pressable again when a new check cycle republishes it.
 
 ## Create diagnostics safely
 
