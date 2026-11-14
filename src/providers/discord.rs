@@ -3083,4 +3083,195 @@ mod tests {
         }
         panic!("no verified Discord endpoint: {}", failures.join("; "));
     }
+
+    // WO-DISC-C: STRUCTURAL source-pin scanner helpers (test region only; they read the
+    // shipped text of this file and assert nothing about runtime behavior).
+    /// The shipped production region of this file: LF-normalized text from the file start
+    /// up to (excluding) the `#[cfg(test)]` attribute that opens `mod tests`.
+    fn shipped_production_region() -> String {
+        let source = include_str!("discord.rs").replace("\r\n", "\n");
+        let tests = source
+            .find("\nmod tests {")
+            .expect("the shipped file carries the test module");
+        let region = source[..tests].trim_end();
+        region
+            .strip_suffix("#[cfg(test)]")
+            .map(str::trim_end)
+            .unwrap_or(region)
+            .to_string()
+    }
+
+    fn is_ident_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+
+    /// First identifier of `text` (leading whitespace skipped), if any.
+    fn leading_ident(text: &str) -> Option<&str> {
+        let text = text.trim_start();
+        let end = text
+            .char_indices()
+            .find(|(_, c)| !is_ident_char(*c))
+            .map_or(text.len(), |(i, _)| i);
+        text.get(..end)
+            .filter(|ident| !ident.is_empty() && !ident.starts_with(|c: char| c.is_ascii_digit()))
+    }
+
+    /// Last identifier of `text` (trailing whitespace skipped), if any.
+    fn trailing_ident(text: &str) -> Option<&str> {
+        let text = text.trim_end();
+        let start = text
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !is_ident_char(*c))
+            .map_or(0, |(i, _)| i + 1);
+        text.get(start..)
+            .filter(|ident| !ident.is_empty() && !ident.starts_with(|c: char| c.is_ascii_digit()))
+    }
+
+    /// `<receiver>.<member>` at the end of `text`, as two identifiers.
+    fn trailing_member(text: &str) -> Option<(&str, &str)> {
+        let text = text.trim_end();
+        let member = trailing_ident(text)?;
+        let head = text[..text.len() - member.len()].strip_suffix('.')?;
+        Some((trailing_ident(head)?, member))
+    }
+
+    /// `<receiver>.<member>` at the start of `text`, as two identifiers.
+    fn leading_member(text: &str) -> Option<(&str, &str)> {
+        let text = text.trim_start();
+        let receiver = leading_ident(text)?;
+        let tail = text[receiver.len()..].strip_prefix('.')?;
+        let member = leading_ident(tail)?;
+        Some((receiver, member))
+    }
+
+    /// The `a.<field> != b.<field>` field names of one shipped comparison predicate, in
+    /// source order; every operand must read the predicate's `a` / `b` config parameter.
+    fn compared_fields(source: &str, fn_head: &str) -> Vec<String> {
+        let start = source.find(fn_head).expect("the shipped predicate exists");
+        let body = &source[start..];
+        let end = body
+            .find("\n}")
+            .expect("the shipped predicate ends with a top-level closing brace");
+        let body = &body[..end];
+        let mut fields = Vec::new();
+        let mut offset = 0;
+        while let Some(relative) = body[offset..].find("!=") {
+            let at = offset + relative;
+            let (left_recv, left) =
+                trailing_member(&body[..at]).expect("an `a.<field>` left operand");
+            let (right_recv, right) =
+                leading_member(&body[at + 2..]).expect("a `b.<field>` right operand");
+            assert_eq!(
+                (left_recv, right_recv),
+                ("a", "b"),
+                "each comparison must read the predicate's two config parameters"
+            );
+            assert_eq!(
+                left, right,
+                "the predicate compares the same field on both sides ({left} vs {right})"
+            );
+            fields.push(left.to_string());
+            offset = at + 2;
+        }
+        fields
+    }
+
+    /// Member names read off a bare `Config` receiver in the shipped text: the receiver
+    /// spelling must be exactly `config`/`cfg` and must start at a boundary whose preceding
+    /// character is neither an identifier character nor `.`, so `self.config.<field>` (a field
+    /// of the runtime struct) and the shared `Arc<RwLock<Config>>` receivers named
+    /// `*_config` are excluded; the member must not be plumbing (`clone`, `read`, ...).
+    fn bare_config_members(source: &str, receivers: &[&str], plumbing: &[&str]) -> Vec<String> {
+        let chars: Vec<char> = source.chars().collect();
+        let mut members = Vec::new();
+        let mut index = 0;
+        while index < chars.len() {
+            let at_boundary = index == 0 || {
+                let previous = chars[index - 1];
+                !(is_ident_char(previous) || previous == '.')
+            };
+            let hit = at_boundary.then(|| {
+                receivers.iter().find_map(|receiver| {
+                    let name: Vec<char> = receiver.chars().collect();
+                    let after = index + name.len();
+                    if chars[index..].starts_with(name.as_slice()) && chars.get(after) == Some(&'.')
+                    {
+                        let member: String = chars[after + 1..]
+                            .iter()
+                            .take_while(|c| is_ident_char(**c))
+                            .collect();
+                        (!member.is_empty() && !plumbing.contains(&member.as_str()))
+                            .then_some(member)
+                    } else {
+                        None
+                    }
+                })
+            });
+            if let Some(Some(member)) = hit {
+                members.push(member);
+            }
+            index += 1;
+        }
+        members
+    }
+
+    /// WO-DISC-C (EC-8 audit follow-up (c); the WO-A1-08 audit's F-4 hardening
+    /// recommendation) STRUCTURAL source pin of the Discord re-arm gate. Discord is the only
+    /// provider loop without an `Arc<AtomicU64>` generation: it re-arms by comparing
+    /// configuration CONTENT, so the closed field set of `session_config_changed` IS its
+    /// generation gate. This test inspects the shipped text of this file (production region =
+    /// file start to the `#[cfg(test)]` attribute that opens `mod tests`) and pins:
+    ///
+    /// * (a) the `a.<field> != b.<field>` comparisons inside `session_config_changed` are
+    ///   EXACTLY the seven pinned fields, in source order, and
+    /// * (b) every field read off a bare `Config` receiver in that region
+    ///   (`config.<field>` / `cfg.<field>`, with the receiver rules and the plumbing
+    ///   allowlist documented above) is one of those seven.
+    ///
+    /// A new `config.<field>` read in the worker path, or a field added to / removed from the
+    /// comparison, reddens this test and forces a conscious update of the pinned set.
+    ///
+    /// This is a structural inspection of production source text (the EC-8/EC-5 and WO-TEL-B
+    /// `include_str!` pin pattern), NOT a behavioral driver: the IPC session loop needs a live
+    /// Discord pipe, so its loop path stays hardware-gated (the live-pipe test
+    /// `live_endpoint_identity_smoke` remains ignored) and no runtime re-arm behavior is claimed
+    /// here.
+    #[test]
+    fn discord_source_pin_of_the_session_config_read_field_set() {
+        // The re-arm gate as shipped (L1527-1535): the seven fields it compares.
+        const PINNED: [&str; 7] = [
+            "discord_enabled",
+            "safe_mode",
+            "discord_client_id",
+            "discord_linger",
+            "discord_max_speakers",
+            "discord_show_self",
+            "discord_show_channel",
+        ];
+        const RECEIVERS: [&str; 2] = ["config", "cfg"];
+        // Census of the shipped production region (WO-DISC-C-receiver-census.txt): the only
+        // bare-receiver members that are not Config fields are this lock/clone plumbing.
+        const PLUMBING: [&str; 2] = ["clone", "read"];
+        let region = shipped_production_region();
+        let compared = compared_fields(&region, "fn session_config_changed(");
+        assert_eq!(
+            compared, PINNED,
+            "session_config_changed must compare exactly the pinned field set, in source order"
+        );
+        let reads = bare_config_members(&region, &RECEIVERS, &PLUMBING);
+        let outside: Vec<&str> = reads
+            .iter()
+            .map(String::as_str)
+            .filter(|field| !PINNED.contains(field))
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "a Config field read in the production region is outside the pinned set: {outside:?}"
+        );
+        assert!(
+            reads.iter().any(|read| read == "discord_client_id"),
+            "the read pin is not vacuous: the shipped production region reads pinned Config fields"
+        );
+    }
 }
