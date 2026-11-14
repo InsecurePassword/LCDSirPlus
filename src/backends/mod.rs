@@ -2410,21 +2410,44 @@ mod tests {
         // BEFORE the window is armed, so even the spawn bookkeeping allocations
         // (metadata class, the EC-2-disclosed instrumentation pattern) are outside
         // the measured window; the armed thread itself allocates nothing inside it.
+        // WO-QA-05 (WO-QA-04-AUDIT R6, ranked option 1 = SELF-MEASURED ORACLE): the span
+        // is event-proven, not wall-clock. Each load thread publishes the allocations it
+        // has LANDED (one report per allocation site) and the window closes its
+        // observation when every thread has self-reported a full round of the three
+        // classes, bounded by the WO-QA-01 10 s loud-panic budget. The liveness witness is
+        // the actor's own report: "foreign allocations happened" is proven by the threads
+        // that made them, not by a clock. The 30 ms sleep this replaces was not a liveness
+        // test but a volume race: `window()` RESETS the counters (`reset()` inside
+        // `alloc_count::window`, infra mod.rs:1266), so the old form compared the whole
+        // pre-arm foreign history (measured 1,116,691) with a post-arm count restarted at
+        // zero (measured 984,854) - the red row in receipt §2. Both baselines below are
+        // read in the window's own epoch, and each SeqCst report is published AFTER that
+        // thread's `N_FOREIGN` bump (the bump runs first in program order), so observing n
+        // report increments beyond a baseline PROVES the foreign counter grew by at least
+        // n in the same span. No assertion was deleted and no sleep was inflated.
         static RUNNING: AtomicUsize = AtomicUsize::new(0);
         static STOP: AtomicBool = AtomicBool::new(false);
+        // One self-report slot per load thread: the allocations it has landed.
+        static LANDED: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
         RUNNING.store(0, Ordering::SeqCst);
         STOP.store(false, Ordering::SeqCst);
+        for report in &LANDED {
+            report.store(0, Ordering::SeqCst);
+        }
         let mut handles = Vec::new();
-        for _ in 0..4 {
-            handles.push(std::thread::spawn(|| {
+        for report in LANDED.iter() {
+            handles.push(std::thread::spawn(move || {
                 RUNNING.fetch_add(1, Ordering::SeqCst);
                 while !STOP.load(Ordering::SeqCst) {
                     let pixel = vec![7u8; crate::backends::alloc_count::PIXELS];
+                    report.fetch_add(1, Ordering::SeqCst);
                     let key = vec![9u8; crate::backends::alloc_count::HID_REPORT];
+                    report.fetch_add(1, Ordering::SeqCst);
                     // A Box, not a vec!: the point is the 64-byte heap allocation in the
                     // metadata class, and clippy's array suggestion would move it to the
                     // stack and un-measure the class.
                     let metadata: Box<[u8; 64]> = Box::new([1u8; 64]);
+                    report.fetch_add(1, Ordering::SeqCst);
                     std::hint::black_box(pixel[0] + key[0] + metadata[0]);
                 }
             }));
@@ -2432,10 +2455,39 @@ mod tests {
         while RUNNING.load(Ordering::SeqCst) < 4 {
             std::thread::sleep(Duration::from_millis(1));
         }
-        let foreign_before = crate::backends::alloc_count::foreign();
         let _window = crate::backends::alloc_count::window();
         let before = crate::backends::alloc_count::snapshot();
-        std::thread::sleep(Duration::from_millis(30));
+        // The window is armed, so the counters are in THIS window's epoch (the arm zeroed
+        // them): the foreign baseline is read after the arm and is comparable with the
+        // after-sample, which is what makes the liveness assertion provable.
+        let foreign_before = crate::backends::alloc_count::foreign();
+        let witness_base: [usize; 4] = std::array::from_fn(|id| LANDED[id].load(Ordering::SeqCst));
+        let rounds = || -> usize {
+            LANDED
+                .iter()
+                .zip(witness_base.iter())
+                .map(|(report, base)| report.load(Ordering::SeqCst) - *base)
+                .min()
+                .unwrap_or(0)
+        };
+        // The event-proven span: every load thread must land a full round (all three
+        // measured classes) beyond its baseline. It closes as soon as the witness is
+        // satisfied - typically well under a millisecond - and 10 s of total starvation
+        // panics loudly with every counter value, so a starved cohort is never a green.
+        const ROUNDS: usize = 3;
+        let span = Instant::now();
+        let deadline = span + Duration::from_secs(10);
+        while rounds() < ROUNDS {
+            assert!(
+                Instant::now() < deadline,
+                "the load threads landed no full allocation round within the 10 s budget: self_report_min_rounds={} base={witness_base:?} reports={:?} foreign_before={foreign_before} span_ms={}",
+                rounds(),
+                LANDED.iter().map(|report| report.load(Ordering::SeqCst)).collect::<Vec<usize>>(),
+                span.elapsed().as_millis(),
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let span_ms = span.elapsed().as_millis();
         let d = crate::backends::alloc_count::subtract(
             crate::backends::alloc_count::snapshot(),
             before,
@@ -2445,6 +2497,13 @@ mod tests {
             handle.join().unwrap();
         }
         let foreign_after = crate::backends::alloc_count::foreign();
+        // The actor witness summed over the four load threads: allocations PROVEN to have
+        // landed inside the window's span, each one counted by `bump` as foreign.
+        let self_report: usize = LANDED
+            .iter()
+            .zip(witness_base.iter())
+            .map(|(report, base)| report.load(Ordering::SeqCst) - *base)
+            .sum();
         assert_eq!(
             d.4, 0,
             "the armed window measured allocations made by other threads: {d:?}"
@@ -2454,8 +2513,16 @@ mod tests {
             "the 6880-byte class is not contaminated by cross-thread loads: {d:?}"
         );
         assert!(
+            self_report >= ROUNDS * 4,
+            "the load threads' self-reports must prove a full allocation round each: self_report={self_report} min={} span_ms={span_ms}",
+            ROUNDS * 4
+        );
+        assert!(
             foreign_after > foreign_before,
-            "the load threads' allocations must be counted as foreign, not lost: before={foreign_before} after={foreign_after}"
+            "the load threads' allocations must be counted as foreign, not lost: before={foreign_before} after={foreign_after} self_report={self_report} span_ms={span_ms}"
+        );
+        println!(
+            "WO-QA-05-ALLOC-WINDOW before={before:?} d={d:?} foreign_before={foreign_before} foreign_after={foreign_after} self_report={self_report} span_ms={span_ms}"
         );
     }
 
