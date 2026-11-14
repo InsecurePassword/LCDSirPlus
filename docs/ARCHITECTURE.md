@@ -171,9 +171,11 @@ checklist cannot drift from the tree.
 | `src/providers/ccd.rs` | app loop, reload-driven: `src/app.rs:219` re-resolves the topology through `resolve_ccd_topology` (`src/app.rs:651-657`) inside the same reload block that bumps the generation. No config reference in the module (0 hits); explicit lists arrive as arguments | the app-loop `topology` value is replaced by the reloaded one at `src/app.rs:219` | `from_lists_builds_masks`, `from_lists_single_when_one_side_missing` |
 
 Two bounded cadence details the checklist records without changing: the four `telemetry.rs`
-sampling loops keep their loop-local `last_attempt` stamp across a bump, so a re-tuned poll
-interval takes effect on the next due sample (the config value itself is re-read every
-iteration), and the HWiNFO/LHM diagnostic dedupe deliberately survives a bump, as pinned by
+sampling loops clear their loop-local `last_attempt` stamp on the loop head when the generation
+moves (the same re-arm the network worker does), so a re-tuned poll interval takes effect on the
+immediately-next sample and no stamp taken under the old policy suppresses it; under an unchanged
+generation the configured cadence is untouched, and the HWiNFO/LHM diagnostic dedupe deliberately
+survives a bump, as pinned by
 `hwinfo_diagnostic_survives_generation_and_changes_once_per_selector`. Neither masks an
 invalidation: every stale-generation result is refused, and `invalidate_telemetry_publication`
 stays explicit.

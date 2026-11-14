@@ -1158,8 +1158,13 @@ fn spawn_headset(
         .name("telemetry-headset".into())
         .spawn(move || {
             let mut last_attempt = None;
+            let mut last_generation = 0u64;
             while !shutdown.load(Ordering::Relaxed) {
                 let (generation, cfg) = current_request(&config, &generation);
+                if generation != last_generation {
+                    last_generation = generation;
+                    last_attempt = None;
+                }
                 if !enabled(&cfg, "headset") {
                     last_attempt = None;
                 } else {
@@ -1201,8 +1206,13 @@ fn spawn_lhm(
         .name("telemetry-lhm".into())
         .spawn(move || {
             let mut last_attempt = None;
+            let mut last_generation = 0u64;
             while !shutdown.load(Ordering::Relaxed) {
                 let (generation, cfg) = current_request(&config, &generation);
+                if generation != last_generation {
+                    last_generation = generation;
+                    last_attempt = None;
+                }
                 if let Some(url) = lhm_url(&cfg) {
                     let now = Instant::now();
                     let settled_interval = (cfg.lhm_stale_after / 2).max(cfg.lhm_interval);
@@ -1246,8 +1256,13 @@ fn spawn_hwinfo(
         .name("telemetry-hwinfo".into())
         .spawn(move || {
             let mut last_attempt = None;
+            let mut last_generation = 0u64;
             while !shutdown.load(Ordering::Relaxed) {
                 let (generation, cfg) = current_request(&config, &generation);
+                if generation != last_generation {
+                    last_generation = generation;
+                    last_attempt = None;
+                }
                 if enabled(&cfg, "hwinfo") {
                     let now = Instant::now();
                     let interval = sampling_interval(
@@ -1471,8 +1486,13 @@ fn spawn_gpu(
         .spawn(move || {
             let mut provider = gpu::Provider::new("off");
             let mut last_attempt = None;
+            let mut last_generation = 0u64;
             while !shutdown.load(Ordering::Relaxed) {
                 let (generation, cfg) = current_request(&config, &generation);
+                if generation != last_generation {
+                    last_generation = generation;
+                    last_attempt = None;
+                }
                 if enabled(&cfg, "gpu") {
                     let now = Instant::now();
                     let interval = sampling_interval(
@@ -2860,5 +2880,90 @@ mod tests {
                 .unwrap()
                 .max(cfg.lhm_interval)
         );
+    }
+
+    /// The shipped text of one sampling loop function (LF-normalized), from its
+    /// signature up to the next top-level `fn`.
+    fn shipped_loop_source(fn_head: &str) -> String {
+        let source = include_str!("telemetry.rs").replace("\r\n", "\n");
+        let start = source
+            .find(fn_head)
+            .expect("the shipped sampling loop exists");
+        let rest = &source[start..];
+        let end = ["\nfn ", "\npub fn "]
+            .iter()
+            .filter_map(|needle| rest.find(*needle))
+            .min()
+            .expect("the shipped loop is followed by a fn");
+        rest[..end].to_string()
+    }
+
+    /// WO-TEL-B (EC8-F1 re-arm) STRUCTURAL pin of the shipped source of all four
+    /// sampling loops. Per loop it proves: a single loop-local generation tracker; the
+    /// cadence clear present exactly once and only inside the
+    /// `if generation != last_generation` branch; exactly three `last_attempt = None;`
+    /// statements (declaration, generation branch, disabled arm) so no unconditional
+    /// per-iteration reset exists; the order loop-head generation read -> generation
+    /// branch -> `due` cadence gate; and that the emitted `SlowEvent` carries the loop's
+    /// own generation.
+    ///
+    /// This is a structural inspection of production source (the EC-8/EC-5 `include_str!`
+    /// pin pattern), NOT a behavioral driver: the loops' sampling arms call live device
+    /// APIs (`headset::query`, `lhm::sample_extended`, `hwinfo::sample`,
+    /// `gpu::Provider::sample`) with real `Instant::now()` + `TICK` sleeps, and no
+    /// hardware-free seam executes them (see the seam map in the WO-TEL-B receipt), so
+    /// production-sensitive BEHAVIORAL coverage of the reset is a documented gap, not a
+    /// claim of this test.
+    #[test]
+    fn telemetry_sampling_loops_clear_cadence_only_on_generation_change() {
+        const READ: &str = "let (generation, cfg) = current_request(&config, &generation);";
+        const BRANCH: &str = "if generation != last_generation {\n                    last_generation = generation;\n                    last_attempt = None;\n                }";
+        for (fn_head, event) in [
+            (
+                "fn spawn_headset(",
+                "SlowEvent::Headset(\n                                generation,",
+            ),
+            ("fn spawn_lhm(", "SlowEvent::Lhm(generation,"),
+            ("fn spawn_hwinfo(", "SlowEvent::Hwinfo(generation,"),
+            ("fn spawn_gpu(", "SlowEvent::Gpu(generation,"),
+        ] {
+            let loop_src = shipped_loop_source(fn_head);
+            assert_eq!(
+                loop_src.matches("let mut last_generation = 0u64;").count(),
+                1,
+                "{fn_head}: exactly one loop-local generation tracker"
+            );
+            assert_eq!(
+                loop_src.matches(BRANCH).count(),
+                1,
+                "{fn_head}: the cadence clear exists exactly once, inside the generation-change branch"
+            );
+            assert_eq!(
+                loop_src.matches("last_attempt = None;").count(),
+                3,
+                "{fn_head}: declaration + generation branch + disabled arm only, never an unconditional clear"
+            );
+            let read = loop_src
+                .find(READ)
+                .expect("{fn_head}: the loop-head generation read");
+            let branch = loop_src
+                .find(BRANCH)
+                .expect("{fn_head}: the generation-change branch");
+            let gate = loop_src
+                .find("if due(last_attempt, interval, now) {")
+                .expect("{fn_head}: the cadence gate");
+            assert!(
+                read < branch && branch < gate,
+                "{fn_head}: generation read, then the conditional clear, then the cadence gate"
+            );
+            assert!(
+                !loop_src.contains(&format!("{READ}\n                last_attempt = None;")),
+                "{fn_head}: the clear must not sit unconditionally at the loop head"
+            );
+            assert!(
+                loop_src.contains(event),
+                "{fn_head}: the published event carries the loop's own generation"
+            );
+        }
     }
 }
