@@ -186,6 +186,10 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
         preview_surface_active(opts.preview_always, &cfg, &backend_state),
     ));
 
+    // SOAK-OBS2: the resource-line tracker is seeded at start, so the first
+    // line lands at t~60 s (the interval), never at t=0.
+    let mut last_soak_resources = Instant::now();
+
     while running {
         let now = Instant::now();
 
@@ -477,6 +481,14 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
         // next iteration's bind site.
         hang_owner.invalidate();
 
+        // SOAK-OBS2: one ASCII resource line every 60 s of loop time; the gate
+        // mirrors the L202 `config_refresh` compare and never allocates per frame.
+        if soak_resources_due(now.duration_since(last_soak_resources)) {
+            last_soak_resources = now;
+            let sample = soak_resources_sample(&snapshot, now, process_epoch);
+            crate::log_info!("{}", soak_resources_line(&sample));
+        }
+
         std::thread::sleep(Duration::from_millis(10));
     }
 
@@ -485,6 +497,132 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
     backend.shutdown();
     ui.shutdown();
     Ok(0)
+}
+
+/// SOAK-OBS2: one ASCII resource line per minute in the soak log.
+///
+/// The 60 s cadence is CODE-DERIVED, not a measured value: it is 6,000
+/// iterations of the app loop's own 10 ms sleep, gated in the shape of the
+/// existing `config_refresh` compare. It adds no config key, no thread, no
+/// timer and no per-frame allocation.
+const SOAK_RESOURCES_INTERVAL_SECS: u64 = 60;
+const SOAK_RESOURCES_INTERVAL: Duration = Duration::from_secs(SOAK_RESOURCES_INTERVAL_SECS);
+
+fn soak_resources_due(elapsed: Duration) -> bool {
+    elapsed >= SOAK_RESOURCES_INTERVAL
+}
+
+/// One sample of the schema. The OS quantities are read once per line;
+/// `sys_busy_pct` is only ever the last published reading (`None` = before the
+/// first publish, rendered as `none`).
+#[derive(Clone, Copy, Debug)]
+struct SoakResourcesSample {
+    pid: u32,
+    uptime_s: u64,
+    cpu_s: f64,
+    priv_bytes: u64,
+    ws_bytes: u64,
+    handles: u64,
+    sys_avail_mb: u64,
+    sys_busy_pct: Option<f64>,
+}
+
+/// The schema line: pure (no I/O, no clock, no syscall), fixed key order.
+fn soak_resources_line(sample: &SoakResourcesSample) -> String {
+    let SoakResourcesSample {
+        pid,
+        uptime_s,
+        cpu_s,
+        priv_bytes,
+        ws_bytes,
+        handles,
+        sys_avail_mb,
+        sys_busy_pct,
+    } = *sample;
+    let busy = match sys_busy_pct {
+        Some(value) => format!("{value:.1}"),
+        None => "none".to_string(),
+    };
+    format!("soak-resources: pid={pid} uptime_s={uptime_s} cpu_s={cpu_s:.2} priv_bytes={priv_bytes} ws_bytes={ws_bytes} handles={handles} sys_avail_mb={sys_avail_mb} sys_busy_pct={busy}")
+}
+
+/// Reads the per-process counters and the system's free memory, plus the busy
+/// percent already published in `snapshot`. A failed counter call yields 0 for
+/// its own field only; the line is never skipped and never a silent partial.
+fn soak_resources_sample(
+    snapshot: &Snapshot,
+    now: Instant,
+    process_epoch: Instant,
+) -> SoakResourcesSample {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentProcessId, GetProcessHandleCount, GetProcessTimes,
+    };
+
+    let sys_busy_pct = snapshot
+        .readings
+        .lookup(MetricKey::CPUUtilization, "cpu-system")
+        .map(|reading| reading.number)
+        .filter(|value| value.is_finite());
+    let pid = unsafe { GetCurrentProcessId() };
+    let mut cpu_s = 0.0;
+    let mut handles = 0;
+    let mut priv_bytes = 0;
+    let mut ws_bytes = 0;
+    let mut sys_avail_mb = 0;
+    unsafe {
+        let process = GetCurrentProcess();
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        if GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user).is_ok() {
+            let units =
+                |time: &FILETIME| ((time.dwHighDateTime as u64) << 32) | time.dwLowDateTime as u64;
+            cpu_s = (units(&kernel) + units(&user)) as f64 / 1e7;
+        }
+        let mut count = 0u32;
+        if GetProcessHandleCount(process, &mut count).is_ok() {
+            handles = u64::from(count);
+        }
+        let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+            ..Default::default()
+        };
+        if K32GetProcessMemoryInfo(
+            process,
+            &mut counters as *mut PROCESS_MEMORY_COUNTERS_EX as *mut _,
+            counters.cb,
+        )
+        .as_bool()
+        {
+            priv_bytes = counters.PrivateUsage as u64;
+            ws_bytes = counters.WorkingSetSize as u64;
+        }
+        let mut status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        if GlobalMemoryStatusEx(&mut status).is_ok() {
+            sys_avail_mb = status.ullAvailPhys / 1_048_576;
+        }
+    }
+    SoakResourcesSample {
+        pid,
+        uptime_s: now.duration_since(process_epoch).as_secs(),
+        cpu_s,
+        priv_bytes,
+        ws_bytes,
+        handles,
+        sys_avail_mb,
+        sys_busy_pct,
+    }
 }
 
 fn proc_hang_owner(slots: &Manager) -> Option<usize> {
@@ -3214,5 +3352,103 @@ mod tests {
                 "a first sample is a real zero delta, so it stays valid"
             );
         }
+    }
+
+    /// The schema line, byte-exact, on both `sys_busy_pct` paths.
+    #[test]
+    fn soak_resources_line_renders_exact_schema_with_none_busy() {
+        let sample = SoakResourcesSample {
+            pid: 4242,
+            uptime_s: 3600,
+            cpu_s: 12.5,
+            priv_bytes: 1_048_576,
+            ws_bytes: 2_097_152,
+            handles: 99,
+            sys_avail_mb: 8_192,
+            sys_busy_pct: Some(37.5),
+        };
+        assert_eq!(
+            soak_resources_line(&sample),
+            "soak-resources: pid=4242 uptime_s=3600 cpu_s=12.50 priv_bytes=1048576 ws_bytes=2097152 handles=99 sys_avail_mb=8192 sys_busy_pct=37.5"
+        );
+        assert_eq!(
+            soak_resources_line(&SoakResourcesSample {
+                sys_busy_pct: None,
+                ..sample
+            }),
+            "soak-resources: pid=4242 uptime_s=3600 cpu_s=12.50 priv_bytes=1048576 ws_bytes=2097152 handles=99 sys_avail_mb=8192 sys_busy_pct=none"
+        );
+    }
+
+    /// Behavioral: the gate predicate fires at the 60 s boundary and never
+    /// earlier. The loop wiring (the tracker seeded at start + the single gate
+    /// site) is structural and pinned by
+    /// `soak_resources_source_pin_of_60s_constant_and_single_emit_site`: the
+    /// app loop has no time seam, it uses `Instant`, not an injected clock.
+    #[test]
+    fn soak_resources_cadence_gate_fires_at_60s_never_earlier() {
+        for below in [
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_millis(59_999),
+            Duration::from_nanos(59_999_999_999),
+        ] {
+            assert!(!soak_resources_due(below), "must not fire at {below:?}");
+        }
+        for at_or_above in [
+            Duration::from_secs(60),
+            Duration::from_millis(60_001),
+            Duration::from_secs(3_600),
+        ] {
+            assert!(
+                soak_resources_due(at_or_above),
+                "must fire at {at_or_above:?}"
+            );
+        }
+    }
+
+    /// Structural pin, the TEL-B `include_str!` occurrence-count form, sliced at
+    /// `mod tests` so the pin's own quoted literals cannot self-count. It pins:
+    /// the 60 s constant exactly once, one cadence predicate, one schema
+    /// formatter body, one key-order format string, and exactly one emit call
+    /// site. Renaming a schema key, changing 60, duplicating the formatter or
+    /// removing/duplicating the emit call breaks an assert.
+    #[test]
+    fn soak_resources_source_pin_of_60s_constant_and_single_emit_site() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let production = source.split("mod tests {").next().unwrap_or_default();
+        assert_eq!(
+            production
+                .matches("const SOAK_RESOURCES_INTERVAL_SECS: u64 = 60;")
+                .count(),
+            1,
+            "the 60 s constant exists exactly once"
+        );
+        assert_eq!(
+            production.matches("fn soak_resources_due(").count(),
+            1,
+            "one cadence predicate"
+        );
+        assert_eq!(
+            production
+                .matches("fn soak_resources_line(sample: &SoakResourcesSample)")
+                .count(),
+            1,
+            "one schema formatter body"
+        );
+        assert_eq!(
+            production
+                .matches("soak-resources: pid={pid} uptime_s={uptime_s} cpu_s=")
+                .count(),
+            1,
+            "the key order lives in exactly one format string"
+        );
+        assert_eq!(
+            production
+                .matches("crate::log_info!(\"{}\", soak_resources_line(&sample));")
+                .count(),
+            1,
+            "exactly one emit call site in the loop"
+        );
     }
 }
