@@ -1927,8 +1927,29 @@ mod tests {
         assert_eq!(pinned.dll.identity.links, 1);
     }
 
+    /// WO-QA-06 conversion of the Q-4 residue (WO-QA-04 R2 case H + the sibling sites
+    /// `2015:9`/`2056:9`): `CIRCUIT_OPEN` and `SDK_OWNER_ACTIVE` are suite-global production
+    /// statics, and the three tests below are the ONLY test-region writers. libtest runs them
+    /// on parallel threads, so a sibling's `store(false)` can land between production's
+    /// `store(true)` (1381) and this family's `circuit_open()` reads - WO-QA-06 measured it
+    /// live: 15% of 32-way-load windows, the registered site `1964:9` fired under load, 0% at
+    /// suite density (chain 5/189). The guard serializes the three scenarios: while one runs,
+    /// no sibling mutates the statics, so every read observes the value its own scenario
+    /// produced. Assertions, the 1 ms bound and the driven gates stay verbatim.
+    static CIRCUIT_SCENARIO_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The guard is taken at the scenario head and released when the test body returns. A
+    /// sibling panic poisons the lock; that panic is already the suite's red, so the survivor
+    /// proceeds on the inner value - loud, never a silent green.
+    fn circuit_scenario_guard() -> std::sync::MutexGuard<'static, ()> {
+        CIRCUIT_SCENARIO_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn unreturning_owner_opens_the_circuit_without_borrowed_data() {
+        let _guard = circuit_scenario_guard();
         CIRCUIT_OPEN.store(false, Ordering::Release);
         let (requests, receiver) = mpsc::sync_channel(1);
         // WO-QA-04 driven time: the owner's stall is a gate, not wall clock.
@@ -2006,6 +2027,7 @@ mod tests {
 
     #[test]
     fn open_refused_while_the_circuit_is_open_names_circuit_open() {
+        let _guard = circuit_scenario_guard();
         CIRCUIT_OPEN.store(true, Ordering::Release);
         let owner = LCore {
             path: PathBuf::from(r"C:\fixture\Logitech Gaming Software\LCore.exe"),
@@ -2018,6 +2040,7 @@ mod tests {
 
     #[test]
     fn stalled_owned_discovery_opens_circuit_and_blocks_overlap() {
+        let _guard = circuit_scenario_guard();
         CIRCUIT_OPEN.store(false, Ordering::Release);
         SDK_OWNER_ACTIVE.store(false, Ordering::Release);
         claim_sdk_owner().unwrap();
