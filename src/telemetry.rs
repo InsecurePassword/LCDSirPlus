@@ -1153,6 +1153,7 @@ fn spawn_headset(
     consumers: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     tx: mpsc::SyncSender<SlowEvent>,
+    query: fn(Duration) -> Result<headset::Status, String>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("telemetry-headset".into())
@@ -1179,10 +1180,7 @@ fn spawn_headset(
                         last_attempt = Some(now);
                         if !send_slow(
                             &tx,
-                            SlowEvent::Headset(
-                                generation,
-                                headset::query(cfg.headset_query_timeout),
-                            ),
+                            SlowEvent::Headset(generation, query(cfg.headset_query_timeout)),
                         ) {
                             return;
                         }
@@ -1194,6 +1192,15 @@ fn spawn_headset(
         .expect("headset telemetry thread")
 }
 
+// The LHM sampler's fn-pointer type is factored into an alias: four parameters plus a tuple
+// result trip clippy's `type_complexity` lint inline, and a suppression is not permitted.
+type LhmSampler = fn(
+    &str,
+    &std::collections::BTreeMap<String, String>,
+    &lhm::ExtendedSelectors,
+    Duration,
+) -> Result<(lhm::ExtendedSample, SystemTime), String>;
+
 fn spawn_lhm(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
@@ -1201,6 +1208,7 @@ fn spawn_lhm(
     shutdown: Arc<AtomicBool>,
     temps_need_refresh: Arc<AtomicBool>,
     tx: mpsc::SyncSender<SlowEvent>,
+    sample: LhmSampler,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("telemetry-lhm".into())
@@ -1226,7 +1234,7 @@ fn spawn_lhm(
                         sampling_interval(&cfg, consumers.load(Ordering::Relaxed), "lhm", full);
                     if due(last_attempt, interval, now) {
                         last_attempt = Some(now);
-                        let result = lhm::sample_extended(
+                        let result = sample(
                             url,
                             &cfg.lhm_sensors,
                             &lhm_selectors(&cfg),
@@ -1251,6 +1259,7 @@ fn spawn_hwinfo(
     consumers: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     tx: mpsc::SyncSender<SlowEvent>,
+    sample: fn(&hwinfo::Selectors, Duration) -> Result<hwinfo::Sample, String>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("telemetry-hwinfo".into())
@@ -1274,7 +1283,7 @@ fn spawn_hwinfo(
                     if due(last_attempt, interval, now) {
                         last_attempt = Some(now);
                         let selectors = hwinfo_selectors(&cfg);
-                        let result = hwinfo::sample(&selectors, cfg.hwinfo_stale_after);
+                        let result = sample(&selectors, cfg.hwinfo_stale_after);
                         if !send_slow(&tx, SlowEvent::Hwinfo(generation, selectors, result)) {
                             return;
                         }
@@ -1474,12 +1483,19 @@ fn derive_fan_percent(
     }
 }
 
+// Seam adapter for the GPU loop: its sampler is a method on the loop-owned stateful
+// `gpu::Provider`, so the fn-pointer seam takes the provider as an argument. Byte-equal body.
+fn gpu_sample(provider: &mut gpu::Provider, selector: &str) -> Result<gpu::Sample, String> {
+    provider.sample(selector)
+}
+
 fn spawn_gpu(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
     consumers: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     tx: mpsc::SyncSender<SlowEvent>,
+    sample: fn(&mut gpu::Provider, &str) -> Result<gpu::Sample, String>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("telemetry-gpu".into())
@@ -1505,7 +1521,7 @@ fn spawn_gpu(
                         last_attempt = Some(now);
                         if !send_slow(
                             &tx,
-                            SlowEvent::Gpu(generation, provider.sample(&cfg.gpu_provider)),
+                            SlowEvent::Gpu(generation, sample(&mut provider, &cfg.gpu_provider)),
                         ) {
                             return;
                         }
@@ -1535,6 +1551,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
         Arc::clone(&consumers),
         Arc::clone(&shutdown),
         slow_tx.clone(),
+        headset::query,
     )];
     threads.push(spawn_lhm(
         Arc::clone(&config),
@@ -1543,6 +1560,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
         Arc::clone(&shutdown),
         Arc::clone(&temps_need_refresh),
         slow_tx.clone(),
+        lhm::sample_extended,
     ));
     threads.push(spawn_gpu(
         Arc::clone(&config),
@@ -1550,6 +1568,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
         Arc::clone(&consumers),
         Arc::clone(&shutdown),
         slow_tx.clone(),
+        gpu_sample,
     ));
     threads.push(spawn_hwinfo(
         Arc::clone(&config),
@@ -1557,6 +1576,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
         Arc::clone(&consumers),
         Arc::clone(&shutdown),
         slow_tx.clone(),
+        hwinfo::sample,
     ));
     let (presentmon_rx, presentmon_thread) = presentmon::spawn(
         Arc::clone(&config),
@@ -1648,6 +1668,9 @@ pub fn spawn(cfg: &Config) -> Telemetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::OnceLock;
 
     #[test]
     fn auto_lhm_url_resolves_and_off_disables() {
@@ -2907,22 +2930,21 @@ mod tests {
     /// branch -> `due` cadence gate; and that the emitted `SlowEvent` carries the loop's
     /// own generation.
     ///
-    /// This is a structural inspection of production source (the EC-8/EC-5 `include_str!`
-    /// pin pattern), NOT a behavioral driver: the loops' sampling arms call live device
-    /// APIs (`headset::query`, `lhm::sample_extended`, `hwinfo::sample`,
-    /// `gpu::Provider::sample`) with real `Instant::now()` + `TICK` sleeps, and no
-    /// hardware-free seam executes them (see the seam map in the WO-TEL-B receipt), so
-    /// production-sensitive BEHAVIORAL coverage of the reset is a documented gap, not a
-    /// claim of this test.
+    /// This test is a structural inspection of production source (the EC-8/EC-5 `include_str!`
+    /// pin pattern). The headset `SlowEvent::Headset(generation, ..)` token below is the shipped
+    /// one-line form after the WO-TEL-C sampler seam (rustfmt collapsed the shortened call); the
+    /// structural claims are unchanged. Production-sensitive BEHAVIORAL coverage of the same
+    /// reset now exists on the real loops, through the WO-TEL-C injected-sampler seams:
+    /// `telemetry_headset_loop_behavioral_generation_bump_rearms_sampling`,
+    /// `telemetry_lhm_loop_behavioral_generation_bump_rearms_sampling`,
+    /// `telemetry_hwinfo_loop_behavioral_generation_bump_rearms_sampling`,
+    /// `telemetry_gpu_loop_behavioral_generation_bump_rearms_sampling`.
     #[test]
     fn telemetry_sampling_loops_clear_cadence_only_on_generation_change() {
         const READ: &str = "let (generation, cfg) = current_request(&config, &generation);";
         const BRANCH: &str = "if generation != last_generation {\n                    last_generation = generation;\n                    last_attempt = None;\n                }";
         for (fn_head, event) in [
-            (
-                "fn spawn_headset(",
-                "SlowEvent::Headset(\n                                generation,",
-            ),
+            ("fn spawn_headset(", "SlowEvent::Headset(generation,"),
             ("fn spawn_lhm(", "SlowEvent::Lhm(generation,"),
             ("fn spawn_hwinfo(", "SlowEvent::Hwinfo(generation,"),
             ("fn spawn_gpu(", "SlowEvent::Gpu(generation,"),
@@ -2965,5 +2987,753 @@ mod tests {
                 "{fn_head}: the published event carries the loop's own generation"
             );
         }
+    }
+    // WO-TEL-C: BEHAVIORAL coverage of the four sampling loops' generation re-arm, driven on the
+    // REAL production loop bodies through the fn-pointer sampler seams (the four injected samplers
+    // named as the minimal seam in WO-TEL-B §8). Shared machinery first, then one behavioral test
+    // per loop. In every test the shipped `spawn_*` loop runs on its own thread and ONLY the
+    // sampler is injected (a scripted fn performing zero device I/O, proved by
+    // `assert_injected_sampler_is_io_free`): the loop head, the `current_request` generation read,
+    // the WO-TEL-B generation tracker and branch clear, the `enabled` arm, the
+    // `sampling_interval`/`due` cadence gate, the `TICK` pacing and the `send_slow` publication
+    // are shipped production code, and every assertion runs on the REAL `SlowEvent` stream at the
+    // production `tx` receiver. Channel handshake: the sampler signals entry, then blocks until
+    // the test releases it (loud 5 s budget, never a hang). No `thread::sleep` in these tests:
+    // every budget is a bounded `recv_timeout`. Precedent: the WO-F3-NET network-worker slow probe
+    // (`src/providers/network.rs`, the `SlowProbe`/`install_slow_probe`/`block_in_probe` trio).
+
+    struct ScriptedSampler<R> {
+        enter: Sender<()>,
+        release: Mutex<Receiver<()>>,
+        outcomes: Mutex<VecDeque<R>>,
+    }
+
+    static HEADSET_BEHAVIORAL_SAMPLER: OnceLock<ScriptedSampler<Result<headset::Status, String>>> =
+        OnceLock::new();
+    static LHM_BEHAVIORAL_SAMPLER: OnceLock<
+        ScriptedSampler<Result<(lhm::ExtendedSample, SystemTime), String>>,
+    > = OnceLock::new();
+    static HWINFO_BEHAVIORAL_SAMPLER: OnceLock<ScriptedSampler<Result<hwinfo::Sample, String>>> =
+        OnceLock::new();
+    static GPU_BEHAVIORAL_SAMPLER: OnceLock<ScriptedSampler<Result<gpu::Sample, String>>> =
+        OnceLock::new();
+
+    /// "The real loop reached the next thing I drove it to" budget (the loop ticks every TICK).
+    const BEHAVIORAL_WAIT: Duration = Duration::from_secs(2);
+    /// The driven cadence for the config-driven loops (a test input to the real cadence gate).
+    const BEHAVIORAL_DRIVEN: Duration = Duration::from_millis(400);
+    /// A bounded multi-tick window in which a cadence-respecting loop must not enter the sampler.
+    const BEHAVIORAL_SUPPRESS_WINDOW: Duration = Duration::from_millis(250);
+    /// A cadence that cannot fall due inside a behavioral test, so any entry proves a clear.
+    const BEHAVIORAL_LONG: Duration = Duration::from_secs(30);
+    /// The HWiNFO loop's cadence is the shipped `EXTENDED_POLL` (1 s), so its mid-cadence bump
+    /// budget is half of that: an entry inside it proves the clear, not a due interval.
+    const BEHAVIORAL_HWINFO_HALF: Duration = Duration::from_millis(500);
+
+    fn install_scripted_sampler<R>(
+        slot: &'static OnceLock<ScriptedSampler<R>>,
+        outcomes: Vec<R>,
+    ) -> (Receiver<()>, Sender<()>) {
+        let (enter_tx, enter_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        assert!(
+            slot.set(ScriptedSampler {
+                enter: enter_tx,
+                release: Mutex::new(release_rx),
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+            })
+            .is_ok(),
+            "each scripted-sampler slot is installed exactly once (one behavioral test per slot)"
+        );
+        (enter_rx, release_tx)
+    }
+
+    fn sampled_in_slot<R>(slot: &OnceLock<ScriptedSampler<R>>) -> R {
+        let sampler = slot
+            .get()
+            .expect("the test installs the scripted sampler before spawning the real loop");
+        sampler
+            .enter
+            .send(())
+            .expect("the scripted sampler signals its entry to the test");
+        sampler
+            .release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the test releases the scripted sampler (loud 5 s budget, never a hang)");
+        sampler
+            .outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("the scripted Ok/Err sequence is not exhausted")
+    }
+
+    fn behavioral_headset_sampler(_timeout: Duration) -> Result<headset::Status, String> {
+        sampled_in_slot(&HEADSET_BEHAVIORAL_SAMPLER)
+    }
+
+    fn behavioral_lhm_sampler(
+        _url: &str,
+        _overrides: &std::collections::BTreeMap<String, String>,
+        _selectors: &lhm::ExtendedSelectors,
+        _timeout: Duration,
+    ) -> Result<(lhm::ExtendedSample, SystemTime), String> {
+        sampled_in_slot(&LHM_BEHAVIORAL_SAMPLER)
+    }
+
+    fn behavioral_hwinfo_sampler(
+        _selectors: &hwinfo::Selectors,
+        _max_age: Duration,
+    ) -> Result<hwinfo::Sample, String> {
+        sampled_in_slot(&HWINFO_BEHAVIORAL_SAMPLER)
+    }
+
+    fn behavioral_gpu_sampler(
+        _provider: &mut gpu::Provider,
+        _selector: &str,
+    ) -> Result<gpu::Sample, String> {
+        sampled_in_slot(&GPU_BEHAVIORAL_SAMPLER)
+    }
+
+    /// Zero-real-I/O proof for an injected sampler: the shipped text of the injected fn itself
+    /// carries no call-shaped token of a live provider entry point, HID, HTTP, socket, pipe,
+    /// shared-memory, GPU-library or process API. It touches only its scripted slot.
+    const INJECTED_SAMPLER_IO_TOKENS: [&str; 19] = [
+        "headset::query(",
+        "lhm::sample_extended(",
+        "hwinfo::sample(",
+        "gpu_sample(",
+        "provider.sample(",
+        "::new(",
+        "http::",
+        "crate::http",
+        "tcpstream",
+        "udpsocket",
+        "hidd_",
+        "hidapi",
+        "createfile",
+        "deviceiocontrol",
+        "readfile",
+        "writefile",
+        "nvapi",
+        "adlx",
+        "namedpipe",
+    ];
+
+    fn assert_injected_sampler_is_io_free(fn_name: &str) {
+        let source = include_str!("telemetry.rs").replace("\r\n", "\n");
+        let head = format!("fn {fn_name}(");
+        let start = source
+            .find(&head)
+            .expect("the injected sampler exists in the shipped source");
+        let close = "\n    }";
+        let rest = &source[start..];
+        let end = rest
+            .find(close)
+            .expect("the injected sampler is a braced fn in the tests region");
+        let body = rest[..end + close.len()].to_lowercase();
+        for token in INJECTED_SAMPLER_IO_TOKENS {
+            assert!(
+                !body.contains(token),
+                "the injected sampler `{fn_name}` must perform zero real I/O; found `{token}`"
+            );
+        }
+    }
+
+    fn headset_event(event: SlowEvent) -> (u64, Result<(bool, i32), String>) {
+        match event {
+            SlowEvent::Headset(generation, result) => (
+                generation,
+                result.map(|status| (status.online, status.percent)),
+            ),
+            _ => panic!("the headset loop published a non-headset event"),
+        }
+    }
+
+    fn lhm_event(event: SlowEvent) -> (u64, Result<SystemTime, String>) {
+        match event {
+            SlowEvent::Lhm(generation, result) => (generation, result.map(|(_, at)| at)),
+            _ => panic!("the LHM loop published a non-LHM event"),
+        }
+    }
+
+    fn hwinfo_event(event: SlowEvent) -> (u64, String, Result<(f64, SystemTime), String>) {
+        match event {
+            SlowEvent::Hwinfo(generation, selectors, result) => (
+                generation,
+                selectors.cpu_temp.sensor_label,
+                result.map(|sample| (sample.cpu_temp_c.unwrap_or_default(), sample.sampled_at)),
+            ),
+            _ => panic!("the HWiNFO loop published a non-HWiNFO event"),
+        }
+    }
+
+    fn gpu_event(event: SlowEvent) -> (u64, Result<(String, SystemTime), String>) {
+        match event {
+            SlowEvent::Gpu(generation, result) => (
+                generation,
+                result.map(|sample| (sample.backend, sample.sampled_at)),
+            ),
+            _ => panic!("the GPU loop published a non-GPU event"),
+        }
+    }
+
+    fn retune<T>(config: &Arc<RwLock<Config>>, change: T)
+    where
+        T: FnOnce(&mut Config),
+    {
+        let mut next = config.read().unwrap().clone();
+        change(&mut next);
+        *config.write().unwrap() = next;
+    }
+
+    fn marker_time(index: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(index)
+    }
+
+    /// BEHAVIORAL (WO-TEL-C) headset loop through the sampler seam. REAL code: the whole
+    /// `spawn_headset` body - loop head, generation read, WO-TEL-B tracker + conditional clear,
+    /// `enabled`, `sampling_interval`/`due` cadence gate, `TICK` pacing, `SlowEvent::Headset`
+    /// publication. INJECTED: only `behavioral_headset_sampler` (production `spawn` passes the
+    /// real `headset::query` in that slot). Proves on the real path: (i) sampler entered and `Ok`
+    /// published with the loop's generation and the scripted payload; (ii) with no bump the second
+    /// sample is suppressed until the driven interval passes; (iii) a mid-cadence generation bump
+    /// with the provider still enabled emits the next-tick sample (the WO-TEL-B §8 claim); (iv) an
+    /// `Err` sampler outcome is published with the correct generation.
+    #[test]
+    fn telemetry_headset_loop_behavioral_generation_bump_rearms_sampling() {
+        assert_injected_sampler_is_io_free("behavioral_headset_sampler");
+        let status = |online: bool, percent: i32| headset::Status {
+            online,
+            percent,
+            ..Default::default()
+        };
+        let (enter_rx, release_tx) = install_scripted_sampler(
+            &HEADSET_BEHAVIORAL_SAMPLER,
+            vec![
+                Ok(status(true, 100)),
+                Ok(status(true, 100)),
+                Ok(status(false, 33)),
+                Err("synthetic headset query failure".to_string()),
+            ],
+        );
+        let config = Arc::new(RwLock::new(Config {
+            headset_enabled: true,
+            headset_poll: BEHAVIORAL_DRIVEN,
+            headset_query_timeout: Duration::from_millis(1),
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(8);
+        let loop_thread = spawn_headset(
+            Arc::clone(&config),
+            Arc::clone(&generation),
+            Arc::new(AtomicU64::new(ALL_CONSUMERS)),
+            Arc::clone(&shutdown),
+            tx,
+            behavioral_headset_sampler,
+        );
+        let cadence_start = Instant::now();
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(i) the real headset loop sampled through the seam");
+        release_tx.send(()).expect("release #1");
+        let (gen1, payload1) = headset_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(i) the loop published SlowEvent::Headset"),
+        );
+        assert_eq!(gen1, 1, "(i) the first event carries the loop's generation");
+        assert_eq!(
+            payload1.expect("(i) the scripted Ok status is published"),
+            (true, 100),
+            "(i) the payload comes from the injected script, not a device read"
+        );
+        assert!(
+            enter_rx
+                .recv_timeout(BEHAVIORAL_SUPPRESS_WINDOW)
+                .is_err(),
+            "(ii) under an unchanged generation the loop must stay suppressed across at least {} TICKs of the {BEHAVIORAL_DRIVEN:?} cadence",
+            BEHAVIORAL_SUPPRESS_WINDOW.as_millis() / TICK.as_millis(),
+        );
+        enter_rx
+            .recv_timeout(BEHAVIORAL_DRIVEN + Duration::from_millis(600))
+            .expect("(ii) the second sample becomes due once the driven interval passes");
+        release_tx.send(()).expect("release #2");
+        let (gen2, payload2) = headset_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(ii) the due sample is published"),
+        );
+        assert_eq!(
+            gen2, 1,
+            "(ii) the cadence-respecting sample keeps the unchanged generation"
+        );
+        assert!(payload2.is_ok(), "(ii) the scripted Ok is published");
+        assert!(
+            cadence_start.elapsed() >= BEHAVIORAL_DRIVEN - 3 * TICK,
+            "(ii) the second sample arrived no earlier than the driven cadence, elapsed {:?}",
+            cadence_start.elapsed()
+        );
+        retune(&config, |cfg| cfg.headset_poll = BEHAVIORAL_LONG);
+        generation.fetch_add(1, Ordering::SeqCst);
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(iii) the generation bump cleared `last_attempt`, so the real loop samples on the next tick under a 30 s cadence");
+        release_tx.send(()).expect("release #3");
+        let (gen3, payload3) = headset_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(iii) the re-armed next-tick sample is published"),
+        );
+        assert_eq!(
+            gen3, 2,
+            "(iii) the re-armed sample is published on the new generation"
+        );
+        assert_eq!(
+            payload3.expect("(iii) the scripted Ok is published"),
+            (false, 33),
+            "(iii) the payload is the script's third outcome"
+        );
+        assert!(
+            enter_rx
+                .recv_timeout(BEHAVIORAL_SUPPRESS_WINDOW)
+                .is_err(),
+            "(iv) with the generation unchanged the loop keeps its cadence: an unconditional per-iteration clear would enter the sampler every tick"
+        );
+        generation.fetch_add(1, Ordering::SeqCst);
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(iv) the second bump re-arms the sampler");
+        release_tx.send(()).expect("release #4");
+        let (gen4, payload4) = headset_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(iv) the Err outcome is published on the loop's own tx stream"),
+        );
+        assert_eq!(
+            gen4, 3,
+            "(iv) the published Err carries the current generation"
+        );
+        assert_eq!(
+            payload4
+                .expect_err("(iv) the scripted Err is published as-is")
+                .as_str(),
+            "synthetic headset query failure",
+            "(iv) the failure text comes from the script"
+        );
+        shutdown.store(true, Ordering::Release);
+        loop_thread
+            .join()
+            .expect("the headset loop joins within the sampler's loud 5 s budget");
+    }
+
+    /// BEHAVIORAL (WO-TEL-C) LHM loop through the sampler seam. REAL code: the whole `spawn_lhm`
+    /// body - `lhm_url` gate, loop head, generation read, WO-TEL-B tracker + conditional clear,
+    /// the `lhm_mode`/`temps_need_refresh` interval selection, `sampling_interval`/`due`, `TICK`
+    /// pacing and `SlowEvent::Lhm` publication. INJECTED: only `behavioral_lhm_sampler`
+    /// (production passes the real `lhm::sample_extended`); the synthetic URL is never dialed, so
+    /// zero HTTP. Same four claims as the headset test, on the LHM event stream.
+    #[test]
+    fn telemetry_lhm_loop_behavioral_generation_bump_rearms_sampling() {
+        assert_injected_sampler_is_io_free("behavioral_lhm_sampler");
+        let (enter_rx, release_tx) = install_scripted_sampler(
+            &LHM_BEHAVIORAL_SAMPLER,
+            vec![
+                Ok((lhm::ExtendedSample::default(), marker_time(1))),
+                Ok((lhm::ExtendedSample::default(), marker_time(2))),
+                Ok((lhm::ExtendedSample::default(), marker_time(3))),
+                Err("synthetic LHM sample failure".to_string()),
+            ],
+        );
+        let config = Arc::new(RwLock::new(Config {
+            lhm_mode: "on".into(),
+            lhm_url: "http://127.0.0.1:1/synthetic-lhm-never-dialed".into(),
+            lhm_interval: BEHAVIORAL_DRIVEN,
+            lhm_stale_after: BEHAVIORAL_LONG,
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(8);
+        let loop_thread = spawn_lhm(
+            Arc::clone(&config),
+            Arc::clone(&generation),
+            Arc::new(AtomicU64::new(ALL_CONSUMERS)),
+            Arc::clone(&shutdown),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            behavioral_lhm_sampler,
+        );
+        let cadence_start = Instant::now();
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(i) the real LHM loop sampled through the seam");
+        release_tx.send(()).expect("release #1");
+        let (gen1, payload1) = lhm_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(i) the loop published SlowEvent::Lhm"),
+        );
+        assert_eq!(gen1, 1, "(i) the first event carries the loop's generation");
+        assert_eq!(
+            payload1.expect("(i) the scripted Ok sample is published"),
+            marker_time(1),
+            "(i) the payload timestamp comes from the injected script, not from LHM"
+        );
+        assert!(
+            enter_rx
+                .recv_timeout(BEHAVIORAL_SUPPRESS_WINDOW)
+                .is_err(),
+            "(ii) under an unchanged generation the LHM loop must stay suppressed across at least {} TICKs of the {BEHAVIORAL_DRIVEN:?} cadence",
+            BEHAVIORAL_SUPPRESS_WINDOW.as_millis() / TICK.as_millis(),
+        );
+        enter_rx
+            .recv_timeout(BEHAVIORAL_DRIVEN + Duration::from_millis(600))
+            .expect("(ii) the second sample becomes due once the driven interval passes");
+        release_tx.send(()).expect("release #2");
+        let (gen2, payload2) = lhm_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(ii) the due sample is published"),
+        );
+        assert_eq!(
+            gen2, 1,
+            "(ii) the cadence-respecting sample keeps the unchanged generation"
+        );
+        assert_eq!(
+            payload2.expect("(ii) the scripted Ok is published"),
+            marker_time(2),
+            "(ii) the payload is the script's second outcome"
+        );
+        assert!(
+            cadence_start.elapsed() >= BEHAVIORAL_DRIVEN - 3 * TICK,
+            "(ii) the second sample arrived no earlier than the driven cadence, elapsed {:?}",
+            cadence_start.elapsed()
+        );
+        retune(&config, |cfg| cfg.lhm_interval = BEHAVIORAL_LONG);
+        generation.fetch_add(1, Ordering::SeqCst);
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(iii) the generation bump cleared `last_attempt`, so the real LHM loop samples on the next tick under a 30 s cadence");
+        release_tx.send(()).expect("release #3");
+        let (gen3, payload3) = lhm_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(iii) the re-armed next-tick sample is published"),
+        );
+        assert_eq!(
+            gen3, 2,
+            "(iii) the re-armed sample is published on the new generation"
+        );
+        assert_eq!(
+            payload3.expect("(iii) the scripted Ok is published"),
+            marker_time(3),
+            "(iii) the payload is the script's third outcome"
+        );
+        assert!(
+            enter_rx
+                .recv_timeout(BEHAVIORAL_SUPPRESS_WINDOW)
+                .is_err(),
+            "(iv) with the generation unchanged the LHM loop keeps its cadence: an unconditional per-iteration clear would enter the sampler every tick"
+        );
+        generation.fetch_add(1, Ordering::SeqCst);
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(iv) the second bump re-arms the sampler");
+        release_tx.send(()).expect("release #4");
+        let (gen4, payload4) = lhm_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(iv) the Err outcome is published on the loop's own tx stream"),
+        );
+        assert_eq!(
+            gen4, 3,
+            "(iv) the published Err carries the current generation"
+        );
+        assert_eq!(
+            payload4
+                .expect_err("(iv) the scripted Err is published as-is")
+                .as_str(),
+            "synthetic LHM sample failure",
+            "(iv) the failure text comes from the script"
+        );
+        shutdown.store(true, Ordering::Release);
+        loop_thread
+            .join()
+            .expect("the LHM loop joins within the sampler's loud 5 s budget");
+    }
+
+    /// BEHAVIORAL (WO-TEL-C) HWiNFO loop through the sampler seam. REAL code: the whole
+    /// `spawn_hwinfo` body - `hwinfo_configured` gate, loop head, generation read, WO-TEL-B
+    /// tracker + conditional clear, the shipped `EXTENDED_POLL` cadence with
+    /// `sampling_interval`/`due`, `hwinfo_selectors` (its output is published with the event),
+    /// `TICK` pacing and `SlowEvent::Hwinfo` publication. INJECTED: only
+    /// `behavioral_hwinfo_sampler` (production passes the real `hwinfo::sample`), so the HWiNFO
+    /// shared-memory IPC is never touched.
+    #[test]
+    fn telemetry_hwinfo_loop_behavioral_generation_bump_rearms_sampling() {
+        assert_injected_sampler_is_io_free("behavioral_hwinfo_sampler");
+        let sample = |cpu_temp_c: f64, index: u64| hwinfo::Sample {
+            cpu_temp_c: Some(cpu_temp_c),
+            total_power_w: None,
+            cpu_package_power_w: None,
+            gpu_board_power_w: None,
+            issues: Vec::new(),
+            sampled_at: marker_time(index),
+        };
+        let (enter_rx, release_tx) = install_scripted_sampler(
+            &HWINFO_BEHAVIORAL_SAMPLER,
+            vec![
+                Ok(sample(11.0, 1)),
+                Ok(sample(22.0, 2)),
+                Ok(sample(33.0, 3)),
+                Err("synthetic HWiNFO sample failure".to_string()),
+            ],
+        );
+        let config = Arc::new(RwLock::new(Config {
+            hwinfo_cpu_temp_sensor: "CPU Exact".into(),
+            hwinfo_cpu_temp_reading: "Package Temperature".into(),
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(8);
+        let loop_thread = spawn_hwinfo(
+            Arc::clone(&config),
+            Arc::clone(&generation),
+            Arc::new(AtomicU64::new(ALL_CONSUMERS)),
+            Arc::clone(&shutdown),
+            tx,
+            behavioral_hwinfo_sampler,
+        );
+        let cadence_start = Instant::now();
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(i) the real HWiNFO loop sampled through the seam");
+        release_tx.send(()).expect("release #1");
+        let (gen1, selector, payload1) = hwinfo_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(i) the loop published SlowEvent::Hwinfo"),
+        );
+        assert_eq!(gen1, 1, "(i) the first event carries the loop's generation");
+        assert_eq!(
+            selector, "CPU Exact",
+            "(i) the published selector set is built by the real `hwinfo_selectors` from the live config"
+        );
+        assert_eq!(
+            payload1.expect("(i) the scripted Ok sample is published"),
+            (11.0, marker_time(1)),
+            "(i) the payload comes from the injected script, not from HWiNFO"
+        );
+        assert!(
+            enter_rx
+                .recv_timeout(BEHAVIORAL_HWINFO_HALF)
+                .is_err(),
+            "(ii) under an unchanged generation the HWiNFO loop must stay suppressed across at least {} TICKs of the shipped {EXTENDED_POLL:?} cadence",
+            BEHAVIORAL_HWINFO_HALF.as_millis() / TICK.as_millis(),
+        );
+        enter_rx
+            .recv_timeout(EXTENDED_POLL + Duration::from_millis(600))
+            .expect("(ii) the second sample becomes due once the shipped interval passes");
+        release_tx.send(()).expect("release #2");
+        let (gen2, _, payload2) = hwinfo_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(ii) the due sample is published"),
+        );
+        assert_eq!(
+            gen2, 1,
+            "(ii) the cadence-respecting sample keeps the unchanged generation"
+        );
+        assert_eq!(
+            payload2.expect("(ii) the scripted Ok is published"),
+            (22.0, marker_time(2)),
+            "(ii) the payload is the script's second outcome"
+        );
+        assert!(
+            cadence_start.elapsed() >= EXTENDED_POLL - 3 * TICK,
+            "(ii) the second sample arrived no earlier than the shipped cadence, elapsed {:?}",
+            cadence_start.elapsed()
+        );
+        generation.fetch_add(1, Ordering::SeqCst);
+        enter_rx
+            .recv_timeout(BEHAVIORAL_HWINFO_HALF)
+            .expect("(iii) the mid-cadence generation bump cleared `last_attempt`, so the real HWiNFO loop samples on the next tick, far inside its {EXTENDED_POLL:?} cadence");
+        release_tx.send(()).expect("release #3");
+        let (gen3, _, payload3) = hwinfo_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(iii) the re-armed next-tick sample is published"),
+        );
+        assert_eq!(
+            gen3, 2,
+            "(iii) the re-armed sample is published on the new generation"
+        );
+        assert_eq!(
+            payload3.expect("(iii) the scripted Ok is published"),
+            (33.0, marker_time(3)),
+            "(iii) the payload is the script's third outcome"
+        );
+        assert!(
+            enter_rx
+                .recv_timeout(BEHAVIORAL_HWINFO_HALF)
+                .is_err(),
+            "(iv) with the generation unchanged the HWiNFO loop keeps its cadence: an unconditional per-iteration clear would enter the sampler every tick"
+        );
+        generation.fetch_add(1, Ordering::SeqCst);
+        enter_rx
+            .recv_timeout(BEHAVIORAL_HWINFO_HALF)
+            .expect("(iv) the second bump re-arms the sampler");
+        release_tx.send(()).expect("release #4");
+        let (gen4, _, payload4) = hwinfo_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(iv) the Err outcome is published on the loop's own tx stream"),
+        );
+        assert_eq!(
+            gen4, 3,
+            "(iv) the published Err carries the current generation"
+        );
+        assert_eq!(
+            payload4
+                .expect_err("(iv) the scripted Err is published as-is")
+                .as_str(),
+            "synthetic HWiNFO sample failure",
+            "(iv) the failure text comes from the script"
+        );
+        shutdown.store(true, Ordering::Release);
+        loop_thread
+            .join()
+            .expect("the HWiNFO loop joins within the sampler's loud 5 s budget");
+    }
+
+    /// BEHAVIORAL (WO-TEL-C) GPU loop through the sampler seam. REAL code: the whole `spawn_gpu`
+    /// body - the loop-owned `gpu::Provider::new("off")` construction (inert: no backend open),
+    /// `enabled`, loop head, generation read, WO-TEL-B tracker + conditional clear,
+    /// `sampling_interval`/`due`, `TICK` pacing and `SlowEvent::Gpu` publication. INJECTED: only
+    /// `behavioral_gpu_sampler` in the slot where production `spawn` passes the `gpu_sample`
+    /// adapter (whose body is the shipped `provider.sample(selector)`); the injected sampler
+    /// ignores the provider, so no GPU library is loaded or called.
+    #[test]
+    fn telemetry_gpu_loop_behavioral_generation_bump_rearms_sampling() {
+        assert_injected_sampler_is_io_free("behavioral_gpu_sampler");
+        let sample = |backend: &str, index: u64| gpu::Sample {
+            backend: backend.into(),
+            readings: Vec::new(),
+            temperature: Metric::valid(11.0, marker_time(index)),
+            power_w: None,
+            sampled_at: marker_time(index),
+        };
+        let (enter_rx, release_tx) = install_scripted_sampler(
+            &GPU_BEHAVIORAL_SAMPLER,
+            vec![
+                Ok(sample("synthetic-injected-one", 1)),
+                Ok(sample("synthetic-injected-two", 2)),
+                Ok(sample("synthetic-injected-three", 3)),
+                Err("synthetic GPU sample failure".to_string()),
+            ],
+        );
+        let config = Arc::new(RwLock::new(Config {
+            gpu_provider: "nvapi".into(),
+            telemetry_interval: BEHAVIORAL_DRIVEN,
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(8);
+        let loop_thread = spawn_gpu(
+            Arc::clone(&config),
+            Arc::clone(&generation),
+            Arc::new(AtomicU64::new(ALL_CONSUMERS)),
+            Arc::clone(&shutdown),
+            tx,
+            behavioral_gpu_sampler,
+        );
+        let cadence_start = Instant::now();
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(i) the real GPU loop sampled through the seam");
+        release_tx.send(()).expect("release #1");
+        let (gen1, payload1) = gpu_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(i) the loop published SlowEvent::Gpu"),
+        );
+        assert_eq!(gen1, 1, "(i) the first event carries the loop's generation");
+        assert_eq!(
+            payload1.expect("(i) the scripted Ok sample is published"),
+            ("synthetic-injected-one".to_string(), marker_time(1)),
+            "(i) the backend name and timestamp come from the injected script, not a GPU backend"
+        );
+        assert!(
+            enter_rx
+                .recv_timeout(BEHAVIORAL_SUPPRESS_WINDOW)
+                .is_err(),
+            "(ii) under an unchanged generation the GPU loop must stay suppressed across at least {} TICKs of the {BEHAVIORAL_DRIVEN:?} cadence",
+            BEHAVIORAL_SUPPRESS_WINDOW.as_millis() / TICK.as_millis(),
+        );
+        enter_rx
+            .recv_timeout(BEHAVIORAL_DRIVEN + Duration::from_millis(600))
+            .expect("(ii) the second sample becomes due once the driven interval passes");
+        release_tx.send(()).expect("release #2");
+        let (gen2, payload2) = gpu_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(ii) the due sample is published"),
+        );
+        assert_eq!(
+            gen2, 1,
+            "(ii) the cadence-respecting sample keeps the unchanged generation"
+        );
+        assert_eq!(
+            payload2.expect("(ii) the scripted Ok is published"),
+            ("synthetic-injected-two".to_string(), marker_time(2)),
+            "(ii) the payload is the script's second outcome"
+        );
+        assert!(
+            cadence_start.elapsed() >= BEHAVIORAL_DRIVEN - 3 * TICK,
+            "(ii) the second sample arrived no earlier than the driven cadence, elapsed {:?}",
+            cadence_start.elapsed()
+        );
+        retune(&config, |cfg| cfg.telemetry_interval = BEHAVIORAL_LONG);
+        generation.fetch_add(1, Ordering::SeqCst);
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(iii) the generation bump cleared `last_attempt`, so the real GPU loop samples on the next tick under a 30 s cadence");
+        release_tx.send(()).expect("release #3");
+        let (gen3, payload3) = gpu_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(iii) the re-armed next-tick sample is published"),
+        );
+        assert_eq!(
+            gen3, 2,
+            "(iii) the re-armed sample is published on the new generation"
+        );
+        assert_eq!(
+            payload3.expect("(iii) the scripted Ok is published"),
+            ("synthetic-injected-three".to_string(), marker_time(3)),
+            "(iii) the payload is the script's third outcome"
+        );
+        assert!(
+            enter_rx
+                .recv_timeout(BEHAVIORAL_SUPPRESS_WINDOW)
+                .is_err(),
+            "(iv) with the generation unchanged the GPU loop keeps its cadence: an unconditional per-iteration clear would enter the sampler every tick"
+        );
+        generation.fetch_add(1, Ordering::SeqCst);
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(iv) the second bump re-arms the sampler");
+        release_tx.send(()).expect("release #4");
+        let (gen4, payload4) = gpu_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(iv) the Err outcome is published on the loop's own tx stream"),
+        );
+        assert_eq!(
+            gen4, 3,
+            "(iv) the published Err carries the current generation"
+        );
+        assert_eq!(
+            payload4
+                .expect_err("(iv) the scripted Err is published as-is")
+                .as_str(),
+            "synthetic GPU sample failure",
+            "(iv) the failure text comes from the script"
+        );
+        shutdown.store(true, Ordering::Release);
+        loop_thread
+            .join()
+            .expect("the GPU loop joins within the sampler's loud 5 s budget");
     }
 }
