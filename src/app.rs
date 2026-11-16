@@ -699,20 +699,27 @@ fn module_provider_consumers(module: &str) -> &'static [&'static str] {
     }
 }
 
-/// EC-3: the gated providers the fixed main-display bars read. Layout 1
-/// (`main_display 1`, the shipped default in `config.rs`) is the `dashboard`
-/// default arm in `src/render/renderer.rs` L215-232, which draws the `GPU ` and
-/// `VRAM` metric bars from `MetricKey::GPUUtilization`/`VRAMUtilization`; layout
-/// 2 is `main_display_2` L270-287 with the same two bars. Both are drawn in
-/// every frame of those layouts and only the native `gpu` provider emits those
-/// keys, so layouts 1 and 2 consume `gpu` whatever the slots and alerts show;
-/// layout 3 (`main_display_3` L312-356) draws CPU/RAM/NET bars only, so it
-/// consumes no gated provider.
-fn main_display_provider_consumers(main_display: i32) -> &'static [&'static str] {
-    match main_display {
-        3 => &[],
-        _ => &["gpu"],
-    }
+/// EC-3 + WO-TEL-D3-B1 (L1, core tier): the gated providers the fixed main-display bars read.
+/// Layout 1 (`main_display 1`, the shipped default in `config.rs`) is the `dashboard` default
+/// arm in `src/render/renderer.rs` L215-232, which draws the `GPU ` and `VRAM` metric bars from
+/// `MetricKey::GPUUtilization`/`VRAMUtilization`; layout 2 is `main_display_2` L270-287 with the
+/// same two bars. Both are drawn in every frame of those layouts and only the native `gpu`
+/// provider emits those keys, so layouts 1 and 2 consume `gpu` whatever the slots and alerts
+/// show. Layout 3 (`main_display_3` L312-356) draws CPU/RAM/NET bars only.
+///
+/// WO-TEL-D3-B1 (L1) SUPERSEDES the accepted WO-A1-03 F-1 layout arm `3 => &[]` (prior content =
+/// that arm + this doc's layout-3 sentence at `ec3df0d`; disposition =
+/// `WO-TEL-D3-A-AUDIT.md` §C4 DG-1 **ACCEPTED as the directive violation** + §10 ratification
+/// item 1, adopted by the manager into `WO-TEL-D3-B1.json` scope L1): GPU utilization and VRAM
+/// are **CORE** readings (the user directive, `HANDOFF.md` §2A), so the `gpu` bit is demanded
+/// under EVERY slot choice, layout 3 included. F-1's anti-starvation intent is preserved and
+/// strengthened: the rule that kept a bar-less layout from starving a provider now keeps it from
+/// starving a core reading. The 7-bit wire (`GATED_PROVIDERS`/`consumer_bit`/`ALL_CONSUMERS`),
+/// `provider_consumer_bits` (incl. the preview `ALL_CONSUMERS` early return), the loop gate
+/// `telemetry.rs:1723`, the backoff and the park arm stay byte-identical; the `gpu` demand
+/// VALUE is the whole change, so the GPU-bar protection for layouts 1/2 is untouched.
+fn main_display_provider_consumers(_main_display: i32) -> &'static [&'static str] {
+    &["gpu"]
 }
 
 /// EC-3: which gated providers have a consumer right now. Union of the fixed
@@ -1226,7 +1233,7 @@ fn build_snapshot(
 ) -> Snapshot {
     let now = SystemTime::now();
     let monotonic_now = Instant::now();
-    let clock = clock::read();
+    let clock = clock::read(&cfg.date_format);
     let per_lp = cpu_provider.update();
 
     let (cpu_dual, cache_load, freq_load) = if topology.dual {
@@ -3164,6 +3171,11 @@ mod tests {
         // main_display 3 draws no fixed GPU/VRAM bar, so this table pins the
         // slot/alert/preview contribution alone; the fixed-bar rule is covered
         // by `fixed_main_display_gpu_bars_keep_the_gpu_provider_consumed`.
+        // WO-TEL-D3-B1 (L1) PIN LOCKSTEP, DECLARED (not silent, no deletion): the layout-3
+        // baseline rows here asserted "every gated provider quiescent" and single-provider
+        // equalities. `gpu` is a CORE reading now, so the layout rule contributes the `gpu`
+        // bit in every row of this `main_display 3` fixture; the slot/alert/preview legs are
+        // byte-identical claims and stay exactly as shipped.
         let quiescent = Config {
             main_display: 3,
             temperature_warning_enabled: false,
@@ -3171,17 +3183,18 @@ mod tests {
             headset_enabled: false,
             ..Config::default()
         };
+        let gpu_bit = crate::telemetry::consumer_bit("gpu");
         assert_eq!(
             provider_consumer_bits(&idle, &quiescent, false),
-            0,
-            "no slot, alert or snapshot consumer => every gated provider quiescent"
+            gpu_bit,
+            "no slot, alert or snapshot consumer => every OPTIONAL provider quiescent; the core gpu demand rides the layout rule (WO-TEL-D3-B1 L1)"
         );
 
         let disk = slots_showing(["CLOCK", "DISK_IO", "CLOCK", "CLOCK"]);
         assert_eq!(
             provider_consumer_bits(&disk, &quiescent, false),
-            crate::telemetry::consumer_bit("performance"),
-            "DISK_IO consumes the performance provider"
+            crate::telemetry::consumer_bit("performance") | gpu_bit,
+            "DISK_IO consumes the performance provider (the core gpu demand is the L1 lockstep term)"
         );
         let temps = slots_showing(["CPU_TEMP", "GPU_TEMP", "THERMALS", "CLOCK"]);
         assert_eq!(
@@ -3227,13 +3240,18 @@ mod tests {
         };
         assert_eq!(
             provider_consumer_bits(&idle, &headset_alerts, false),
-            crate::telemetry::consumer_bit("headset")
+            crate::telemetry::consumer_bit("headset") | gpu_bit,
+            "an enabled headset alert keeps the headset provider consumed (L1 lockstep term: the core gpu demand rides the layout rule)"
         );
         let safe = Config {
             safe_mode: true,
             ..headset_alerts
         };
-        assert_eq!(provider_consumer_bits(&idle, &safe, false), 0);
+        assert_eq!(
+            provider_consumer_bits(&idle, &safe, false),
+            gpu_bit,
+            "L1 lockstep, DECLARED: the gated word is layout/slot/alert driven, so it carries the core gpu demand even under `safe_mode`; the provider parks because `enabled(cfg, \"gpu\")` is false under safe mode (`telemetry.rs:369-371`), and the shipped DG-4 exclusion row stays true (accepted: `safe_mode` stops gpu by design)"
+        );
         assert!(
             preview_surface_active(
                 false,
@@ -3254,8 +3272,9 @@ mod tests {
         // `VRAMUtilization` every frame, and only the native gpu provider emits
         // those keys, so the panel the user is watching is a gpu consumer and the
         // gate must not apply. Layout 3 (`main_display_3` L312-356) draws only
-        // CPU/RAM/NET bars, so it must not set the gpu bit (no over-coverage of
-        // the EC-3 saving).
+        // CPU/RAM/NET bars; WO-TEL-D3-B1 (L1) keeps the `gpu` bit set there too,
+        // because GPU utilization and VRAM are CORE readings (see the supersession
+        // note on the layout-3 leg below), so no layout starves a core reading.
         let idle = slots_showing(["CLOCK", "CLEAR", "CLOCK", "CLOCK"]);
         let quiescent = |main_display| Config {
             main_display,
@@ -3289,17 +3308,106 @@ mod tests {
                 "the visible GPU/VRAM bars keep the configured gpu cadence"
             );
         }
+        // WO-TEL-D3-B1 (L1) SUPERSESSION of the WO-A1-03 F-1 layout-3 leg, DECLARED here and in
+        // the receipt (prior content of these two asserts, quoted verbatim at `ec3df0d`:
+        // `assert_eq!(bits & gpu_bit, 0, "layout 3 draws no GPU/VRAM bar, so gpu stays gated");`
+        // and `assert!(sampling_interval(&cfg, bits, "gpu", cfg.telemetry_interval)
+        // > cfg.telemetry_interval, "layout 3 keeps the EC-3 quiescence saving");`).
+        // Rationale: `WO-TEL-D3-A-AUDIT.md` §C4 DG-1 ruled the clear a directive violation
+        // (GPU utilization + VRAM stop), §10 ratified LAZY-1 into D3-B1. The layout-1/2 legs
+        // above stay byte-identical, and the "no over-coverage" concern is answered by the P2
+        // leg: the core demand keeps gpu at the CONFIGURED cadence, never faster.
         let cfg = quiescent(3);
         let bits = provider_consumer_bits(&idle, &cfg, false);
         assert_eq!(
+            bits, gpu_bit,
+            "layout 3 keeps the CORE gpu demand (GPU utilization + VRAM are core readings); the optional providers stay quiescent"
+        );
+        assert_eq!(
+            crate::telemetry::sampling_interval(&cfg, bits, "gpu", cfg.telemetry_interval),
+            cfg.telemetry_interval,
+            "the core demand samples at the configured cadence: core-always never accelerates the gpu loop (P2)"
+        );
+    }
+
+    /// WO-TEL-D3-B1 (L1, core tier) RED-FIRST falsifier of DG-1. GPU utilization and VRAM are
+    /// CORE readings (user directive + `HANDOFF.md` §2A), so the `gpu` consumer bit is set by
+    /// the layout rule for EVERY layout, including layout 3, which draws no GPU/VRAM bar. At
+    /// `ec3df0d` the rule was `3 => &[]` (the accepted WO-A1-03 F-1 anti-starvation shape), so
+    /// a layout-3 panel cleared the bit and the gpu loop parked (`telemetry.rs:1723` gate =>
+    /// `1740-1743` park), stopping BOTH core readings = the ratified directive violation.
+    /// This test fails at that baseline and passes on the always-demanded rule.
+    ///
+    /// The cadence leg is the P2 preservation proof: core-always demand must NOT accelerate
+    /// the gpu sampler - a demanded provider samples at exactly `telemetry_interval`.
+    #[test]
+    fn core_gpu_and_vram_are_demanded_under_every_layout() {
+        let idle = slots_showing(["CLOCK", "CLEAR", "CLOCK", "CLOCK"]);
+        let core_off = |main_display| Config {
+            main_display,
+            temperature_warning_enabled: false,
+            memory_warning_enabled: false,
+            headset_enabled: false,
+            ..Config::default()
+        };
+        let gpu_bit = crate::telemetry::consumer_bit("gpu");
+        assert_ne!(gpu_bit, 0, "gpu is a gated provider");
+        for main_display in [1, 2, 3] {
+            let cfg = core_off(main_display);
+            let bits = provider_consumer_bits(&idle, &cfg, false);
+            assert_ne!(
+                bits & gpu_bit,
+                0,
+                "layout {main_display} keeps the gpu provider DEMANDED: GPU utilization and VRAM are core readings, sampled under every slot choice"
+            );
+            assert_eq!(
+                crate::telemetry::sampling_interval(&cfg, bits, "gpu", cfg.telemetry_interval),
+                cfg.telemetry_interval,
+                "layout {main_display} samples gpu at the configured cadence - core-always never accelerates it"
+            );
+            let word = bits | provider_demand_bits(&slots_current(&idle), &idle, &cfg);
+            assert_ne!(
+                word & gpu_bit,
+                0,
+                "the word the app PUBLISHES (gated | demand, `app.rs:186-192`/`328-333`) carries the core gpu demand under layout {main_display}"
+            );
+        }
+        // The optional-off shape: every optional provider disabled, preview hidden (a connected
+        // panel), gpu capability present. The core demand must survive a fully-lazy config.
+        let lazy_off = Config {
+            main_display: 3,
+            gpu_provider: "auto".into(),
+            presentmon_enabled: false,
+            controller_enabled: false,
+            audio_enabled: false,
+            discord_enabled: false,
+            network_probe_enabled: false,
+            lhm_mode: "off".into(),
+            headset_enabled: false,
+            temperature_warning_enabled: false,
+            memory_warning_enabled: false,
+            ..Config::default()
+        };
+        let bits = provider_consumer_bits(&idle, &lazy_off, false);
+        assert_ne!(
             bits & gpu_bit,
             0,
-            "layout 3 draws no GPU/VRAM bar, so gpu stays gated"
+            "a config with every OPTIONAL provider off keeps the gpu core demand"
+        );
+        assert_eq!(
+            provider_demand_bits(&slots_current(&idle), &idle, &lazy_off),
+            crate::telemetry::extended_consumer_bit("net"),
+            "L1 touches the gated word only: the extended (reading-keyed) demand word keeps the shipped layout rule (net bars), so the presentmon/audio/controller/netif parks stay byte-identical"
         );
         assert!(
-            crate::telemetry::sampling_interval(&cfg, bits, "gpu", cfg.telemetry_interval)
-                > cfg.telemetry_interval,
-            "layout 3 keeps the EC-3 quiescence saving"
+            !preview_surface_active(
+                false,
+                &lazy_off,
+                &BackendState::Connected {
+                    kind: BackendKind::Sdk
+                }
+            ),
+            "the proof shape is reachable with the preview hidden (the demand is not preview-carried)"
         );
     }
 

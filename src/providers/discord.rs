@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -2146,9 +2146,46 @@ fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(Duration::from_secs(30))
 }
 
+/// WO-TEL-D3-B1 (L3): the module's copy of the shipped generation-guarded request read
+/// (`telemetry.rs:202-240`, production twin `providers/presentmon.rs:1262-1274`). A 100 ms park
+/// iteration under an unchanged generation reuses the cached `Arc<Config>` (one refcount bump)
+/// instead of cloning the whole `Config` — the ~10 full clones/s the D3-A census measured at
+/// `discord_client_id ""` (§A3.2) drop to zero — and the fresh path IS the shipped `SeqCst`
+/// before/after pairing, so the cached value belongs to the generation reported with it. The
+/// accepted content-driven re-arm (`session_config_changed`) and the config gate predicate
+/// (`provider_enabled`) are untouched.
+fn current_config(config: &RwLock<Config>) -> Config {
+    config.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn current_request(config: &RwLock<Config>, generation: &AtomicU64) -> (u64, Config) {
+    loop {
+        let before = generation.load(Ordering::SeqCst);
+        let config = current_config(config);
+        if before == generation.load(Ordering::SeqCst) {
+            return (before, config);
+        }
+    }
+}
+
+fn cached_request(
+    config: &RwLock<Config>,
+    generation: &AtomicU64,
+    cache: &mut (u64, Arc<Config>),
+) -> (u64, Arc<Config>) {
+    let before = generation.load(Ordering::SeqCst);
+    if before == cache.0 && before != 0 && generation.load(Ordering::SeqCst) == before {
+        return (before, Arc::clone(&cache.1));
+    }
+    let (generation, config) = current_request(config, generation);
+    *cache = (generation, Arc::new(config));
+    (generation, Arc::clone(&cache.1))
+}
+
 pub struct Runtime {
     pub updates: mpsc::Receiver<DiscordState>,
     config: Arc<RwLock<Config>>,
+    generation: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -2156,6 +2193,10 @@ pub struct Runtime {
 impl Runtime {
     pub fn update_config(&self, config: &Config) {
         *self.config.write().unwrap_or_else(|e| e.into_inner()) = config.clone();
+        // WO-TEL-D3-B1 (L3): the write-then-bump pairing of the D2-accepted
+        // `Telemetry::update_config` machinery, which is what invalidates the worker's
+        // `cached_request` copy; the re-arm bound stays the loop's own 100 ms park iteration.
+        self.generation.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -2170,10 +2211,17 @@ impl Drop for Runtime {
 
 pub fn spawn(config: &Config) -> Runtime {
     let shared = Arc::new(RwLock::new(config.clone()));
+    // WO-TEL-D3-B1 (L3): the generation the cached request read is keyed on; `update_config`
+    // bumps it after every write (the D2-accepted pairing). It starts at 1, like `Telemetry`'s.
+    let generation = Arc::new(AtomicU64::new(1));
     let shutdown = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let worker_config = shared.clone();
+    let worker_generation = generation.clone();
     let worker_shutdown = shutdown.clone();
+    // The cache seed: the `Config` `spawn` received, as an `Arc` the worker owns (the shipped
+    // loops seed their cache the same way, from `current_config`).
+    let seed = Arc::new(config.clone());
     let thread = std::thread::Builder::new()
         .name("lcdsirplus-discord".into())
         .spawn(move || {
@@ -2181,21 +2229,31 @@ pub fn spawn(config: &Config) -> Runtime {
             let latest = Mutex::new(DiscordState::default());
             let token_owner = TokenExchangeOwner::default();
             let mut backoff = Duration::from_secs(1);
+            let mut request = (0u64, seed);
+            // WO-TEL-D3-B1 (L4): the parked disabled state is published ONCE per park
+            // transition, on the first parked iteration, using the shipped `disabled_published`
+            // flag shape (`providers/network.rs:210` + `241-253`,
+            // `providers/hang.rs:844` + `898-915`); the 100 ms park sleep and the backoff reset
+            // stay byte-identical, so the loop is never a busy loop and the accepted config
+            // gate (`provider_enabled`) is untouched.
+            let mut parked_published = false;
             while !worker_shutdown.load(Ordering::Relaxed) {
-                let config = worker_config
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+                let (_request_generation, config) =
+                    cached_request(&worker_config, &worker_generation, &mut request);
                 if !provider_enabled(&config) {
-                    state = unavailable(&state, "disabled");
-                    let _ = tx.send(state.clone());
+                    if !parked_published {
+                        parked_published = true;
+                        state = unavailable(&state, "disabled");
+                        let _ = tx.send(state.clone());
+                    }
                     std::thread::sleep(Duration::from_millis(100));
                     backoff = Duration::from_secs(1);
                     continue;
                 }
+                parked_published = false;
                 let started = Instant::now();
                 let result = connect_and_serve(
-                    config.clone(),
+                    (*config).clone(),
                     &worker_config,
                     &worker_shutdown,
                     &tx,
@@ -2241,6 +2299,7 @@ pub fn spawn(config: &Config) -> Runtime {
     Runtime {
         updates: rx,
         config: shared,
+        generation,
         shutdown,
         thread: Some(thread),
     }
@@ -3345,6 +3404,106 @@ mod tests {
         assert!(
             !provider_enabled(&safe),
             "safe mode stays the shipped kill switch"
+        );
+    }
+
+    /// WO-TEL-D3-B1 (L3) STRUCTURAL pin of the parked-loop config read, following the shipped
+    /// needle pattern `telemetry.rs::telemetry_loops_read_a_cached_request_under_an_unchanged_generation`
+    /// (and the production twin `providers/presentmon.rs:1262`). Proves: exactly ONE cached
+    /// loop-head read, ZERO full-`Config` clone sites in the worker body (the ~10/s clone stream
+    /// is gone), the cache seeded at the loop head, and the generation bump inside
+    /// `Runtime::update_config` AFTER the write (the D2-accepted pairing). The harness-count is
+    /// printed for the receipt. The accepted config gate (`provider_enabled`) stays byte-identical.
+    #[test]
+    fn discord_park_loop_head_reads_a_cached_arc_config() {
+        let source = include_str!("discord.rs").replace("\r\n", "\n");
+        let head = source
+            .find("pub fn spawn(config: &Config) -> Runtime {")
+            .expect("the shipped worker spawn exists");
+        let tail = source
+            .find(".expect(\"spawn Discord worker\")")
+            .expect("the shipped worker thread closes the loop");
+        assert!(
+            tail > head,
+            "the worker body sits between the spawn signature and its thread handle"
+        );
+        let loop_src = &source[head..tail];
+        let full_clone = "let config = worker_config\n                    .read()\n                    .unwrap_or_else(|e| e.into_inner())\n                    .clone();";
+        let clones = loop_src.matches(full_clone).count();
+        let cached = loop_src
+            .matches("cached_request(&worker_config, &worker_generation, &mut request);")
+            .count();
+        println!("D3B1-L3 harness-count: worker-loop full-Config clone sites = {clones}, cached loop-head reads = {cached}");
+        assert_eq!(
+            clones, 0,
+            "L3: the parked loop performs ZERO full-Config clones per iteration (~10/s removed)"
+        );
+        assert_eq!(
+            cached, 1,
+            "L3: exactly one cached loop-head request read (the shipped `cached_request` shape)"
+        );
+        assert!(
+            loop_src.contains("let seed = Arc::new(config.clone());")
+                && loop_src.contains("let mut request = (0u64, seed);"),
+            "L3: the cache is seeded from the `Config` `spawn` received (an `Arc` the worker owns), exactly as the shipped loops seed from `current_config`"
+        );
+        let impl_head = source
+            .find("impl Runtime {")
+            .expect("the shipped Runtime impl exists");
+        let impl_tail = source
+            .find("impl Drop for Runtime {")
+            .expect("the shipped Drop impl exists");
+        let runtime_src = &source[impl_head..impl_tail];
+        assert!(
+            runtime_src.contains("self.generation.fetch_add(1, Ordering::SeqCst);"),
+            "L3: `update_config` bumps the generation AFTER the write (the D2-accepted cached_request/update_config machinery pattern)"
+        );
+        assert!(
+            source.contains("generation: Arc<AtomicU64>,"),
+            "L3: the generation lives in the Runtime/spawn pair only (zero new shared state)"
+        );
+    }
+
+    /// WO-TEL-D3-B1 (L4) RED-FIRST behavioral proof on the REAL shipped `spawn`/`Runtime`. An
+    /// unconfigured client parks in the accepted disabled arm (zero I/O: the body hard-fails
+    /// before any pipe open, `connect_and_serve` is never entered) and publishes its disabled
+    /// state ONCE, not once per 100 ms iteration. At `ec3df0d` the arm sent per iteration, so
+    /// this test is RED there (4-5 publishes inside the window).
+    #[test]
+    fn discord_park_publishes_its_disabled_state_once() {
+        let runtime = spawn(&Config {
+            discord_enabled: true,
+            discord_client_id: String::new(),
+            ..Config::default()
+        });
+        let start = Instant::now();
+        let mut publishes = 0usize;
+        let mut first = None;
+        while start.elapsed() < Duration::from_millis(400) {
+            match runtime.updates.try_recv() {
+                Ok(state) => {
+                    publishes += 1;
+                    if publishes == 1 {
+                        first = Some(state);
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(10)),
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        drop(runtime);
+        let state = first.expect("the parked loop publishes its disabled state at least once");
+        assert_eq!(
+            state.error, "disabled",
+            "L4: the parked state is the explicit disabled state, never silence and never a stale speaker set"
+        );
+        assert!(
+            !state.connected && !state.authenticated,
+            "L4: the parked state claims no connection (never stale-as-fresh)"
+        );
+        assert_eq!(
+            publishes, 1,
+            "L4: the park publishes ONCE, not per 100 ms iteration ({publishes} publishes measured across 400 ms)"
         );
     }
 }

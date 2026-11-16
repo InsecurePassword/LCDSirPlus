@@ -831,6 +831,31 @@ fn current_request(config: &RwLock<Config>, generation: &AtomicU64) -> (u64, Con
     }
 }
 
+/// WO-TEL-D3-B1 (L5): the shipped request-read helpers of `telemetry.rs:198-240`, module-local
+/// copy exactly as `providers/presentmon.rs:1262-1274` carries it. The 50 ms worker loop head
+/// reuses the cached `Arc<Config>` under an unchanged generation (the parked/disabled detector,
+/// `hang_enabled 0` in the dev config, cloned a full `Config` ~20 times/s), and the fresh path
+/// IS the shipped `SeqCst` pairing, so the cached value belongs to the generation reported with
+/// it. The EC-8 rule (a bump clears tracker/cadence/policy and republishes for the new
+/// generation) and the accepted mid-cycle freshness re-read are byte-identical.
+fn current_config(config: &RwLock<Config>) -> Config {
+    config.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn cached_request(
+    config: &RwLock<Config>,
+    generation: &AtomicU64,
+    cache: &mut (u64, Arc<Config>),
+) -> (u64, Arc<Config>) {
+    let before = generation.load(Ordering::SeqCst);
+    if before == cache.0 && before != 0 && generation.load(Ordering::SeqCst) == before {
+        return (before, Arc::clone(&cache.1));
+    }
+    let (generation, config) = current_request(config, generation);
+    *cache = (generation, Arc::new(config));
+    (generation, Arc::clone(&cache.1))
+}
+
 fn worker(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
@@ -849,8 +874,11 @@ fn worker(
     let mut published_indeterminate = 0usize;
     let mut current_generation = 0;
     let mut publish_generation = 0u64;
+    // WO-TEL-D3-B1 (L5): the cache the loop head reads through (seeded from the shipped
+    // `current_config` shape, exactly as the four telemetry sampling loops seed theirs).
+    let mut request = (0u64, Arc::new(current_config(&config)));
     while !shutdown.load(Ordering::Relaxed) {
-        let (request_generation, cfg) = current_request(&config, &generation);
+        let (request_generation, cfg) = cached_request(&config, &generation, &mut request);
         if request_generation != current_generation {
             current_generation = request_generation;
             tracker.clear();
@@ -869,7 +897,7 @@ fn worker(
                 return;
             }
         }
-        let policy = Policy::from(&cfg);
+        let policy = Policy::from(cfg.as_ref());
         if reset_on_policy_change(&mut current_policy, &policy, &mut tracker, &mut cadence) {
             log_worker_transition(
                 &mut published_available,
@@ -4467,5 +4495,70 @@ mod tests {
     #[ignore = "proves early/wrong-identity release leaves owned child alive until cleanup"]
     fn disposable_harness_action_negative_smoke() {
         assert!(action_smoke(true).is_ok());
+    }
+
+    /// WO-TEL-D3-B1 (L5) STRUCTURAL pin of the hung-detector worker's loop-head config read,
+    /// following the shipped needle pattern of
+    /// `telemetry.rs::telemetry_loops_read_a_cached_request_under_an_unchanged_generation` and
+    /// the production twin `providers/presentmon.rs:1262`. Proves: the 50 ms loop head reads a
+    /// cached `Arc<Config>` (the ~20 full-`Config` clones/s of the disabled/parked detector are
+    /// gone), the cache is seeded exactly as the shipped loops seed theirs, the ONLY remaining
+    /// `current_request` in the worker is the accepted mid-cycle freshness re-read, and the
+    /// EC-8 generation-bump rule (a bump republishes a cleared state, `Policy::from` rides the
+    /// same value) stays byte-identical. The harness-count is printed for the receipt.
+    ///
+    /// Declared disposition (contract L5 / audit §C6): `hang.rs` is UNBANNED for this order;
+    /// prior content = HEAD blob `5f965a08…` / file SHA256 head `89058032…`, POST = the new
+    /// blob recorded in the receipt's preservation table; the ledger region pin is restated in
+    /// lockstep, NOT weakened.
+    #[test]
+    fn hung_worker_loop_head_reads_a_cached_arc_config() {
+        let source = include_str!("hang.rs").replace("\r\n", "\n");
+        let head = source
+            .find("fn worker(\n")
+            .expect("the shipped worker function exists");
+        let tail = source
+            .find("fn log_worker_transition(")
+            .expect("the shipped transition logger closes the worker");
+        assert!(
+            tail > head,
+            "the worker is followed by its transition logger"
+        );
+        let loop_src = &source[head..tail];
+        let head_reads = loop_src
+            .matches("let (request_generation, cfg) = current_request(&config, &generation);")
+            .count();
+        let cached = loop_src
+            .matches("let (request_generation, cfg) = cached_request(&config, &generation, &mut request);")
+            .count();
+        let direct = loop_src
+            .matches("current_request(&config, &generation)")
+            .count();
+        println!("D3B1-L5 harness-count: loop-head full-Config reads = {head_reads}, cached loop-head reads = {cached}, direct request reads in the worker = {direct}");
+        assert_eq!(
+            head_reads, 0,
+            "L5: the 50 ms loop head performs no full-Config clone (~20/s removed)"
+        );
+        assert_eq!(
+            cached, 1,
+            "L5: exactly one cached loop-head request read (the shipped `cached_request` shape)"
+        );
+        assert!(
+            loop_src.contains("let mut request = (0u64, Arc::new(current_config(&config)));"),
+            "L5: the cache is seeded from the shipped `current_config` shape"
+        );
+        assert_eq!(
+            direct, 1,
+            "L5: the accepted mid-cycle freshness re-read stays a direct `current_request` (generation-keyed poll validity untouched)"
+        );
+        assert!(
+            loop_src.contains("let policy = Policy::from(cfg.as_ref());"),
+            "L5: the policy still derives from the request read with the generation stamped beside it (EC-8 semantics unchanged; `as_ref` is the `Arc<Config>` -> `&Config` deref the shipped `From<&Config>` impl needs)"
+        );
+        assert_eq!(
+            loop_src.matches("last_attempt = None;").count(),
+            loop_src.matches("cadence.last_attempt = None;").count(),
+            "L5: the cache change adds no cadence-clear site (every clear stays the shipped `cadence.` form)"
+        );
     }
 }

@@ -318,6 +318,35 @@ fn gpu_stale_after(cfg: &Config) -> Duration {
         .max(Duration::from_secs(3))
 }
 
+/// WO-TEL-D3-B1 (L2, core tier): the explicit core-unavailable reading rows a gpu park publishes.
+/// The four keys are the core set — GPU utilization + VRAM utilization/used/total — i.e. the keys
+/// `providers/gpu.rs::project` publishes from a real sample (L194-220). Each row carries
+/// `Availability::Unavailable` and `has_value = false`, the shipped no-value shape: the renderer
+/// routes it to `DisplayState::Unavailable` (`renderer.rs:1705-1723`) and the alert, bottleneck
+/// and `current_number` lookups all require `has_value`, so a parked core reading is STATED,
+/// never silent, and can never present a stale value as fresh. `freshness = Current` labels the
+/// availability statement (made now), not a measurement.
+fn core_gpu_unavailable_readings() -> Vec<Reading> {
+    let at = SystemTime::now();
+    [
+        (MetricKey::GPUUtilization, ValueKind::Percent),
+        (MetricKey::VRAMUtilization, ValueKind::Percent),
+        (MetricKey::VRAMUsed, ValueKind::Bytes),
+        (MetricKey::VRAMTotal, ValueKind::Bytes),
+    ]
+    .into_iter()
+    .map(|(key, kind)| Reading {
+        key,
+        kind,
+        availability: Availability::Unavailable,
+        freshness: Freshness::Current,
+        hardware_id: "gpu:core".to_string(),
+        sampled_at: Some(at),
+        ..Reading::default()
+    })
+    .collect()
+}
+
 /// Keep-alive bound of a gated provider: its own existing stale-after interval.
 /// `None` means the provider has no staleness rule and is therefore never gated.
 fn keep_alive_interval(cfg: &Config, provider: &str) -> Option<Duration> {
@@ -819,6 +848,28 @@ impl Worker {
         }
     }
 
+    /// WO-TEL-D3-B1 (L2, core tier): publish the explicit core-unavailable row set ONCE per park
+    /// transition. GPU utilization and VRAM are CORE readings, so a parked/disabled/failing gpu
+    /// capability states that in the reading rows instead of leaving silence — and never as a
+    /// per-tick stream. The published row set is its own dedupe, i.e. the shipped publish-once
+    /// rule of `providers/network.rs:241-253` (flag 249, reset 253) and `providers/hang.rs:898-915`
+    /// (flag 911, reset 915) with the flag state derived from the content it publishes, so no new
+    /// shared state exists: a repeat parked tick rewrites nothing, sets no dirty flag, and the
+    /// change-or-due publish gate (`Self::publish`) sees no change.
+    fn publish_core_gpu_unavailable(&mut self) {
+        let already_published = self.update.gpu_readings.len() == 4
+            && self
+                .update
+                .gpu_readings
+                .iter()
+                .all(|reading| !reading.has_value);
+        if already_published {
+            return;
+        }
+        self.update.gpu_readings = core_gpu_unavailable_readings();
+        self.publish_dirty = true;
+    }
+
     fn apply_gpu(&mut self, result: Result<gpu::Sample, String>, now: Instant) {
         match result {
             Ok(sample) => {
@@ -842,6 +893,9 @@ impl Worker {
             }
             Err(e) => {
                 crate::log_debug!("native GPU sample failed: {}", e);
+                // WO-TEL-D3-B1 (L2): a failing/absent/disabled gpu capability states the core
+                // tier explicitly (bounded, one publication, never silence, never stale-as-fresh).
+                self.publish_core_gpu_unavailable();
                 self.set_provider("gpu", false);
             }
         }
@@ -1154,7 +1208,13 @@ impl Worker {
             }
             mark_reading_stale(self.native_gpu_power.as_mut(), gpu_stale);
         } else {
-            self.update.gpu_readings.clear();
+            // WO-TEL-D3-B1 (L2): the disabled/parked gpu capability publishes the four CORE
+            // rows as explicit unavailable, ONCE (the shipped publish-once rule, deduped by the
+            // published row set itself), replacing the shipped `gpu_readings.clear()` = silent
+            // absence. The rest of the shipped disabled arm is byte-identical: temperature,
+            // power, backend cache, success stamp and the health row removal stay as accepted
+            // (GPU temperature/power are NOT core readings - `HANDOFF.md` §2A).
+            self.publish_core_gpu_unavailable();
             self.native_gpu_temp = Metric::default();
             self.gpu_success = None;
             self.gpu_backend.clear();
@@ -1712,6 +1772,10 @@ fn spawn_gpu(
             // no GPU bar/temperature/alert consumer parks the loop in the
             // shipped disabled arm, which also unloads the vendor handles.
             let mut failures = 0u32;
+            // WO-TEL-D3-B1 (L2): the park publishes its explicit core-unavailable statement
+            // ONCE per park transition, using the shipped `disabled_published` shape
+            // (`providers/network.rs:210` + `241-253`, `providers/hang.rs:844` + `898-915`).
+            let mut parked_published = false;
             while !shutdown.load(Ordering::Relaxed) {
                 let (generation, cfg) = cached_request(&config, &generation, &mut request);
                 if generation != last_generation {
@@ -1721,6 +1785,7 @@ fn spawn_gpu(
                 // WO-TEL-D2 (S4, U-10): streak survives a bump (same rule as the
                 // LHM loop above); the cleared stamp samples immediately.
                 if enabled(&cfg, "gpu") && demanded(consumers.load(Ordering::Relaxed), "gpu") {
+                    parked_published = false;
                     let now = Instant::now();
                     let full =
                         backoff_interval(cfg.telemetry_interval, gpu_stale_after(&cfg), failures);
@@ -1740,6 +1805,25 @@ fn spawn_gpu(
                 } else {
                     last_attempt = None;
                     provider = gpu::Provider::new("off");
+                    // WO-TEL-D3-B1 (L2, core tier): GPU utilization + VRAM are core readings, so
+                    // parking states it explicitly once (bounded, <= one publish per park
+                    // transition, the loop's own 50 ms tick = the shipped park cadence). The
+                    // reason is named, never silent; the coordinator turns it into the four
+                    // explicit unavailable core rows (`apply_gpu` Err arm + `apply_freshness`
+                    // disabled arm), deduped by the published row set.
+                    if !parked_published {
+                        parked_published = true;
+                        let reason = if cfg.safe_mode {
+                            "gpu core readings unavailable: safe mode"
+                        } else if !enabled(&cfg, "gpu") {
+                            "gpu core readings unavailable: native GPU provider disabled"
+                        } else {
+                            "gpu core readings unavailable: no display consumer"
+                        };
+                        if !send_slow(&tx, SlowEvent::Gpu(generation, Err(reason.into()))) {
+                            return;
+                        }
+                    }
                 }
                 std::thread::sleep(TICK);
             }
@@ -3984,6 +4068,7 @@ mod tests {
         ScriptedSampler<Result<(lhm::ExtendedSample, SystemTime), String>>,
     > = OnceLock::new();
     static BO_GPU_SAMPLER: OnceLock<ScriptedSampler<Result<gpu::Sample, String>>> = OnceLock::new();
+    static PK_GPU_SAMPLER: OnceLock<ScriptedSampler<Result<gpu::Sample, String>>> = OnceLock::new();
 
     fn zd_headset_sampler(_timeout: Duration) -> Result<headset::Status, String> {
         sampled_in_slot(&ZD_HEADSET_SAMPLER)
@@ -4010,6 +4095,13 @@ mod tests {
         _selector: &str,
     ) -> Result<gpu::Sample, String> {
         sampled_in_slot(&ZD_GPU_SAMPLER)
+    }
+
+    fn pk_gpu_sampler(
+        _provider: &mut gpu::Provider,
+        _selector: &str,
+    ) -> Result<gpu::Sample, String> {
+        sampled_in_slot(&PK_GPU_SAMPLER)
     }
 
     fn bo_lhm_sampler(
@@ -4294,6 +4386,134 @@ mod tests {
             .recv_timeout(BEHAVIORAL_WAIT)
             .expect("(P2) re-demand resumes sampling");
         release_tx.send(()).expect("release #2");
+        shutdown.store(true, Ordering::Release);
+        loop_thread
+            .join()
+            .expect("the GPU loop joins within the sampler's loud 5 s budget");
+    }
+
+    /// WO-TEL-D3-B1 (L2, core tier) RED-FIRST falsifier of the silent-absence gap (the DG-2
+    /// framing ruled by `WO-TEL-D3-A-AUDIT.md` §C4: config decides capability, and the
+    /// directive-compatible default is a BOUNDED EXPLICIT-unavailable core row, never silence).
+    /// When the gpu provider is parked (`gpu_provider off`), the four core rows
+    /// `GPUUtilization`/`VRAMUtilization`/`VRAMUsed`/`VRAMTotal` are published as EXPLICIT
+    /// unavailable, ONCE - the shipped publish-once shape (`providers/network.rs:210` +
+    /// `241-253`, `providers/hang.rs:844` + `898-915`) applied here with the published row set
+    /// itself as the dedupe, so no per-tick publish stream and no busy loop exists. At
+    /// `ec3df0d` the disabled arm cleared the rows (`apply_freshness:1157`) = silent absence, so
+    /// this test is RED at that baseline.
+    #[test]
+    fn gpu_disabled_park_publishes_explicit_core_unavailable_rows_once() {
+        let cfg = Config {
+            gpu_provider: "off".into(),
+            ..Config::default()
+        };
+        let mut worker = test_worker(cfg.clone());
+        let base = Instant::now();
+        worker.apply_slow_event(
+            SlowEvent::Gpu(
+                1,
+                Err("gpu core readings unavailable: native GPU provider disabled".into()),
+            ),
+            1,
+            base,
+        );
+        let rows = worker.update.gpu_readings.clone();
+        for key in [
+            MetricKey::GPUUtilization,
+            MetricKey::VRAMUtilization,
+            MetricKey::VRAMUsed,
+            MetricKey::VRAMTotal,
+        ] {
+            assert!(
+                rows.iter().any(|reading| reading.key == key
+                    && !reading.has_value
+                    && reading.availability == Availability::Unavailable),
+                "the parked gpu provider publishes an EXPLICIT unavailable core row for {key:?}, never silent absence"
+            );
+        }
+        assert_eq!(
+            rows.len(),
+            4,
+            "the core-unavailable publication is exactly the four core rows (no optional sensor rows ride it)"
+        );
+        let stamp = rows
+            .iter()
+            .find(|reading| reading.key == MetricKey::GPUUtilization)
+            .and_then(|reading| reading.sampled_at)
+            .expect("the explicit unavailable row carries its publication stamp");
+        for tick in 1..=40 {
+            worker.apply_freshness(&cfg, base + Duration::from_millis(50 * tick));
+            assert_eq!(
+                worker.update.gpu_readings.len(),
+                4,
+                "the core rows stay published across the park (tick {}), never cleared to silence",
+                tick
+            );
+        }
+        assert_eq!(
+            worker
+                .update
+                .gpu_readings
+                .iter()
+                .find(|reading| reading.key == MetricKey::GPUUtilization)
+                .and_then(|reading| reading.sampled_at),
+            Some(stamp),
+            "the park publishes ONCE: 40 coordinator ticks never re-stamp the core-unavailable rows (no per-tick publish stream)"
+        );
+        assert!(
+            worker.update.gpu_readings.iter().all(|r| !r.has_value),
+            "no core-unavailable row carries a value, so a parked provider can never present stale as fresh"
+        );
+    }
+
+    /// WO-TEL-D3-B1 (L2) RED-FIRST seam proof on the REAL gpu loop through the shipped
+    /// WO-TEL-C sampler seam: entering the park publishes exactly ONE explicit core-unavailable
+    /// event carrying the loop's generation, and the sampler is entered ZERO times while parked.
+    /// At `ec3df0d` the park arm (`telemetry.rs:1740-1743`) published nothing => RED there.
+    /// Demand/gate state is driven directly (the shipped seam contract), so this proof is
+    /// independent of the L1 layout rule.
+    #[test]
+    fn gpu_loop_park_publishes_one_core_unavailable_event() {
+        assert_injected_sampler_is_io_free("pk_gpu_sampler");
+        let (enter_rx, _release_tx) = install_scripted_sampler(&PK_GPU_SAMPLER, Vec::new());
+        let config = Arc::new(RwLock::new(Config {
+            gpu_provider: "off".into(),
+            telemetry_interval: BEHAVIORAL_DRIVEN,
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let consumers = Arc::new(AtomicU64::new(consumer_bit("gpu")));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(8);
+        let loop_thread = spawn_gpu(
+            Arc::clone(&config),
+            Arc::clone(&generation),
+            Arc::clone(&consumers),
+            Arc::clone(&shutdown),
+            tx,
+            pk_gpu_sampler,
+        );
+        let (generation_id, outcome) = gpu_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(L2) the park publishes one explicit core-unavailable event"),
+        );
+        assert_eq!(
+            generation_id, 1,
+            "(L2) the park event carries the live generation"
+        );
+        assert!(
+            outcome.is_err(),
+            "(L2) the park event states the core-unavailable reason (an Err payload), not a sample"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(400)).is_err(),
+            "(L2) the park publishes ONCE: no repeat publish stream across >= 8 TICKs"
+        );
+        assert!(
+            enter_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "(L2) the parked loop enters the sampler ZERO times (no busy loop)"
+        );
         shutdown.store(true, Ordering::Release);
         loop_thread
             .join()

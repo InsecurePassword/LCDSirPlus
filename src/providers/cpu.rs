@@ -18,8 +18,12 @@ use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
 const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION: u32 = 8;
 
+/// WO-TEL-D3-B1 (L7): the record capacity the provider samples into. 256 records x the 48 B
+/// record (the const assertion below) = 12,288 B, the resident buffer size the census measured.
+const RECORDS: usize = 256;
+
 #[repr(C)]
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 struct SystemProcessorPerformanceInformation {
     idle_time: i64,
     kernel_time: i64,
@@ -104,6 +108,12 @@ fn utilization(current: &[[i64; 3]], previous: &[[i64; 3]]) -> Vec<f64> {
 #[derive(Debug, Default)]
 pub struct CpuLoadProvider {
     prev: Vec<[i64; 3]>,
+    /// WO-TEL-D3-B1 (L7): the resident per-LP record buffer (256 x 48 B = 12,288 B, sized once
+    /// and reused by every sample), so the per-sample allocation is gone. The buffer holds the
+    /// raw records ONLY: the EC-5 single-derivation rule (`busy_percent`, family (b)) is
+    /// untouched, and the app-loop consumer set (CPU bar, CCD split, peak, bottleneck, soak line)
+    /// keeps reading the same `utilization` output.
+    buffer: Vec<SystemProcessorPerformanceInformation>,
 }
 
 impl CpuLoadProvider {
@@ -117,20 +127,22 @@ impl CpuLoadProvider {
         let Some(nt) = nt_query() else {
             return Vec::new();
         };
-        let mut buffer = vec![SystemProcessorPerformanceInformation::default(); 256];
+        if self.buffer.len() != RECORDS {
+            self.buffer = vec![SystemProcessorPerformanceInformation::default(); RECORDS];
+        }
         let mut returned = 0u32;
         let status = unsafe {
             nt(
                 SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION,
-                buffer.as_mut_ptr() as *mut core::ffi::c_void,
-                std::mem::size_of_val(buffer.as_slice()) as u32,
+                self.buffer.as_mut_ptr() as *mut core::ffi::c_void,
+                std::mem::size_of_val(self.buffer.as_slice()) as u32,
                 &mut returned,
             )
         };
         if status < 0 {
             return Vec::new();
         }
-        let Some(current) = decode_samples(&buffer, returned as usize) else {
+        let Some(current) = decode_samples(&self.buffer, returned as usize) else {
             return Vec::new();
         };
         let out = utilization(&current, &self.prev);
@@ -417,5 +429,87 @@ mod tests {
             "CPU-LIVE count={} C={cache:.2} F={frequency:.2}",
             second.len()
         );
+    }
+
+    /// WO-TEL-D3-B1 (L7) STRUCTURAL + behavioral pin: the provider samples into ONE resident
+    /// record buffer, so the per-sample `vec![…; 256]` allocation (256 records x 48 B =
+    /// **12,288 B per sample**, the size the census measured) is gone. The buffer is allocated
+    /// at most once per provider lifetime; consecutive samples reuse it (proved by pointer
+    /// identity). The EC-5 single-derivation pins stay byte-identical: the change touches the
+    /// buffer ONLY, never `busy_percent`/`decode_samples`/`utilization`.
+    ///
+    /// Disclosed caveat (the registered alloc-harness limitation: `backends/mod.rs` `alloc_count`
+    /// plus the debug-profile flake register): production has no allocation counters, so this
+    /// proof is code-derived (the allocation site is guarded) and test-side (buffer identity),
+    /// NOT an allocation count measured in the release suite.
+    #[test]
+    fn cpu_provider_reuses_one_resident_sample_buffer() {
+        const RECORDS: usize = 256;
+        assert_eq!(
+            std::mem::size_of::<SystemProcessorPerformanceInformation>() * RECORDS,
+            12_288,
+            "L7 size verification: 256 records x the record size = the 12,288 B/sample the census counted"
+        );
+        let source = include_str!("cpu.rs").replace("\r\n", "\n");
+        let struct_head = source
+            .find("pub struct CpuLoadProvider {")
+            .expect("the shipped provider struct exists");
+        let struct_src = &source[struct_head
+            ..source
+                .find("impl CpuLoadProvider {")
+                .expect("the shipped impl exists")];
+        let impl_head = source
+            .find("impl CpuLoadProvider {")
+            .expect("the shipped impl exists");
+        let impl_src = &source[impl_head
+            ..source
+                .find("/// Aggregate utilization over a logical-processor mask")
+                .expect("the shipped aggregate docs close the provider impl")];
+        let alloc_sites = impl_src
+            .matches("vec![SystemProcessorPerformanceInformation::default(); RECORDS]")
+            .count();
+        println!("D3B1-L7 harness-count: record-buffer allocation sites in the provider impl = {alloc_sites}");
+        assert!(
+            struct_src.contains("buffer: Vec<SystemProcessorPerformanceInformation>,"),
+            "L7: the record buffer is a provider field (resident state, reused across samples)"
+        );
+        assert_eq!(
+            alloc_sites, 1,
+            "L7: exactly one allocation site exists, and it must sit behind the resident-buffer guard"
+        );
+        assert!(
+            impl_src.contains("if self.buffer.len() != RECORDS {"),
+            "L7: the single allocation site is the guard that fills the resident buffer once"
+        );
+        assert!(
+            impl_src.contains("std::mem::size_of_val(self.buffer.as_slice())"),
+            "L7: the query length is the resident buffer's own byte size (48 B x records)"
+        );
+        assert!(
+            impl_src.matches("self.buffer").count() >= 4,
+            "L7: the sampling path reads and writes the resident buffer (non-vacuity of the pin above)"
+        );
+        let mut provider = CpuLoadProvider::new();
+        let first = provider.update();
+        let first_ptr = provider.buffer.as_ptr();
+        let second = provider.update();
+        let second_ptr = provider.buffer.as_ptr();
+        println!(
+            "D3B1-L7 sample shape: per_lp first={} second={} buffer_len={}",
+            first.len(),
+            second.len(),
+            provider.buffer.len()
+        );
+        assert_eq!(
+            first_ptr, second_ptr,
+            "L7: two consecutive samples share ONE buffer allocation (the per-sample alloc is gone)"
+        );
+        if nt_query().is_some() {
+            assert_eq!(
+                provider.buffer.len(),
+                RECORDS,
+                "L7: on a live host the resident buffer holds the full 256-record capacity"
+            );
+        }
     }
 }
