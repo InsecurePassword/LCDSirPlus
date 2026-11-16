@@ -180,11 +180,16 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
     let process_epoch = Instant::now();
     // EC-3: seed the consumer set before the first tick so the panel's own
     // modules keep their providers at full cadence from the start.
-    telemetry_runtime.set_consumers(provider_consumer_bits(
-        &effective_slot_modules(&slots, &snapshot, &cfg),
-        &cfg,
-        preview_surface_active(opts.preview_always, &cfg, &backend_state),
-    ));
+    // WO-TEL-D2 (S1): the word gains the reading-keyed demand bits for the
+    // previously never-gated metering providers (same publication path).
+    let seed_modules = effective_slot_modules(&slots, &snapshot, &cfg);
+    telemetry_runtime.set_consumers(
+        provider_consumer_bits(
+            &seed_modules,
+            &cfg,
+            preview_surface_active(opts.preview_always, &cfg, &backend_state),
+        ) | provider_demand_bits(&slots, &seed_modules, &cfg),
+    );
 
     // SOAK-OBS2: the resource-line tracker is seeded at start, so the first
     // line lands at t~60 s (the interval), never at t=0.
@@ -320,11 +325,13 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
             // Relaxed on purpose: the bitmask is a self-contained word with no
             // payload published alongside it, so no Acquire/Release pairing is
             // required, and a one-tick-stale read only delays a cadence decision.
-            telemetry_runtime.set_consumers(provider_consumer_bits(
-                &slot_modules,
-                &cfg,
-                preview_surface_active(opts.preview_always, &cfg, &backend_state),
-            ));
+            telemetry_runtime.set_consumers(
+                provider_consumer_bits(
+                    &slot_modules,
+                    &cfg,
+                    preview_surface_active(opts.preview_always, &cfg, &backend_state),
+                ) | provider_demand_bits(&slots, &slot_modules, &cfg),
+            );
             let view = View {
                 slot_modules,
                 hung_index: hang_hold.hung_index,
@@ -818,6 +825,90 @@ fn preview_for_backend(cfg: &Config, state: &BackendState) -> bool {
             }
         ),
     }
+}
+
+/// WO-TEL-D2 (S1): the reading-keyed demand registry for the metering providers
+/// EC-3 never gated. Keys are the displayed-reading module names (the config
+/// slot-list vocabulary); values are provider names in `telemetry.rs`
+/// `EXTENDED_CONSUMER_PROVIDERS`, occupying the extended bit range of the SAME
+/// published consumer word (bits above the shipped 7). Demand is the module the
+/// panel effectively shows (`effective_slot_modules`, fall-through included: a
+/// slot displaying a placeholder consumes nothing behind it; slot alternatives
+/// reachable only by cycling are demand-on-switch). Alert categories do not
+/// extend this map: `alerts.rs` reads gated providers only, so the protected
+/// alert demand stays exactly the shipped 7-bit derivation.
+fn module_extended_consumers(module: &str) -> &'static [&'static str] {
+    match module.to_ascii_uppercase().as_str() {
+        "AUDIO" | "MIC_STATUS" => &["audio"],
+        "CONTROLLER_BATTERY" => &["controller"],
+        "NET_IN" | "NET_OUT" | "NET_BOTH" | "NET_IN_GRAPH" | "NET_OUT_GRAPH" | "NET_GRAPH" => {
+            &["net"]
+        }
+        // The presentmon keys include the graph slots: `renderer.rs:87` ->
+        // `capture()` L117-118 stores `s.game.frame_time_ms`/`s.game.fps` into
+        // the graph history every render, and `FPS_GRAPH`/`FRAME_TIME` consume
+        // that history, so displaying them demands collection (U-3 structural
+        // reader modelled as a display consumer of the published fields).
+        "FPS_CURRENT" | "FPS_1LOW" | "FPS_01LOW" | "FPS_GRAPH" | "FRAME_TIME" | "SESSION_TIME"
+        | "SESSION_SUMMARY" | "GAME_NAME" => &["presentmon"],
+        _ => &[],
+    }
+}
+
+/// WO-TEL-D2 (S1): the fixed-bar layout rule for the extended word. Layout 1
+/// draws `CPU`/`RAM`/`GPU `/`VRAM` (`GPU `/`VRAM` come from the gated `gpu`
+/// provider, consumed by the shipped `main_display_provider_consumers`);
+/// layouts 2 and 3 also draw the `NET IN`/`NET OUT` bars
+/// (`renderer.rs:289-311`, `renderer.rs:335-356`), which read the netif
+/// metrics, so they consume `net`.
+fn main_display_extended_consumers(main_display: i32) -> &'static [&'static str] {
+    match main_display {
+        1 => &[],
+        _ => &["net"],
+    }
+}
+
+/// WO-TEL-D2 (S1): the extended demand word, published on the existing path
+/// (`app.rs` seed and render tick) beside the unchanged gated word. The preview
+/// keeps consuming every GATED provider (`ALL_CONSUMERS` early-return is the
+/// ratified U-9 preserve; a visible preview shows the slots, and the extended
+/// word derives from those same displayed modules, so the preview consumes
+/// every displayed reading through both words together). `PROVIDER_STATUS`/
+/// `ALERTS` keep the shipped gated-only mapping: health rows and the
+/// presentmon availability predicate (`app.rs:745-763`) are fed by publication
+/// (health + staleness stamps), not by fresh polls, per WO-TEL-D1-AUDIT
+/// amendment 2.
+///
+/// WO-TEL-D2-FIX (F-AUD-1): the presentmon bit is the one derivation that does
+/// NOT ride the fall-through display. The fall-through is driven by the health
+/// row the park itself publishes (`providers/presentmon.rs:1455-1463` =
+/// `stop_and_report_cleanup` + `unavailable("no display consumer")`), so
+/// deriving this bit from `modules` self-locks the gate: with
+/// `presentmon_deferred 1` (the `config.rs:299` default) a selected
+/// `FPS_CURRENT`/`FRAME_TIME`/`GAME_NAME` module would never re-arm the 1 s
+/// target poll, and a game launch would stay undetectable for the session. The
+/// bit therefore rides the RAW current selection (`slots.current`), which keeps
+/// the ratified rule that slot ALTERNATIVES are demand-on-select and keeps the
+/// U-3 saving for every shape with no presentmon-backed module selected. Every
+/// other provider's derivation below is byte-untouched.
+fn provider_demand_bits(slots: &Manager, modules: &[String; 4], cfg: &Config) -> u64 {
+    let mut bits = 0u64;
+    for provider in main_display_extended_consumers(cfg.main_display) {
+        bits |= crate::telemetry::extended_consumer_bit(provider);
+    }
+    for module in modules {
+        for provider in module_extended_consumers(module) {
+            bits |= crate::telemetry::extended_consumer_bit(provider);
+        }
+    }
+    if cfg.presentmon_enabled && !cfg.safe_mode && cfg.presentmon_target_mode != "disabled" {
+        for slot in 0..4 {
+            if module_extended_consumers(&slots.current(slot)).contains(&"presentmon") {
+                bits |= crate::telemetry::extended_consumer_bit("presentmon");
+            }
+        }
+    }
+    bits
 }
 
 fn temperature_pane_warning(cfg: &Config) -> bool {
@@ -3055,6 +3146,18 @@ mod tests {
         modules.map(String::from)
     }
 
+    /// WO-TEL-D2-FIX: the RAW current selection behind a displayed-module set
+    /// (every slot selects exactly the module the panel shows). The demand tests
+    /// pass it beside the displayed array, so each shipped assertion keeps
+    /// pinning exactly the derivation it pinned before.
+    fn slots_current(modules: &[String; 4]) -> Manager {
+        let mut cfg = Config::default();
+        for (slot, module) in modules.iter().enumerate() {
+            cfg.slots[slot] = vec![module.clone()];
+        }
+        Manager::new(&cfg, [0; 4])
+    }
+
     #[test]
     fn consumer_set_covers_slots_alerts_and_the_preview_surface() {
         let idle = slots_showing(["CLOCK", "CLEAR", "CLOCK", "CLOCK"]);
@@ -3449,6 +3552,334 @@ mod tests {
                 .count(),
             1,
             "exactly one emit call site in the loop"
+        );
+    }
+
+    /// WO-TEL-D2 (S1): the reading-keyed demand registry for the metering
+    /// providers. Demand is keyed by the DISPLAYED reading (the effective slot
+    /// module), never by a configured slot alternative; the alert categories
+    /// add nothing to the extended word (they read gated providers only).
+    #[test]
+    fn reading_demand_maps_displayed_modules_to_extended_providers() {
+        let quiescent = Config {
+            main_display: 1,
+            ..Config::default()
+        };
+        let idle = slots_showing(["CLOCK", "CLEAR", "CLOCK", "CLOCK"]);
+        assert_eq!(
+            provider_demand_bits(&slots_current(&idle), &idle, &quiescent),
+            0,
+            "layout 1 with no metering module displayed => every metering provider parks"
+        );
+        let audio = slots_showing(["CLOCK", "AUDIO", "CLOCK", "CLOCK"]);
+        assert_eq!(
+            provider_demand_bits(&slots_current(&audio), &audio, &quiescent),
+            crate::telemetry::extended_consumer_bit("audio"),
+            "the volume reading demands the audio endpoint read"
+        );
+        let mic = slots_showing(["MIC_STATUS", "CLEAR", "CLEAR", "CLEAR"]);
+        assert_eq!(
+            provider_demand_bits(&slots_current(&mic), &mic, &quiescent),
+            crate::telemetry::extended_consumer_bit("audio"),
+            "the mic reading shares the ONE audio collection op (P3 sharing, same bit)"
+        );
+        let pad = slots_showing(["CONTROLLER_BATTERY", "CLEAR", "CLEAR", "CLEAR"]);
+        assert_eq!(
+            provider_demand_bits(&slots_current(&pad), &pad, &quiescent),
+            crate::telemetry::extended_consumer_bit("controller"),
+            "the controller reading demands xinput on select (demand-on-switch)"
+        );
+        assert_eq!(
+            provider_demand_bits(&slots_current(&idle), &idle, &quiescent),
+            0,
+            "the same lists parked at index 0 park again (the registry reads the selection, not the config lists)"
+        );
+    }
+
+    /// WO-TEL-D2 (S1, U-11): the netif demand rule — displayed NET_* modules
+    /// demand netif; layouts 2/3 draw the NET IN/OUT bars and demand netif
+    /// unconditionally; layout 1 with no NET module does not.
+    #[test]
+    fn reading_demand_maps_net_bar_layouts_and_net_modules_to_netif() {
+        let idle = slots_showing(["CLOCK", "CLEAR", "CLOCK", "CLOCK"]);
+        let net_bit = crate::telemetry::extended_consumer_bit("net");
+        assert_eq!(
+            provider_demand_bits(
+                &slots_current(&idle),
+                &idle,
+                &Config {
+                    main_display: 1,
+                    ..Config::default()
+                }
+            ),
+            0,
+            "layout 1 draws no NET bar"
+        );
+        assert_eq!(
+            provider_demand_bits(
+                &slots_current(&idle),
+                &idle,
+                &Config {
+                    main_display: 2,
+                    ..Config::default()
+                }
+            ),
+            net_bit,
+            "layout 2 draws the NET IN/OUT bars (renderer.rs:289-311)"
+        );
+        assert_eq!(
+            provider_demand_bits(
+                &slots_current(&idle),
+                &idle,
+                &Config {
+                    main_display: 3,
+                    ..Config::default()
+                }
+            ),
+            net_bit,
+            "layout 3 draws the NET IN/OUT bars (renderer.rs:335-356)"
+        );
+        let nets = slots_showing(["CLOCK", "NET_BOTH", "NET_GRAPH", "CLOCK"]);
+        assert_eq!(
+            provider_demand_bits(
+                &slots_current(&nets),
+                &nets,
+                &Config {
+                    main_display: 1,
+                    ..Config::default()
+                }
+            ),
+            net_bit,
+            "the NET_* modules demand netif exactly once (dual display = shared op)"
+        );
+    }
+
+    /// WO-TEL-D2 (S2, U-3): presentmon demand = displayed game readings,
+    /// graph slots included (the `capture()` history consumer); the live-soak
+    /// shape (FPS_CURRENT fallen through by `presentmon_deferred`) demands
+    /// nothing, so zero-demand = no target poll and no child retries.
+    #[test]
+    fn reading_demand_maps_presentmon_backed_modules_including_graph_slots() {
+        let pm_bit = crate::telemetry::extended_consumer_bit("presentmon");
+        let quiescent = Config {
+            main_display: 1,
+            ..Config::default()
+        };
+        let game = slots_showing(["FPS_CURRENT", "FRAME_TIME", "GAME_NAME", "CLOCK"]);
+        assert_eq!(
+            provider_demand_bits(&slots_current(&game), &game, &quiescent),
+            pm_bit,
+            "the game readings demand presentmon once (frame time feeds the graph surface too)"
+        );
+        let graphs = slots_showing(["FPS_GRAPH", "SESSION_SUMMARY", "CLOCK", "CLOCK"]);
+        assert_eq!(
+            provider_demand_bits(&slots_current(&graphs), &graphs, &quiescent),
+            pm_bit,
+            "the FPS graph slot (the renderer graph-history consumer) and the session readings demand presentmon"
+        );
+        // The live-soak display state after the fall-throughs: slot 1 shows
+        // NET_BOTH (not FPS_CURRENT), slot 2 DISK_IO, slot 3 THERMALS, slot 0
+        // HEADSET_BATTERY => the extended word demands netif only.
+        let fallen = slots_showing(["HEADSET_BATTERY", "NET_BOTH", "DISK_IO", "THERMALS"]);
+        assert_eq!(
+            provider_demand_bits(&slots_current(&fallen), &fallen, &quiescent),
+            crate::telemetry::extended_consumer_bit("net"),
+            "the fallen-through display demands netif only: presentmon, audio and xinput park at the live soak"
+        );
+        let cleared = slots_showing(["CLEAR", "CLEAR", "CLEAR", "CLEAR"]);
+        assert_eq!(
+            provider_demand_bits(&slots_current(&cleared), &cleared, &quiescent),
+            0,
+            "no displayed reading => no demand"
+        );
+    }
+
+    /// WO-TEL-D2 (S1, U-9 preserve): the preview keeps the shipped gated
+    /// `ALL_CONSUMERS` early return; the published word is `gated | demand`,
+    /// and every shipped gated fixture equality survives the union.
+    #[test]
+    fn preview_and_gated_word_keep_their_shipped_shape_under_the_extended_word() {
+        let idle = slots_showing(["CLOCK", "CLEAR", "CLOCK", "CLOCK"]);
+        let quiescent3 = Config {
+            main_display: 3,
+            temperature_warning_enabled: false,
+            memory_warning_enabled: false,
+            headset_enabled: false,
+            ..Config::default()
+        };
+        assert_eq!(
+            provider_consumer_bits(&idle, &quiescent3, true),
+            crate::telemetry::ALL_CONSUMERS,
+            "the preview consumes every gated provider, exactly as shipped (U-9 preserve)"
+        );
+        assert_eq!(
+            provider_demand_bits(&slots_current(&idle), &idle, &quiescent3),
+            crate::telemetry::extended_consumer_bit("net"),
+            "layout 3's preview shows the NET bars, so the extended word demands netif"
+        );
+        let quiescent1 = Config {
+            main_display: 1,
+            ..quiescent3
+        };
+        assert_eq!(
+            provider_demand_bits(&slots_current(&idle), &idle, &quiescent1),
+            0,
+            "a layout 1 idle preview adds no metering demand beyond the preserved gated-all"
+        );
+        let disk = slots_showing(["CLOCK", "DISK_IO", "CLOCK", "CLOCK"]);
+        assert_eq!(
+            provider_consumer_bits(&disk, &quiescent1, false)
+                | provider_demand_bits(&slots_current(&disk), &disk, &quiescent1),
+            crate::telemetry::consumer_bit("performance") | crate::telemetry::consumer_bit("gpu"),
+            "the combined publish word keeps the gated fixture shape: DISK_IO demands performance, layout 1's fixed bars demand gpu (the shipped bare equality lives in the gated function, pinned by the EC-3 tests)"
+        );
+        let temps = slots_showing(["CPU_TEMP", "GPU_TEMP", "THERMALS", "CLOCK"]);
+        assert_eq!(
+            provider_consumer_bits(&temps, &quiescent1, false)
+                | provider_demand_bits(&slots_current(&temps), &temps, &quiescent1),
+            crate::telemetry::consumer_bit("hwinfo")
+                | crate::telemetry::consumer_bit("lhm")
+                | crate::telemetry::consumer_bit("gpu"),
+            "temperature displays demand only gated providers: the union adds no extended bits"
+        );
+    }
+
+    /// WO-TEL-D2-FIX (F-AUD-1, C2 gate): the presentmon demand bit derives from
+    /// the RAW current selection, not from the fall-through display. The
+    /// fall-through is driven by the health row the park itself publishes
+    /// (`providers/presentmon.rs:1455-1463`: `stop_and_report_cleanup` +
+    /// `unavailable("no display consumer")` => `providers["presentmon"] = false`),
+    /// so a demand bit taken from the fallen-through list self-locks: with
+    /// `presentmon_deferred 1` (the `config.rs:299` default, and the live-soak
+    /// config) a selected `FPS_CURRENT` could never re-arm the 1 s target poll,
+    /// and a game launch would stay undetectable for the whole session.
+    /// The DISPLAY fall-through stays byte-identical (asserted below), every
+    /// other provider's derivation is untouched, and slot ALTERNATIVES stay
+    /// demand-on-select: only `slots.current` demands.
+    #[test]
+    fn presentmon_demand_from_raw_selection_rearms_while_parked() {
+        // The live-soak shape: layout 1 (no NET bar), the soak's presentmon
+        // config, slot 2 (index 1) SELECTING `FPS_CURRENT` with a `NET_BOTH`
+        // alternative.
+        let cfg = Config {
+            main_display: 1,
+            ..Config::default()
+        };
+        assert!(
+            cfg.presentmon_deferred,
+            "config.rs:299 default = deferred 1"
+        );
+        assert!(cfg.presentmon_enabled, "config.rs:294 default = enabled");
+        assert_eq!(cfg.presentmon_target_mode, "presenting", "config.rs:298");
+        let mut soak = Config::default();
+        soak.slots[1] = vec!["FPS_CURRENT".to_string(), "NET_BOTH".to_string()];
+        let slots = Manager::new(&soak, [0; 4]);
+        assert_eq!(slots.current(1), "FPS_CURRENT", "the RAW current selection");
+        let mut snapshot = Snapshot::default();
+        snapshot.providers.insert("presentmon".to_string(), false);
+        let shown = effective_slot_modules(&slots, &snapshot, &cfg);
+        assert_eq!(
+            shown[1], "NET_BOTH",
+            "the fall-through DISPLAY is unchanged: the panel keeps its shipped fallback"
+        );
+        let pm_bit = crate::telemetry::extended_consumer_bit("presentmon");
+        let net_bit = crate::telemetry::extended_consumer_bit("net");
+        let bits = provider_demand_bits(&slots, &shown, &cfg);
+        assert_ne!(
+            bits & pm_bit,
+            0,
+            "F-AUD-1 RE-ARM: a SELECTED FPS module keeps presentmon demanded while the park publishes health=false, so the worker re-enters reconcile and a game launch is detected"
+        );
+        assert_ne!(
+            bits & net_bit,
+            0,
+            "the fallen-through display still demands netif: every other derivation byte-untouched"
+        );
+        assert_eq!(
+            bits & crate::telemetry::extended_consumer_bit("audio"),
+            0,
+            "audio demand stays display-derived (layout 1 draws no NET bar either)"
+        );
+        assert_eq!(
+            bits & crate::telemetry::extended_consumer_bit("controller"),
+            0,
+            "controller demand stays display-derived"
+        );
+        // Slot ALTERNATIVES stay demand-on-select: cycling slot 2 onto the
+        // `NET_BOTH` alternative releases the presentmon demand again.
+        let mut cycled = Manager::new(&soak, [0; 4]);
+        cycled.cycle(1, 1);
+        assert_eq!(
+            cycled.current(1),
+            "NET_BOTH",
+            "the alternative, now selected"
+        );
+        let shown2 = effective_slot_modules(&cycled, &snapshot, &cfg);
+        assert_eq!(
+            provider_demand_bits(&cycled, &shown2, &cfg) & pm_bit,
+            0,
+            "demand-on-select: an FPS alternative that is NOT the current selection demands no presentmon"
+        );
+        // The shipped enablement guard keeps its meaning: presentmon off => no demand.
+        let off = Config {
+            main_display: 1,
+            presentmon_enabled: false,
+            ..Config::default()
+        };
+        assert_eq!(
+            provider_demand_bits(
+                &slots,
+                &effective_slot_modules(&slots, &snapshot, &off),
+                &off,
+            ) & pm_bit,
+            0,
+            "presentmon_enabled 0 => no demand bit (the enablement guard, not the selection)"
+        );
+        // BOUND leg (the shipped activation-resume bound, asserted numerically on
+        // the production source): the demand word reaches the worker through the
+        // app's render gate (<= 100 ms, `app.rs:318`/`app.rs:328`), the worker
+        // reads the published word exactly once per loop iteration and sleeps the
+        // shipped 50 ms, and the 1 s `TARGET_POLL` gate is already due after the
+        // park (`last_target_poll` ages, the park never stamps it) => re-arm
+        // within render 100 ms + worker 50 ms = 150 ms, target poll on that tick.
+        let source = include_str!("providers/presentmon.rs").replace("\r\n", "\n");
+        let start = source.find("fn run(\n").expect("the shipped worker exists");
+        let rest = &source[start..];
+        let end = rest
+            .find("\n    let mut stderr = String::new();")
+            .expect("the shipped loop-end marker closes the worker loop");
+        let run = &rest[..end];
+        assert_eq!(
+            run.matches("crate::telemetry::demanded(").count(),
+            1,
+            "the worker reads the demand word exactly once per loop iteration (the re-arm input)"
+        );
+        assert_eq!(
+            run.matches("consumers.load(Ordering::Relaxed)").count(),
+            1,
+            "one published-word read per iteration (no extra wakeups)"
+        );
+        let gate = run
+            .find("if !crate::telemetry::demanded(")
+            .expect("the shipped demand gate");
+        let reconcile = run.find("capture.reconcile(").expect("the reconcile call");
+        assert!(
+            gate < reconcile,
+            "a set demand bit re-enters reconcile on the next loop tick (the park never reaches it)"
+        );
+        assert_eq!(
+            run.matches("std::thread::sleep(Duration::from_millis(50))")
+                .count(),
+            4,
+            "every worker path sleeps the shipped 50 ms (the 50 ms half of the re-arm bound)"
+        );
+        assert!(
+            source.contains("const TARGET_POLL: Duration = Duration::from_secs(1);"),
+            "the 1 s target-poll gate is due on re-entry (the park never stamps `last_target_poll`)"
+        );
+        assert!(
+            cfg.render_interval <= Duration::from_millis(100),
+            "the app publishes the demand word at most every 100 ms => re-arm bound = 150 ms"
         );
     }
 }

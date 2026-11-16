@@ -152,6 +152,7 @@ fn latest_channel() -> (LatestSender, LatestUpdates) {
 struct Worker {
     config: Arc<RwLock<Config>>,
     config_generation: Arc<AtomicU64>,
+    request_cache: (u64, Arc<Config>),
     consumers: Arc<AtomicU64>,
     tx: LatestSender,
     slow_rx: mpsc::Receiver<SlowEvent>,
@@ -172,10 +173,10 @@ struct Worker {
     performance_attempt: Option<Instant>,
     connections_attempt: Option<Instant>,
     battery_attempt: Option<Instant>,
+    performance_failures: u32,
     presentmon_rx: mpsc::Receiver<presentmon::Update>,
     hang_rx: mpsc::Receiver<hang::Update>,
     network_rx: mpsc::Receiver<network::Update>,
-    temps_need_refresh: Arc<AtomicBool>,
     hwinfo_cpu_temp: Metric,
     lhm_cpu_temp: Metric,
     native_gpu_temp: Metric,
@@ -190,6 +191,8 @@ struct Worker {
     lhm_diagnostic: Option<&'static str>,
     generation: u64,
     safe_mode_active: bool,
+    publish_dirty: bool,
+    last_publish: Option<Instant>,
 }
 
 fn current_config(config: &RwLock<Config>) -> Config {
@@ -205,6 +208,35 @@ fn current_request(config: &RwLock<Config>, generation: &AtomicU64) -> (u64, Con
             return (after, config);
         }
     }
+}
+
+/// WO-TEL-D2 (S5, U-8): the generation-guarded request read for the five
+/// 50 ms-tick hot sites (coordinator tick, four sampling loops); the presentmon
+/// worker loop head carries the same-shaped copy in `providers/presentmon.rs`.
+/// A `50 ms` tick under an unchanged generation reuses the cached `Arc<Config>`
+/// (one refcount bump) instead of a full `Config` clone; the config only ever
+/// changes when the generation moves (`Telemetry::update_config` writes before
+/// the bump), so the cache is valid for the whole generation. A changed
+/// generation takes the shipped `current_request` rule copy above, so the
+/// cached value belongs to the generation reported with it and the shipped
+/// `SeqCst` pairing is untouched. The network worker keeps its shipped
+/// per-iteration `current_request` (F-D2-3: its EC-8 mid-probe pins change
+/// config content at a fixed generation).
+fn cached_request(
+    config: &RwLock<Config>,
+    generation: &AtomicU64,
+    cache: &mut (u64, Arc<Config>),
+) -> (u64, Arc<Config>) {
+    let before = generation.load(Ordering::SeqCst);
+    if before == cache.0 && before != 0 && generation.load(Ordering::SeqCst) == before {
+        return (before, Arc::clone(&cache.1));
+    }
+    // The fresh read IS the shipped rule copy (no duplicated `SeqCst` pair):
+    // `current_request` pairs the lock read with the generation loads, so the
+    // value cached here belongs to the generation reported with it.
+    let (generation, config) = current_request(config, generation);
+    *cache = (generation, Arc::new(config));
+    (generation, Arc::clone(&cache.1))
 }
 
 fn due(last_attempt: Option<Instant>, period: Duration, now: Instant) -> bool {
@@ -245,6 +277,41 @@ pub fn consumer_bit(provider: &str) -> u64 {
 /// Every gated provider consumed (full cadence for all of them).
 pub const ALL_CONSUMERS: u64 = (1 << GATED_PROVIDERS.len()) - 1;
 
+/// WO-TEL-D2 (S1): the never-gated metering providers the consumer word gains
+/// demand bits for, so a reading with no displayed consumer collects nothing.
+/// The 7-bit gated protocol above is unchanged; these names occupy bits
+/// immediately above it in the SAME published word, and a reading-keyed demand
+/// map in the app's derivation (`app.rs` `module_extended_consumers`) feeds
+/// them from the existing publication path. Providers outside both lists
+/// (hang, network probe, the app-loop trio) stay ungated by construction:
+/// they carry no bit, so no demand can stop them.
+pub const EXTENDED_CONSUMER_PROVIDERS: [&str; 4] = ["controller", "audio", "net", "presentmon"];
+
+/// Demand bit for one metering provider; `0` for names outside
+/// `EXTENDED_CONSUMER_PROVIDERS`. Distinct from `consumer_bit`: the gated and
+/// extended bit ranges never overlap.
+pub fn extended_consumer_bit(provider: &str) -> u64 {
+    EXTENDED_CONSUMER_PROVIDERS
+        .iter()
+        .position(|name| *name == provider)
+        .map_or(0, |index| 1 << (GATED_PROVIDERS.len() + index))
+}
+
+/// Test affordance: every metering provider consumed at once (the full demand
+/// word the fixtures publish so a shipped pin can drive every gated arm).
+/// Production never publishes it - the app derives the word from the displayed
+/// modules (`app.rs` `provider_consumer_bits | provider_demand_bits`).
+#[cfg(test)]
+pub const ALL_EXTENDED_CONSUMERS: u64 =
+    ((1 << EXTENDED_CONSUMER_PROVIDERS.len()) - 1) << GATED_PROVIDERS.len();
+
+/// Demand view of one published word: true when the provider's own bit (gated
+/// or extended) is set; names with no bit are never demand-gated.
+pub fn demanded(consumers: u64, provider: &str) -> bool {
+    let bit = consumer_bit(provider) | extended_consumer_bit(provider);
+    bit != 0 && consumers & bit != 0
+}
+
 fn gpu_stale_after(cfg: &Config) -> Duration {
     cfg.telemetry_interval
         .saturating_mul(3)
@@ -276,6 +343,26 @@ pub fn sampling_interval(cfg: &Config, consumers: u64, provider: &str, full: Dur
         return keep_alive_interval(cfg, provider).unwrap_or(full).max(full);
     }
     full
+}
+
+/// WO-TEL-D2 (S4): the provider-outcome backoff that replaces the shipped
+/// failure-inverts-cadence shape (`temps_need_refresh`). Consecutive provider
+/// failures grow the demanded cadence by doubling from `base` toward the
+/// provider's own staleness bound `bound` — the same bound EC-3 derives — so a
+/// permanently failing provider is polled no faster than the keep-alive need,
+/// never at the full cadence. A success returns `base`. `failures == 0` is the
+/// healthy path and returns `base` exactly, so a demanded, healthy provider is
+/// indistinguishable from the shipped cadence. The doubling shift is clamped so
+/// `base << shift` cannot wrap a `u32` milliseconds value: the clamp saturates
+/// far above every shipped bound (128 × base ≥ bound within 8 doublings).
+pub fn backoff_interval(base: Duration, bound: Duration, failures: u32) -> Duration {
+    if failures == 0 {
+        return base;
+    }
+    let shift = failures.min(8);
+    base.saturating_mul(1u32 << shift)
+        .min(bound.max(base))
+        .max(base)
 }
 
 fn enabled(cfg: &Config, provider: &str) -> bool {
@@ -477,50 +564,83 @@ fn set_provider_diagnostic(
 
 impl Worker {
     fn tick(&mut self) -> bool {
-        let (generation, cfg) = current_request(&self.config, &self.config_generation);
+        let (generation, cfg) = cached_request(
+            &self.config,
+            &self.config_generation,
+            &mut self.request_cache,
+        );
         let now = Instant::now();
 
         if generation != self.generation {
             self.reset_state(generation);
         }
 
+        let mut applied = false;
         while let Ok(event) = self.slow_rx.try_recv() {
             self.apply_slow_event(event, generation, now);
+            applied = true;
         }
         while let Ok(update) = self.presentmon_rx.try_recv() {
             self.apply_presentmon_update(update, generation);
+            applied = true;
         }
         while let Ok(update) = self.hang_rx.try_recv() {
             self.apply_hang_update(update, generation);
+            applied = true;
         }
         while let Ok(update) = self.network_rx.try_recv() {
             self.apply_network_update(update, generation, &cfg, now);
+            applied = true;
         }
+        self.publish_dirty |= applied;
 
         if cfg.safe_mode {
             self.hwinfo_diagnostic = None;
             if !self.safe_mode_active {
                 self.reset_state(generation);
                 self.safe_mode_active = true;
+                self.publish_dirty = true;
             }
             self.update = Update {
                 generation,
                 ..Default::default()
             };
-            return self.tx.send(self.update.clone());
+            return self.publish(generation, &cfg, now);
         }
         self.safe_mode_active = false;
 
-        self.poll_controller(&cfg, now);
-        self.poll_audio(&cfg, now);
-        self.poll_network(&cfg, now);
         let consumers = self.consumers.load(Ordering::Relaxed);
+        self.poll_controller(&cfg, consumers, now);
+        self.poll_audio(&cfg, consumers, now);
+        self.poll_network(&cfg, consumers, now);
         self.poll_performance(&cfg, consumers, now);
         self.poll_connections(&cfg, consumers, now);
         self.poll_battery(&cfg, consumers, now);
         self.apply_freshness(&cfg, now);
         self.rebuild_extended_readings(&cfg);
         self.update.generation = generation;
+        self.publish(generation, &cfg, now)
+    }
+
+    /// WO-TEL-D2 (S5, U-8): publish on change-or-due. A data change (applied
+    /// event, poll attempt, generation reset, safe-mode entry) publishes on the
+    /// tick that made it; staleness and cadence riding publish at the
+    /// `telemetry_interval` boundary — the app's own consumption cadence
+    /// (`app.rs` snapshot gate), so the app drains a value no staler than the
+    /// pre-20-Hz stream ever showed it. The capacity-1 coalescing channel and
+    /// the generation stamp ride unchanged. A send that fails (disconnected)
+    /// still consumes the due slot; the coordinator loop then exits on the
+    /// `false`, exactly as the shipped unconditional send did.
+    fn publish(&mut self, generation: u64, cfg: &Config, now: Instant) -> bool {
+        debug_assert_eq!(self.update.generation, generation);
+        let due = self
+            .last_publish
+            .is_none_or(|last| now.duration_since(last) >= cfg.telemetry_interval);
+        if !self.publish_dirty && !due {
+            return true;
+        }
+        self.publish_dirty = false;
+        self.last_publish = Some(now);
         self.tx.send(self.update.clone())
     }
 
@@ -545,6 +665,7 @@ impl Worker {
         self.performance_attempt = None;
         self.connections_attempt = None;
         self.battery_attempt = None;
+        self.performance_failures = 0;
         self.hwinfo_cpu_temp = Metric::default();
         self.lhm_cpu_temp = Metric::default();
         self.native_gpu_temp = Metric::default();
@@ -556,8 +677,9 @@ impl Worker {
         self.performance_readings.clear();
         self.connection_reading = None;
         self.lhm_diagnostic = None;
-        self.temps_need_refresh.store(true, Ordering::Relaxed);
         self.generation = generation;
+        self.publish_dirty = true;
+        self.last_publish = None;
     }
 
     fn apply_slow_event(&mut self, event: SlowEvent, generation: u64, now: Instant) {
@@ -760,17 +882,23 @@ impl Worker {
         }
     }
 
-    fn poll_controller(&mut self, cfg: &Config, now: Instant) {
+    fn poll_controller(&mut self, cfg: &Config, consumers: u64, now: Instant) {
         if !enabled(cfg, "controller") {
             self.controller_attempt = None;
             self.update.controller = ControllerBattery::default();
             self.remove_provider("controller");
             return;
         }
+        // WO-TEL-D2 (S2, U-7): no displayed CONTROLLER_BATTERY consumer => the
+        // poll does not run; the shipped disabled arm above stays byte-identical.
+        if !demanded(consumers, "controller") {
+            return;
+        }
         if !due(self.controller_attempt, cfg.controller_poll, now) {
             return;
         }
         self.controller_attempt = Some(now);
+        self.publish_dirty = true;
         match xinput::query(cfg.controller_index) {
             Ok(Some((index, battery))) => {
                 self.update.controller = ControllerBattery {
@@ -797,17 +925,23 @@ impl Worker {
         }
     }
 
-    fn poll_audio(&mut self, cfg: &Config, now: Instant) {
+    fn poll_audio(&mut self, cfg: &Config, consumers: u64, now: Instant) {
         if !enabled(cfg, "audio") {
             self.audio_attempt = None;
             self.update.audio = None;
             self.remove_provider("audio");
             return;
         }
+        // WO-TEL-D2 (S2, U-2): no displayed AUDIO/MIC_STATUS consumer => the COM
+        // endpoint read does not run; the shipped disabled arm stays byte-identical.
+        if !demanded(consumers, "audio") {
+            return;
+        }
         if !due(self.audio_attempt, cfg.audio_poll, now) {
             return;
         }
         self.audio_attempt = Some(now);
+        self.publish_dirty = true;
         match audio::read() {
             Ok(state) => {
                 self.update.audio = Some(state);
@@ -823,17 +957,25 @@ impl Worker {
         }
     }
 
-    fn poll_network(&mut self, cfg: &Config, now: Instant) {
+    fn poll_network(&mut self, cfg: &Config, consumers: u64, now: Instant) {
         if !enabled(cfg, "net") {
             self.net_attempt = None;
             self.update.net = None;
             self.remove_provider("net");
             return;
         }
+        // WO-TEL-D2 (S2, U-11): the 1 Hz netif poll stops when no NET_* module
+        // and no NET bar is displayed (the persistence the demand release leaves
+        // today); the delta math divides by the real elapsed span, so the
+        // resume's first sample re-baselines and every later rate is correct.
+        if !demanded(consumers, "net") {
+            return;
+        }
         if !due(self.net_attempt, NETWORK_POLL, now) {
             return;
         }
         self.net_attempt = Some(now);
+        self.publish_dirty = true;
         match self.net.update() {
             Ok(sample) => {
                 self.update.net = sample;
@@ -848,13 +990,25 @@ impl Worker {
     }
 
     fn poll_performance(&mut self, cfg: &Config, consumers: u64, now: Instant) {
-        let interval = sampling_interval(cfg, consumers, "performance", EXTENDED_POLL);
+        // WO-TEL-D2 (S2/S4, U-5..U-8 family): zero-demand => no sampling; the
+        // EC-3 keep-alive math below stays the shipped function. U-12: a PDH
+        // sample failure makes `providers/performance.rs` drop the query, so the
+        // NEXT poll re-opens `PdhOpenQueryW` + the 3 counters; the consecutive-
+        // failure streak grows the interval toward the provider's own
+        // staleness bound, bounding that re-open to the keep-alive cadence.
+        if !demanded(consumers, "performance") {
+            return;
+        }
+        let full = backoff_interval(EXTENDED_POLL, EXTENDED_STALE, self.performance_failures);
+        let interval = sampling_interval(cfg, consumers, "performance", full);
         if !due(self.performance_attempt, interval, now) {
             return;
         }
         self.performance_attempt = Some(now);
+        self.publish_dirty = true;
         match self.performance.sample() {
             Ok(Some(sample)) => {
+                self.performance_failures = 0;
                 self.performance_readings = vec![
                     Reading::current_number(
                         MetricKey::DiskReadBytesPerSec,
@@ -881,8 +1035,12 @@ impl Worker {
                 self.performance_success = Some(now);
                 self.set_provider("performance", true);
             }
-            Ok(None) => self.set_provider("performance", true),
+            Ok(None) => {
+                self.performance_failures = 0;
+                self.set_provider("performance", true);
+            }
             Err(error) => {
+                self.performance_failures = self.performance_failures.saturating_add(1);
                 crate::log_debug!("performance sample failed: {}", error);
                 self.set_provider("performance", false);
             }
@@ -890,11 +1048,17 @@ impl Worker {
     }
 
     fn poll_connections(&mut self, cfg: &Config, consumers: u64, now: Instant) {
+        // WO-TEL-D2 (S2, U-5): `CONNECTIONS` in no displayed module => no poll;
+        // the TCP-table copy stops entirely at demand 0.
+        if !demanded(consumers, "connections") {
+            return;
+        }
         let interval = sampling_interval(cfg, consumers, "connections", EXTENDED_POLL);
         if !due(self.connections_attempt, interval, now) {
             return;
         }
         self.connections_attempt = Some(now);
+        self.publish_dirty = true;
         match connections::sample() {
             Ok(sample) => {
                 self.connection_reading = Some(Reading::current_number(
@@ -915,11 +1079,17 @@ impl Worker {
     }
 
     fn poll_battery(&mut self, cfg: &Config, consumers: u64, now: Instant) {
+        // WO-TEL-D2 (S2, U-6): `SYSTEM_BATTERY` in no displayed module => no
+        // `GetSystemPowerStatus` call; the EC-3 floor below stays the shipped math.
+        if !demanded(consumers, "system battery") {
+            return;
+        }
         let interval = sampling_interval(cfg, consumers, "system battery", BATTERY_POLL);
         if !due(self.battery_attempt, interval, now) {
             return;
         }
         self.battery_attempt = Some(now);
+        self.publish_dirty = true;
         match system_power::sample() {
             Ok(sample) => {
                 self.update.system_battery = SystemBattery {
@@ -1050,13 +1220,6 @@ impl Worker {
             self.network_success = None;
             self.remove_provider("network probe");
         }
-        self.temps_need_refresh.store(
-            !self.update.cpu_temp.valid
-                || self.update.cpu_temp.stale
-                || !self.update.gpu_temp.valid
-                || self.update.gpu_temp.stale,
-            Ordering::Relaxed,
-        );
     }
 
     fn rebuild_extended_readings(&mut self, cfg: &Config) {
@@ -1158,15 +1321,22 @@ fn spawn_headset(
     std::thread::Builder::new()
         .name("telemetry-headset".into())
         .spawn(move || {
+            let mut request = (0u64, Arc::new(current_config(&config)));
             let mut last_attempt = None;
             let mut last_generation = 0u64;
             while !shutdown.load(Ordering::Relaxed) {
-                let (generation, cfg) = current_request(&config, &generation);
+                let (generation, cfg) = cached_request(&config, &generation, &mut request);
                 if generation != last_generation {
                     last_generation = generation;
                     last_attempt = None;
                 }
-                if !enabled(&cfg, "headset") {
+                if !enabled(&cfg, "headset")
+                    || !demanded(consumers.load(Ordering::Relaxed), "headset")
+                {
+                    // WO-TEL-D2 (S2, U-1 family): the zero-demand park reuses the
+                    // shipped disabled arm (clear + `sleep(TICK)`), so a reading
+                    // with no displayed consumer performs zero HID queries and
+                    // the generation-only clear stays byte-identical.
                     last_attempt = None;
                 } else {
                     let now = Instant::now();
@@ -1206,30 +1376,51 @@ fn spawn_lhm(
     generation: Arc<AtomicU64>,
     consumers: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
-    temps_need_refresh: Arc<AtomicBool>,
     tx: mpsc::SyncSender<SlowEvent>,
     sample: LhmSampler,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("telemetry-lhm".into())
         .spawn(move || {
+            let mut request = (0u64, Arc::new(current_config(&config)));
             let mut last_attempt = None;
             let mut last_generation = 0u64;
+            // WO-TEL-D2 (S4, U-1): the shipped `temps_need_refresh` store read
+            // here inverted the cadence — an endpoint yielding nothing was
+            // polled at the FULL rate (removed mechanism; the audit refutes any
+            // production-rate claim from the soak log). The provider's own
+            // outcome now drives a backoff: consecutive sampler `Err`s double
+            // the interval from the configured cadence up to the existing
+            // `lhm_stale_after` bound; a success resets it. Demand (S2): no
+            // displayed temperature/alert consumer parks the loop in the
+            // shipped disabled arm — zero HTTP.
+            let mut failures = 0u32;
             while !shutdown.load(Ordering::Relaxed) {
-                let (generation, cfg) = current_request(&config, &generation);
+                let (generation, cfg) = cached_request(&config, &generation, &mut request);
                 if generation != last_generation {
                     last_generation = generation;
                     last_attempt = None;
                 }
-                if let Some(url) = lhm_url(&cfg) {
+                // WO-TEL-D2 (S4, U-1): the failure streak deliberately survives a
+                // generation bump (the cleared stamp above still samples
+                // immediately; the next success resets the streak). Keeping the
+                // shipped branch shape byte-exact is the structural pin
+                // `telemetry_sampling_loops_clear_cadence_only_on_generation_change`.
+                if let Some(url) =
+                    lhm_url(&cfg).filter(|_| demanded(consumers.load(Ordering::Relaxed), "lhm"))
+                {
                     let now = Instant::now();
                     let settled_interval = (cfg.lhm_stale_after / 2).max(cfg.lhm_interval);
-                    let full = if cfg.lhm_mode == "on" || temps_need_refresh.load(Ordering::Relaxed)
-                    {
+                    let base = if cfg.lhm_mode == "on" {
                         cfg.lhm_interval
                     } else {
                         settled_interval
                     };
+                    let full = backoff_interval(
+                        base,
+                        keep_alive_interval(&cfg, "lhm").unwrap_or(base),
+                        failures,
+                    );
                     let interval =
                         sampling_interval(&cfg, consumers.load(Ordering::Relaxed), "lhm", full);
                     if due(last_attempt, interval, now) {
@@ -1240,6 +1431,10 @@ fn spawn_lhm(
                             &lhm_selectors(&cfg),
                             Duration::from_secs(2),
                         );
+                        match &result {
+                            Ok(_) => failures = 0,
+                            Err(_) => failures = failures.saturating_add(1),
+                        }
                         if !send_slow(&tx, SlowEvent::Lhm(generation, Box::new(result))) {
                             return;
                         }
@@ -1264,15 +1459,19 @@ fn spawn_hwinfo(
     std::thread::Builder::new()
         .name("telemetry-hwinfo".into())
         .spawn(move || {
+            let mut request = (0u64, Arc::new(current_config(&config)));
             let mut last_attempt = None;
             let mut last_generation = 0u64;
             while !shutdown.load(Ordering::Relaxed) {
-                let (generation, cfg) = current_request(&config, &generation);
+                let (generation, cfg) = cached_request(&config, &generation, &mut request);
                 if generation != last_generation {
                     last_generation = generation;
                     last_attempt = None;
                 }
-                if enabled(&cfg, "hwinfo") {
+                // WO-TEL-D2 (S2): zero display demand parks the loop in the
+                // shipped disabled arm — the shared-memory mapping is never opened.
+                if enabled(&cfg, "hwinfo") && demanded(consumers.load(Ordering::Relaxed), "hwinfo")
+                {
                     let now = Instant::now();
                     let interval = sampling_interval(
                         &cfg,
@@ -1500,29 +1699,41 @@ fn spawn_gpu(
     std::thread::Builder::new()
         .name("telemetry-gpu".into())
         .spawn(move || {
+            let mut request = (0u64, Arc::new(current_config(&config)));
             let mut provider = gpu::Provider::new("off");
             let mut last_attempt = None;
             let mut last_generation = 0u64;
+            // WO-TEL-D2 (S4, U-10): `providers/gpu.rs:69` clears the backend
+            // cache on a failed sample, so the next poll re-runs the vendor
+            // open chain (`nvapi64.dll`/`amdadlx64.dll`/`nvml.dll` loads). The
+            // consecutive-failure streak doubles the demanded interval up to the
+            // provider's own staleness bound (`gpu_stale_after`), bounding that
+            // re-open to the keep-alive cadence; success resets it. Demand (S2):
+            // no GPU bar/temperature/alert consumer parks the loop in the
+            // shipped disabled arm, which also unloads the vendor handles.
+            let mut failures = 0u32;
             while !shutdown.load(Ordering::Relaxed) {
-                let (generation, cfg) = current_request(&config, &generation);
+                let (generation, cfg) = cached_request(&config, &generation, &mut request);
                 if generation != last_generation {
                     last_generation = generation;
                     last_attempt = None;
                 }
-                if enabled(&cfg, "gpu") {
+                // WO-TEL-D2 (S4, U-10): streak survives a bump (same rule as the
+                // LHM loop above); the cleared stamp samples immediately.
+                if enabled(&cfg, "gpu") && demanded(consumers.load(Ordering::Relaxed), "gpu") {
                     let now = Instant::now();
-                    let interval = sampling_interval(
-                        &cfg,
-                        consumers.load(Ordering::Relaxed),
-                        "gpu",
-                        cfg.telemetry_interval,
-                    );
+                    let full =
+                        backoff_interval(cfg.telemetry_interval, gpu_stale_after(&cfg), failures);
+                    let interval =
+                        sampling_interval(&cfg, consumers.load(Ordering::Relaxed), "gpu", full);
                     if due(last_attempt, interval, now) {
                         last_attempt = Some(now);
-                        if !send_slow(
-                            &tx,
-                            SlowEvent::Gpu(generation, sample(&mut provider, &cfg.gpu_provider)),
-                        ) {
+                        let result = sample(&mut provider, &cfg.gpu_provider);
+                        match &result {
+                            Ok(_) => failures = 0,
+                            Err(_) => failures = failures.saturating_add(1),
+                        }
+                        if !send_slow(&tx, SlowEvent::Gpu(generation, result)) {
                             return;
                         }
                     }
@@ -1542,7 +1753,6 @@ pub fn spawn(cfg: &Config) -> Telemetry {
     let generation = Arc::new(AtomicU64::new(1));
     let consumers = Arc::new(AtomicU64::new(ALL_CONSUMERS));
     let shutdown = Arc::new(AtomicBool::new(false));
-    let temps_need_refresh = Arc::new(AtomicBool::new(true));
     let (tx, rx) = latest_channel();
     let (slow_tx, slow_rx) = mpsc::sync_channel(8);
     let mut threads = vec![spawn_headset(
@@ -1558,7 +1768,6 @@ pub fn spawn(cfg: &Config) -> Telemetry {
         Arc::clone(&generation),
         Arc::clone(&consumers),
         Arc::clone(&shutdown),
-        Arc::clone(&temps_need_refresh),
         slow_tx.clone(),
         lhm::sample_extended,
     ));
@@ -1581,6 +1790,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
     let (presentmon_rx, presentmon_thread) = presentmon::spawn(
         Arc::clone(&config),
         Arc::clone(&generation),
+        Arc::clone(&consumers),
         Arc::clone(&shutdown),
     );
     let (hang_rx, hang_thread) = hang::spawn(
@@ -1598,6 +1808,7 @@ pub fn spawn(cfg: &Config) -> Telemetry {
     let worker = Worker {
         config: Arc::clone(&config),
         config_generation: Arc::clone(&generation),
+        request_cache: (0u64, Arc::new(cfg.clone())),
         consumers: Arc::clone(&consumers),
         tx,
         slow_rx,
@@ -1621,7 +1832,6 @@ pub fn spawn(cfg: &Config) -> Telemetry {
         presentmon_rx,
         hang_rx,
         network_rx,
-        temps_need_refresh,
         hwinfo_cpu_temp: Metric::default(),
         lhm_cpu_temp: Metric::default(),
         native_gpu_temp: Metric::default(),
@@ -1634,8 +1844,11 @@ pub fn spawn(cfg: &Config) -> Telemetry {
         connection_reading: None,
         hwinfo_diagnostic: None,
         lhm_diagnostic: None,
+        performance_failures: 0,
         generation: 1,
         safe_mode_active: cfg.safe_mode,
+        publish_dirty: true,
+        last_publish: None,
     };
     let coordinator_shutdown = Arc::clone(&shutdown);
     let coordinator = std::thread::Builder::new()
@@ -1801,7 +2014,7 @@ mod tests {
     }
 
     fn test_worker(cfg: Config) -> Worker {
-        let config = Arc::new(RwLock::new(cfg));
+        let config = Arc::new(RwLock::new(cfg.clone()));
         let generation = Arc::new(AtomicU64::new(1));
         let (tx, _updates) = latest_channel();
         let (_slow_tx, slow_rx) = mpsc::sync_channel(1);
@@ -1811,6 +2024,7 @@ mod tests {
         Worker {
             config,
             config_generation: generation,
+            request_cache: (0u64, Arc::new(cfg)),
             consumers: Arc::new(AtomicU64::new(ALL_CONSUMERS)),
             tx,
             slow_rx,
@@ -1834,10 +2048,10 @@ mod tests {
             performance_attempt: None,
             connections_attempt: None,
             battery_attempt: None,
+            performance_failures: 0,
             presentmon_rx,
             hang_rx,
             network_rx,
-            temps_need_refresh: Arc::new(AtomicBool::new(false)),
             hwinfo_cpu_temp: Metric::default(),
             lhm_cpu_temp: Metric::default(),
             native_gpu_temp: Metric::default(),
@@ -1852,6 +2066,8 @@ mod tests {
             lhm_diagnostic: None,
             generation: 1,
             safe_mode_active: false,
+            publish_dirty: true,
+            last_publish: None,
         }
     }
 
@@ -2941,7 +3157,16 @@ mod tests {
     /// `telemetry_gpu_loop_behavioral_generation_bump_rearms_sampling`.
     #[test]
     fn telemetry_sampling_loops_clear_cadence_only_on_generation_change() {
-        const READ: &str = "let (generation, cfg) = current_request(&config, &generation);";
+        // WO-TEL-D2 cite-lockstep (disclosed, not weakened): the loop-head READ
+        // token names the cached request read (U-8: the 50 ms tick reuses the
+        // `Arc<Config>` under an unchanged generation; the shipped `SeqCst`
+        // before/after pair is the same rule). The generation-branch CLEAR block,
+        // the `last_attempt = None;` count (declaration + branch + disabled arm;
+        // the zero-demand park REUSES the shipped disabled arm, adding no clear
+        // site), the read-branch-gate order, and the event tokens are the same
+        // structural claims as shipped.
+        const READ: &str =
+            "let (generation, cfg) = cached_request(&config, &generation, &mut request);";
         const BRANCH: &str = "if generation != last_generation {\n                    last_generation = generation;\n                    last_attempt = None;\n                }";
         for (fn_head, event) in [
             ("fn spawn_headset(", "SlowEvent::Headset(generation,"),
@@ -3329,7 +3554,9 @@ mod tests {
 
     /// BEHAVIORAL (WO-TEL-C) LHM loop through the sampler seam. REAL code: the whole `spawn_lhm`
     /// body - `lhm_url` gate, loop head, generation read, WO-TEL-B tracker + conditional clear,
-    /// the `lhm_mode`/`temps_need_refresh` interval selection, `sampling_interval`/`due`, `TICK`
+    /// the `lhm_mode` settled-cadence interval selection (WO-TEL-D2: with the
+    /// `temps_need_refresh` inversion removed, `lhm_mode "on"` keeps the full configured
+    /// cadence — the driven cadences below are unchanged), `sampling_interval`/`due`, `TICK`
     /// pacing and `SlowEvent::Lhm` publication. INJECTED: only `behavioral_lhm_sampler`
     /// (production passes the real `lhm::sample_extended`); the synthetic URL is never dialed, so
     /// zero HTTP. Same four claims as the headset test, on the LHM event stream.
@@ -3360,7 +3587,6 @@ mod tests {
             Arc::clone(&generation),
             Arc::new(AtomicU64::new(ALL_CONSUMERS)),
             Arc::clone(&shutdown),
-            Arc::new(AtomicBool::new(false)),
             tx,
             behavioral_lhm_sampler,
         );
@@ -3735,5 +3961,1212 @@ mod tests {
         loop_thread
             .join()
             .expect("the GPU loop joins within the sampler's loud 5 s budget");
+    }
+
+    // WO-TEL-D2: proofs for the ratified demand-gating scope. Seam loops (P1/P2
+    // on the REAL production loop bodies, only the sampler injected, WO-TEL-C
+    // pattern: a fresh scripted-sampler slot per test, channel handshake, loud
+    // bounded budgets, zero real I/O); coordinator polls (P1/P2/P4 driven with
+    // the shipped `due`/`apply_freshness` machinery on synthetic `now`s);
+    // backoff (pure function + loop-level outcome ladders). The demand word is
+    // a plain `Arc<AtomicU64>` the app's render tick publishes in production
+    // (`app.rs:183/323`), so a store flips demand exactly like a slot cycle.
+
+    static ZD_HEADSET_SAMPLER: OnceLock<ScriptedSampler<Result<headset::Status, String>>> =
+        OnceLock::new();
+    static ZD_LHM_SAMPLER: OnceLock<
+        ScriptedSampler<Result<(lhm::ExtendedSample, SystemTime), String>>,
+    > = OnceLock::new();
+    static ZD_HWINFO_SAMPLER: OnceLock<ScriptedSampler<Result<hwinfo::Sample, String>>> =
+        OnceLock::new();
+    static ZD_GPU_SAMPLER: OnceLock<ScriptedSampler<Result<gpu::Sample, String>>> = OnceLock::new();
+    static BO_LHM_SAMPLER: OnceLock<
+        ScriptedSampler<Result<(lhm::ExtendedSample, SystemTime), String>>,
+    > = OnceLock::new();
+    static BO_GPU_SAMPLER: OnceLock<ScriptedSampler<Result<gpu::Sample, String>>> = OnceLock::new();
+
+    fn zd_headset_sampler(_timeout: Duration) -> Result<headset::Status, String> {
+        sampled_in_slot(&ZD_HEADSET_SAMPLER)
+    }
+
+    fn zd_lhm_sampler(
+        _url: &str,
+        _overrides: &std::collections::BTreeMap<String, String>,
+        _selectors: &lhm::ExtendedSelectors,
+        _timeout: Duration,
+    ) -> Result<(lhm::ExtendedSample, SystemTime), String> {
+        sampled_in_slot(&ZD_LHM_SAMPLER)
+    }
+
+    fn zd_hwinfo_sampler(
+        _selectors: &hwinfo::Selectors,
+        _max_age: Duration,
+    ) -> Result<hwinfo::Sample, String> {
+        sampled_in_slot(&ZD_HWINFO_SAMPLER)
+    }
+
+    fn zd_gpu_sampler(
+        _provider: &mut gpu::Provider,
+        _selector: &str,
+    ) -> Result<gpu::Sample, String> {
+        sampled_in_slot(&ZD_GPU_SAMPLER)
+    }
+
+    fn bo_lhm_sampler(
+        _url: &str,
+        _overrides: &std::collections::BTreeMap<String, String>,
+        _selectors: &lhm::ExtendedSelectors,
+        _timeout: Duration,
+    ) -> Result<(lhm::ExtendedSample, SystemTime), String> {
+        sampled_in_slot(&BO_LHM_SAMPLER)
+    }
+
+    fn bo_gpu_sampler(
+        _provider: &mut gpu::Provider,
+        _selector: &str,
+    ) -> Result<gpu::Sample, String> {
+        sampled_in_slot(&BO_GPU_SAMPLER)
+    }
+
+    fn lhm_outcomes(count: usize) -> Vec<Result<(lhm::ExtendedSample, SystemTime), String>> {
+        (0..count)
+            .map(|_| Err("synthetic LHM endpoint failure (backoff ladder)".to_string()))
+            .collect()
+    }
+
+    fn gpu_outcomes(count: usize) -> Vec<Result<gpu::Sample, String>> {
+        (0..count)
+            .map(|_| Err("synthetic GPU open failure (backoff ladder)".to_string()))
+            .collect()
+    }
+
+    /// A scripted Ok outcome for the zero-demand loops (content irrelevant; the
+    /// payload is never inspected beyond `is_ok`).
+    fn headset_ok(index: u64) -> Result<headset::Status, String> {
+        Ok(headset::Status {
+            online: true,
+            percent: index as i32,
+            ..Default::default()
+        })
+    }
+
+    fn lhm_ok(index: u64) -> Result<(lhm::ExtendedSample, SystemTime), String> {
+        Ok((lhm::ExtendedSample::default(), marker_time(index)))
+    }
+
+    fn hwinfo_ok(index: u64) -> Result<hwinfo::Sample, String> {
+        Ok(hwinfo::Sample {
+            cpu_temp_c: Some(index as f64),
+            total_power_w: None,
+            cpu_package_power_w: None,
+            gpu_board_power_w: None,
+            issues: Vec::new(),
+            sampled_at: marker_time(index),
+        })
+    }
+
+    fn gpu_ok(index: u64) -> Result<gpu::Sample, String> {
+        Ok(gpu::Sample {
+            backend: format!("synthetic-{index}"),
+            readings: Vec::new(),
+            temperature: Metric::valid(60.0 + index as f64, marker_time(index)),
+            power_w: None,
+            sampled_at: marker_time(index),
+        })
+    }
+
+    /// P1+P2 for the four seam loops: with demand 0 the REAL loop parks (zero
+    /// sampler entries over a window spanning several keep-alive bounds), and
+    /// publishing the demand bit starts the sampler on the next tick within
+    /// `BEHAVIORAL_WAIT` (the production bound is <=100 ms publication + one
+    /// 50 ms `TICK`; the budget here is 2 s). Falsifiability: the shipped
+    /// keep-alive floor sampled at `t = 0` with demand 0 (`due(None) = true`),
+    /// so removing the demand gate makes the window assertion red; freezing the
+    /// demand word makes the resume assertion red.
+    #[test]
+    fn telemetry_headset_loop_zero_demand_parks_and_resume_samples_within_bound() {
+        assert_injected_sampler_is_io_free("zd_headset_sampler");
+        let (enter_rx, release_tx) =
+            install_scripted_sampler(&ZD_HEADSET_SAMPLER, vec![headset_ok(1), headset_ok(2)]);
+        let config = Arc::new(RwLock::new(Config {
+            headset_enabled: true,
+            headset_poll: BEHAVIORAL_DRIVEN,
+            headset_stale_after: Duration::from_millis(200),
+            headset_query_timeout: Duration::from_millis(1),
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let consumers = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(8);
+        let loop_thread = spawn_headset(
+            Arc::clone(&config),
+            Arc::clone(&generation),
+            Arc::clone(&consumers),
+            Arc::clone(&shutdown),
+            tx,
+            zd_headset_sampler,
+        );
+        assert!(
+            enter_rx.recv_timeout(Duration::from_millis(900)).is_err(),
+            "(P1) the real headset loop enters the sampler ZERO times across 900 ms (> 2 x the 200 ms keep-alive bound) while no consumer reads the headset"
+        );
+        consumers.store(consumer_bit("headset"), Ordering::Relaxed);
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(P2) the demand bit starts the sampler on the next tick");
+        release_tx.send(()).expect("release #1");
+        let (gen1, _) = headset_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(P2) the demanded sample is published"),
+        );
+        assert_eq!(gen1, 1, "(P2) the event carries the loop generation");
+        consumers.store(0, Ordering::Relaxed);
+        assert!(
+            enter_rx.recv_timeout(Duration::from_millis(900)).is_err(),
+            "(P1) demand release parks the loop again (zero further entries)"
+        );
+        consumers.store(consumer_bit("headset"), Ordering::Relaxed);
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(P2) re-demand resumes sampling");
+        release_tx.send(()).expect("release #2");
+        shutdown.store(true, Ordering::Release);
+        loop_thread
+            .join()
+            .expect("the headset loop joins within the sampler's loud 5 s budget");
+    }
+
+    #[test]
+    fn telemetry_lhm_loop_zero_demand_parks_and_resume_samples_within_bound() {
+        assert_injected_sampler_is_io_free("zd_lhm_sampler");
+        let (enter_rx, release_tx) =
+            install_scripted_sampler(&ZD_LHM_SAMPLER, vec![lhm_ok(1), lhm_ok(2)]);
+        let config = Arc::new(RwLock::new(Config {
+            lhm_mode: "on".into(),
+            lhm_url: "http://127.0.0.1:1/synthetic-lhm-never-dialed".into(),
+            lhm_interval: BEHAVIORAL_DRIVEN,
+            lhm_stale_after: Duration::from_millis(200),
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let consumers = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(8);
+        let loop_thread = spawn_lhm(
+            Arc::clone(&config),
+            Arc::clone(&generation),
+            Arc::clone(&consumers),
+            Arc::clone(&shutdown),
+            tx,
+            zd_lhm_sampler,
+        );
+        assert!(
+            enter_rx.recv_timeout(Duration::from_millis(900)).is_err(),
+            "(P1) the real LHM loop enters the sampler ZERO times across 900 ms (> 2 x the 200 ms keep-alive bound) while no consumer reads temperatures"
+        );
+        consumers.store(consumer_bit("lhm"), Ordering::Relaxed);
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(P2) the demand bit starts the sampler on the next tick");
+        release_tx.send(()).expect("release #1");
+        let (gen1, _) = lhm_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(P2) the demanded sample is published"),
+        );
+        assert_eq!(gen1, 1, "(P2) the event carries the loop generation");
+        consumers.store(0, Ordering::Relaxed);
+        assert!(
+            enter_rx.recv_timeout(Duration::from_millis(900)).is_err(),
+            "(P1) demand release parks the loop again (zero further entries)"
+        );
+        consumers.store(consumer_bit("lhm"), Ordering::Relaxed);
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(P2) re-demand resumes sampling");
+        release_tx.send(()).expect("release #2");
+        shutdown.store(true, Ordering::Release);
+        loop_thread
+            .join()
+            .expect("the LHM loop joins within the sampler's loud 5 s budget");
+    }
+
+    #[test]
+    fn telemetry_hwinfo_loop_zero_demand_parks_and_resume_samples_within_bound() {
+        assert_injected_sampler_is_io_free("zd_hwinfo_sampler");
+        let (enter_rx, release_tx) =
+            install_scripted_sampler(&ZD_HWINFO_SAMPLER, vec![hwinfo_ok(1), hwinfo_ok(2)]);
+        let config = Arc::new(RwLock::new(Config {
+            hwinfo_cpu_temp_sensor: "CPU Exact".into(),
+            hwinfo_cpu_temp_reading: "Package Temperature".into(),
+            hwinfo_stale_after: Duration::from_millis(200),
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let consumers = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(8);
+        let loop_thread = spawn_hwinfo(
+            Arc::clone(&config),
+            Arc::clone(&generation),
+            Arc::clone(&consumers),
+            Arc::clone(&shutdown),
+            tx,
+            zd_hwinfo_sampler,
+        );
+        assert!(
+            enter_rx.recv_timeout(Duration::from_millis(1_600)).is_err(),
+            "(P1) the real HWiNFO loop enters the sampler ZERO times across 1.6 s (>= the shipped 1 s EXTENDED_POLL cadence, whose first sample fires immediately under the keep-alive rule) while no consumer reads HWiNFO-backed readings"
+        );
+        consumers.store(consumer_bit("hwinfo"), Ordering::Relaxed);
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(P2) the demand bit starts the sampler on the next tick");
+        release_tx.send(()).expect("release #1");
+        let (gen1, selector, _) = hwinfo_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(P2) the demanded sample is published"),
+        );
+        assert_eq!(gen1, 1, "(P2) the event carries the loop generation");
+        assert_eq!(
+            selector, "CPU Exact",
+            "(P2) selectors come from the live config"
+        );
+        consumers.store(0, Ordering::Relaxed);
+        assert!(
+            enter_rx.recv_timeout(Duration::from_millis(1_600)).is_err(),
+            "(P1) demand release parks the loop again (zero further entries)"
+        );
+        consumers.store(consumer_bit("hwinfo"), Ordering::Relaxed);
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(P2) re-demand resumes sampling");
+        release_tx.send(()).expect("release #2");
+        shutdown.store(true, Ordering::Release);
+        loop_thread
+            .join()
+            .expect("the HWiNFO loop joins within the sampler's loud 5 s budget");
+    }
+
+    #[test]
+    fn telemetry_gpu_loop_zero_demand_parks_and_resume_samples_within_bound() {
+        assert_injected_sampler_is_io_free("zd_gpu_sampler");
+        let (enter_rx, release_tx) =
+            install_scripted_sampler(&ZD_GPU_SAMPLER, vec![gpu_ok(1), gpu_ok(2)]);
+        let config = Arc::new(RwLock::new(Config {
+            gpu_provider: "auto".into(),
+            telemetry_interval: BEHAVIORAL_DRIVEN,
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let consumers = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(8);
+        let loop_thread = spawn_gpu(
+            Arc::clone(&config),
+            Arc::clone(&generation),
+            Arc::clone(&consumers),
+            Arc::clone(&shutdown),
+            tx,
+            zd_gpu_sampler,
+        );
+        assert!(
+            enter_rx.recv_timeout(Duration::from_millis(900)).is_err(),
+            "(P1) the real GPU loop enters the sampler ZERO times across 900 ms (>= 2 x the 400 ms driven cadence and >= the 3 s keep-alive floor's first-sample at t=0) while no consumer reads GPU-backed surfaces; with demand 0 the shipped disabled arm also keeps the vendor provider unloaded (no open chain)"
+        );
+        consumers.store(consumer_bit("gpu"), Ordering::Relaxed);
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(P2) the demand bit starts the sampler on the next tick");
+        release_tx.send(()).expect("release #1");
+        let (gen1, _) = gpu_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(P2) the demanded sample is published"),
+        );
+        assert_eq!(gen1, 1, "(P2) the event carries the loop generation");
+        consumers.store(0, Ordering::Relaxed);
+        assert!(
+            enter_rx.recv_timeout(Duration::from_millis(900)).is_err(),
+            "(P1) demand release parks the loop again (zero further entries)"
+        );
+        consumers.store(consumer_bit("gpu"), Ordering::Relaxed);
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(P2) re-demand resumes sampling");
+        release_tx.send(()).expect("release #2");
+        shutdown.store(true, Ordering::Release);
+        loop_thread
+            .join()
+            .expect("the GPU loop joins within the sampler's loud 5 s budget");
+    }
+
+    /// P-backoff (U-1): the demanded LHM loop facing consecutive provider
+    /// failures grows its interval toward the keep-alive bound — the shipped
+    /// inversion polled a failing endpoint at FULL cadence forever. Falsified
+    /// by restoring the inversion (full cadence on failure -> entry count
+    /// crosses the bound) and by dropping the backoff call.
+    #[test]
+    fn telemetry_lhm_loop_provider_outcome_backoff_is_bounded_by_keep_alive() {
+        assert_injected_sampler_is_io_free("bo_lhm_sampler");
+        let (enter_rx, release_tx) = install_scripted_sampler(&BO_LHM_SAMPLER, lhm_outcomes(40));
+        let config = Arc::new(RwLock::new(Config {
+            lhm_mode: "on".into(),
+            lhm_url: "http://127.0.0.1:1/synthetic-lhm-never-dialed".into(),
+            lhm_interval: Duration::from_millis(50),
+            lhm_stale_after: Duration::from_millis(1_000),
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let consumers = Arc::new(AtomicU64::new(consumer_bit("lhm")));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(64);
+        let loop_thread = spawn_lhm(
+            Arc::clone(&config),
+            Arc::clone(&generation),
+            Arc::clone(&consumers),
+            Arc::clone(&shutdown),
+            tx,
+            bo_lhm_sampler,
+        );
+        let start = Instant::now();
+        let mut entries = 0usize;
+        while start.elapsed() < Duration::from_millis(3_500) {
+            match enter_rx.recv_timeout(Duration::from_millis(1_200)) {
+                Ok(()) => {
+                    entries += 1;
+                    release_tx.send(()).expect("release ladder step");
+                }
+                Err(_) => break,
+            }
+        }
+        // Ladder with base 50 ms, bound 1000 ms: 0,50,150,350,750,1750,2750,3500
+        // = 8 entries in 3.5 s (loop tick adds slack). The unbacked cadence
+        // (shipped inversion shape) enters ~70 times in the same window.
+        assert!(
+            (3..=14).contains(&entries),
+            "(U-1) consecutive sampler failures back off within the keep-alive bound: {entries} entries in 3.5 s at a 50 ms full cadence (bounds: >=3 proves sampling continues; <=14 proves the bound)"
+        );
+        // The published Err stream keeps the current generation (diagnostics
+        // path unchanged).
+        let (gen, _) = lhm_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("the ladder publishes its Err outcomes"),
+        );
+        assert_eq!(
+            gen, 1,
+            "the failed-outcome events carry the live generation"
+        );
+        shutdown.store(true, Ordering::Release);
+        loop_thread
+            .join()
+            .expect("the LHM loop joins within the sampler's loud 5 s budget");
+    }
+
+    /// P-backoff (U-10): the same ladder bounds the GPU vendor re-open chain.
+    #[test]
+    fn telemetry_gpu_loop_provider_outcome_backoff_is_bounded_by_keep_alive() {
+        assert_injected_sampler_is_io_free("bo_gpu_sampler");
+        let (enter_rx, release_tx) = install_scripted_sampler(&BO_GPU_SAMPLER, gpu_outcomes(80));
+        let config = Arc::new(RwLock::new(Config {
+            gpu_provider: "auto".into(),
+            telemetry_interval: Duration::from_millis(50),
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let consumers = Arc::new(AtomicU64::new(consumer_bit("gpu")));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(64);
+        let loop_thread = spawn_gpu(
+            Arc::clone(&config),
+            Arc::clone(&generation),
+            Arc::clone(&consumers),
+            Arc::clone(&shutdown),
+            tx,
+            bo_gpu_sampler,
+        );
+        let start = Instant::now();
+        let mut entries = 0usize;
+        while start.elapsed() < Duration::from_millis(3_500) {
+            match enter_rx.recv_timeout(Duration::from_millis(1_200)) {
+                Ok(()) => {
+                    entries += 1;
+                    release_tx.send(()).expect("release ladder step");
+                }
+                Err(_) => break,
+            }
+        }
+        // gpu_stale_after = max(3 x 50 ms, 3 s) = 3 s: ladder 0,50,150,350,750,
+        // 1750,3500 = 7 entries in 3.5 s; unbacked = ~70.
+        assert!(
+            (3..=14).contains(&entries),
+            "(U-10) consecutive vendor-open failures back off within the staleness bound: {entries} entries in 3.5 s at a 50 ms full cadence"
+        );
+        let (gen, _) = gpu_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("the ladder publishes its Err outcomes"),
+        );
+        assert_eq!(
+            gen, 1,
+            "the failed-outcome events carry the live generation"
+        );
+        shutdown.store(true, Ordering::Release);
+        loop_thread
+            .join()
+            .expect("the GPU loop joins within the sampler's loud 5 s budget");
+    }
+
+    /// P-backoff (U-1/U-10/U-12 shared mechanism): the pure ladder.
+    #[test]
+    fn provider_outcome_backoff_is_exponential_bounded_and_never_faster_than_configured() {
+        let base = Duration::from_millis(300);
+        let bound = Duration::from_secs(3);
+        assert_eq!(
+            backoff_interval(base, bound, 0),
+            base,
+            "healthy keeps full cadence"
+        );
+        assert_eq!(backoff_interval(base, bound, 1), Duration::from_millis(600));
+        assert_eq!(
+            backoff_interval(base, bound, 2),
+            Duration::from_millis(1_200)
+        );
+        assert_eq!(
+            backoff_interval(base, bound, 3),
+            Duration::from_millis(2_400)
+        );
+        assert_eq!(
+            backoff_interval(base, bound, 4),
+            bound,
+            "4.8 s clamps to the provider's own staleness bound"
+        );
+        assert_eq!(
+            backoff_interval(base, bound, 64),
+            bound,
+            "a long failure streak can never outrun the bound, and the clamped shift never wraps"
+        );
+        assert_eq!(
+            backoff_interval(base, Duration::from_millis(100), 3),
+            base,
+            "a bound below the configured cadence leaves the cadence intact"
+        );
+    }
+
+    /// P1+P2 (coordinator, gated set): connections, system battery,
+    /// performance — with demand 0 the polls record no attempt (no
+    /// `GetTcpTable2`, no `GetSystemPowerStatus`, no PDH open/collect) and
+    /// publish no provider health rows; demanding a reading samples on the same
+    /// synthetic tick (resume `due` fires on the stale stamp).
+    #[test]
+    fn zero_demand_gated_coordinator_polls_sample_never_and_demand_samples_immediately() {
+        let cfg = Config::default();
+        let mut worker = test_worker(cfg.clone());
+        let base = Instant::now();
+        let consumers = 0u64;
+        for step in 1..=12u32 {
+            let now = base + Duration::from_secs(step as u64);
+            worker.poll_connections(&cfg, consumers, now);
+            worker.poll_battery(&cfg, consumers, now);
+            worker.poll_performance(&cfg, consumers, now);
+            assert!(
+                worker.connections_attempt.is_none()
+                    && worker.battery_attempt.is_none()
+                    && worker.performance_attempt.is_none(),
+                "P1: no demand records no attempt (step {step})"
+            );
+            assert!(
+                worker
+                    .update
+                    .providers
+                    .iter()
+                    .all(|(name, _)| name != "connections"
+                        && name != "system battery"
+                        && name != "performance"),
+                "P1: no demand touches no provider health row (step {step})"
+            );
+        }
+        let demanded = consumer_bit("connections")
+            | consumer_bit("system battery")
+            | consumer_bit("performance");
+        let now = base + Duration::from_secs(13);
+        worker.poll_connections(&cfg, demanded, now);
+        worker.poll_battery(&cfg, demanded, now);
+        worker.poll_performance(&cfg, demanded, now);
+        assert!(
+            worker.connections_attempt.is_some()
+                && worker.battery_attempt.is_some()
+                && worker.performance_attempt.is_some(),
+            "P2: the demand stamp makes every gated poll due on its first demanded call"
+        );
+        assert!(
+            worker
+                .update
+                .providers
+                .iter()
+                .any(|(name, _)| name == "connections"),
+            "P2: the demanded connections poll runs (real `GetTcpTable2` on this host)"
+        );
+    }
+
+    /// P1+P2 (coordinator, extended set): controller (xinput), audio (COM),
+    /// netif (`GetIfTable2`) — zero demand records no attempt and publishes no
+    /// health rows; demand samples on the first tick.
+    #[test]
+    fn zero_demand_metering_coordinator_polls_sample_never_and_demand_samples_immediately() {
+        let cfg = Config::default();
+        let mut worker = test_worker(cfg.clone());
+        let base = Instant::now();
+        for step in 1..=12u32 {
+            let now = base + Duration::from_secs(step as u64);
+            worker.poll_controller(&cfg, 0, now);
+            worker.poll_audio(&cfg, 0, now);
+            worker.poll_network(&cfg, 0, now);
+            assert!(
+                worker.controller_attempt.is_none()
+                    && worker.audio_attempt.is_none()
+                    && worker.net_attempt.is_none(),
+                "P1: no demand records no attempt (step {step})"
+            );
+            assert!(
+                worker
+                    .update
+                    .providers
+                    .iter()
+                    .all(|(name, _)| name != "controller" && name != "audio" && name != "net"),
+                "P1: no demand touches no provider health row (step {step})"
+            );
+        }
+        let demanded = extended_consumer_bit("controller")
+            | extended_consumer_bit("audio")
+            | extended_consumer_bit("net");
+        let now = base + Duration::from_secs(13);
+        worker.poll_controller(&cfg, demanded, now);
+        worker.poll_audio(&cfg, demanded, now);
+        worker.poll_network(&cfg, demanded, now);
+        assert!(
+            worker.controller_attempt.is_some()
+                && worker.audio_attempt.is_some()
+                && worker.net_attempt.is_some(),
+            "P2: the demand stamp makes every metering poll due on its first demanded call (U-11 persistence-stop, U-2/U-7)"
+        );
+    }
+
+    /// P4: a poll-stopped gated provider publishes STALE-marked values and
+    /// never returns to `Current` while demand stays 0 — the shipped
+    /// `apply_freshness` stamps from `last_success`, so zero-poll cannot make
+    /// an old value look fresh (this is the invariant the D2 gate relies on).
+    #[test]
+    fn gated_poll_stops_publish_stale_marked_and_never_returns_to_current() {
+        let cfg = Config::default();
+        let mut worker = test_worker(cfg.clone());
+        let base = Instant::now();
+        let demanded = consumer_bit("connections") | consumer_bit("system battery");
+        worker.poll_connections(&cfg, demanded, base);
+        worker.poll_battery(&cfg, demanded, base);
+        worker.apply_freshness(&cfg, base);
+        // Demand release: attempts frozen, successes age past the bounds.
+        for step in 1..=8u32 {
+            let later = base + Duration::from_secs(step as u64 * 4);
+            worker.poll_connections(&cfg, 0, later);
+            worker.poll_battery(&cfg, 0, later);
+            worker.apply_freshness(&cfg, later);
+            if let Some(reading) = &worker.connection_reading {
+                let expected = if step >= 1 {
+                    // The first poll succeeded at `base`; from base+4 s the
+                    // 3 s EXTENDED_STALE bound has passed.
+                    Freshness::Stale
+                } else {
+                    Freshness::Current
+                };
+                assert_eq!(
+                    reading.freshness,
+                    expected,
+                    "P4: the stopped connections reading stamps {expected:?} at +{} s and never returns to Current",
+                    step * 4
+                );
+            }
+            if worker.update.system_battery.sampled_at.is_some() {
+                let expected = if step * 4 > 15 {
+                    Freshness::Stale
+                } else {
+                    Freshness::Current
+                };
+                assert_eq!(
+                    worker.update.system_battery.freshness,
+                    expected,
+                    "P4: the stopped battery reading follows the shipped 15 s stamp at +{} s",
+                    step * 4
+                );
+            }
+        }
+        let late = base + Duration::from_secs(120);
+        worker.poll_connections(&cfg, 0, late);
+        worker.poll_battery(&cfg, 0, late);
+        worker.apply_freshness(&cfg, late);
+        if let Some(reading) = &worker.connection_reading {
+            assert_eq!(
+                reading.freshness,
+                Freshness::Stale,
+                "P4: 2 minutes without demand keeps the reading Stale — stale never fresh again"
+            );
+        }
+        if worker.update.system_battery.sampled_at.is_some() {
+            assert_eq!(
+                worker.update.system_battery.freshness,
+                Freshness::Stale,
+                "P4: the system battery reading stamps Stale past its 15 s bound and stays Stale"
+            );
+        }
+    }
+
+    /// P3: two consumers of one provider (the THERMALS slot pair of displayed
+    /// readings AND the enabled temperature alert map to the SAME single
+    /// demand bit) resolve to exactly ONE collection op per interval: the
+    /// shared-`scheduled_samples` count equals the single-consumer formula.
+    #[test]
+    fn two_consumers_of_one_provider_resolve_to_one_collection_op() {
+        let cfg = Config::default();
+        let horizon = Duration::from_secs(300);
+        let full = cfg.lhm_interval;
+        let gated = scheduled_samples(&cfg, consumer_bit("lhm"), "lhm", full, horizon, None);
+        assert_eq!(
+            gated.len(),
+            (horizon.as_millis() / full.as_millis()) as usize + 1,
+            "P3: one demanded provider samples exactly horizon/full+1 times — display + alert demand share this single op"
+        );
+        // The app's derivation collapses both consumers onto that one bit
+        // (`app.rs` tests pin the union equality; here the word-level sharing):
+        let display = consumer_bit("hwinfo") | consumer_bit("lhm") | consumer_bit("gpu");
+        let alert = consumer_bit("hwinfo") | consumer_bit("lhm") | consumer_bit("gpu");
+        assert_eq!(
+            display | alert,
+            display,
+            "P3: the alert demand is the same bits as the display demand — no second op exists"
+        );
+        // Extended sharing: the AUDIO and MIC_STATUS readings share one audio op.
+        let audio_bit = extended_consumer_bit("audio");
+        assert_ne!(audio_bit, 0, "audio carries an extended demand bit");
+        assert_eq!(
+            sampling_interval(&cfg, audio_bit, "audio", EXTENDED_POLL),
+            EXTENDED_POLL,
+            "P3: the extended word never enters the gated math — one audio op, no EC-3 rate effect"
+        );
+    }
+
+    /// S1 bit registry shape: the extended bits sit directly above the shipped
+    /// 7, never collide with `consumer_bit`, and name the four metering
+    /// providers of the ratified list.
+    #[test]
+    fn extended_consumer_bits_sit_above_the_gated_seven_without_collision() {
+        assert_eq!(GATED_PROVIDERS.len(), 7, "the shipped gated word");
+        assert_eq!(ALL_CONSUMERS, 0b111_1111);
+        assert_eq!(ALL_EXTENDED_CONSUMERS, 0b1111 << 7);
+        for provider in EXTENDED_CONSUMER_PROVIDERS {
+            let bit = extended_consumer_bit(provider);
+            assert_ne!(bit, 0, "{provider} has an extended demand bit");
+            assert_eq!(
+                consumer_bit(provider),
+                0,
+                "{provider} is not a gated provider (shipped pins intact)"
+            );
+            assert_eq!(
+                bit & ALL_CONSUMERS,
+                0,
+                "{provider} bit is above the gated range"
+            );
+            assert!(
+                demanded(ALL_EXTENDED_CONSUMERS, provider),
+                "{provider} demanded by the extended-all word"
+            );
+            assert!(
+                !demanded(ALL_CONSUMERS, provider),
+                "{provider} not demanded by the gated-all word"
+            );
+            assert!(!demanded(0, provider), "{provider} parks at demand 0");
+        }
+        for provider in GATED_PROVIDERS {
+            assert!(demanded(ALL_CONSUMERS, provider));
+            assert!(
+                !demanded(ALL_EXTENDED_CONSUMERS, provider),
+                "{provider} has no extended bit"
+            );
+            assert!(!demanded(0, provider));
+        }
+        // Mandatory lanes carry no demand key at all: no word can gate them.
+        for provider in ["hang", "network probe", "clock", "cpu", "memory"] {
+            assert_eq!(consumer_bit(provider), 0);
+            assert_eq!(extended_consumer_bit(provider), 0);
+            assert!(
+                !demanded(u64::MAX, provider),
+                "{provider} is never demand-gated"
+            );
+        }
+    }
+
+    /// U-8 proof A (behavioral): the coordinator publishes on change-or-due,
+    /// not per 50 ms tick. With a 5 s `telemetry_interval` a second instant
+    /// `tick()` publishes NOTHING (the shipped 20 Hz stream would), a generation
+    /// bump publishes IMMEDIATELY (the due gate never delays invalidation), and
+    /// an applied slow event publishes on its tick.
+    #[test]
+    fn coordinator_publishes_on_change_or_due_not_every_tick() {
+        let cfg = Config {
+            safe_mode: true, // isolates the publish gate: the tick short-circuits
+            telemetry_interval: Duration::from_secs(5),
+            ..Config::default()
+        };
+        let config = Arc::new(RwLock::new(cfg.clone()));
+        let generation = Arc::new(AtomicU64::new(1));
+        let (tx, updates) = latest_channel();
+        let (_slow_tx, slow_rx) = mpsc::sync_channel(1);
+        let (_presentmon_tx, presentmon_rx) = mpsc::channel();
+        let (_hang_tx, hang_rx) = mpsc::channel();
+        let (_network_tx, network_rx) = mpsc::channel();
+        let mut worker = Worker {
+            config,
+            config_generation: Arc::clone(&generation),
+            request_cache: (0u64, Arc::new(cfg.clone())),
+            consumers: Arc::new(AtomicU64::new(ALL_CONSUMERS)),
+            tx,
+            slow_rx,
+            update: Update {
+                generation: 1,
+                ..Default::default()
+            },
+            net: netif::NetProvider::new(),
+            performance: performance::Provider::new(),
+            headset_success: None,
+            lhm_success: None,
+            gpu_success: None,
+            performance_success: None,
+            connections_success: None,
+            battery_success: None,
+            hwinfo_success: None,
+            network_success: None,
+            controller_attempt: None,
+            audio_attempt: None,
+            net_attempt: None,
+            performance_attempt: None,
+            connections_attempt: None,
+            battery_attempt: None,
+            performance_failures: 0,
+            presentmon_rx,
+            hang_rx,
+            network_rx,
+            hwinfo_cpu_temp: Metric::default(),
+            lhm_cpu_temp: Metric::default(),
+            native_gpu_temp: Metric::default(),
+            lhm_gpu_temp: Metric::default(),
+            gpu_backend: String::new(),
+            native_gpu_power: None,
+            lhm_readings: Vec::new(),
+            hwinfo_readings: Vec::new(),
+            performance_readings: Vec::new(),
+            connection_reading: None,
+            hwinfo_diagnostic: None,
+            lhm_diagnostic: None,
+            generation: 1,
+            safe_mode_active: cfg.safe_mode,
+            publish_dirty: true,
+            last_publish: None,
+        };
+        assert!(
+            worker.tick(),
+            "the first tick publishes (reset-due) and keeps the loop alive"
+        );
+        assert!(
+            updates.try_recv().is_ok(),
+            "U-8: the first tick's publish is drained"
+        );
+        assert!(
+            worker.tick(),
+            "the second tick keeps the loop alive with no change"
+        );
+        assert!(
+            matches!(updates.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "U-8: an instant second tick publishes NOTHING (the shipped 20 Hz stream published every tick)"
+        );
+        generation.fetch_add(1, Ordering::SeqCst);
+        assert!(worker.tick());
+        let update = updates
+            .try_recv()
+            .expect("U-8: a generation change publishes IMMEDIATELY (change, not due)");
+        assert_eq!(
+            update.generation, 2,
+            "U-8: the generation stamp rides the publish (invalidation semantics untouched)"
+        );
+        assert!(
+            worker.tick(),
+            "the third tick after the change keeps the loop alive"
+        );
+        assert!(
+            worker.tick(),
+            "the fourth tick after the change keeps the loop alive"
+        );
+        assert!(
+            matches!(updates.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "U-8: the new generation settles quiet again inside the 5 s due window"
+        );
+    }
+
+    /// U-8 proof B (structural): the five hot 50 ms sites read through the
+    /// generation-guarded cache (no steady-state `Config` clone); the shipped
+    /// `current_request` stays for the slow sites, and the publish site is the
+    /// single gated `publish` call.
+    #[test]
+    fn telemetry_loops_read_a_cached_request_under_an_unchanged_generation() {
+        for fn_head in [
+            "fn spawn_headset(",
+            "fn spawn_lhm(",
+            "fn spawn_hwinfo(",
+            "fn spawn_gpu(",
+        ] {
+            let loop_src = shipped_loop_source(fn_head);
+            assert_eq!(
+                loop_src
+                    .matches("let (generation, cfg) = cached_request(&config, &generation, &mut request);")
+                    .count(),
+                1,
+                "{fn_head}: exactly one cached loop-head request read"
+            );
+            assert_eq!(
+                loop_src
+                    .matches("current_request(&config, &generation)")
+                    .count(),
+                0,
+                "{fn_head}: no per-tick full-Config clone at the loop head"
+            );
+            assert!(
+                loop_src.contains("let mut request = (0u64, Arc::new(current_config(&config)));"),
+                "{fn_head}: the cache is seeded from the shipped `current_config`"
+            );
+        }
+        let source = include_str!("telemetry.rs").replace("\r\n", "\n");
+        let tick = source
+            .find("fn tick(&mut self) -> bool {")
+            .expect("the coordinator tick exists");
+        let tick_body = &source[tick..tick + source[tick..].find("\n    fn ").unwrap()];
+        assert_eq!(
+            tick_body.matches("&mut self.request_cache").count(),
+            1,
+            "U-8: the coordinator tick reads the cache (rustfmt-wrapped args included)"
+        );
+        assert!(
+            tick_body.contains("cached_request("),
+            "U-8: the tick's request read is the cached primitive"
+        );
+        assert_eq!(
+            tick_body.matches("self.tx.send(").count(),
+            0,
+            "U-8: the tick no longer sends an Update clone unconditionally"
+        );
+        assert_eq!(
+            tick_body
+                .matches("self.publish(generation, &cfg, now)")
+                .count(),
+            2,
+            "U-8: the safe-mode and normal arms publish through the one gated site"
+        );
+        assert!(
+            source.contains("if !self.publish_dirty && !due {"),
+            "U-8: the change-or-due gate is the single publish predicate (in the `publish` fn)"
+        );
+    }
+
+    /// The shipped text of one `Worker` method (LF-normalized), from its
+    /// indented signature up to the next `fn` at the same indentation.
+    fn shipped_method_source(fn_head: &str) -> String {
+        let source = include_str!("telemetry.rs").replace("\r\n", "\n");
+        let start = source
+            .find(fn_head)
+            .expect("the shipped coordinator poll exists");
+        let rest = &source[start..];
+        let end = ["\n    fn ", "\n    pub fn "]
+            .iter()
+            .filter_map(|needle| rest[1..].find(*needle).map(|p| p + 1))
+            .min()
+            .expect("the shipped poll is followed by a method");
+        rest[..end].to_string()
+    }
+
+    /// WO-TEL-D2 STRUCTURAL pin (TEL-B `include_str!` occurrence form) of the
+    /// coordinator poll arms: every demand-gated poll carries its zero-demand
+    /// arm exactly once, and the U-12 PDH re-open backoff wiring sits inside
+    /// `poll_performance`. Probes: removing a demand gate (P-idle) or
+    /// restoring the fixed EXTENDED_POLL cadence over the failure streak (P16,
+    /// inversion-restored) breaks an assert of this pin.
+    #[test]
+    fn coordinator_poll_demand_gates_and_pdh_backoff_wiring_are_structural() {
+        for (fn_head, provider) in [
+            (
+                "    fn poll_controller(&mut self, cfg: &Config, consumers: u64, now: Instant) {",
+                "controller",
+            ),
+            (
+                "    fn poll_audio(&mut self, cfg: &Config, consumers: u64, now: Instant) {",
+                "audio",
+            ),
+            (
+                "    fn poll_network(&mut self, cfg: &Config, consumers: u64, now: Instant) {",
+                "net",
+            ),
+            (
+                "    fn poll_performance(&mut self, cfg: &Config, consumers: u64, now: Instant) {",
+                "performance",
+            ),
+            (
+                "    fn poll_connections(&mut self, cfg: &Config, consumers: u64, now: Instant) {",
+                "connections",
+            ),
+            (
+                "    fn poll_battery(&mut self, cfg: &Config, consumers: u64, now: Instant) {",
+                "system battery",
+            ),
+        ] {
+            let src = shipped_method_source(fn_head);
+            assert_eq!(
+                src.matches(&format!(
+                    "if !demanded(consumers, \"{provider}\") {{\n            return;\n        }}"
+                ))
+                .count(),
+                1,
+                "{provider}: exactly one zero-demand arm in the poll (demand-gate token)"
+            );
+            assert!(
+                src.contains("if !due("),
+                "{provider}: the shipped cadence gate survives behind the demand arm"
+            );
+        }
+        let perf = shipped_method_source(
+            "    fn poll_performance(&mut self, cfg: &Config, consumers: u64, now: Instant) {",
+        );
+        assert_eq!(
+            perf
+                .matches("backoff_interval(EXTENDED_POLL, EXTENDED_STALE, self.performance_failures)")
+                .count(),
+            1,
+            "U-12: the PDH re-open chain (query drop per failure) is bounded by the provider-outcome backoff"
+        );
+        assert_eq!(
+            perf.matches(
+                "self.performance_failures = self.performance_failures.saturating_add(1);"
+            )
+            .count(),
+            1,
+            "U-12: sample failures grow the streak; success arms reset it"
+        );
+        assert_eq!(
+            perf.matches("self.performance_failures = 0;").count(),
+            2,
+            "U-12: both success arms (`Some` and baseline `None`) reset the streak"
+        );
+    }
+
+    /// WO-TEL-D2 (S1, publish-site wiring pin): the demand word reaches the
+    /// published consumers value at BOTH app sites. The four
+    /// `app::tests::reading_demand_*` tests pin the derivation (the pure
+    /// function); this pin covers the wiring, which the P6 registry probes
+    /// (P-reg-render / P-reg-seed) found unpinned - dropping the
+    /// `| provider_demand_bits(..)` term at either site makes one count drop,
+    /// while the shipped 7-bit call keeps its own shape.
+    #[test]
+    fn registry_publish_sites_wire_the_demand_word_structurally() {
+        let app = include_str!("../src/app.rs");
+        assert_eq!(
+            app.matches("telemetry_runtime.set_consumers(").count(),
+            2,
+            "S1: exactly the two shipped publish sites write the consumers word"
+        );
+        assert_eq!(
+            app.matches(") | provider_demand_bits(&slots, &seed_modules, &cfg),")
+                .count(),
+            1,
+            "S1: the seed publish site ORs the demand word into the shipped call"
+        );
+        assert_eq!(
+            app.matches(") | provider_demand_bits(&slots, &slot_modules, &cfg),")
+                .count(),
+            1,
+            "S1: the render publish site ORs the demand word into the shipped call"
+        );
+        assert!(
+            app.contains(
+                "set_consumers(\n        provider_consumer_bits(\n            &seed_modules,"
+            ),
+            "S1: the seed publish site keeps the shipped gated derivation as the left operand"
+        );
+        assert!(
+            app.contains("set_consumers(\n                provider_consumer_bits(\n                    &slot_modules,"),
+            "S1: the render publish site keeps the shipped gated derivation as the left operand"
+        );
+    }
+
+    /// WO-TEL-D2-FIX (register R-D2-1 / audit F-AUD-6): the parked EXTENDED set
+    /// publishes STALE-marked values and never a fresh one after a demand
+    /// release. The set is `audio` + `net` + `controller` (the coordinator arms
+    /// at `telemetry.rs:885/928/960`, demand arms `:894-896/:937-939/:971-973`)
+    /// plus `presentmon` (its park is on its own worker loop,
+    /// `providers/presentmon.rs:1455-1463`). The extended trio have no
+    /// `*_success` stamp (only `*_attempt`, cleared by `reset_state:662-664`), so
+    /// the shipped `stale()` rule (`:248-252`) is applied to the frozen last
+    /// attempt, and the freeze of that attempt AND of the published `sampled_at`
+    /// stamp (`update.audio_sampled_at`, `update.net.sampled_at` - the stamps the
+    /// app feeds its consumers through `Metric::valid(value, sampled_at)`,
+    /// `app.rs:1377-1395`) is the "never fresh again" half. A parked arm marks
+    /// nothing dirty, so the change-or-due publish gate (`:634-645`) has no fresh
+    /// payload to send. The presentmon leg is structural (the shipped pin form:
+    /// its fresh path needs the child process + ETW session, i.e. hardware).
+    #[test]
+    fn parked_extended_provider_set_publishes_stale_and_never_fresh() {
+        let cfg = Config::default();
+        let mut worker = test_worker(cfg.clone());
+        let base = Instant::now();
+        let demanded = extended_consumer_bit("audio")
+            | extended_consumer_bit("net")
+            | extended_consumer_bit("controller");
+        worker.poll_audio(&cfg, demanded, base);
+        worker.poll_network(&cfg, demanded, base);
+        worker.poll_controller(&cfg, demanded, base);
+        let audio_attempt = worker.audio_attempt;
+        let net_attempt = worker.net_attempt;
+        let controller_attempt = worker.controller_attempt;
+        assert!(
+            audio_attempt.is_some() && net_attempt.is_some() && controller_attempt.is_some(),
+            "R-D2-1: the demanded polls stamped their attempts (the shipped demand arm)"
+        );
+        let audio_stamp = worker.update.audio_sampled_at;
+        let net_stamp = worker.update.net.as_ref().map(|sample| sample.sampled_at);
+        worker.apply_freshness(&cfg, base);
+        assert!(
+            worker.publish_dirty,
+            "R-D2-1: the demanded sample is a change"
+        );
+        worker.publish(1, &cfg, base);
+        assert!(
+            !worker.publish_dirty,
+            "R-D2-1: the demanded sample publishes once and clears the flag"
+        );
+        // Demand release: each parked arm freezes its attempt AND its payload
+        // stamp, the shipped rule marks the frozen sample stale at every step,
+        // and no parked arm marks a change => nothing fresh is published. (The
+        // P4 shape of `gated_poll_stops_publish_stale_marked_…`, which stamps
+        // `Freshness::Stale` directly for the gated pair.)
+        for step in 1..=8u32 {
+            let later = base + Duration::from_secs(step as u64 * 4);
+            worker.poll_audio(&cfg, 0, later);
+            worker.poll_network(&cfg, 0, later);
+            worker.poll_controller(&cfg, 0, later);
+            worker.apply_freshness(&cfg, later);
+            assert_eq!(
+                worker.audio_attempt,
+                audio_attempt,
+                "R-D2-1: the parked audio arm never re-stamps (+{} s)",
+                step * 4
+            );
+            assert_eq!(
+                worker.net_attempt,
+                net_attempt,
+                "R-D2-1: the parked netif arm never re-stamps (+{} s)",
+                step * 4
+            );
+            assert_eq!(
+                worker.controller_attempt,
+                controller_attempt,
+                "R-D2-1: the parked xinput arm never re-stamps (+{} s)",
+                step * 4
+            );
+            assert_eq!(
+                worker.update.audio_sampled_at,
+                audio_stamp,
+                "R-D2-1: the audio payload never gains a fresh stamp (+{} s)",
+                step * 4
+            );
+            assert_eq!(
+                worker.update.net.as_ref().map(|sample| sample.sampled_at),
+                net_stamp,
+                "R-D2-1: the netif payload never gains a fresh stamp (+{} s)",
+                step * 4
+            );
+            assert!(
+                !worker.publish_dirty,
+                "R-D2-1: a parked arm marks no change, so the publish gate has nothing fresh to send (+{} s)",
+                step * 4
+            );
+            assert!(
+                stale(audio_attempt, EXTENDED_STALE, later)
+                    && stale(net_attempt, EXTENDED_STALE, later)
+                    && stale(controller_attempt, EXTENDED_STALE, later),
+                "R-D2-1: past the 3 s `EXTENDED_STALE` bound the parked trio is STALE-marked by the shipped rule (+{} s)",
+                step * 4
+            );
+        }
+        let late = base + Duration::from_secs(120);
+        worker.poll_audio(&cfg, 0, late);
+        worker.poll_network(&cfg, 0, late);
+        worker.poll_controller(&cfg, 0, late);
+        worker.apply_freshness(&cfg, late);
+        assert!(
+            stale(audio_attempt, cfg.audio_poll, late)
+                && stale(net_attempt, NETWORK_POLL, late)
+                && stale(controller_attempt, cfg.controller_poll, late),
+            "R-D2-1: two minutes without demand keeps every parked sample stale past its OWN cadence bound - stale never fresh again"
+        );
+        assert_eq!(
+            worker.update.audio_sampled_at, audio_stamp,
+            "R-D2-1: the audio stamp is identical at +120 s"
+        );
+        assert_eq!(
+            worker.update.net.as_ref().map(|sample| sample.sampled_at),
+            net_stamp,
+            "R-D2-1: the netif stamp is identical at +120 s"
+        );
+        // The marking mechanism the register names: `apply_freshness` writes no
+        // staleness stamp for the extended trio (their consumers age the
+        // published `sampled_at` stamp), so zero-poll cannot make an old value
+        // look fresh - the honest shape of the invariant this test pins.
+        let freshness =
+            shipped_method_source("fn apply_freshness(&mut self, cfg: &Config, now: Instant) {");
+        assert!(
+            freshness.len() > 500,
+            "R-D2-1: the slicer found the shipped stamps"
+        );
+        assert_eq!(
+            freshness.matches("self.update.audio").count(),
+            0,
+            "R-D2-1: no audio freshness writer exists (the stamp is the published `sampled_at`)"
+        );
+        assert_eq!(
+            freshness.matches("self.update.net").count(),
+            0,
+            "R-D2-1: no netif freshness writer exists (the stamp is the published `sampled_at`)"
+        );
+        assert_eq!(
+            freshness.matches("self.update.controller").count(),
+            0,
+            "R-D2-1: no controller freshness writer exists"
+        );
+        // presentmon leg (structural, the shipped pin form): the park publishes
+        // the deduped unavailable row and never reaches the fresh-sample path, so
+        // a parked presentmon can publish no fresh game reading.
+        let source = include_str!("providers/presentmon.rs").replace("\r\n", "\n");
+        let start = source.find("fn run(\n").expect("the shipped worker exists");
+        let rest = &source[start..];
+        let end = rest
+            .find("\n    let mut stderr = String::new();")
+            .expect("the shipped loop-end marker closes the worker loop");
+        let run = &rest[..end];
+        assert_eq!(
+            run.matches("capture.unavailable(").count(),
+            1,
+            "R-D2-1: the park publishes exactly one unavailable row (health=false, the readings are never marked fresh)"
+        );
+        assert!(
+            run.contains("\"no display consumer\""),
+            "R-D2-1: the parked presentmon names the demand reason on the record it publishes"
+        );
+        assert_eq!(
+            run.matches("capture.reconcile(").count(),
+            1,
+            "R-D2-1: the only fresh-sample path is the single reconcile call behind the demand gate"
+        );
     }
 }

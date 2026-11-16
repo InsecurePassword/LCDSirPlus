@@ -2129,7 +2129,17 @@ fn unavailable(_previous: &DiscordState, error: &str) -> DiscordState {
 }
 
 fn provider_enabled(config: &Config) -> bool {
-    config.discord_enabled && !config.safe_mode
+    // WO-TEL-D2 (S3, U-4): CONFIG GATE, not a demand gate. `discord_enabled 1`
+    // is an explicitly enabled background consumer (the speaker overlay
+    // `renderer.rs:101-107` reads the state every frame), so a configured
+    // client keeps the shipped reconnect behavior unchanged. An EMPTY
+    // `discord_client_id` is a permanent configuration failure — the body
+    // hard-fails at the `connect_and_serve` entry before any pipe open — so it
+    // routes into the shipped disabled arm (100 ms park, backoff reset, zero
+    // connect cycles, zero WARN publishes). Re-arm is content-driven:
+    // `session_config_changed` already compares `discord_client_id`, and the
+    // disabled arm re-reads the config every iteration.
+    config.discord_enabled && !config.safe_mode && !config.discord_client_id.trim().is_empty()
 }
 
 fn next_backoff(current: Duration) -> Duration {
@@ -3010,7 +3020,16 @@ mod tests {
 
     #[test]
     fn lifecycle_fingerprint_safe_mode_and_backoff_are_bounded() {
-        let base = Config::default();
+        // WO-TEL-D2 (S3, U-4) contract-forced line: `provider_enabled` now also
+        // requires a configured `discord_client_id` (empty = permanent
+        // configuration failure => the shipped disabled arm), so the base here
+        // carries one. Every shipped predicate below is byte-identical; the
+        // unconfigured side of the gate is pinned by
+        // `provider_enabled_requires_a_configured_client_id`.
+        let base = Config {
+            discord_client_id: "123456789012345678".into(),
+            ..Config::default()
+        };
         assert!(provider_enabled(&base));
         let mut safe = base.clone();
         safe.safe_mode = true;
@@ -3272,6 +3291,60 @@ mod tests {
         assert!(
             reads.iter().any(|read| read == "discord_client_id"),
             "the read pin is not vacuous: the shipped production region reads pinned Config fields"
+        );
+    }
+
+    /// WO-TEL-D2 (S3, U-4): the config gate truth table for `provider_enabled`.
+    /// An unconfigured `discord_client_id` is a permanent configuration failure
+    /// (the body hard-fails at the same trim check before any pipe open), so the
+    /// gate routes the worker into the shipped disabled arm: no reconnect
+    /// cycles, no backoff ladder, no per-cycle WARN publishes. A CONFIGURED
+    /// client is an explicitly enabled background consumer (the speaker
+    /// overlay reads the state every frame), so it keeps the shipped behavior
+    /// unchanged — demand gating is NOT applied to Discord (audit amendment 1).
+    #[test]
+    fn provider_enabled_requires_a_configured_client_id() {
+        let configured = Config {
+            discord_enabled: true,
+            safe_mode: false,
+            discord_client_id: "123456789012345678".into(),
+            ..Config::default()
+        };
+        assert!(
+            provider_enabled(&configured),
+            "a configured client keeps the shipped reconnect behavior (background consumer)"
+        );
+        let unconfigured = Config {
+            discord_client_id: String::new(),
+            ..configured.clone()
+        };
+        assert!(
+            !provider_enabled(&unconfigured),
+            "an empty client_id parks the worker in the disabled arm (full loop stop, no backoff cycles)"
+        );
+        let whitespace = Config {
+            discord_client_id: "   ".into(),
+            ..configured.clone()
+        };
+        assert!(
+            !provider_enabled(&whitespace),
+            "whitespace-only client_id matches the body's own trim check at the `connect_and_serve` entry"
+        );
+        let disabled = Config {
+            discord_enabled: false,
+            ..configured.clone()
+        };
+        assert!(
+            !provider_enabled(&disabled),
+            "an explicit disable stays a disable (shipped top switch)"
+        );
+        let safe = Config {
+            safe_mode: true,
+            ..configured
+        };
+        assert!(
+            !provider_enabled(&safe),
+            "safe mode stays the shipped kill switch"
         );
     }
 }

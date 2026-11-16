@@ -1233,12 +1233,13 @@ impl Stats {
 pub fn spawn(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
+    consumers: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
 ) -> (mpsc::Receiver<Update>, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("telemetry-presentmon".into())
-        .spawn(move || run(config, generation, shutdown, tx))
+        .spawn(move || run(config, generation, consumers, shutdown, tx))
         .expect("PresentMon telemetry thread");
     (rx, thread)
 }
@@ -1251,6 +1252,25 @@ fn current_request(config: &RwLock<Config>, generation: &AtomicU64) -> (u64, Con
             return (before, config);
         }
     }
+}
+
+/// WO-TEL-D2 (S5, U-8): the 50 ms loop head reuses the cached `Arc<Config>`
+/// under an unchanged generation (no 20 Hz `Config` clone); a changed
+/// generation takes the module's shipped `current_request` rule copy, so the
+/// cached value belongs to the generation reported with it. Generation
+/// semantics are untouched.
+fn cached_request(
+    config: &RwLock<Config>,
+    generation: &AtomicU64,
+    cache: &mut (u64, Arc<Config>),
+) -> (u64, Arc<Config>) {
+    let before = generation.load(Ordering::SeqCst);
+    if before == cache.0 && before != 0 && generation.load(Ordering::SeqCst) == before {
+        return (before, Arc::clone(&cache.1));
+    }
+    let (generation, config) = current_request(config, generation);
+    *cache = (generation, Arc::new(config));
+    (generation, Arc::clone(&cache.1))
 }
 
 fn confirm_start_request(
@@ -1400,13 +1420,18 @@ fn join_thread_bounded<T>(
 fn run(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
+    consumers: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     tx: mpsc::Sender<Update>,
 ) {
     let mut capture = Capture::default();
     let mut current_generation = 0;
+    let mut request = (
+        0u64,
+        Arc::new(config.read().unwrap_or_else(|e| e.into_inner()).clone()),
+    );
     while !shutdown.load(Ordering::Relaxed) {
-        let (request_generation, cfg) = current_request(&config, &generation);
+        let (request_generation, cfg) = cached_request(&config, &generation, &mut request);
         if request_generation != current_generation {
             if capture.stop_and_report_cleanup(&tx, request_generation, Instant::now()) {
                 std::thread::sleep(Duration::from_millis(50));
@@ -1414,6 +1439,27 @@ fn run(
             }
             capture = Capture::default();
             current_generation = request_generation;
+        }
+        // WO-TEL-D2 (S2, U-3): no displayed presentmon-backed module
+        // (`app.rs module_extended_consumers`, fall-through included) => ZERO
+        // target polls AND ZERO child-spawn retries: the reconcile gate (target
+        // selection, executable resolution, the child spawn retry ladder) is
+        // never reached. The park reuses the shipped disabled-arm shape:
+        // `stop_and_report_cleanup` once, one deduped `unavailable` publication
+        // (health: `providers["presentmon"]` false => the availability
+        // predicate `app.rs:745-763` keeps falling through, fed by publication,
+        // not by fresh polls), then the existing 50 ms sleep. Demand return
+        // re-enters reconcile: the 1 s target-poll gate is due
+        // (`last_target_poll` stale), so selection runs on the next worker tick
+        // after publication (<=100 ms render + 50 ms loop).
+        if !crate::telemetry::demanded(consumers.load(Ordering::Relaxed), "presentmon") {
+            if capture.stop_and_report_cleanup(&tx, request_generation, Instant::now()) {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            capture.unavailable(&tx, request_generation, "no display consumer".into());
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
         }
         capture.reconcile(&cfg, request_generation, &tx, &|target, key| {
             confirm_start_request(
@@ -3040,13 +3086,18 @@ mod tests {
             ..Config::default()
         }));
         let generation = Arc::new(AtomicU64::new(1));
+        // WO-TEL-D2 (U-3): demand the presentmon readings so the worker reaches
+        // `reconcile` (the shipped disabled-config path this test pins); demand
+        // 0 would park the worker before the config gate.
+        let consumers = Arc::new(AtomicU64::new(crate::telemetry::ALL_EXTENDED_CONSUMERS));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let thread = {
             let config = Arc::clone(&config);
             let generation = Arc::clone(&generation);
+            let consumers = Arc::clone(&consumers);
             let shutdown = Arc::clone(&shutdown);
-            std::thread::spawn(move || run(config, generation, shutdown, tx))
+            std::thread::spawn(move || run(config, generation, consumers, shutdown, tx))
         };
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut published = None;
@@ -5449,8 +5500,85 @@ mod tests {
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicU64::new(1));
-        let (_updates, thread) = spawn(config, generation, Arc::clone(&shutdown));
+        let (_updates, thread) = spawn(
+            config,
+            generation,
+            // WO-TEL-D2 (U-3): demand 0 parks the worker in the new gate arm;
+            // shutdown then joins it through the same lifecycle (zero child work).
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&shutdown),
+        );
         shutdown.store(true, Ordering::Relaxed);
         assert!(thread.join().is_ok());
+    }
+
+    /// WO-TEL-D2 (S2, U-3) STRUCTURAL pin (TEL-B `include_str!` occurrence
+    /// form; name/doc are honest: this inspects shipped source, the worker's
+    /// real-thread child behavior needs hardware and stays in the ignored
+    /// native tests). Claims: the worker loop reads the demand word exactly
+    /// once; the demand gate precedes `capture.reconcile(`; the park arm stops
+    /// a running child (`stop_and_report_cleanup`) and publishes the deduped
+    /// unavailable reason on the shipped 50 ms sleep; the child-spawn machinery
+    /// (`resolve_executable`, `.spawn()`, the `TARGET_POLL` selection) occurs
+    /// ZERO times inside the `run` slice — it lives behind the gate, inside
+    /// reconcile, which the demand-0 path never reaches.
+    #[test]
+    fn presentmon_run_gate_stops_target_poll_and_child_spawn_at_zero_demand() {
+        let source = include_str!("presentmon.rs").replace("\r\n", "\n");
+        let start = source.find("fn run(\n").expect("the shipped worker exists");
+        // Slice the WORKER LOOP BODY: from the shipped `fn run(` head to the
+        // loop-end marker (the shutdown drain), so the slice is the loop, not
+        // the following `impl Capture` block (where the gated machinery lives).
+        let rest = &source[start..];
+        let end = rest
+            .find("\n    let mut stderr = String::new();")
+            .expect("the shipped loop-end marker closes the worker loop");
+        let run = &rest[..end];
+        assert_eq!(
+            run.matches("crate::telemetry::demanded(").count(),
+            1,
+            "the demand read exists exactly once in the worker loop"
+        );
+        assert_eq!(
+            run.matches("consumers.load(Ordering::Relaxed)").count(),
+            1,
+            "the worker reads the published consumer word once per loop iteration"
+        );
+        let gate = run
+            .find("if !crate::telemetry::demanded(")
+            .expect("the demand gate");
+        let reconcile = run.find("capture.reconcile(").expect("the reconcile call");
+        assert!(
+            gate < reconcile,
+            "the gate precedes the reconcile path: demand 0 performs no target poll and no child-spawn retry"
+        );
+        assert!(
+            run.contains("stop_and_report_cleanup(&tx, request_generation, Instant::now())"),
+            "the park stops a running child once (shipped cleanup arm)"
+        );
+        assert!(
+            run.contains("\"no display consumer\""),
+            "the park publishes the deduped unavailable reason (health-fed availability predicate stays consistent)"
+        );
+        assert_eq!(
+            run.matches("resolve_executable").count(),
+            0,
+            "the run loop never resolves the executable itself"
+        );
+        assert_eq!(
+            run.matches(".spawn()").count(),
+            0,
+            "the run loop never spawns a child (the CreateProcess retry ladder lives behind the gate)"
+        );
+        assert_eq!(
+            run.matches("capture.unavailable(").count(),
+            1,
+            "the park arm publishes the unavailable state through the dedupe exactly once per iteration"
+        );
+        assert_eq!(
+            run.matches("std::thread::sleep(Duration::from_millis(50))").count(),
+            4,
+            "generation cleanup, demand park (cleanup-pending), demand park (settled) and the main loop all reuse the shipped 50 ms sleep"
+        );
     }
 }
