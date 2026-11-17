@@ -69,6 +69,7 @@ pub const MODULES: &[&str] = &[
     "CLOCK",
     "GAME_NAME",
     "PROVIDER_STATUS",
+    "DISCORD",
     "CPU_LOAD",
     "RAM_USAGE",
     "GPU_LOAD",
@@ -944,7 +945,7 @@ mod tests {
 
     #[test]
     fn module_registry_is_exact_unique_and_case_insensitive() {
-        assert_eq!(MODULES.len(), 51);
+        assert_eq!(MODULES.len(), 52);
         let unique: std::collections::HashSet<_> = MODULES.iter().collect();
         assert_eq!(unique.len(), MODULES.len());
         assert!(MODULES

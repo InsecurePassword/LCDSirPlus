@@ -28,11 +28,11 @@ Microsoft `windows` crate and the vendored `winres` build dependency.
 Run from the repository root:
 
 ```powershell
-cargo build
-cargo build --release
-cargo fmt --check
-cargo clippy --all-targets
-cargo test --release --locked
+cargo build --workspace -j 1
+cargo build --workspace --release --locked -j 1
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -j 1
+cargo test --workspace --release --locked -j 1
 pwsh -NoProfile -NonInteractive -WindowStyle Hidden -File .\scripts\Test.ps1
 ```
 
@@ -167,7 +167,7 @@ manual checks where automation cannot reproduce them.
 
 ## Update documentation
 
-`modules.md` is the canonical quick reference for all 51 values. Its table must
+`modules.md` is the canonical quick reference for all 52 values. Its table must
 contain exactly the `src/config.rs` values in code order and be mirrored exactly
 in the instruction manual/PDF. The parser/document inventory has 106 accepted
 entries, the default template has 79 active keys, and exactly five advanced
@@ -190,3 +190,12 @@ under vendor terms. LibreHardwareMonitor is MPL-2.0. NVIDIA and AMD interfaces
 come from vendor-installed drivers. None of those projects endorses
 LCDSirPlus. Update `THIRD_PARTY_LICENSES.txt` only through the separate legal
 and dependency review process.
+
+## PR 1 paired build verification
+
+The supported build and test commands select the whole workspace. The application
+and `lcdsirplus_discord.dll` are a paired output; both are covered by the
+reproducibility evidence and staged package inventories. `Test.ps1` respects
+`CARGO_TARGET_DIR` and performs a credentials-free ABI handshake against the DLL
+beside the built EXE. Missing-DLL tests use an explicitly absent fixture path;
+do not move DLLs out of `deps` to make a suite pass.

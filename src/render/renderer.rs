@@ -10,8 +10,9 @@ use super::font::{fit_text, text_width};
 use super::Frame;
 use crate::history::Series;
 use crate::model::{
-    session_duration, AcState, Availability, DeviceStatus, Freshness, HardwareKind, HardwareRole,
-    HeadsetBattery, HungTarget, Metric, MetricKey, ReadingsSnapshot, Snapshot, ValueKind, WIDTH,
+    session_duration, AcState, Availability, DeviceStatus, DiscordState, Freshness, HardwareKind,
+    HardwareRole, HeadsetBattery, HungTarget, Metric, MetricKey, ReadingsSnapshot, Snapshot,
+    ValueKind, WIDTH,
 };
 use crate::telemetry::PROBE_INDETERMINATE;
 
@@ -19,6 +20,10 @@ use crate::telemetry::PROBE_INDETERMINATE;
 #[derive(Clone, Copy, Debug)]
 pub struct OverlayOptions {
     pub main_display: i32,
+    pub discord_linger: Duration,
+    pub discord_max_speakers: usize,
+    pub discord_show_self: bool,
+    pub discord_show_channel: bool,
     pub network_graph_ceiling_download_mbps: f64,
     pub network_graph_ceiling_upload_mbps: f64,
     pub disk_graph_ceiling_mbps: f64,
@@ -31,6 +36,10 @@ impl Default for OverlayOptions {
     fn default() -> Self {
         OverlayOptions {
             main_display: 1,
+            discord_linger: Duration::from_millis(700),
+            discord_max_speakers: 2,
+            discord_show_self: false,
+            discord_show_channel: false,
             network_graph_ceiling_download_mbps: 1000.0,
             network_graph_ceiling_upload_mbps: 1000.0,
             disk_graph_ceiling_mbps: 1000.0,
@@ -577,6 +586,10 @@ impl Renderer {
                 &first_non_empty(&[&s.game.game_name, &s.game.process_name], "N/A"),
             ),
             "PROVIDER_STATUS" => provider_slot(f, left, width, &s.providers, &s.device_status),
+            "DISCORD" => {
+                let (title, value) = discord_slot_text(&s.discord, s.now, opts, width);
+                self.text_slot(f, left, width, &title, &value);
+            }
             "CPU_LOAD_GRAPH" => self.fixed_graph_slot(
                 f,
                 left,
@@ -1717,6 +1730,89 @@ fn canonical_cpu_domain_temperature(readings: &ReadingsSnapshot, role: HardwareR
     metric.valid = true;
     metric.stale = state == DisplayState::Stale;
     metric
+}
+
+/// Explicitly selected voice information. Never changes the dashboard or owns input.
+/// Names are fitted to a single slot; any omitted speakers retain an explicit +N suffix.
+fn discord_slot_text(
+    state: &DiscordState,
+    now: Option<SystemTime>,
+    opts: &OverlayOptions,
+    width: i32,
+) -> (String, String) {
+    let title = if opts.discord_show_channel && !state.channel_name.is_empty() {
+        state.channel_name.clone()
+    } else {
+        "DISCORD".to_string()
+    };
+    if !state.connected {
+        return (title, "OFFLINE".into());
+    }
+    if !state.authenticated {
+        return (title, "AUTH".into());
+    }
+    let mut speakers: Vec<_> = state
+        .speakers
+        .iter()
+        .filter(|speaker| {
+            (opts.discord_show_self || !speaker.is_self)
+                && (speaker.speaking
+                    || speaker.stopped_at.zip(now).is_some_and(|(stopped, now)| {
+                        now.duration_since(stopped)
+                            .is_ok_and(|age| age <= opts.discord_linger)
+                    }))
+        })
+        .collect();
+    speakers.sort_by(|a, b| {
+        b.speaking
+            .cmp(&a.speaking)
+            .then_with(|| a.started_at.cmp(&b.started_at))
+            .then_with(|| a.user_id.cmp(&b.user_id))
+    });
+    if speakers.is_empty() {
+        return (
+            title,
+            if state.self_mute { "MUTED" } else { "QUIET" }.into(),
+        );
+    }
+    let limit = opts.discord_max_speakers.clamp(1, 4).min(speakers.len());
+    let mut names = String::new();
+    let mut included = 0;
+    for speaker in speakers.iter().take(limit) {
+        let name = if speaker.name.is_empty() {
+            "?"
+        } else {
+            &speaker.name
+        };
+        let proposed = if names.is_empty() {
+            name.to_string()
+        } else {
+            format!("{names}/{name}")
+        };
+        let omitted = speakers.len() - included - 1;
+        let suffix = if omitted > 0 {
+            format!("+{omitted}")
+        } else {
+            String::new()
+        };
+        if included > 0 && text_width(&proposed, 1) + text_width(&suffix, 1) > width {
+            break;
+        }
+        names = proposed;
+        included += 1;
+    }
+    let omitted = speakers.len() - included;
+    let suffix = if omitted > 0 {
+        format!("+{omitted}")
+    } else {
+        String::new()
+    };
+    let value = format!(
+        "{}{}",
+        fit_text(&names, (width - text_width(&suffix, 1)).max(0), 1),
+        suffix
+    );
+    (title, value)
 }
 
 fn slot_bounds(i: usize) -> (i32, i32) {
@@ -3438,8 +3534,8 @@ mod tests {
 
     #[test]
     fn canonical_registry_dispatches_all_modules_with_bounded_frames() {
-        // WO-REMOVE-ALERTS: 53 -> 51 (ALERTS and BOTTLENECK retired with their features).
-        assert_eq!(crate::config::MODULES.len(), 51);
+        // ALERTS and BOTTLENECK remain retired; DISCORD is an explicitly selected, noninterrupting pane.
+        assert_eq!(crate::config::MODULES.len(), 52);
         let normal = audit_snapshot();
         let edge = edge_snapshot();
         let status = status_snapshot();
@@ -3924,5 +4020,97 @@ mod tests {
         assert_eq!(format_disk_rate('W', 842_000.0, 38), "W 842KB/s");
         assert_eq!(format_disk_rate('R', 999_999.0, 38), "R 1MB/s");
         assert_eq!(format_disk_rate('R', f64::MAX, 38), "R >99GB/s");
+    }
+    #[test]
+    fn selected_discord_changes_only_its_slot_and_never_takes_over() {
+        let mut snapshot = Snapshot {
+            now: Some(SystemTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let opts = OverlayOptions::default();
+        let mut view = View {
+            slot_modules: ["CLOCK", "DISCORD", "CLOCK", "CLOCK"].map(str::to_string),
+            ..Default::default()
+        };
+        let before = Renderer::new().render(&snapshot, opts, &view);
+        snapshot.discord = DiscordState {
+            connected: true,
+            authenticated: true,
+            channel_name: "Room".into(),
+            speakers: vec![crate::model::Speaker {
+                user_id: "1".into(),
+                name: "Alice".into(),
+                speaking: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let after = Renderer::new().render(&snapshot, opts, &view);
+        assert_ne!(before.hash_hex(), after.hash_hex());
+        let (left, width) = slot_bounds(1);
+        for y in 0..crate::model::HEIGHT {
+            for x in 0..crate::model::WIDTH {
+                if y < 26 || x < left as usize || x >= (left + width) as usize {
+                    assert_eq!(
+                        before.pixels[y * crate::model::WIDTH + x],
+                        after.pixels[y * crate::model::WIDTH + x]
+                    );
+                }
+            }
+        }
+        view.slot_modules[1] = "CLOCK".into();
+        let configured_away = Renderer::new().render(&snapshot, opts, &view);
+        snapshot.discord = DiscordState::default();
+        assert_eq!(
+            configured_away.hash_hex(),
+            Renderer::new().render(&snapshot, opts, &view).hash_hex()
+        );
+    }
+
+    #[test]
+    fn selected_discord_honors_linger_self_channel_and_overflow() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let mut state = DiscordState {
+            connected: true,
+            authenticated: true,
+            channel_name: "Chat".into(),
+            ..Default::default()
+        };
+        state.speakers = vec![
+            crate::model::Speaker {
+                user_id: "1".into(),
+                name: "Self".into(),
+                is_self: true,
+                speaking: true,
+                ..Default::default()
+            },
+            crate::model::Speaker {
+                user_id: "2".into(),
+                name: "Amy".into(),
+                speaking: false,
+                stopped_at: Some(now - Duration::from_millis(100)),
+                ..Default::default()
+            },
+        ];
+        let opts = OverlayOptions {
+            discord_show_channel: true,
+            discord_max_speakers: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            discord_slot_text(&state, Some(now), &opts, 37),
+            ("Chat".into(), "Amy".into())
+        );
+        assert_eq!(
+            discord_slot_text(&state, Some(now + Duration::from_secs(1)), &opts, 37).1,
+            "QUIET"
+        );
+        let show_self = OverlayOptions {
+            discord_show_self: true,
+            ..opts
+        };
+        assert!(discord_slot_text(&state, Some(now), &show_self, 37)
+            .1
+            .ends_with("+1"));
     }
 }

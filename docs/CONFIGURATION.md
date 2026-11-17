@@ -85,14 +85,14 @@ Layouts 2 and 3 scale inbound/IN bars with
 
 | Key | Default | Constraint |
 |---|---|---|
-| `slot_0` | `HEADSET_BATTERY CPU_TEMP CONTROLLER_BATTERY` | One or more of the 51 button values. |
+| `slot_0` | `HEADSET_BATTERY CPU_TEMP CONTROLLER_BATTERY` | One or more of the 52 button values. |
 | `slot_1` | `FPS_CURRENT NET_BOTH NET_GRAPH FRAME_TIME SESSION_TIME` | One or more button values. |
 | `slot_2` | `PROC_HANG FPS_1LOW DISK_IO DISK_IO_GRAPH GPU_TEMP PING JITTER AUDIO` | One or more button values. |
 | `slot_3` | `THERMALS POWER_LIMIT` | One or more button values. |
 
 The lists map to physical and preview buttons 1 through 4. A short press moves
 through one list. `PROC_HANG` may appear only once across all four lists. See
-the canonical [51-value button option reference](../modules.md) and the manual's
+the canonical [52-value button option reference](../modules.md) and the manual's
 [slot setup steps](INSTRUCTION-MANUAL.md#choose-layouts-and-button-options).
 
 ## Set CPU bars

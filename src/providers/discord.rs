@@ -977,6 +977,18 @@ fn unload_module(
     true
 }
 
+/// Many short successful polls form one healthy session. A slow failing call is
+/// not evidence of health, and a short-lived connection retains failure backoff.
+fn session_backoff(backoff: Duration, connected_since: Option<Instant>, now: Instant) -> Duration {
+    if connected_since
+        .is_some_and(|since| now.saturating_duration_since(since) >= Duration::from_secs(30))
+    {
+        Duration::from_secs(1)
+    } else {
+        backoff
+    }
+}
+
 fn start_session(
     table: *const LcsdV1,
     config: &Config,
@@ -1209,6 +1221,7 @@ fn spawn_worker(runtime: &Runtime, config: &Config) -> std::thread::JoinHandle<(
             let mut load_attempted_generation = 0u64;
             let mut revision = u64::MAX;
             let mut first_step = true;
+            let mut connected_since = None;
             let context = WorkerContext {
                 shutdown: worker_shutdown.clone(),
                 config: worker_config.clone(),
@@ -1279,6 +1292,7 @@ fn spawn_worker(runtime: &Runtime, config: &Config) -> std::thread::JoinHandle<(
                             handle = started_handle;
                             revision = u64::MAX;
                             first_step = true;
+                            connected_since = None;
                         }
                         Err(message) => {
                             state = unavailable(&state, &message);
@@ -1312,7 +1326,6 @@ fn spawn_worker(runtime: &Runtime, config: &Config) -> std::thread::JoinHandle<(
                     Some(loaded) => loaded.table,
                     None => continue,
                 };
-                let started = Instant::now();
                 let timeout = if first_step {
                     CONNECT_STEP_TIMEOUT_MS
                 } else {
@@ -1320,18 +1333,21 @@ fn spawn_worker(runtime: &Runtime, config: &Config) -> std::thread::JoinHandle<(
                 };
                 let code = unsafe { ((*table).poll_io)(handle, timeout) };
                 first_step = false;
+                let now = Instant::now();
+                if matches!(code, LCSD_OK | LCSD_IDLE) {
+                    connected_since.get_or_insert(now);
+                }
+                backoff = session_backoff(backoff, connected_since, now);
                 publish_component_state(table, handle, &mut state, &mut revision, &worker_tx);
                 match code {
                     LCSD_OK | LCSD_IDLE => {
-                        if started.elapsed() >= Duration::from_secs(30) {
-                            backoff = Duration::from_secs(1);
-                        }
                         continue;
                     }
                     LCSD_E_CANCELED => {
                         // The shipped content-driven re-arm: the session ends, the state says so,
                         // the backoff resets, and the next iteration re-arms on the new content.
                         end_session(table, &mut handle, &worker_census);
+                        connected_since = None;
                         state = unavailable(&state, "reconfiguring");
                         let _ = worker_tx.send(state.clone());
                         backoff = Duration::from_secs(1);
@@ -1353,9 +1369,7 @@ fn spawn_worker(runtime: &Runtime, config: &Config) -> std::thread::JoinHandle<(
                     backoff = Duration::from_secs(1);
                     continue;
                 }
-                if started.elapsed() >= Duration::from_secs(30) {
-                    backoff = Duration::from_secs(1);
-                }
+                connected_since = None;
                 state = unavailable(&state, &error);
                 let _ = worker_tx.send(state.clone());
                 crate::log_warn!("Discord RPC disconnected: {}", error);
@@ -2200,9 +2214,9 @@ fn unavailable(_previous: &DiscordState, error: &str) -> DiscordState {
 
 fn provider_enabled(config: &Config) -> bool {
     // WO-TEL-D2 (S3, U-4): CONFIG GATE, not a demand gate. `discord_enabled 1`
-    // is an explicitly enabled background consumer (the speaker overlay
-    // `renderer.rs:101-107` reads the state every frame), so a configured
-    // client keeps the shipped reconnect behavior unchanged. An EMPTY
+    // is the effective gate supplied by the app's selected DISCORD pane. The
+    // app masks it off without changing stored preferences when no pane consumes
+    // voice state, so only an active display keeps reconnect behavior running. An EMPTY
     // `discord_client_id` is a permanent configuration failure — the body
     // hard-fails at the `connect_and_serve` entry before any pipe open — so it
     // routes into the shipped disabled arm (100 ms park, backoff reset, zero
@@ -3491,6 +3505,31 @@ mod tests {
         drop(runtime);
     }
 
+    fn missing_component_fixture() -> PathBuf {
+        static PATH: OnceLock<PathBuf> = OnceLock::new();
+        PATH.get_or_init(|| {
+            std::env::temp_dir()
+                .join(format!(
+                    "lcdsirplus-absent-component-{}-{}",
+                    std::process::id(),
+                    random_nonce().unwrap()
+                ))
+                .join(COMPONENT_NAME)
+        })
+        .clone()
+    }
+
+    fn missing_component_loader(
+        diagnostic: &mut [u8; LOADER_DIAGNOSTIC_CAPACITY],
+    ) -> Result<Module, LoadFault> {
+        let path = missing_component_fixture();
+        assert!(
+            !path.exists(),
+            "the absent-module fixture must remain absent"
+        );
+        load_table_from(&path, diagnostic)
+    }
+
     /// V1(c): a missing / corrupt module is a non-fatal, classified failure with ONE bounded,
     /// secret-free diagnostic and no retry loop.
     #[test]
@@ -3539,9 +3578,13 @@ mod tests {
             Some(COMPONENT_NAME),
             "the loader resolves ONE exact file name beside the executable (no search path)"
         );
-        // The production loader, in this layout (no module beside the test binary): the app keeps
-        // running, one attempt, one diagnostic.
-        let runtime = spawn_with(&enabled_config("123456789012345678"), load_production_table);
+        // Exercise the real loader against an owned absent path. A workspace build may
+        // legitimately leave its DLL beside the test executable; do not move that DLL.
+        let path = missing_component_fixture();
+        let runtime = spawn_with(
+            &enabled_config("123456789012345678"),
+            missing_component_loader,
+        );
         let update = wait_for_state(&runtime, |state| {
             state.error == "discord module unavailable"
         })
@@ -3690,10 +3733,10 @@ mod tests {
         // is not attributable to this provider, so it is reported above, and the per-cycle
         // module-handle claim is carried by the exact per-Runtime census (unloads == 50,
         // retained == 0, module_retained() false every cycle) plus GetModuleHandleW at rest below.
-        let path = component_path().unwrap();
+        let path = missing_component_fixture();
         assert!(
             !component_loaded(&path),
-            "the module is absent at rest (disabled)"
+            "the injected lifecycle loader never loads the absent image"
         );
         drop(runtime);
     }
@@ -3708,8 +3751,8 @@ mod tests {
             discord_client_id: "123456789012345678".into(),
             ..Config::default()
         };
-        let runtime = spawn_with(&off, load_production_table);
-        let path = component_path().unwrap();
+        let runtime = spawn_with(&off, missing_component_loader);
+        let path = missing_component_fixture();
         for cycle in 0..50 {
             runtime.update_config(&on);
             // WO-TEL-D3-E (F-1 class, pre-existing at `4ef030a`): the activation edge's load
@@ -4105,5 +4148,26 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn reconnect_backoff_resets_after_many_short_successful_steps() {
+        let start = Instant::now();
+        let mut backoff = Duration::from_secs(16);
+        for step in 0..300 {
+            backoff = session_backoff(
+                backoff,
+                Some(start),
+                start + Duration::from_millis(step * 100),
+            );
+            assert_eq!(backoff, Duration::from_secs(16));
+        }
+        assert_eq!(
+            session_backoff(backoff, Some(start), start + Duration::from_secs(30)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            session_backoff(backoff, None, start + Duration::from_secs(60)),
+            Duration::from_secs(16)
+        );
     }
 }

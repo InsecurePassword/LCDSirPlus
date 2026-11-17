@@ -334,8 +334,16 @@ impl HoldState {
         targets: &[HungTarget],
         provider_available: bool,
     ) -> Option<Audit> {
-        let policy = Policy::from(cfg);
         self.prune_terminal(targets);
+        if !self
+            .presses
+            .iter()
+            .flatten()
+            .any(|press| press.bound.is_some() && !press.canceled && !press.resolved)
+        {
+            return None;
+        }
+        let policy = Policy::from(cfg);
         for (button, press) in self
             .presses
             .iter_mut()
@@ -515,7 +523,6 @@ impl HoldState {
         targets: &[HungTarget],
         provider_available: bool,
     ) -> HoldCommand {
-        let policy = Policy::from(cfg);
         self.prune_terminal(targets);
         let owner = if self.owner_resolved {
             self.owner
@@ -529,6 +536,7 @@ impl HoldState {
         }) else {
             return HoldCommand::None;
         };
+        let policy = Policy::from(cfg);
         let press = press.as_mut().unwrap();
         let (index, target, bound_policy) = press.bound.as_ref().unwrap();
         if !provider_available

@@ -192,6 +192,7 @@ try {
 
         [IO.Directory]::CreateDirectory($portableRoot) | Out-Null
         Copy-Item -LiteralPath (Join-Path $verifiedBuild 'LCDSirPlus.exe') -Destination (Join-Path $portableRoot 'LCDSirPlus.exe')
+        Copy-Item -LiteralPath (Join-Path $verifiedBuild 'lcdsirplus_discord.dll') -Destination (Join-Path $portableRoot 'lcdsirplus_discord.dll')
         Copy-Item -LiteralPath (Join-Path $verifiedBuild 'lcdsirplus.txt') -Destination (Join-Path $portableRoot 'lcdsirplus.txt')
         Copy-Item -LiteralPath (Join-Path $repo 'third_party\PresentMon\PresentMon.exe') -Destination (Join-Path $portableRoot 'PresentMon.exe')
         [IO.File]::WriteAllText((Join-Path $portableRoot 'SOURCE-COMMIT.txt'), $head + "`n", [Text.Encoding]::ASCII)
@@ -209,6 +210,7 @@ try {
 
         [IO.Directory]::CreateDirectory($innoPayload) | Out-Null
         Copy-Item -LiteralPath (Join-Path $verifiedBuild 'LCDSirPlus.exe') -Destination (Join-Path $innoPayload 'LCDSirPlus.exe')
+        Copy-Item -LiteralPath (Join-Path $verifiedBuild 'lcdsirplus_discord.dll') -Destination (Join-Path $innoPayload 'lcdsirplus_discord.dll')
         Copy-Item -LiteralPath (Join-Path $verifiedBuild 'lcdsirplus.txt') -Destination (Join-Path $innoPayload 'lcdsirplus.default.txt')
         Copy-Item -LiteralPath (Join-Path $repo 'third_party\PresentMon\PresentMon.exe') -Destination (Join-Path $innoPayload 'PresentMon.exe')
         [IO.File]::WriteAllText((Join-Path $innoPayload 'lcdsirplus.layout'), 'installed-v1', (New-Object Text.UTF8Encoding($false)))

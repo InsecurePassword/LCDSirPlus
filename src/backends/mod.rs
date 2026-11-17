@@ -757,7 +757,7 @@ fn select_physical_kind(kind: BackendKind, lcore_present: bool) -> Result<Backen
 /// trusted LCore is an SDK candidate; otherwise a G13 HID discovery candidate.
 /// Read-only — it never opens a device, so it cannot start a connection.
 fn device_candidates_present(kind: BackendKind) -> bool {
-    let owner_present = sdk::lcore().ok().flatten().is_some();
+    let owner_present = sdk::lcore_present().unwrap_or(true);
     match select_physical_kind(kind, owner_present) {
         Ok(BackendKind::Sdk) => true,
         Ok(BackendKind::Hid) => !hid::discover().candidates.is_empty(),
@@ -773,9 +773,8 @@ fn ownership_changed(device: &PhysicalDevice) -> Result<bool, LossError> {
     if let PhysicalDevice::Scripted(_) = device {
         return Ok(false);
     }
-    let present = sdk::lcore()
-        .map_err(|reason| LossError::new(LossCause::ProbeFail, reason))?
-        .is_some();
+    let present =
+        sdk::lcore_present().map_err(|reason| LossError::new(LossCause::ProbeFail, reason))?;
     Ok(ownership_conflict(device.kind(), present))
 }
 
@@ -824,19 +823,20 @@ fn physical_worker(
     let mut last_probe: Option<Instant> = None;
 
     'outer: loop {
-        if commands.reconnect.swap(false, Ordering::AcqRel) {
+        let reconnect_requested = commands.reconnect.swap(false, Ordering::AcqRel);
+        if reconnect_requested {
             backoff = reconnect;
             let _ = msg_tx.send(Message::ReconnectStarted);
         }
         if terminal {
             // RC-6: the ladder is terminal. Device-open attempts are skipped;
             // shutdown, frame-submit, and reconnect wakes stay live, and each
-            // wake re-probes for a hotplugged candidate at most once per
-            // `button_poll` — the worker's existing cadence key.
-            if sleep_until_wake(commands, wake_rx, backoff) {
+            // wake observes the existing reconnect deadline. Ordinary frame wakes
+            // must not drive process/HID discovery at the button polling rate.
+            if !reconnect_requested && sleep_until_wake(commands, wake_rx, backoff) {
                 break 'outer;
             }
-            if last_probe.is_none_or(|when| when.elapsed() >= button_poll) {
+            if reconnect_requested || last_probe.is_none_or(|when| when.elapsed() >= reconnect) {
                 last_probe = Some(Instant::now());
                 if probe(kind) {
                     terminal = false;
@@ -883,7 +883,7 @@ fn physical_worker(
                     tracker.disconnect(Instant::now(), active_kind.name()),
                 ));
                 let mut last_sent: Option<Vec<u8>> = None;
-                let mut health_reported = false;
+                let mut last_health: Option<Instant> = None;
                 backoff = reconnect;
 
                 loop {
@@ -987,9 +987,13 @@ fn physical_worker(
                     }
 
                     let poll = device.poll(button_poll.max(Duration::from_millis(10)));
-                    if !health_reported && last_sent.is_some() && poll.is_ok() {
+                    let completed_at = Instant::now();
+                    if last_sent.is_some()
+                        && poll.is_ok()
+                        && health_report_due(last_health, completed_at)
+                    {
                         let _ = msg_tx.send(Message::PhysicalHealthy(active_kind));
-                        health_reported = true;
+                        last_health = Some(completed_at);
                     }
                     match poll {
                         Ok(Some(buttons)) => {
@@ -1029,6 +1033,12 @@ fn physical_worker(
             }
         }
     }
+}
+
+/// A successful poll is progress even without new buttons or a changed frame.
+/// Coalesce health to one message per second; no new thread, timer or queue.
+fn health_report_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(1))
 }
 
 fn sleep_interruptible(
@@ -2690,5 +2700,77 @@ mod tests {
             "the ping-pong must recycle released buffers; fills-after-release counted {reuse_fills}"
         );
         println!("WO-A1-02 EC-2 exclusivity measured: reads={reads} reuse_fills={reuse_fills} buffers={}", state.len());
+    }
+    #[test]
+    fn connection_health_continues_after_first_frame_without_per_tick_messages() {
+        let start = Instant::now();
+        assert!(health_report_due(None, start));
+        assert!(!health_report_due(
+            Some(start),
+            start + Duration::from_millis(999)
+        ));
+        assert!(health_report_due(
+            Some(start),
+            start + Duration::from_secs(1)
+        ));
+        assert!(!health_report_due(
+            Some(start + Duration::from_secs(1)),
+            start + Duration::from_millis(1100)
+        ));
+        assert!(health_report_due(
+            Some(start + Duration::from_secs(1)),
+            start + Duration::from_secs(2)
+        ));
+    }
+
+    #[test]
+    fn physical_worker_reports_progress_after_the_initial_health_message() {
+        fn open_health(_: BackendKind, _: &str) -> Result<PhysicalDevice, LossError> {
+            Ok(PhysicalDevice::Scripted(ScriptedDevice {
+                scenario: "scripted-health-progress",
+                session: 1,
+            }))
+        }
+        let (commands, wake) = command_queue();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_commands = Arc::clone(&commands);
+        let worker = std::thread::spawn(move || {
+            let interval = Duration::from_millis(10);
+            physical_worker(
+                BackendKind::Hid,
+                &worker_commands,
+                &wake,
+                &tx,
+                interval,
+                interval,
+                interval,
+                interval,
+                "normal".into(),
+                false,
+                "health-progress".into(),
+                open_health,
+                probe_never,
+            );
+        });
+        commands.submit(&pixels(1));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut health = 0;
+        while health < 2 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(Message::PhysicalHealthy(BackendKind::Hid)) => health += 1,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        commands.shutdown();
+        worker.join().unwrap();
+        assert_eq!(
+            health, 2,
+            "a healthy established worker must keep reporting completed I/O progress"
+        );
     }
 }

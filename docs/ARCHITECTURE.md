@@ -279,3 +279,33 @@ per-installing-user sign-in task and verifies its complete definition before
 change or removal. Update and repair preserve LocalAppData. Uninstall removes
 installed files and the owned task but preserves user settings, logs, and
 credentials.
+
+## PR 1 integration corrections
+
+These current rules replace earlier implementation-era assumptions in the
+source-history table: preview renders the same selected consumers as the panel
+and never demands all optional providers. Discord voice state has an explicit
+`DISCORD` slot; the application masks only the runtime enable gate when this
+pane is unselected, without changing the stored configuration or CLI
+authorization behavior. It uses the existing worker/DLL enable-disable lifecycle.
+The hung-owner cache is invalidated by the production command dispatcher only
+when a command cycles a slot. Idle hold checks do not clone the ignore policy.
+Network demand release discards cumulative counters; the first resumed sample
+is a baseline, and only the next active interval supplies a rate.
+
+Connected physical workers publish completed-poll progress at most once per
+second. Each report refreshes the existing watchdog; absence, backoff and
+reconfiguration clear it. A reconnect request does not prove native I/O has
+returned. HID cancellation still retains its pending-operation lifetime until
+completion; no thread kill or early buffer release was introduced.
+
+Optional slow collectors block on their existing thread park tokens while disabled or
+unconsumed. Configuration/demand changes and shutdown unpark those same workers;
+active sampling cadence and core GPU/VRAM policy are unchanged. Initial demand is
+published before worker creation, avoiding a startup poll of hidden optional readings.
+Derived reading vectors retain capacity and are rebuilt only for a due or dirty
+publication; freshness evaluation still runs before that decision.
+
+Resource-log counter failures are written as `none`, not zero. Successful resource
+lines retain their prior schema. Log consumers must skip CPU deltas spanning a
+missing counter, and exclude missing memory/load samples from numeric summaries.

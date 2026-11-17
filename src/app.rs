@@ -149,15 +149,23 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
 
     // Providers.
     let mut cpu_provider = cpu::CpuLoadProvider::new();
-    let telemetry_runtime = crate::telemetry::spawn(&cfg);
-    let discord_runtime = crate::providers::discord::spawn(&cfg);
+    let mut slots = Manager::new(&cfg, [0; 4]);
+    let mut snapshot = Snapshot::default();
+    let seed_modules = effective_slot_modules(&slots, &snapshot, &cfg);
+    let mut discord_demanded = discord_display_demand(&seed_modules);
+    let telemetry_runtime = crate::telemetry::spawn(
+        &cfg,
+        provider_consumer_bits(&seed_modules, &cfg, false)
+            | provider_demand_bits(&slots, &seed_modules, &cfg),
+    );
+    let discord_runtime =
+        crate::providers::discord::spawn(&discord_runtime_config(&cfg, discord_demanded));
     let mut telemetry = crate::telemetry::Update {
         generation: telemetry_runtime.generation(),
         ..Default::default()
     };
     let mut discord = DiscordState::default();
     let mut renderer = Renderer::new();
-    let mut slots = Manager::new(&cfg, [0; 4]);
     let mut hang_hold = hang::HoldState::default();
     // EC-4: the startup bind marks the owner resolved; later binds happen only
     // when the slot configuration changes.
@@ -168,7 +176,6 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
 
     let mut last_telemetry = Instant::now() - cfg.telemetry_interval;
     let mut last_render = Instant::now() - cfg.render_interval;
-    let mut snapshot = Snapshot::default();
     let mut running = true;
     let mut backend_state = BackendState::Discovering;
     // RC-5: the label last published to the panel/log surface, so a change is
@@ -179,7 +186,6 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
     // modules keep their providers at full cadence from the start.
     // WO-TEL-D2 (S1): the word gains the reading-keyed demand bits for the
     // previously never-gated metering providers (same publication path).
-    let seed_modules = effective_slot_modules(&slots, &snapshot, &cfg);
     telemetry_runtime.set_consumers(
         provider_consumer_bits(
             &seed_modules,
@@ -228,8 +234,12 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                         let generation = telemetry_runtime.update_config(&cfg);
                         invalidate_telemetry_publication(&mut telemetry, &mut snapshot, generation);
                         renderer = Renderer::new();
-                        discord_runtime.update_config(&cfg);
                         slots.apply(&cfg);
+                        discord_demanded = discord_display_demand(&effective_slot_modules(
+                            &slots, &snapshot, &cfg,
+                        ));
+                        discord_runtime
+                            .update_config(&discord_runtime_config(&cfg, discord_demanded));
                         hang_owner.invalidate();
                         if let Some(audit) = hang_owner.bind(&slots, &mut hang_hold) {
                             log_hang_audit(&audit);
@@ -304,6 +314,13 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
         if now.duration_since(last_render) >= cfg.render_interval {
             last_render = now;
             let slot_modules = effective_slot_modules(&slots, &snapshot, &cfg);
+            let demanded = discord_display_demand(&slot_modules);
+            if demanded != discord_demanded {
+                discord_demanded = demanded;
+                discord_runtime.update_config(&discord_runtime_config(&cfg, demanded));
+                discord = DiscordState::default();
+                snapshot.discord = DiscordState::default();
+            }
             // EC-3: publish the consumer set alongside the modules the panel
             // shows, so a quiescent provider returns to full cadence on the
             // next scheduled tick when a consumer reappears.
@@ -328,6 +345,10 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                 &snapshot,
                 OverlayOptions {
                     main_display: cfg.main_display,
+                    discord_linger: cfg.discord_linger,
+                    discord_max_speakers: cfg.discord_max_speakers.max(1) as usize,
+                    discord_show_self: cfg.discord_show_self,
+                    discord_show_channel: cfg.discord_show_channel,
                     disk_graph_ceiling_mbps: cfg.disk_graph_ceiling_mbps,
                     fps_graph_ceiling: cfg.fps_graph_ceiling,
                     cpu_temp_max_c: cfg.cpu_temp_max_c,
@@ -396,8 +417,13 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                     for event in events {
                         let command =
                             hang_hold.event(event, &cfg, published_hung, hang_provider_available);
-                        apply_hold_command(command, &mut hang_hold, &mut slots, &cfg);
-                        hang_owner.invalidate();
+                        apply_hold_command(
+                            command,
+                            &mut hang_hold,
+                            &mut slots,
+                            &cfg,
+                            &mut hang_owner,
+                        );
                         if let Some(audit) = hang_owner.bind(&slots, &mut hang_hold) {
                             log_hang_audit(&audit);
                         }
@@ -446,10 +472,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
             log_hang_audit(&audit);
         }
         let command = hang_hold.tick(now, &cfg, published_hung, hang_provider_available);
-        apply_hold_command(command, &mut hang_hold, &mut slots, &cfg);
-        // EC-4: the command can cycle a slot, so the owner is stale until the
-        // next iteration's bind site.
-        hang_owner.invalidate();
+        apply_hold_command(command, &mut hang_hold, &mut slots, &cfg, &mut hang_owner);
 
         // SOAK-OBS2: one ASCII resource line every 60 s of loop time; the gate
         // mirrors the L202 `config_refresh` compare and never allocates per frame.
@@ -489,11 +512,11 @@ fn soak_resources_due(elapsed: Duration) -> bool {
 struct SoakResourcesSample {
     pid: u32,
     uptime_s: u64,
-    cpu_s: f64,
-    priv_bytes: u64,
-    ws_bytes: u64,
-    handles: u64,
-    sys_avail_mb: u64,
+    cpu_s: Option<f64>,
+    priv_bytes: Option<u64>,
+    ws_bytes: Option<u64>,
+    handles: Option<u64>,
+    sys_avail_mb: Option<u64>,
     sys_busy_pct: Option<f64>,
 }
 
@@ -513,12 +536,21 @@ fn soak_resources_line(sample: &SoakResourcesSample) -> String {
         Some(value) => format!("{value:.1}"),
         None => "none".to_string(),
     };
-    format!("soak-resources: pid={pid} uptime_s={uptime_s} cpu_s={cpu_s:.2} priv_bytes={priv_bytes} ws_bytes={ws_bytes} handles={handles} sys_avail_mb={sys_avail_mb} sys_busy_pct={busy}")
+    let cpu = cpu_s.map_or_else(|| "none".into(), |value| format!("{value:.2}"));
+    let counter =
+        |value: Option<u64>| value.map_or_else(|| "none".into(), |value| value.to_string());
+    let (priv_bytes, ws_bytes, handles, sys_avail_mb) = (
+        counter(priv_bytes),
+        counter(ws_bytes),
+        counter(handles),
+        counter(sys_avail_mb),
+    );
+    format!("soak-resources: pid={pid} uptime_s={uptime_s} cpu_s={cpu} priv_bytes={priv_bytes} ws_bytes={ws_bytes} handles={handles} sys_avail_mb={sys_avail_mb} sys_busy_pct={busy}")
 }
 
 /// Reads the per-process counters and the system's free memory, plus the busy
-/// percent already published in `snapshot`. A failed counter call yields 0 for
-/// its own field only; the line is never skipped and never a silent partial.
+/// percent already published in `snapshot`. A failed counter call yields `none`
+/// for its field, never a fabricated zero. Consumers must skip invalid deltas.
 fn soak_resources_sample(
     snapshot: &Snapshot,
     now: Instant,
@@ -536,14 +568,19 @@ fn soak_resources_sample(
     let sys_busy_pct = snapshot
         .readings
         .lookup(MetricKey::CPUUtilization, "cpu-system")
+        .filter(|reading| {
+            reading.has_value
+                && reading.availability == crate::model::Availability::Available
+                && reading.freshness == crate::model::Freshness::Current
+        })
         .map(|reading| reading.number)
         .filter(|value| value.is_finite());
     let pid = unsafe { GetCurrentProcessId() };
-    let mut cpu_s = 0.0;
-    let mut handles = 0;
-    let mut priv_bytes = 0;
-    let mut ws_bytes = 0;
-    let mut sys_avail_mb = 0;
+    let mut cpu_s = None;
+    let mut handles = None;
+    let mut priv_bytes = None;
+    let mut ws_bytes = None;
+    let mut sys_avail_mb = None;
     unsafe {
         let process = GetCurrentProcess();
         let (mut created, mut exited, mut kernel, mut user) = (
@@ -555,11 +592,11 @@ fn soak_resources_sample(
         if GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user).is_ok() {
             let units =
                 |time: &FILETIME| ((time.dwHighDateTime as u64) << 32) | time.dwLowDateTime as u64;
-            cpu_s = (units(&kernel) + units(&user)) as f64 / 1e7;
+            cpu_s = Some((units(&kernel) + units(&user)) as f64 / 1e7);
         }
         let mut count = 0u32;
         if GetProcessHandleCount(process, &mut count).is_ok() {
-            handles = u64::from(count);
+            handles = Some(u64::from(count));
         }
         let mut counters = PROCESS_MEMORY_COUNTERS_EX {
             cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
@@ -572,15 +609,15 @@ fn soak_resources_sample(
         )
         .as_bool()
         {
-            priv_bytes = counters.PrivateUsage as u64;
-            ws_bytes = counters.WorkingSetSize as u64;
+            priv_bytes = Some(counters.PrivateUsage as u64);
+            ws_bytes = Some(counters.WorkingSetSize as u64);
         }
         let mut status = MEMORYSTATUSEX {
             dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
             ..Default::default()
         };
         if GlobalMemoryStatusEx(&mut status).is_ok() {
-            sys_avail_mb = status.ullAvailPhys / 1_048_576;
+            sys_avail_mb = Some(status.ullAvailPhys / 1_048_576);
         }
     }
     SoakResourcesSample {
@@ -677,7 +714,7 @@ fn module_provider_consumers(module: &str) -> &'static [&'static str] {
 /// under EVERY slot choice, layout 3 included. F-1's anti-starvation intent is preserved and
 /// strengthened: the rule that kept a bar-less layout from starving a provider now keeps it from
 /// starving a core reading. The 7-bit wire (`GATED_PROVIDERS`/`consumer_bit`/`ALL_CONSUMERS`),
-/// `provider_consumer_bits` (incl. the preview `ALL_CONSUMERS` early return), the loop gate
+/// `provider_consumer_bits` (the preview uses the same selected consumers), the loop gate
 /// `telemetry.rs:1723`, the backoff and the park arm stay byte-identical; the `gpu` demand
 /// VALUE is the whole change, so the GPU-bar protection for layouts 1/2 is untouched.
 fn main_display_provider_consumers(_main_display: i32) -> &'static [&'static str] {
@@ -685,17 +722,15 @@ fn main_display_provider_consumers(_main_display: i32) -> &'static [&'static str
 }
 
 /// EC-3: which gated providers have a consumer right now. Union of the fixed
-/// main-display bars, the displayed slot modules and the preview surface (a
-/// visible preview is a snapshot consumer of everything, so gating never applies
-/// while a human is watching). Event-driven: computed with the slot modules, not
+/// main-display bars and the displayed slot modules. The preview renders the
+/// same dashboard and adds no independent demand. Computed with the slot modules, not
 /// per tick. WO-REMOVE-ALERTS retired the third leg, the enabled alert
 /// categories, with the feature: no non-hang alarm consumer can keep a provider
 /// at full cadence, and no display consumer is lost with it (the temperature,
 /// memory and headset readings ride their own module arms).
-fn provider_consumer_bits(modules: &[String; 4], cfg: &Config, preview_active: bool) -> u64 {
-    if preview_active {
-        return crate::telemetry::ALL_CONSUMERS;
-    }
+fn provider_consumer_bits(modules: &[String; 4], cfg: &Config, _preview_active: bool) -> u64 {
+    // The preview draws these same selected readings. It is not a subscription
+    // to every optional provider, even when device loss opens it automatically.
     let mut bits = 0u64;
     for provider in main_display_provider_consumers(cfg.main_display) {
         bits |= crate::telemetry::consumer_bit(provider);
@@ -709,7 +744,7 @@ fn provider_consumer_bits(modules: &[String; 4], cfg: &Config, preview_active: b
 }
 
 /// EC-3 consumer surface: the preview window shows the same slots, so treat it as
-/// a consumer of every gated provider whenever the preview policy keeps it visible.
+/// another presentation of those readings, not an all-provider subscription.
 fn preview_surface_active(preview_always: bool, cfg: &Config, state: &BackendState) -> bool {
     preview_always || preview_for_backend(cfg, state)
 }
@@ -875,6 +910,20 @@ fn provider_demand_bits(slots: &Manager, modules: &[String; 4], cfg: &Config) ->
         }
     }
     bits
+}
+
+fn discord_display_demand(modules: &[String; 4]) -> bool {
+    modules
+        .iter()
+        .any(|module| module.eq_ignore_ascii_case("DISCORD"))
+}
+
+/// Reuse the existing enable/disable lifecycle; allocate a config only at a
+/// selection edge or reload, never per tick. The user's stored config is unchanged.
+fn discord_runtime_config(cfg: &Config, demanded: bool) -> Config {
+    let mut effective = cfg.clone();
+    effective.discord_enabled &= demanded;
+    effective
 }
 
 fn network_overlay_options(cfg: &Config) -> OverlayOptions {
@@ -1397,8 +1446,11 @@ fn apply_hold_command(
     hold: &mut hang::HoldState,
     slots: &mut Manager,
     cfg: &Config,
+    owner: &mut HangOwner,
 ) {
-    apply_hold_command_with(command, hold, slots, cfg, hang::terminate_bound_target);
+    if apply_hold_command_with(command, hold, slots, cfg, hang::terminate_bound_target) {
+        owner.invalidate();
+    }
 }
 
 fn apply_hold_command_with<F>(
@@ -1407,7 +1459,8 @@ fn apply_hold_command_with<F>(
     slots: &mut Manager,
     cfg: &Config,
     terminate: F,
-) where
+) -> bool
+where
     F: FnOnce(&crate::model::HungTarget, &Config) -> hang::ActionReport,
 {
     match command {
@@ -1417,12 +1470,13 @@ fn apply_hold_command_with<F>(
             // any button, slot 4 (index 3) included, is the ordinary slot cycle.
             let module = slots.cycle(index, if backward { -1 } else { 1 });
             crate::log_debug!("button {} -> slot module {}", index + 1, module);
+            return index < 4;
         }
         hang::HoldCommand::Audit(audit) => log_hang_audit(&audit),
         hang::HoldCommand::Terminate(target) => {
             if cfg.safe_mode {
                 log_hang_audit(&hang::Audit::raised(target, "refused-safe-mode"));
-                return;
+                return false;
             }
             log_hang_audit(&hang::Audit::raised(target.clone(), "attempted"));
             let report = terminate(&target, cfg);
@@ -1437,6 +1491,7 @@ fn apply_hold_command_with<F>(
             hold.report_action(&target, report.outcome);
         }
     }
+    false
 }
 
 struct ConfigWatcher {
@@ -1618,7 +1673,7 @@ mod tests {
         );
         assert_eq!(
             provider_consumer_bits(&idle, &plain, true),
-            crate::telemetry::ALL_CONSUMERS,
+            crate::telemetry::consumer_bit("gpu"),
             "a visible preview keeps the shipped prompt-consumer rule"
         );
     }
@@ -3199,8 +3254,8 @@ mod tests {
         );
         assert_eq!(
             provider_consumer_bits(&idle, &quiescent, true),
-            crate::telemetry::ALL_CONSUMERS,
-            "a visible preview is a snapshot consumer of everything"
+            gpu_bit,
+            "preview mirrors selected readings without activating hidden providers"
         );
         let safe = Config {
             main_display: 3,
@@ -3458,11 +3513,11 @@ mod tests {
         let sample = SoakResourcesSample {
             pid: 4242,
             uptime_s: 3600,
-            cpu_s: 12.5,
-            priv_bytes: 1_048_576,
-            ws_bytes: 2_097_152,
-            handles: 99,
-            sys_avail_mb: 8_192,
+            cpu_s: Some(12.5),
+            priv_bytes: Some(1_048_576),
+            ws_bytes: Some(2_097_152),
+            handles: Some(99),
+            sys_avail_mb: Some(8_192),
             sys_busy_pct: Some(37.5),
         };
         assert_eq!(
@@ -3703,8 +3758,8 @@ mod tests {
         };
         assert_eq!(
             provider_consumer_bits(&idle, &quiescent3, true),
-            crate::telemetry::ALL_CONSUMERS,
-            "the preview consumes every gated provider, exactly as shipped (U-9 preserve)"
+            crate::telemetry::consumer_bit("gpu"),
+            "preview mirrors the selected readings, without hidden provider demand"
         );
         assert_eq!(
             provider_demand_bits(&slots_current(&idle), &idle, &quiescent3),
@@ -3718,7 +3773,7 @@ mod tests {
         assert_eq!(
             provider_demand_bits(&slots_current(&idle), &idle, &quiescent1),
             0,
-            "a layout 1 idle preview adds no metering demand beyond the preserved gated-all"
+            "a layout 1 idle preview adds no optional metering demand"
         );
         let disk = slots_showing(["CLOCK", "DISK_IO", "CLOCK", "CLOCK"]);
         assert_eq!(
@@ -3875,5 +3930,99 @@ mod tests {
             cfg.render_interval <= Duration::from_millis(100),
             "the app publishes the demand word at most every 100 ms => re-arm bound = 150 ms"
         );
+    }
+    #[test]
+    fn idle_production_dispatch_keeps_hang_owner_cached_until_a_real_cycle() {
+        let cfg = Config::default();
+        let mut slots = Manager::new(&cfg, [0; 4]);
+        let mut hold = hang::HoldState::default();
+        let mut owner = HangOwner::default();
+        owner.bind(&slots, &mut hold);
+        for _ in 0..1000 {
+            apply_hold_command(
+                hang::HoldCommand::None,
+                &mut hold,
+                &mut slots,
+                &cfg,
+                &mut owner,
+            );
+            owner.bind(&slots, &mut hold);
+        }
+        assert_eq!(owner.resolutions, 1);
+        apply_hold_command(
+            hang::HoldCommand::Cycle {
+                index: 2,
+                backward: false,
+            },
+            &mut hold,
+            &mut slots,
+            &cfg,
+            &mut owner,
+        );
+        owner.bind(&slots, &mut hold);
+        assert_eq!(owner.resolutions, 2);
+    }
+
+    #[test]
+    fn preview_and_device_loss_never_demand_undisplayed_optional_readings() {
+        let cfg = Config::default();
+        let modules = slots_showing(["CLOCK", "CPU_LOAD", "RAM_USAGE", "CLOCK"]);
+        for state in [
+            BackendState::Discovering,
+            BackendState::Connected {
+                kind: BackendKind::Sdk,
+            },
+        ] {
+            assert_eq!(
+                provider_consumer_bits(&modules, &cfg, preview_surface_active(false, &cfg, &state)),
+                crate::telemetry::consumer_bit("gpu"),
+            );
+        }
+        let displayed = slots_showing(["HEADSET_BATTERY", "CLOCK", "CLOCK", "CLOCK"]);
+        assert_eq!(
+            provider_consumer_bits(&displayed, &cfg, true),
+            crate::telemetry::consumer_bit("gpu") | crate::telemetry::consumer_bit("headset"),
+        );
+    }
+
+    #[test]
+    fn discord_has_demand_only_while_selected_without_rewriting_user_preferences() {
+        let cfg = Config {
+            discord_enabled: true,
+            discord_client_id: "123456789".into(),
+            ..Default::default()
+        };
+        let mut hidden = slots_showing(["CLOCK", "CPU_LOAD", "RAM_USAGE", "CLOCK"]);
+        assert!(!discord_display_demand(&hidden));
+        assert!(!discord_runtime_config(&cfg, discord_display_demand(&hidden)).discord_enabled);
+        hidden[2] = "DISCORD".into();
+        assert!(discord_runtime_config(&cfg, discord_display_demand(&hidden)).discord_enabled);
+        assert!(cfg.discord_enabled);
+        let disabled = Config {
+            discord_enabled: false,
+            ..cfg.clone()
+        };
+        assert!(!discord_runtime_config(&disabled, true).discord_enabled);
+    }
+
+    #[test]
+    fn failed_soak_counters_are_unavailable_not_measured_zero() {
+        let failed = SoakResourcesSample {
+            pid: 1,
+            uptime_s: 60,
+            cpu_s: None,
+            priv_bytes: None,
+            ws_bytes: None,
+            handles: None,
+            sys_avail_mb: None,
+            sys_busy_pct: None,
+        };
+        assert_eq!(soak_resources_line(&failed), "soak-resources: pid=1 uptime_s=60 cpu_s=none priv_bytes=none ws_bytes=none handles=none sys_avail_mb=none sys_busy_pct=none");
+        let measured = SoakResourcesSample {
+            cpu_s: Some(0.0),
+            priv_bytes: Some(0),
+            ..failed
+        };
+        assert!(soak_resources_line(&measured).contains("cpu_s=0.00 priv_bytes=0 "));
     }
 }

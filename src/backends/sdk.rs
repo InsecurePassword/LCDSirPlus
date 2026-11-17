@@ -141,7 +141,23 @@ struct AuthenticodeIdentity {
     thumbprint: Vec<u8>,
 }
 
-pub fn lcore() -> Result<Option<LCore>, String> {
+/// Presence-only ownership check. Full path and SDK trust checks still run on open.
+/// This preserves ambiguity/failure handling without allocating a 64 KiB path
+/// buffer or canonicalizing an executable on every button-poll iteration.
+pub fn lcore_present() -> Result<bool, String> {
+    lcore_pid().map(|pid| pid.is_some())
+}
+
+fn lcore_name(units: &[u16]) -> bool {
+    let expected = b"lcore.exe";
+    units.len() == expected.len()
+        && units
+            .iter()
+            .zip(expected)
+            .all(|(&unit, expected)| unit <= 0x7f && (unit as u8).eq_ignore_ascii_case(expected))
+}
+
+fn lcore_pid() -> Result<Option<u32>, String> {
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
             .map_err(|e| format!("LCore discovery: {e}"))?;
@@ -153,31 +169,36 @@ pub fn lcore() -> Result<Option<LCore>, String> {
             let _ = CloseHandle(snapshot);
             return Err(format!("enumerate LCore.exe processes: {error}"));
         }
-        let mut found = Vec::new();
+        let mut found = None;
         loop {
             let end = entry
                 .szExeFile
                 .iter()
                 .position(|c| *c == 0)
                 .unwrap_or(entry.szExeFile.len());
-            if String::from_utf16_lossy(&entry.szExeFile[..end]).eq_ignore_ascii_case("LCore.exe") {
-                found.push(entry.th32ProcessID);
+            if lcore_name(&entry.szExeFile[..end]) && found.replace(entry.th32ProcessID).is_some() {
+                let _ = CloseHandle(snapshot);
+                return Err(
+                    "multiple running LCore.exe processes make SDK selection ambiguous".into(),
+                );
             }
             if let Err(error) = Process32NextW(snapshot, &mut entry) {
-                if error.code() != ERROR_NO_MORE_FILES.to_hresult() {
-                    let _ = CloseHandle(snapshot);
-                    return Err(format!("enumerate LCore.exe processes: {error}"));
-                }
-                break;
+                let _ = CloseHandle(snapshot);
+                return if error.code() == ERROR_NO_MORE_FILES.to_hresult() {
+                    Ok(found)
+                } else {
+                    Err(format!("enumerate LCore.exe processes: {error}"))
+                };
             }
         }
-        let _ = CloseHandle(snapshot);
-        if found.len() > 1 {
-            return Err("multiple running LCore.exe processes make SDK selection ambiguous".into());
-        }
-        let Some(pid) = found.first().copied() else {
-            return Ok(None);
-        };
+    }
+}
+
+pub fn lcore() -> Result<Option<LCore>, String> {
+    let Some(pid) = lcore_pid()? else {
+        return Ok(None);
+    };
+    unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
             .map_err(|e| format!("open LCore.exe process {pid}: {e}"))?;
         let mut buffer = vec![0u16; 32768];
@@ -2394,5 +2415,15 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "the driven SDK payload timeline needed {elapsed:?} of real time; it must need no real-time headroom"
         );
+    }
+    #[test]
+    fn lcore_presence_matching_is_exact_and_ascii_case_insensitive() {
+        assert!(lcore_name(&"LCore.Exe".encode_utf16().collect::<Vec<_>>()));
+        assert!(!lcore_name(
+            &"LCore-helper.exe".encode_utf16().collect::<Vec<_>>()
+        ));
+        assert!(!lcore_name(
+            &"LCore.exe ".encode_utf16().collect::<Vec<_>>()
+        ));
     }
 }

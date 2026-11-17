@@ -112,7 +112,7 @@ Updates and repairs do not replace it.
 3. Right-click empty space and select **Open in Terminal**.
 4. Run `.\LCDSirPlus.exe --preview`.
 
-Keep `LCDSirPlus.exe`, `PresentMon.exe`, `lcdsirplus.txt`, `SECURITY.md`,
+Keep `LCDSirPlus.exe`, `lcdsirplus_discord.dll`, `PresentMon.exe`, `lcdsirplus.txt`, `SECURITY.md`,
 `RELEASE-NOTES.md`, `modules.md`, and the `docs` folder together.
 Portable use creates no installer-owned shortcuts.
 
@@ -258,6 +258,7 @@ In an installed or portable package, open `modules.md` beside `LCDSirPlus.exe`.
 | `CLOCK` | Shows time using the Windows Short time format. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `GAME_NAME` | Shows the selected game or app filename. What you need: PresentMon, included in the 0.3.0 package. A filename may appear under either persist setting; set `presentmon_enabled 0` to prevent this exposure. |
 | `PROVIDER_STATUS` | Shows unavailable tracked data sources or OK. What you need: Built into Windows and LCDSirPlus; no extra software. |
+| `DISCORD` | Shows selected Discord voice speakers and optional channel title without taking over the screen. What you need: Discord Desktop and an authorized configured application. |
 | `CPU_LOAD` | Shows total CPU use. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `RAM_USAGE` | Shows memory use and capacity. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `GPU_LOAD` | Shows GPU use. What you need: An NVIDIA or AMD graphics driver. |
@@ -512,12 +513,13 @@ Discord display needs Discord Desktop and your own application:
    }
    ```
 
-9. Approve the prompt in Discord and join a voice channel. The connection status
-   appears in `PROVIDER_STATUS` (the `Discord` row). Speaking no longer changes
-   the panel: the automatic full-screen speaker takeover was removed, because
-   only the hung-window feature may take the display without your request. No
-   speaker name list is drawn on the LCD in this release, and no replacement
-   pane was added.
+9. Approve the prompt in Discord and join a voice channel. Add `DISCORD` to a
+   button slot and select it to display voice activity. The compact pane shows
+   speaking names (fitted to the slot), a `+N` count for omitted speakers, and
+   optionally the channel as its title. Self visibility, linger and maximum
+   speaker settings still apply. Without a selected `DISCORD` pane, monitoring
+   stops and the optional DLL unloads; authorization commands remain explicit.
+   Speaking never replaces another pane or takes over the dashboard.
 
 Discord's **Public Client** switch does not remove the secret requirement for
 this workflow. Windows protects the secret and access records for the current

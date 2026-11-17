@@ -273,8 +273,8 @@ pub struct Recovery {
     worker_timed_out: bool,
     awaiting_reconnect: bool,
     /// RC-2: when the worker last claimed a physical connection and still owes
-    /// its one `PhysicalHealthy` for that device cycle; cleared by health, by
-    /// any disconnect/absent/discovering publication, and by a reconnect cycle.
+    /// completed-work health for that device cycle. Health refreshes it;
+    /// disconnect/absent/discovering and reconnect clear it.
     liveness_since: Option<Instant>,
     /// RC-2 one-shot: the stall wake for the current connection segment has
     /// been spent; only fresh health re-arms it (repeat-rejection).
@@ -364,6 +364,10 @@ impl Recovery {
     }
 
     pub fn healthy(&mut self, kind: BackendKind) {
+        self.healthy_at(kind, Instant::now());
+    }
+
+    fn healthy_at(&mut self, kind: BackendKind, now: Instant) {
         if self.awaiting_reconnect || !matches!(kind, BackendKind::Hid | BackendKind::Sdk) {
             return;
         }
@@ -375,9 +379,10 @@ impl Recovery {
         // (c) `NO RETRY` is untouched: it is driven by the spent permit and the
         // `Finished` journal, i.e. allowance state, not a sticky failure.
         self.recovery_failure = None;
-        // RC-2: health for this device cycle has arrived, so the liveness clock
-        // stops; fresh health is the only thing that re-arms the one-shot wake.
-        self.liveness_since = None;
+        // Progress refreshes a claimed physical connection instead of disabling
+        // its watchdog after the first successful frame. Unclaimed/virtual or
+        // deliberately disconnected workers do not acquire a liveness clock.
+        self.liveness_since = self.liveness_since.map(|_| now);
         self.stall_actioned = false;
         if self.logitech_result.is_some() {
             self.permit.cancel();
@@ -394,6 +399,7 @@ impl Recovery {
     }
 
     pub fn disconnected(&mut self, now: Instant, cause: LossCause) {
+        self.liveness_since = None;
         self.last_cause = Some(cause);
         if self.previously_connected {
             self.lost_since.get_or_insert(now);
@@ -402,7 +408,7 @@ impl Recovery {
 
     /// RC-2 liveness bookkeeping, driven by the app-side backend drain for every
     /// published state. A physical worker that claims `Connected` owes exactly
-    /// one `PhysicalHealthy` for that device cycle; while it is in backoff,
+    /// periodic completed-work health for that device cycle; while it is in backoff,
     /// `Disconnected`, `Absent`, `Discovering` or shutdown, health is
     /// legitimately absent and nothing may count as a stall.
     pub fn note_liveness(&mut self, now: Instant, state: &BackendState) {
@@ -2357,5 +2363,26 @@ mod tests {
             process_creation_time(unsafe { GetCurrentProcess() }).unwrap(),
         );
         assert!(result.unwrap_err().contains("original retained"));
+    }
+    #[test]
+    fn silence_after_established_health_is_detected_and_progress_rearms_the_clock() {
+        let root = TestDir::new();
+        let start = Instant::now();
+        let mut recovery = Recovery::load(root.journal(), false, 1, start);
+        claim(&mut recovery, start, BackendKind::Sdk);
+        let first = start + Duration::from_secs(1);
+        recovery.healthy_at(BackendKind::Sdk, first);
+        let next = first + recovery.stall_deadline - Duration::from_secs(1);
+        assert!(!recovery.stall_due(next));
+        recovery.healthy_at(BackendKind::Sdk, next);
+        let deadline = next + recovery.stall_deadline;
+        assert!(!recovery.stall_due(deadline - Duration::from_millis(1)));
+        assert!(recovery.stall_due(deadline));
+        let mut wakes = 0;
+        assert!(!recovery.tick(deadline, true, || wakes += 1));
+        assert!(!recovery.tick(deadline + Duration::from_secs(1), true, || wakes += 1));
+        assert_eq!(wakes, 1);
+        recovery.note_liveness(deadline, &BackendState::Discovering);
+        assert!(!recovery.stall_due(deadline + recovery.stall_deadline * 2));
     }
 }

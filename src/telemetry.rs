@@ -67,6 +67,7 @@ pub struct Telemetry {
 impl Drop for Telemetry {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        self.wake_workers();
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -77,7 +78,16 @@ impl Telemetry {
     pub fn update_config(&self, config: &Config) -> u64 {
         let mut current = self.config.write().unwrap_or_else(|e| e.into_inner());
         *current = config.clone();
-        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        drop(current);
+        self.wake_workers();
+        generation
+    }
+
+    fn wake_workers(&self) {
+        for worker in &self.threads {
+            worker.thread().unpark();
+        }
     }
 
     pub fn generation(&self) -> u64 {
@@ -88,7 +98,9 @@ impl Telemetry {
     /// `GATED_PROVIDERS` entry). Event-driven, from the app's render path; the
     /// scheduler reads it at most once per tick.
     pub fn set_consumers(&self, consumers: u64) {
-        self.consumers.store(consumers, Ordering::Relaxed);
+        if self.consumers.swap(consumers, Ordering::Relaxed) != consumers {
+            self.wake_workers();
+        }
     }
 }
 
@@ -274,7 +286,8 @@ pub fn consumer_bit(provider: &str) -> u64 {
         .map_or(0, |index| 1 << index)
 }
 
-/// Every gated provider consumed (full cadence for all of them).
+/// Test fixture demand for every gated provider.
+#[cfg(test)]
 pub const ALL_CONSUMERS: u64 = (1 << GATED_PROVIDERS.len()) - 1;
 
 /// WO-TEL-D2 (S1): the never-gated metering providers the consumer word gains
@@ -646,7 +659,9 @@ impl Worker {
         self.poll_connections(&cfg, consumers, now);
         self.poll_battery(&cfg, consumers, now);
         self.apply_freshness(&cfg, now);
-        self.rebuild_extended_readings(&cfg);
+        if self.publish_dirty || self.publication_due(&cfg, now) {
+            self.rebuild_extended_readings(&cfg);
+        }
         self.update.generation = generation;
         self.publish(generation, &cfg, now)
     }
@@ -662,15 +677,18 @@ impl Worker {
     /// `false`, exactly as the shipped unconditional send did.
     fn publish(&mut self, generation: u64, cfg: &Config, now: Instant) -> bool {
         debug_assert_eq!(self.update.generation, generation);
-        let due = self
-            .last_publish
-            .is_none_or(|last| now.duration_since(last) >= cfg.telemetry_interval);
+        let due = self.publication_due(cfg, now);
         if !self.publish_dirty && !due {
             return true;
         }
         self.publish_dirty = false;
         self.last_publish = Some(now);
         self.tx.send(self.update.clone())
+    }
+
+    fn publication_due(&self, cfg: &Config, now: Instant) -> bool {
+        self.last_publish
+            .is_none_or(|last| now.saturating_duration_since(last) >= cfg.telemetry_interval)
     }
 
     fn reset_state(&mut self, generation: u64) {
@@ -946,6 +964,9 @@ impl Worker {
         // WO-TEL-D2 (S2, U-7): no displayed CONTROLLER_BATTERY consumer => the
         // poll does not run; the shipped disabled arm above stays byte-identical.
         if !demanded(consumers, "controller") {
+            self.publish_dirty |= self.controller_attempt.take().is_some();
+            self.update.controller = ControllerBattery::default();
+            self.remove_provider("controller");
             return;
         }
         if !due(self.controller_attempt, cfg.controller_poll, now) {
@@ -989,6 +1010,10 @@ impl Worker {
         // WO-TEL-D2 (S2, U-2): no displayed AUDIO/MIC_STATUS consumer => the COM
         // endpoint read does not run; the shipped disabled arm stays byte-identical.
         if !demanded(consumers, "audio") {
+            self.publish_dirty |= self.audio_attempt.take().is_some();
+            self.update.audio = None;
+            self.update.audio_sampled_at = None;
+            self.remove_provider("audio");
             return;
         }
         if !due(self.audio_attempt, cfg.audio_poll, now) {
@@ -1020,9 +1045,13 @@ impl Worker {
         }
         // WO-TEL-D2 (S2, U-11): the 1 Hz netif poll stops when no NET_* module
         // and no NET bar is displayed (the persistence the demand release leaves
-        // today); the delta math divides by the real elapsed span, so the
-        // resume's first sample re-baselines and every later rate is correct.
+        // today). Discard its counters on release: the first resumed poll captures
+        // a fresh baseline, not an average across an unobserved interval.
         if !demanded(consumers, "net") {
+            self.publish_dirty |= self.net_attempt.take().is_some() || self.update.net.is_some();
+            self.net.reset();
+            self.update.net = None;
+            self.remove_provider("net");
             return;
         }
         if !due(self.net_attempt, NETWORK_POLL, now) {
@@ -1283,17 +1312,19 @@ impl Worker {
     }
 
     fn rebuild_extended_readings(&mut self, cfg: &Config) {
-        let mut readings: Vec<Reading> = self
-            .lhm_readings
-            .iter()
-            .filter(|reading| {
-                !matches!(
-                    reading.key,
-                    MetricKey::TotalPower | MetricKey::CPUPower | MetricKey::GPUPower
-                )
-            })
-            .cloned()
-            .collect();
+        let mut readings = std::mem::take(&mut self.update.extended_readings);
+        readings.clear();
+        readings.extend(
+            self.lhm_readings
+                .iter()
+                .filter(|reading| {
+                    !matches!(
+                        reading.key,
+                        MetricKey::TotalPower | MetricKey::CPUPower | MetricKey::GPUPower
+                    )
+                })
+                .cloned(),
+        );
         readings.extend(self.performance_readings.iter().cloned());
         readings.extend(self.connection_reading.iter().cloned());
         for key in [MetricKey::TotalPower, MetricKey::CPUPower] {
@@ -1394,10 +1425,12 @@ fn spawn_headset(
                     || !demanded(consumers.load(Ordering::Relaxed), "headset")
                 {
                     // WO-TEL-D2 (S2, U-1 family): the zero-demand park reuses the
-                    // shipped disabled arm (clear + `sleep(TICK)`), so a reading
+                    // disabled arm (clear + native park), so a reading
                     // with no displayed consumer performs zero HID queries and
                     // the generation-only clear stays byte-identical.
                     last_attempt = None;
+                    std::thread::park();
+                    continue;
                 } else {
                     let now = Instant::now();
                     let interval = sampling_interval(
@@ -1501,6 +1534,8 @@ fn spawn_lhm(
                     }
                 } else {
                     last_attempt = None;
+                    std::thread::park();
+                    continue;
                 }
                 std::thread::sleep(TICK);
             }
@@ -1549,6 +1584,8 @@ fn spawn_hwinfo(
                     }
                 } else {
                     last_attempt = None;
+                    std::thread::park();
+                    continue;
                 }
                 std::thread::sleep(TICK);
             }
@@ -1824,6 +1861,8 @@ fn spawn_gpu(
                             return;
                         }
                     }
+                    std::thread::park();
+                    continue;
                 }
                 std::thread::sleep(TICK);
             }
@@ -1832,10 +1871,10 @@ fn spawn_gpu(
 }
 
 /// Start the coordinator and owned provider workers.
-pub fn spawn(cfg: &Config) -> Telemetry {
+pub fn spawn(cfg: &Config, initial_consumers: u64) -> Telemetry {
     let config = Arc::new(RwLock::new(cfg.clone()));
     let generation = Arc::new(AtomicU64::new(1));
-    let consumers = Arc::new(AtomicU64::new(ALL_CONSUMERS));
+    let consumers = Arc::new(AtomicU64::new(initial_consumers));
     let shutdown = Arc::new(AtomicBool::new(false));
     let (tx, rx) = latest_channel();
     let (slow_tx, slow_rx) = mpsc::sync_channel(8);
@@ -2522,10 +2561,13 @@ mod tests {
 
     #[test]
     fn safe_mode_runtime_owns_and_joins_all_threads() {
-        let runtime = spawn(&Config {
-            safe_mode: true,
-            ..Config::default()
-        });
+        let runtime = spawn(
+            &Config {
+                safe_mode: true,
+                ..Config::default()
+            },
+            0,
+        );
         assert_eq!(runtime.threads.len(), 8);
         drop(runtime);
     }
@@ -3587,6 +3629,7 @@ mod tests {
         );
         retune(&config, |cfg| cfg.headset_poll = BEHAVIORAL_LONG);
         generation.fetch_add(1, Ordering::SeqCst);
+        loop_thread.thread().unpark();
         enter_rx
             .recv_timeout(BEHAVIORAL_WAIT)
             .expect("(iii) the generation bump cleared `last_attempt`, so the real loop samples on the next tick under a 30 s cadence");
@@ -3611,6 +3654,7 @@ mod tests {
             "(iv) with the generation unchanged the loop keeps its cadence: an unconditional per-iteration clear would enter the sampler every tick"
         );
         generation.fetch_add(1, Ordering::SeqCst);
+        loop_thread.thread().unpark();
         enter_rx
             .recv_timeout(BEHAVIORAL_WAIT)
             .expect("(iv) the second bump re-arms the sampler");
@@ -3631,6 +3675,7 @@ mod tests {
             "(iv) the failure text comes from the script"
         );
         shutdown.store(true, Ordering::Release);
+        loop_thread.thread().unpark();
         loop_thread
             .join()
             .expect("the headset loop joins within the sampler's loud 5 s budget");
@@ -3720,6 +3765,7 @@ mod tests {
         );
         retune(&config, |cfg| cfg.lhm_interval = BEHAVIORAL_LONG);
         generation.fetch_add(1, Ordering::SeqCst);
+        loop_thread.thread().unpark();
         enter_rx
             .recv_timeout(BEHAVIORAL_WAIT)
             .expect("(iii) the generation bump cleared `last_attempt`, so the real LHM loop samples on the next tick under a 30 s cadence");
@@ -3744,6 +3790,7 @@ mod tests {
             "(iv) with the generation unchanged the LHM loop keeps its cadence: an unconditional per-iteration clear would enter the sampler every tick"
         );
         generation.fetch_add(1, Ordering::SeqCst);
+        loop_thread.thread().unpark();
         enter_rx
             .recv_timeout(BEHAVIORAL_WAIT)
             .expect("(iv) the second bump re-arms the sampler");
@@ -3764,6 +3811,7 @@ mod tests {
             "(iv) the failure text comes from the script"
         );
         shutdown.store(true, Ordering::Release);
+        loop_thread.thread().unpark();
         loop_thread
             .join()
             .expect("the LHM loop joins within the sampler's loud 5 s budget");
@@ -3861,6 +3909,7 @@ mod tests {
             cadence_start.elapsed()
         );
         generation.fetch_add(1, Ordering::SeqCst);
+        loop_thread.thread().unpark();
         enter_rx
             .recv_timeout(BEHAVIORAL_HWINFO_HALF)
             .expect("(iii) the mid-cadence generation bump cleared `last_attempt`, so the real HWiNFO loop samples on the next tick, far inside its {EXTENDED_POLL:?} cadence");
@@ -3885,6 +3934,7 @@ mod tests {
             "(iv) with the generation unchanged the HWiNFO loop keeps its cadence: an unconditional per-iteration clear would enter the sampler every tick"
         );
         generation.fetch_add(1, Ordering::SeqCst);
+        loop_thread.thread().unpark();
         enter_rx
             .recv_timeout(BEHAVIORAL_HWINFO_HALF)
             .expect("(iv) the second bump re-arms the sampler");
@@ -3905,6 +3955,7 @@ mod tests {
             "(iv) the failure text comes from the script"
         );
         shutdown.store(true, Ordering::Release);
+        loop_thread.thread().unpark();
         loop_thread
             .join()
             .expect("the HWiNFO loop joins within the sampler's loud 5 s budget");
@@ -3998,6 +4049,7 @@ mod tests {
         );
         retune(&config, |cfg| cfg.telemetry_interval = BEHAVIORAL_LONG);
         generation.fetch_add(1, Ordering::SeqCst);
+        loop_thread.thread().unpark();
         enter_rx
             .recv_timeout(BEHAVIORAL_WAIT)
             .expect("(iii) the generation bump cleared `last_attempt`, so the real GPU loop samples on the next tick under a 30 s cadence");
@@ -4022,6 +4074,7 @@ mod tests {
             "(iv) with the generation unchanged the GPU loop keeps its cadence: an unconditional per-iteration clear would enter the sampler every tick"
         );
         generation.fetch_add(1, Ordering::SeqCst);
+        loop_thread.thread().unpark();
         enter_rx
             .recv_timeout(BEHAVIORAL_WAIT)
             .expect("(iv) the second bump re-arms the sampler");
@@ -4042,6 +4095,7 @@ mod tests {
             "(iv) the failure text comes from the script"
         );
         shutdown.store(true, Ordering::Release);
+        loop_thread.thread().unpark();
         loop_thread
             .join()
             .expect("the GPU loop joins within the sampler's loud 5 s budget");
@@ -4204,6 +4258,7 @@ mod tests {
             "(P1) the real headset loop enters the sampler ZERO times across 900 ms (> 2 x the 200 ms keep-alive bound) while no consumer reads the headset"
         );
         consumers.store(consumer_bit("headset"), Ordering::Relaxed);
+        loop_thread.thread().unpark();
         enter_rx
             .recv_timeout(BEHAVIORAL_WAIT)
             .expect("(P2) the demand bit starts the sampler on the next tick");
@@ -4214,16 +4269,19 @@ mod tests {
         );
         assert_eq!(gen1, 1, "(P2) the event carries the loop generation");
         consumers.store(0, Ordering::Relaxed);
+        loop_thread.thread().unpark();
         assert!(
             enter_rx.recv_timeout(Duration::from_millis(900)).is_err(),
             "(P1) demand release parks the loop again (zero further entries)"
         );
         consumers.store(consumer_bit("headset"), Ordering::Relaxed);
+        loop_thread.thread().unpark();
         enter_rx
             .recv_timeout(BEHAVIORAL_WAIT)
             .expect("(P2) re-demand resumes sampling");
         release_tx.send(()).expect("release #2");
         shutdown.store(true, Ordering::Release);
+        loop_thread.thread().unpark();
         loop_thread
             .join()
             .expect("the headset loop joins within the sampler's loud 5 s budget");
@@ -4258,6 +4316,7 @@ mod tests {
             "(P1) the real LHM loop enters the sampler ZERO times across 900 ms (> 2 x the 200 ms keep-alive bound) while no consumer reads temperatures"
         );
         consumers.store(consumer_bit("lhm"), Ordering::Relaxed);
+        loop_thread.thread().unpark();
         enter_rx
             .recv_timeout(BEHAVIORAL_WAIT)
             .expect("(P2) the demand bit starts the sampler on the next tick");
@@ -4268,16 +4327,19 @@ mod tests {
         );
         assert_eq!(gen1, 1, "(P2) the event carries the loop generation");
         consumers.store(0, Ordering::Relaxed);
+        loop_thread.thread().unpark();
         assert!(
             enter_rx.recv_timeout(Duration::from_millis(900)).is_err(),
             "(P1) demand release parks the loop again (zero further entries)"
         );
         consumers.store(consumer_bit("lhm"), Ordering::Relaxed);
+        loop_thread.thread().unpark();
         enter_rx
             .recv_timeout(BEHAVIORAL_WAIT)
             .expect("(P2) re-demand resumes sampling");
         release_tx.send(()).expect("release #2");
         shutdown.store(true, Ordering::Release);
+        loop_thread.thread().unpark();
         loop_thread
             .join()
             .expect("the LHM loop joins within the sampler's loud 5 s budget");
@@ -4311,6 +4373,7 @@ mod tests {
             "(P1) the real HWiNFO loop enters the sampler ZERO times across 1.6 s (>= the shipped 1 s EXTENDED_POLL cadence, whose first sample fires immediately under the keep-alive rule) while no consumer reads HWiNFO-backed readings"
         );
         consumers.store(consumer_bit("hwinfo"), Ordering::Relaxed);
+        loop_thread.thread().unpark();
         enter_rx
             .recv_timeout(BEHAVIORAL_WAIT)
             .expect("(P2) the demand bit starts the sampler on the next tick");
@@ -4325,16 +4388,19 @@ mod tests {
             "(P2) selectors come from the live config"
         );
         consumers.store(0, Ordering::Relaxed);
+        loop_thread.thread().unpark();
         assert!(
             enter_rx.recv_timeout(Duration::from_millis(1_600)).is_err(),
             "(P1) demand release parks the loop again (zero further entries)"
         );
         consumers.store(consumer_bit("hwinfo"), Ordering::Relaxed);
+        loop_thread.thread().unpark();
         enter_rx
             .recv_timeout(BEHAVIORAL_WAIT)
             .expect("(P2) re-demand resumes sampling");
         release_tx.send(()).expect("release #2");
         shutdown.store(true, Ordering::Release);
+        loop_thread.thread().unpark();
         loop_thread
             .join()
             .expect("the HWiNFO loop joins within the sampler's loud 5 s budget");
@@ -4367,6 +4433,7 @@ mod tests {
             "(P1) the real GPU loop enters the sampler ZERO times across 900 ms (>= 2 x the 400 ms driven cadence and >= the 3 s keep-alive floor's first-sample at t=0) while no consumer reads GPU-backed surfaces; with demand 0 the shipped disabled arm also keeps the vendor provider unloaded (no open chain)"
         );
         consumers.store(consumer_bit("gpu"), Ordering::Relaxed);
+        loop_thread.thread().unpark();
         enter_rx
             .recv_timeout(BEHAVIORAL_WAIT)
             .expect("(P2) the demand bit starts the sampler on the next tick");
@@ -4377,16 +4444,19 @@ mod tests {
         );
         assert_eq!(gen1, 1, "(P2) the event carries the loop generation");
         consumers.store(0, Ordering::Relaxed);
+        loop_thread.thread().unpark();
         assert!(
             enter_rx.recv_timeout(Duration::from_millis(900)).is_err(),
             "(P1) demand release parks the loop again (zero further entries)"
         );
         consumers.store(consumer_bit("gpu"), Ordering::Relaxed);
+        loop_thread.thread().unpark();
         enter_rx
             .recv_timeout(BEHAVIORAL_WAIT)
             .expect("(P2) re-demand resumes sampling");
         release_tx.send(()).expect("release #2");
         shutdown.store(true, Ordering::Release);
+        loop_thread.thread().unpark();
         loop_thread
             .join()
             .expect("the GPU loop joins within the sampler's loud 5 s budget");
@@ -4515,6 +4585,7 @@ mod tests {
             "(L2) the parked loop enters the sampler ZERO times (no busy loop)"
         );
         shutdown.store(true, Ordering::Release);
+        loop_thread.thread().unpark();
         loop_thread
             .join()
             .expect("the GPU loop joins within the sampler's loud 5 s budget");
@@ -4577,6 +4648,7 @@ mod tests {
             "the failed-outcome events carry the live generation"
         );
         shutdown.store(true, Ordering::Release);
+        loop_thread.thread().unpark();
         loop_thread
             .join()
             .expect("the LHM loop joins within the sampler's loud 5 s budget");
@@ -4630,6 +4702,7 @@ mod tests {
             "the failed-outcome events carry the live generation"
         );
         shutdown.store(true, Ordering::Release);
+        loop_thread.thread().unpark();
         loop_thread
             .join()
             .expect("the GPU loop joins within the sampler's loud 5 s budget");
@@ -5146,13 +5219,21 @@ mod tests {
             ),
         ] {
             let src = shipped_method_source(fn_head);
+            let gate = format!("if !demanded(consumers, \"{provider}\") {{");
             assert_eq!(
-                src.matches(&format!(
-                    "if !demanded(consumers, \"{provider}\") {{\n            return;\n        }}"
-                ))
-                .count(),
+                src.matches(&gate).count(),
                 1,
-                "{provider}: exactly one zero-demand arm in the poll (demand-gate token)"
+                "{provider}: one zero-demand branch"
+            );
+            let gate_start = src.find(&gate).unwrap();
+            let gate_end = gate_start + src[gate_start..].find("\n        }").unwrap();
+            assert!(
+                src[gate_start..gate_end].contains("return;"),
+                "{provider}: no-demand exits before native collection"
+            );
+            assert!(
+                gate_end < src.find("if !due(").unwrap(),
+                "{provider}: demand gate precedes cadence and sampling"
             );
             assert!(
                 src.contains("if !due("),
@@ -5223,129 +5304,89 @@ mod tests {
         );
     }
 
-    /// WO-TEL-D2-FIX (register R-D2-1 / audit F-AUD-6): the parked EXTENDED set
-    /// publishes STALE-marked values and never a fresh one after a demand
-    /// release. The set is `audio` + `net` + `controller` (the coordinator arms
-    /// at `telemetry.rs:885/928/960`, demand arms `:894-896/:937-939/:971-973`)
-    /// plus `presentmon` (its park is on its own worker loop,
-    /// `providers/presentmon.rs:1455-1463`). The extended trio have no
-    /// `*_success` stamp (only `*_attempt`, cleared by `reset_state:662-664`), so
-    /// the shipped `stale()` rule (`:248-252`) is applied to the frozen last
-    /// attempt, and the freeze of that attempt AND of the published `sampled_at`
-    /// stamp (`update.audio_sampled_at`, `update.net.sampled_at` - the stamps the
-    /// app feeds its consumers through `Metric::valid(value, sampled_at)`,
-    /// `app.rs:1377-1395`) is the "never fresh again" half. A parked arm marks
-    /// nothing dirty, so the change-or-due publish gate (`:634-645`) has no fresh
-    /// payload to send. The presentmon leg is structural (the shipped pin form:
-    /// its fresh path needs the child process + ETW session, i.e. hardware).
+    /// Demand release explicitly clears rate/audio/controller payloads and their
+    /// cadence stamps. Publish that change once; reactivation cannot carry a
+    /// hidden-interval network rate or delay behind the previous generation.
     #[test]
-    fn parked_extended_provider_set_publishes_stale_and_never_fresh() {
+    fn parked_extended_providers_publish_unavailable_once_and_rearm() {
         let cfg = Config::default();
         let mut worker = test_worker(cfg.clone());
         let base = Instant::now();
-        let demanded = extended_consumer_bit("audio")
-            | extended_consumer_bit("net")
-            | extended_consumer_bit("controller");
-        worker.poll_audio(&cfg, demanded, base);
-        worker.poll_network(&cfg, demanded, base);
-        worker.poll_controller(&cfg, demanded, base);
-        let audio_attempt = worker.audio_attempt;
-        let net_attempt = worker.net_attempt;
-        let controller_attempt = worker.controller_attempt;
-        assert!(
-            audio_attempt.is_some() && net_attempt.is_some() && controller_attempt.is_some(),
-            "R-D2-1: the demanded polls stamped their attempts (the shipped demand arm)"
-        );
-        let audio_stamp = worker.update.audio_sampled_at;
-        let net_stamp = worker.update.net.as_ref().map(|sample| sample.sampled_at);
-        worker.apply_freshness(&cfg, base);
-        assert!(
-            worker.publish_dirty,
-            "R-D2-1: the demanded sample is a change"
-        );
-        worker.publish(1, &cfg, base);
-        assert!(
-            !worker.publish_dirty,
-            "R-D2-1: the demanded sample publishes once and clears the flag"
-        );
-        // Demand release: each parked arm freezes its attempt AND its payload
-        // stamp, the shipped rule marks the frozen sample stale at every step,
-        // and no parked arm marks a change => nothing fresh is published. (The
-        // P4 shape of `gated_poll_stops_publish_stale_marked_…`, which stamps
-        // `Freshness::Stale` directly for the gated pair.)
+        let at = SystemTime::UNIX_EPOCH;
+        worker.audio_attempt = Some(base);
+        worker.net_attempt = Some(base);
+        worker.controller_attempt = Some(base);
+        worker.update.audio = Some(audio::AudioState {
+            volume_percent: 75.0,
+            mic_known: true,
+            mic_muted: false,
+        });
+        worker.update.audio_sampled_at = Some(at);
+        worker.update.net = Some(netif::NetThroughput {
+            in_bps: 100.0,
+            out_bps: 200.0,
+            sampled_at: at,
+        });
+        worker.update.controller = ControllerBattery {
+            connected: true,
+            percent: 75,
+            type_name: "BATTERY".into(),
+            ..Default::default()
+        };
+        worker.publish_dirty = false;
         for step in 1..=8u32 {
-            let later = base + Duration::from_secs(step as u64 * 4);
+            let later = base + Duration::from_millis(step as u64);
             worker.poll_audio(&cfg, 0, later);
             worker.poll_network(&cfg, 0, later);
             worker.poll_controller(&cfg, 0, later);
             worker.apply_freshness(&cfg, later);
+            assert_eq!(worker.audio_attempt, None, "park clears audio cadence");
+            assert_eq!(worker.net_attempt, None, "park clears netif cadence");
             assert_eq!(
-                worker.audio_attempt,
-                audio_attempt,
-                "R-D2-1: the parked audio arm never re-stamps (+{} s)",
-                step * 4
+                worker.controller_attempt, None,
+                "park clears controller cadence"
             );
+            assert!(worker.update.audio.is_none());
+            assert!(worker.update.audio_sampled_at.is_none());
+            assert!(worker.update.net.is_none());
+            assert!(!worker.update.controller.connected);
+            assert_eq!(worker.update.controller.percent, 0);
             assert_eq!(
-                worker.net_attempt,
-                net_attempt,
-                "R-D2-1: the parked netif arm never re-stamps (+{} s)",
-                step * 4
+                worker.publish_dirty,
+                step == 1,
+                "only entering park publishes a change"
             );
-            assert_eq!(
-                worker.controller_attempt,
-                controller_attempt,
-                "R-D2-1: the parked xinput arm never re-stamps (+{} s)",
-                step * 4
-            );
-            assert_eq!(
-                worker.update.audio_sampled_at,
-                audio_stamp,
-                "R-D2-1: the audio payload never gains a fresh stamp (+{} s)",
-                step * 4
-            );
-            assert_eq!(
-                worker.update.net.as_ref().map(|sample| sample.sampled_at),
-                net_stamp,
-                "R-D2-1: the netif payload never gains a fresh stamp (+{} s)",
-                step * 4
-            );
-            assert!(
-                !worker.publish_dirty,
-                "R-D2-1: a parked arm marks no change, so the publish gate has nothing fresh to send (+{} s)",
-                step * 4
-            );
-            assert!(
-                stale(audio_attempt, EXTENDED_STALE, later)
-                    && stale(net_attempt, EXTENDED_STALE, later)
-                    && stale(controller_attempt, EXTENDED_STALE, later),
-                "R-D2-1: past the 3 s `EXTENDED_STALE` bound the parked trio is STALE-marked by the shipped rule (+{} s)",
-                step * 4
-            );
+            worker.publish(1, &cfg, later);
+            assert!(!worker.publish_dirty);
         }
-        let late = base + Duration::from_secs(120);
-        worker.poll_audio(&cfg, 0, late);
-        worker.poll_network(&cfg, 0, late);
-        worker.poll_controller(&cfg, 0, late);
-        worker.apply_freshness(&cfg, late);
+        let demand = extended_consumer_bit("audio")
+            | extended_consumer_bit("net")
+            | extended_consumer_bit("controller");
+        let resumed = base + Duration::from_millis(9);
+        worker.poll_audio(&cfg, demand, resumed);
+        worker.poll_network(&cfg, demand, resumed);
+        worker.poll_controller(&cfg, demand, resumed);
+        assert_eq!(
+            worker.audio_attempt,
+            Some(resumed),
+            "audio re-arms before its old deadline"
+        );
+        assert_eq!(
+            worker.net_attempt,
+            Some(resumed),
+            "netif re-arms before its old deadline"
+        );
+        assert_eq!(
+            worker.controller_attempt,
+            Some(resumed),
+            "controller re-arms before its old deadline"
+        );
         assert!(
-            stale(audio_attempt, cfg.audio_poll, late)
-                && stale(net_attempt, NETWORK_POLL, late)
-                && stale(controller_attempt, cfg.controller_poll, late),
-            "R-D2-1: two minutes without demand keeps every parked sample stale past its OWN cadence bound - stale never fresh again"
+            worker.update.net.is_none(),
+            "first resumed rate sample only establishes a new baseline"
         );
-        assert_eq!(
-            worker.update.audio_sampled_at, audio_stamp,
-            "R-D2-1: the audio stamp is identical at +120 s"
-        );
-        assert_eq!(
-            worker.update.net.as_ref().map(|sample| sample.sampled_at),
-            net_stamp,
-            "R-D2-1: the netif stamp is identical at +120 s"
-        );
-        // The marking mechanism the register names: `apply_freshness` writes no
-        // staleness stamp for the extended trio (their consumers age the
-        // published `sampled_at` stamp), so zero-poll cannot make an old value
-        // look fresh - the honest shape of the invariant this test pins.
+        // Freshness processing cannot restore retired payloads behind the park gate.
+        // The independent PresentMon unavailable-publication checks below are retained.
         let freshness =
             shipped_method_source("fn apply_freshness(&mut self, cfg: &Config, now: Instant) {");
         assert!(
@@ -5391,5 +5432,68 @@ mod tests {
             1,
             "R-D2-1: the only fresh-sample path is the single reconcile call behind the demand gate"
         );
+    }
+    #[test]
+    fn parked_network_clears_rate_and_attempt_before_reactivation() {
+        let cfg = Config::default();
+        let mut worker = test_worker(cfg.clone());
+        let now = Instant::now();
+        worker.net_attempt = Some(now);
+        worker.update.net = Some(netif::NetThroughput {
+            in_bps: 123.0,
+            out_bps: 456.0,
+            sampled_at: SystemTime::now(),
+        });
+        worker.poll_network(&cfg, 0, now);
+        assert!(worker.net_attempt.is_none());
+        assert!(worker.update.net.is_none());
+        worker.poll_network(&cfg, extended_consumer_bit("net"), now);
+        assert!(worker.net_attempt.is_some());
+        assert!(
+            worker.update.net.is_none(),
+            "reactivation establishes a baseline, not a hidden-interval rate"
+        );
+    }
+
+    #[test]
+    fn unchanged_unpublished_tick_does_not_rebuild_derived_readings() {
+        let cfg = Config::default();
+        let mut worker = test_worker(cfg);
+        worker.consumers.store(0, Ordering::Relaxed);
+        worker.publish_dirty = false;
+        worker.last_publish = Some(Instant::now());
+        worker
+            .update
+            .extended_readings
+            .push(Reading::current_number(
+                MetricKey::CPUPower,
+                ValueKind::Watts,
+                50.0,
+                "test-retained",
+                SystemTime::now(),
+            ));
+        assert!(worker.tick());
+        assert_eq!(
+            worker.update.extended_readings.len(),
+            1,
+            "no reconstruction before a publish"
+        );
+        worker.last_publish = None;
+        let _ = worker.tick(); // receiver is intentionally absent in this fixture
+        assert!(
+            worker.update.extended_readings.is_empty(),
+            "due publication reconciles the inputs"
+        );
+    }
+
+    #[test]
+    fn telemetry_shutdown_wakes_disabled_parked_workers() {
+        let cfg = Config {
+            safe_mode: true,
+            ..Config::default()
+        };
+        let runtime = spawn(&cfg, 0);
+        // Drop must wake the native park tokens even when no configuration changed.
+        drop(runtime);
     }
 }

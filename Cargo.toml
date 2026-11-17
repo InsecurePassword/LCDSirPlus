@@ -1,5 +1,6 @@
 [workspace]
 members = ["components/lcdsirplus_discord"]
+default-members = [".", "components/lcdsirplus_discord"]
 # `target` and the vendored `third_party/winres` path dep stay out, as in the standalone baseline.
 exclude = ["target", "third_party/winres"]
 

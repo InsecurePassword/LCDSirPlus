@@ -22,6 +22,13 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 $config = Join-Path $repo 'lcdsirplus.txt'
+$targetRoot = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+    Join-Path $repo 'target'
+} elseif ([IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
+    [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+} else {
+    [IO.Path]::GetFullPath((Join-Path $repo $env:CARGO_TARGET_DIR))
+}
 Set-Location -LiteralPath $repo
 
 function Invoke-LcdCli {
@@ -168,7 +175,7 @@ if ([regex]::Matches($modules, $tableHeaderPattern).Count -ne 1 -or
 $moduleRows = @([regex]::Matches($modules, $tableRowPattern) | ForEach-Object { $_.Groups[1].Value })
 $manualRows = @([regex]::Matches($manual, $tableRowPattern) | ForEach-Object { $_.Groups[1].Value })
 $documentedModules = @([regex]::Matches($modules, $tableRowPattern) | ForEach-Object { $_.Groups[2].Value })
-if ($canonicalModules.Count -ne 51 -or $moduleRows.Count -ne 51 -or $manualRows.Count -ne 51) {
+if ($canonicalModules.Count -ne 52 -or $moduleRows.Count -ne 52 -or $manualRows.Count -ne 52) {
     throw "button option inventory mismatch: source=$($canonicalModules.Count), modules=$($moduleRows.Count), manual=$($manualRows.Count)"
 }
 for ($index = 0; $index -lt $canonicalModules.Count; $index++) {
@@ -292,23 +299,23 @@ foreach ($shortcut in @(
 }
 
 Write-Host '== cargo fmt check ==' -ForegroundColor Cyan
-cargo fmt --check
+cargo fmt --all -- --check
 if ($LASTEXITCODE -ne 0) { throw 'cargo fmt check failed' }
 
 Write-Host '== cargo clippy (zero-warning policy) ==' -ForegroundColor Cyan
-cargo clippy --all-targets 2>&1 | Tee-Object -Variable clippyOutput
+cargo clippy --workspace --all-targets --locked -j 1 2>&1 | Tee-Object -Variable clippyOutput
 if ($LASTEXITCODE -ne 0) { throw 'cargo clippy failed' }
 $warnings = @($clippyOutput | Where-Object { $_ -match 'warning:' })
 if ($warnings.Count -gt 0) { throw "clippy emitted $($warnings.Count) warnings; zero-warning policy violated" }
 
 Write-Host '== cargo test ==' -ForegroundColor Cyan
-cargo test --release --locked
+cargo test --workspace --release --locked -j 1
 if ($LASTEXITCODE -ne 0) { throw 'cargo test failed' }
 
 if ($ReleaseOnly) { return }
 
 Write-Host '== release build ==' -ForegroundColor Cyan
-cargo build --release
+cargo build --workspace --release --locked -j 1
 if ($LASTEXITCODE -ne 0) { throw 'release build failed' }
 
 Add-Type -TypeDefinition @'
@@ -363,8 +370,43 @@ namespace LCDSirPlus {
 }
 '@
 
+Write-Host '== smoke: Discord component ABI ==' -ForegroundColor Cyan
+$dll = Join-Path $targetRoot 'release\lcdsirplus_discord.dll'
+if (-not [IO.File]::Exists($dll)) { throw 'workspace build did not produce lcdsirplus_discord.dll' }
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace LCDSirPlus {
+    public static class DiscordAbiSmoke {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr LoadLibraryEx(string path, IntPtr file, uint flags);
+        [DllImport("kernel32.dll", CharSet = CharSet.Ansi, ExactSpelling = true)]
+        private static extern IntPtr GetProcAddress(IntPtr module, string name);
+        [DllImport("kernel32.dll")] private static extern bool FreeLibrary(IntPtr module);
+        [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+        private delegate IntPtr GetTable(uint magic, uint version, UIntPtr size);
+        public static void Verify(string path) {
+            IntPtr module = LoadLibraryEx(path, IntPtr.Zero, 0x00000900);
+            if (module == IntPtr.Zero) throw new InvalidOperationException("Discord DLL load failed: " + Marshal.GetLastWin32Error());
+            try {
+                IntPtr symbol = GetProcAddress(module, "lcsd_get_table");
+                if (symbol == IntPtr.Zero) throw new InvalidOperationException("Discord ABI export missing");
+                var get = (GetTable)Marshal.GetDelegateForFunctionPointer(symbol, typeof(GetTable));
+                int size = 8 + 10 * IntPtr.Size;
+                IntPtr table = get(0x6453434C, 1, (UIntPtr)size);
+                if (table == IntPtr.Zero || Marshal.ReadInt32(table) < size) throw new InvalidOperationException("Discord ABI table rejected");
+                for (int i = 0; i < 10; i++) {
+                    if (Marshal.ReadIntPtr(table, 8 + i * IntPtr.Size) == IntPtr.Zero) throw new InvalidOperationException("Discord ABI entry missing");
+                }
+            } finally { FreeLibrary(module); }
+        }
+    }
+}
+'@
+[LCDSirPlus.DiscordAbiSmoke]::Verify([IO.Path]::GetFullPath($dll))
+
 Write-Host '== smoke: --version ==' -ForegroundColor Cyan
-$exe = Join-Path $repo 'target\release\LCDSirPlus.exe'
+$exe = Join-Path $targetRoot 'release\LCDSirPlus.exe'
 $version = Invoke-LcdCli $exe @('--version')
 if ($version.ExitCode -ne 0 -or $version.Output.Trim() -cne 'LCDSirPlus 0.3.0') { throw '--version identity failed' }
 
@@ -376,10 +418,10 @@ Write-Host '== smoke: Windows GUI subsystem ==' -ForegroundColor Cyan
 if ((Get-PeSubsystem $exe) -ne 2) { throw 'release executable is not IMAGE_SUBSYSTEM_WINDOWS_GUI' }
 
 Write-Host '== smoke: --validate-config ==' -ForegroundColor Cyan
-$builtConfig = Join-Path $repo 'target\release\lcdsirplus.txt'
+$builtConfig = Join-Path $targetRoot 'release\lcdsirplus.txt'
 if (-not [IO.File]::Exists($builtConfig) -or
     [Convert]::ToBase64String([IO.File]::ReadAllBytes($builtConfig)) -cne [Convert]::ToBase64String([IO.File]::ReadAllBytes($config)) -or
-    [IO.File]::Exists((Join-Path $repo 'target\release\lcdsirplus.local.txt'))) {
+    [IO.File]::Exists((Join-Path $targetRoot 'release\lcdsirplus.local.txt'))) {
     throw 'release build configuration copy is invalid'
 }
 $validation = Invoke-LcdCli $exe @('--validate-config')
@@ -466,3 +508,7 @@ Write-Host 'ALL GATES PASSED' -ForegroundColor Green
 Write-Host 'Physical acceptance (human) is intentionally NOT part of this script:'
 Write-Host '  .\target\release\LCDSirPlus.exe --hardware-test --backend hid --duration-secs 60'
 Write-Host '  .\target\release\LCDSirPlus.exe --hardware-test --backend sdk --duration-secs 60  # with LGS running'
+
+# Expected negative CLI cases leave a nonzero native exit status. All failures
+# have already thrown above; report the complete script result, not that stale code.
+exit 0
