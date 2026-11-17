@@ -322,8 +322,8 @@ fn gpu_stale_after(cfg: &Config) -> Duration {
 /// The four keys are the core set — GPU utilization + VRAM utilization/used/total — i.e. the keys
 /// `providers/gpu.rs::project` publishes from a real sample (L194-220). Each row carries
 /// `Availability::Unavailable` and `has_value = false`, the shipped no-value shape: the renderer
-/// routes it to `DisplayState::Unavailable` (`renderer.rs:1705-1723`) and the alert, bottleneck
-/// and `current_number` lookups all require `has_value`, so a parked core reading is STATED,
+/// routes it to `DisplayState::Unavailable` (`renderer.rs:1705-1723`) and every reading lookup
+/// requires `has_value`, so a parked core reading is STATED,
 /// never silent, and can never present a stale value as fresh. `freshness = Current` labels the
 /// availability statement (made now), not a measurement.
 fn core_gpu_unavailable_readings() -> Vec<Reading> {
@@ -1452,7 +1452,7 @@ fn spawn_lhm(
             // outcome now drives a backoff: consecutive sampler `Err`s double
             // the interval from the configured cadence up to the existing
             // `lhm_stale_after` bound; a success resets it. Demand (S2): no
-            // displayed temperature/alert consumer parks the loop in the
+            // displayed temperature consumer parks the loop in the
             // shipped disabled arm — zero HTTP.
             let mut failures = 0u32;
             while !shutdown.load(Ordering::Relaxed) {
@@ -1769,7 +1769,7 @@ fn spawn_gpu(
             // consecutive-failure streak doubles the demanded interval up to the
             // provider's own staleness bound (`gpu_stale_after`), bounding that
             // re-open to the keep-alive cadence; success resets it. Demand (S2):
-            // no GPU bar/temperature/alert consumer parks the loop in the
+            // no GPU bar/temperature consumer parks the loop in the
             // shipped disabled arm, which also unloads the vendor handles.
             let mut failures = 0u32;
             // WO-TEL-D3-B1 (L2): the park publishes its explicit core-unavailable statement
@@ -4839,9 +4839,12 @@ mod tests {
     }
 
     /// P3: two consumers of one provider (the THERMALS slot pair of displayed
-    /// readings AND the enabled temperature alert map to the SAME single
-    /// demand bit) resolve to exactly ONE collection op per interval: the
+    /// readings AND a second reading-keyed consumer of the same sensors map to the
+    /// SAME single demand bit) resolve to exactly ONE collection op per interval: the
     /// shared-`scheduled_samples` count equals the single-consumer formula.
+    /// WO-REMOVE-ALERTS: the shipped second consumer was the enabled temperature alert
+    /// category; the equality being pinned is the bit sharing, which is what survives
+    /// (the retired alert leg is gone, so the display demand is the only producer).
     #[test]
     fn two_consumers_of_one_provider_resolve_to_one_collection_op() {
         let cfg = Config::default();
@@ -4851,16 +4854,16 @@ mod tests {
         assert_eq!(
             gated.len(),
             (horizon.as_millis() / full.as_millis()) as usize + 1,
-            "P3: one demanded provider samples exactly horizon/full+1 times — display + alert demand share this single op"
+            "P3: one demanded provider samples exactly horizon/full+1 times — every display consumer of that provider shares this single op"
         );
         // The app's derivation collapses both consumers onto that one bit
         // (`app.rs` tests pin the union equality; here the word-level sharing):
         let display = consumer_bit("hwinfo") | consumer_bit("lhm") | consumer_bit("gpu");
-        let alert = consumer_bit("hwinfo") | consumer_bit("lhm") | consumer_bit("gpu");
+        let second = consumer_bit("hwinfo") | consumer_bit("lhm") | consumer_bit("gpu");
         assert_eq!(
-            display | alert,
+            display | second,
             display,
-            "P3: the alert demand is the same bits as the display demand — no second op exists"
+            "P3: a second consumer of the same providers is the same bits as the display demand — no second op exists"
         );
         // Extended sharing: the AUDIO and MIC_STATUS readings share one audio op.
         let audio_bit = extended_consumer_bit("audio");

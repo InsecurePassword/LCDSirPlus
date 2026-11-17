@@ -74,9 +74,11 @@ fn decode_samples(
 /// elapsed time, counter reset) reports `0.0`.
 ///
 /// Every CPU surface consumes values produced here and nowhere else: the
-/// CPU_LOAD bar, CPU_LOAD_GRAPH, the `cpuload` history feed, the BOTTLENECK
-/// peak input, and the CCD Cache/Frequency split (which averages these percents
-/// in [`aggregate`] and adds no arithmetic of its own). A second, independent
+/// CPU_LOAD bar, CPU_LOAD_GRAPH, the `cpuload` history feed, the published
+/// `CPUPeakUtilization` peak reading (WO-REMOVE-ALERTS retired its only consumer,
+/// the BOTTLENECK classifier), and the CCD Cache/Frequency split (which averages
+/// these percents in [`aggregate`] and adds no arithmetic of its own). A second,
+/// independent
 /// derivation anywhere in that path breaks
 /// `ec5_all_cpu_surfaces_share_this_one_derivation`.
 fn busy_percent(current: &[i64; 3], previous: &[i64; 3]) -> f64 {
@@ -111,7 +113,7 @@ pub struct CpuLoadProvider {
     /// WO-TEL-D3-B1 (L7): the resident per-LP record buffer (256 x 48 B = 12,288 B, sized once
     /// and reused by every sample), so the per-sample allocation is gone. The buffer holds the
     /// raw records ONLY: the EC-5 single-derivation rule (`busy_percent`, family (b)) is
-    /// untouched, and the app-loop consumer set (CPU bar, CCD split, peak, bottleneck, soak line)
+    /// untouched, and the app-loop consumer set (CPU bar, CCD split, peak, soak line)
     /// keeps reading the same `utilization` output.
     buffer: Vec<SystemProcessorPerformanceInformation>,
 }
@@ -305,7 +307,7 @@ mod tests {
     }
 
     /// Acceptance (1)/(7): the CPU bar mean, the graph/history value, the
-    /// BOTTLENECK peak input and the CCD mask split are all the SAME derivation.
+    /// `CPUPeakUtilization` peak reading and the CCD mask split are all the SAME derivation.
     /// A second, independent derivation in the aggregate path fails this test.
     #[test]
     fn ec5_all_cpu_surfaces_share_this_one_derivation() {
@@ -323,7 +325,7 @@ mod tests {
             assert!((lp - value).abs() < 1e-9, "LP percent {lp} != {value}");
         }
 
-        // CPU_LOAD bar / CPU_LOAD_GRAPH / history / BOTTLENECK peak input mean over
+        // CPU_LOAD bar / CPU_LOAD_GRAPH / history / CPUPeakUtilization peak mean over
         // all LPs (app.rs: sum/len, and reduce(f64::max) for the peak).
         let bar_mean = per_lp.iter().sum::<f64>() / per_lp.len() as f64;
         assert!(
@@ -338,7 +340,7 @@ mod tests {
         assert_eq!(
             per_lp.iter().copied().reduce(f64::max),
             Some(100.0),
-            "BOTTLENECK peak input is a member of the same set"
+            "the CPUPeakUtilization peak reading is a member of the same set"
         );
 
         // CCD Cache/Frequency split: mean over mask members, hand-derived.

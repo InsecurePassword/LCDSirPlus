@@ -4,7 +4,6 @@
 
 #![windows_subsystem = "windows"]
 
-mod alerts;
 mod app;
 mod backends;
 mod config;

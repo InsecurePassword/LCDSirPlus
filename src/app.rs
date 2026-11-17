@@ -9,8 +9,7 @@ use crate::config::Config;
 use crate::hardware_test::{self, TestConfig, Transport};
 use crate::logging::Level;
 use crate::model::{
-    BottleneckDetector, BottleneckInputs, BottleneckThresholds, DeviceStatus, DiscordState,
-    Freshness, Metric, MetricKey, Reading, ReadingsSnapshot, Snapshot,
+    DeviceStatus, DiscordState, Metric, MetricKey, Reading, ReadingsSnapshot, Snapshot,
 };
 use crate::providers::{ccd, clock, cpu, hang, memory};
 use crate::render::renderer::{OverlayOptions, Renderer, View};
@@ -164,8 +163,6 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
     // when the slot configuration changes.
     let mut hang_owner = HangOwner::default();
     let _ = hang_owner.bind(&slots, &mut hang_hold);
-    let mut alerts = crate::alerts::Manager::default();
-    let mut bottleneck = BottleneckDetector::default();
 
     let mut watcher = ConfigWatcher::new(&watched_files);
 
@@ -224,14 +221,12 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                         if opts.safe_mode {
                             cfg.safe_mode = true;
                         }
-                        alerts.clear_disabled_categories(&cfg);
                         if topology_changed {
                             topology = resolve_ccd_topology(&cfg);
                             crate::log_info!("CCD topology reloaded: {}", topology.detail);
                         }
                         let generation = telemetry_runtime.update_config(&cfg);
                         invalidate_telemetry_publication(&mut telemetry, &mut snapshot, generation);
-                        bottleneck = BottleneckDetector::default();
                         renderer = Renderer::new();
                         discord_runtime.update_config(&cfg);
                         slots.apply(&cfg);
@@ -271,14 +266,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
 
         if now.duration_since(last_telemetry) >= cfg.telemetry_interval {
             last_telemetry = now;
-            snapshot = build_snapshot(
-                &cfg,
-                &topology,
-                &mut cpu_provider,
-                &telemetry,
-                &discord,
-                &mut bottleneck,
-            );
+            snapshot = build_snapshot(&cfg, &topology, &mut cpu_provider, &telemetry, &discord);
         }
         let telemetry_generation = telemetry_runtime.generation();
         let (published_hung, hang_provider_available) =
@@ -302,8 +290,6 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
         if let Some(audit) = hang_hold.reconcile(&cfg, published_hung, hang_provider_available) {
             log_hang_audit(&audit);
         }
-        alerts.evaluate(&mut snapshot, &cfg, now);
-
         // RC-5: publish the device/recovery label on the display surface every
         // loop, so a rebuilt snapshot always carries the current state; the log
         // names each transition once. The frame is rendered and submitted as
@@ -337,22 +323,15 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                 hung_index: hang_hold.hung_index,
                 hung_detail: hang_hold.hung_detail,
                 hung_hold: hang_hold.progress(now, &cfg),
-                ..Default::default()
             };
             let frame = renderer.render(
                 &snapshot,
                 OverlayOptions {
                     main_display: cfg.main_display,
-                    discord_linger: cfg.discord_linger,
-                    discord_max_speakers: cfg.discord_max_speakers.max(1) as usize,
-                    discord_show_self: cfg.discord_show_self,
-                    discord_show_channel: cfg.discord_show_channel,
                     disk_graph_ceiling_mbps: cfg.disk_graph_ceiling_mbps,
                     fps_graph_ceiling: cfg.fps_graph_ceiling,
                     cpu_temp_max_c: cfg.cpu_temp_max_c,
                     gpu_temp_max_c: cfg.gpu_temp_max_c,
-                    warning: temperature_pane_warning(&cfg),
-                    warning_phase: (process_epoch.elapsed().as_millis() / 100) % 2 == 1,
                     ..network_overlay_options(&cfg)
                 },
                 &view,
@@ -417,14 +396,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                     for event in events {
                         let command =
                             hang_hold.event(event, &cfg, published_hung, hang_provider_available);
-                        apply_hold_command(
-                            command,
-                            &mut hang_hold,
-                            &mut slots,
-                            &cfg,
-                            &mut alerts,
-                            &mut snapshot,
-                        );
+                        apply_hold_command(command, &mut hang_hold, &mut slots, &cfg);
                         hang_owner.invalidate();
                         if let Some(audit) = hang_owner.bind(&slots, &mut hang_hold) {
                             log_hang_audit(&audit);
@@ -440,10 +412,8 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
         while let Ok(event) = ui_rx.try_recv() {
             match event {
                 UiEvent::SlotCycle { slot, backward } => {
-                    if slot == 3 && alerts.acknowledge_highest(&mut snapshot) {
-                        crate::log_info!("acknowledged highest critical alert");
-                        continue;
-                    }
+                    // WO-REMOVE-ALERTS: the preview cycle is the ordinary slot action;
+                    // the retired acknowledgement detour owned no input any more.
                     let delta: i64 = if backward { -1 } else { 1 };
                     slots.cycle(slot, delta);
                     hang_owner.invalidate();
@@ -476,14 +446,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
             log_hang_audit(&audit);
         }
         let command = hang_hold.tick(now, &cfg, published_hung, hang_provider_available);
-        apply_hold_command(
-            command,
-            &mut hang_hold,
-            &mut slots,
-            &cfg,
-            &mut alerts,
-            &mut snapshot,
-        );
+        apply_hold_command(command, &mut hang_hold, &mut slots, &cfg);
         // EC-4: the command can cycle a slot, so the owner is stale until the
         // next iteration's bind site.
         hang_owner.invalidate();
@@ -686,15 +649,14 @@ fn module_provider_consumers(module: &str) -> &'static [&'static str] {
         "GPU_TEMP" | "GPU_TEMP_GRAPH" => &["gpu", "lhm"],
         "THERMALS" => &["hwinfo", "lhm", "gpu"],
         "GPU_LOAD" | "GPU_LOAD_GRAPH" | "VRAM_USAGE" => &["gpu"],
-        "BOTTLENECK" => &["gpu", "performance"],
         "POWER_LIMIT" => &["hwinfo", "lhm"],
         "CPU_GPU_POWER" => &["hwinfo", "lhm", "gpu"],
         "VRM_TEMP" | "CHIPSET_TEMP" | "MOTHERBOARD_TEMP" | "CPU_FAN" | "PUMP_RPM" => &["lhm"],
         "DISK_IO" | "DISK_IO_GRAPH" | "HARD_FAULTS" => &["performance"],
         "CONNECTIONS" => &["connections"],
         "SYSTEM_BATTERY" => &["system battery"],
-        // Availability and alert surfaces read every gated provider.
-        "PROVIDER_STATUS" | "ALERTS" => &crate::telemetry::GATED_PROVIDERS,
+        // The availability surface reads every gated provider.
+        "PROVIDER_STATUS" => &crate::telemetry::GATED_PROVIDERS,
         _ => &[],
     }
 }
@@ -704,7 +666,7 @@ fn module_provider_consumers(module: &str) -> &'static [&'static str] {
 /// arm in `src/render/renderer.rs` L215-232, which draws the `GPU ` and `VRAM` metric bars from
 /// `MetricKey::GPUUtilization`/`VRAMUtilization`; layout 2 is `main_display_2` L270-287 with the
 /// same two bars. Both are drawn in every frame of those layouts and only the native `gpu`
-/// provider emits those keys, so layouts 1 and 2 consume `gpu` whatever the slots and alerts
+/// provider emits those keys, so layouts 1 and 2 consume `gpu` whatever the slots
 /// show. Layout 3 (`main_display_3` L312-356) draws CPU/RAM/NET bars only.
 ///
 /// WO-TEL-D3-B1 (L1) SUPERSEDES the accepted WO-A1-03 F-1 layout arm `3 => &[]` (prior content =
@@ -723,10 +685,13 @@ fn main_display_provider_consumers(_main_display: i32) -> &'static [&'static str
 }
 
 /// EC-3: which gated providers have a consumer right now. Union of the fixed
-/// main-display bars, the displayed slot modules, the enabled alert categories,
-/// and the preview surface (a visible preview is a snapshot consumer of
-/// everything, so gating never applies while a human is watching). Event-driven:
-/// computed with the slot modules, not per tick.
+/// main-display bars, the displayed slot modules and the preview surface (a
+/// visible preview is a snapshot consumer of everything, so gating never applies
+/// while a human is watching). Event-driven: computed with the slot modules, not
+/// per tick. WO-REMOVE-ALERTS retired the third leg, the enabled alert
+/// categories, with the feature: no non-hang alarm consumer can keep a provider
+/// at full cadence, and no display consumer is lost with it (the temperature,
+/// memory and headset readings ride their own module arms).
 fn provider_consumer_bits(modules: &[String; 4], cfg: &Config, preview_active: bool) -> u64 {
     if preview_active {
         return crate::telemetry::ALL_CONSUMERS;
@@ -739,9 +704,6 @@ fn provider_consumer_bits(modules: &[String; 4], cfg: &Config, preview_active: b
         for provider in module_provider_consumers(module) {
             bits |= crate::telemetry::consumer_bit(provider);
         }
-    }
-    for provider in crate::alerts::enabled_category_providers(cfg) {
-        bits |= crate::telemetry::consumer_bit(provider);
     }
     bits
 }
@@ -778,18 +740,15 @@ fn effective_slot_modules(slots: &Manager, snapshot: &Snapshot, cfg: &Config) ->
     };
     std::array::from_fn(|slot| {
         let selected = slots.current(slot);
-        let inactive_dynamic = (selected.eq_ignore_ascii_case("PROC_HANG")
-            && snapshot.hung.is_empty())
-            || (selected.eq_ignore_ascii_case("BOTTLENECK")
-                && snapshot.bottleneck.state == crate::model::BottleneckState::None
-                && snapshot.bottleneck.freshness == Freshness::Current);
+        let inactive_dynamic =
+            selected.eq_ignore_ascii_case("PROC_HANG") && snapshot.hung.is_empty();
         let inactive_presentmon = cfg.presentmon_deferred
             && presentmon_available(&selected).is_some_and(|available| !available);
         if !inactive_dynamic && !inactive_presentmon {
             return selected;
         }
 
-        let mut excluded = vec!["PROC_HANG".to_string(), "BOTTLENECK".to_string(), selected];
+        let mut excluded = vec!["PROC_HANG".to_string(), selected];
         loop {
             let excluded_refs: Vec<_> = excluded.iter().map(String::as_str).collect();
             let Some(candidate) = slots.next_except(slot, &excluded_refs) else {
@@ -841,9 +800,9 @@ fn preview_for_backend(cfg: &Config, state: &BackendState) -> bool {
 /// published consumer word (bits above the shipped 7). Demand is the module the
 /// panel effectively shows (`effective_slot_modules`, fall-through included: a
 /// slot displaying a placeholder consumes nothing behind it; slot alternatives
-/// reachable only by cycling are demand-on-switch). Alert categories do not
-/// extend this map: `alerts.rs` reads gated providers only, so the protected
-/// alert demand stays exactly the shipped 7-bit derivation.
+/// reachable only by cycling are demand-on-switch). WO-REMOVE-ALERTS retired the
+/// alert-category note with the feature: no non-hang alarm demand ever entered
+/// this word, and the retired gated-word alert leg is gone with it.
 fn module_extended_consumers(module: &str) -> &'static [&'static str] {
     match module.to_ascii_uppercase().as_str() {
         "AUDIO" | "MIC_STATUS" => &["audio"],
@@ -880,8 +839,8 @@ fn main_display_extended_consumers(main_display: i32) -> &'static [&'static str]
 /// keeps consuming every GATED provider (`ALL_CONSUMERS` early-return is the
 /// ratified U-9 preserve; a visible preview shows the slots, and the extended
 /// word derives from those same displayed modules, so the preview consumes
-/// every displayed reading through both words together). `PROVIDER_STATUS`/
-/// `ALERTS` keep the shipped gated-only mapping: health rows and the
+/// every displayed reading through both words together). `PROVIDER_STATUS` keeps
+/// the shipped gated-only mapping: health rows and the
 /// presentmon availability predicate (`app.rs:745-763`) are fed by publication
 /// (health + staleness stamps), not by fresh polls, per WO-TEL-D1-AUDIT
 /// amendment 2.
@@ -916,10 +875,6 @@ fn provider_demand_bits(slots: &Manager, modules: &[String; 4], cfg: &Config) ->
         }
     }
     bits
-}
-
-fn temperature_pane_warning(cfg: &Config) -> bool {
-    cfg.temperature_warning_enabled && cfg.warning
 }
 
 fn network_overlay_options(cfg: &Config) -> OverlayOptions {
@@ -1047,14 +1002,12 @@ pub fn run_hardware_test(
     // Build the live dashboard frame for STEP 10.
     let mut cpu_provider = cpu::CpuLoadProvider::new();
     let topology = ccd::detect();
-    let mut bottleneck = BottleneckDetector::default();
     let snapshot = build_snapshot(
         &cfg,
         &topology,
         &mut cpu_provider,
         &crate::telemetry::Update::default(),
         &DiscordState::default(),
-        &mut bottleneck,
     );
     let dashboard = crate::render::renderer::Renderer::new().render(
         &snapshot,
@@ -1062,7 +1015,6 @@ pub fn run_hardware_test(
             main_display: cfg.main_display,
             cpu_temp_max_c: cfg.cpu_temp_max_c,
             gpu_temp_max_c: cfg.gpu_temp_max_c,
-            warning: temperature_pane_warning(&cfg),
             ..network_overlay_options(&cfg)
         },
         &View {
@@ -1222,17 +1174,14 @@ fn report_test_results(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_snapshot(
     cfg: &Config,
     topology: &ccd::CcdTopology,
     cpu_provider: &mut cpu::CpuLoadProvider,
     telemetry: &crate::telemetry::Update,
     discord: &DiscordState,
-    bottleneck: &mut BottleneckDetector,
 ) -> Snapshot {
     let now = SystemTime::now();
-    let monotonic_now = Instant::now();
     let clock = clock::read(&cfg.date_format);
     let per_lp = cpu_provider.update();
 
@@ -1314,18 +1263,6 @@ fn build_snapshot(
     }
     snapshot.readings = readings;
 
-    snapshot.bottleneck = bottleneck.update(
-        BottleneckThresholds {
-            cpu_percent: cfg.bottleneck_cpu_percent,
-            gpu_percent: cfg.bottleneck_gpu_percent,
-            memory_percent: cfg.bottleneck_memory_percent,
-            disk_mbps: cfg.bottleneck_disk_mbps,
-            sustain: cfg.bottleneck_sustain,
-        },
-        bottleneck_inputs(&snapshot.readings),
-        monotonic_now,
-    );
-
     if !cfg.safe_mode {
         apply_telemetry(&mut snapshot, telemetry, now);
     }
@@ -1346,24 +1283,6 @@ fn build_snapshot(
         snapshot.hung.clear();
     }
     snapshot
-}
-
-fn current_number(readings: &ReadingsSnapshot, key: MetricKey) -> Option<f64> {
-    readings.lookup(key, "").and_then(|reading| {
-        (reading.has_value && reading.freshness == Freshness::Current).then_some(reading.number)
-    })
-}
-
-fn bottleneck_inputs(readings: &ReadingsSnapshot) -> BottleneckInputs {
-    let disk = current_number(readings, MetricKey::DiskReadBytesPerSec)
-        .zip(current_number(readings, MetricKey::DiskWriteBytesPerSec));
-    BottleneckInputs {
-        cpu_peak_percent: current_number(readings, MetricKey::CPUPeakUtilization),
-        gpu_percent: current_number(readings, MetricKey::GPUUtilization),
-        ram_percent: current_number(readings, MetricKey::RAMUtilization),
-        vram_percent: current_number(readings, MetricKey::VRAMUtilization),
-        disk_mbps: disk.map(|(read, write)| (read + write) / 1_000_000.0),
-    }
 }
 
 fn memory_readings(sample: Result<memory::MemorySample, String>) -> Vec<Reading> {
@@ -1478,18 +1397,8 @@ fn apply_hold_command(
     hold: &mut hang::HoldState,
     slots: &mut Manager,
     cfg: &Config,
-    alerts: &mut crate::alerts::Manager,
-    snapshot: &mut Snapshot,
 ) {
-    apply_hold_command_with(
-        command,
-        hold,
-        slots,
-        cfg,
-        alerts,
-        snapshot,
-        hang::terminate_bound_target,
-    );
+    apply_hold_command_with(command, hold, slots, cfg, hang::terminate_bound_target);
 }
 
 fn apply_hold_command_with<F>(
@@ -1497,8 +1406,6 @@ fn apply_hold_command_with<F>(
     hold: &mut hang::HoldState,
     slots: &mut Manager,
     cfg: &Config,
-    alerts: &mut crate::alerts::Manager,
-    snapshot: &mut Snapshot,
     terminate: F,
 ) where
     F: FnOnce(&crate::model::HungTarget, &Config) -> hang::ActionReport,
@@ -1506,10 +1413,8 @@ fn apply_hold_command_with<F>(
     match command {
         hang::HoldCommand::None => {}
         hang::HoldCommand::Cycle { index, backward } => {
-            if index == 3 && alerts.acknowledge_highest(snapshot) {
-                crate::log_info!("acknowledged highest critical alert");
-                return;
-            }
+            // WO-REMOVE-ALERTS: the retired acknowledgement detour is gone, so a release on
+            // any button, slot 4 (index 3) included, is the ordinary slot cycle.
             let module = slots.cycle(index, if backward { -1 } else { 1 });
             crate::log_debug!("button {} -> slot module {}", index + 1, module);
         }
@@ -1584,6 +1489,187 @@ fn file_signature(path: &std::path::Path) -> Option<FileSignature> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WO-REMOVE-ALERTS (S5, "no ordinary alerts"): extreme CPU/GPU temperature, RAM, VRAM and
+    /// headset-battery samples still publish the correct ordinary readings, and the retired
+    /// evaluator/episode/linger/flash/acknowledgement machinery cannot be observed because it
+    /// is deleted: `Snapshot` has no `alerts` and no `bottleneck` member, and no render option
+    /// can request a pane flash. A repeated identical sample publishes the same values, so no
+    /// dormant state can reappear after a reload.
+    #[test]
+    fn extreme_readings_publish_ordinary_values_and_no_alarm_surface() {
+        let at = SystemTime::UNIX_EPOCH;
+        let telemetry = crate::telemetry::Update {
+            generation: 1,
+            cpu_temp: Metric::valid(150.0, at),
+            gpu_temp: Metric::valid(120.0, at),
+            headset: crate::model::HeadsetBattery {
+                present: true,
+                online: true,
+                percent: 1,
+                ..Default::default()
+            },
+            gpu_readings: vec![
+                Reading::current_percent(MetricKey::GPUUtilization, 99.0, "gpu0", at),
+                Reading::current_percent(MetricKey::VRAMUtilization, 100.0, "gpu0", at),
+            ],
+            extended_readings: vec![Reading::current_percent(
+                MetricKey::RAMUtilization,
+                100.0,
+                "ext-ram",
+                at,
+            )],
+            ..Default::default()
+        };
+        let cfg = Config {
+            ccd_source: "manual".into(),
+            ccd_cache_processors: Some(vec![0]),
+            ccd_frequency_processors: Some(vec![1]),
+            ..Config::default()
+        };
+        let topology = resolve_ccd_topology(&cfg);
+        let mut cpu = cpu::CpuLoadProvider::new();
+        let snapshot = build_snapshot(
+            &cfg,
+            &topology,
+            &mut cpu,
+            &telemetry,
+            &DiscordState::default(),
+        );
+        assert!(snapshot.cpu_temp.valid && !snapshot.cpu_temp.stale);
+        assert_eq!(snapshot.cpu_temp.value, 150.0);
+        assert_eq!(snapshot.gpu_temp.value, 120.0);
+        assert_eq!(
+            snapshot
+                .readings
+                .lookup(MetricKey::RAMUtilization, "")
+                .map(|reading| reading.number),
+            snapshot
+                .readings
+                .lookup(MetricKey::RAMUtilization, "physical-memory")
+                .map(|reading| reading.number),
+            "the core RAM reading keeps its canonical first position"
+        );
+        assert_eq!(
+            snapshot
+                .readings
+                .lookup(MetricKey::RAMUtilization, "ext-ram")
+                .map(|reading| reading.number),
+            Some(100.0)
+        );
+        assert_eq!(
+            snapshot
+                .readings
+                .lookup(MetricKey::VRAMUtilization, "")
+                .map(|reading| reading.number),
+            Some(100.0)
+        );
+        assert!(snapshot.headset.present && snapshot.headset.online);
+        assert_eq!(snapshot.headset.percent, 1);
+
+        let mut cpu2 = cpu::CpuLoadProvider::new();
+        let again = build_snapshot(
+            &cfg,
+            &topology,
+            &mut cpu2,
+            &telemetry,
+            &DiscordState::default(),
+        );
+        assert_eq!(again.cpu_temp.value, snapshot.cpu_temp.value);
+        assert_eq!(again.gpu_temp.value, snapshot.gpu_temp.value);
+        assert_eq!(again.headset.percent, snapshot.headset.percent);
+    }
+
+    /// WO-REMOVE-ALERTS (S5, "no alert-only polling"): the demand word is derived from the
+    /// layout rule, the displayed modules and the preview only. The retired alert category leg,
+    /// the `BOTTLENECK` consumer arm and the `ALERTS` all-gated arm are gone, so a panel that
+    /// shows no optional reading leaves every optional provider quiescent, and a retired module
+    /// name consumes nothing.
+    #[test]
+    fn provider_consumer_bits_carries_no_alert_or_bottleneck_demand() {
+        let idle = slots_showing(["CLOCK", "CLEAR", "CLOCK", "CLOCK"]);
+        let plain = Config {
+            main_display: 3,
+            headset_enabled: true,
+            lhm_mode: "auto".into(),
+            ..Config::default()
+        };
+        let gpu_bit = crate::telemetry::consumer_bit("gpu");
+        assert_ne!(gpu_bit, 0, "gpu is a gated core provider");
+        assert_eq!(
+            provider_consumer_bits(&idle, &plain, false),
+            gpu_bit,
+            "an idle panel demands no optional provider: nothing polls for a deleted alarm"
+        );
+        let ghost = slots_showing(["BOTTLENECK", "ALERTS", "CLOCK", "CLOCK"]);
+        assert_eq!(
+            provider_consumer_bits(&ghost, &plain, false),
+            gpu_bit,
+            "the retired module names consume no provider at all"
+        );
+        assert!(
+            !crate::config::valid_module("ALERTS") && !crate::config::valid_module("BOTTLENECK"),
+            "the retired modules are not selectable, so no configuration can re-arm their demand"
+        );
+        assert_eq!(
+            provider_demand_bits(&slots_current(&ghost), &ghost, &plain),
+            provider_demand_bits(&slots_current(&idle), &idle, &plain),
+            "the extended word ignores the retired names too"
+        );
+        assert_eq!(
+            provider_consumer_bits(&idle, &plain, true),
+            crate::telemetry::ALL_CONSUMERS,
+            "a visible preview keeps the shipped prompt-consumer rule"
+        );
+    }
+
+    /// WO-REMOVE-ALERTS (S5, "buttons and selected readings"): the shared routing helper is the
+    /// production path (`run()` calls `apply_hold_command`, which forwards to
+    /// `apply_hold_command_with`). The physical release on button 4 (index 3) performs the
+    /// ordinary cycle, and the same input never reaches a terminator. The preview route is the
+    /// `UiEvent::SlotCycle` arm in `run()`, which now calls the same `slots.cycle` with no
+    /// acknowledgement branch (proven by the deleted branch in this order's diff).
+    #[test]
+    fn physical_cycle_on_slot_four_cycles_the_slot_and_never_terminates() {
+        use std::cell::Cell;
+
+        let cfg = Config::default();
+        let mut slots = Manager::new(&cfg, [0; 4]);
+        let mut hold = hang::HoldState::default();
+        let kills = Cell::new(0);
+        let before = slots.current(3);
+        apply_hold_command_with(
+            hang::HoldCommand::Cycle {
+                index: 3,
+                backward: false,
+            },
+            &mut hold,
+            &mut slots,
+            &cfg,
+            |_, _| {
+                kills.set(kills.get() + 1);
+                hang::ActionReport::bare(hang::ActionOutcome::Success)
+            },
+        );
+        assert_ne!(slots.current(3), before, "button 4 cycles slot 4 normally");
+        assert_eq!(kills.get(), 0, "the cycle input never reaches a terminator");
+        assert_eq!(
+            slots.current(3),
+            "POWER_LIMIT",
+            "the migrated default slot 4 is THERMALS POWER_LIMIT"
+        );
+
+        let mut preview_slots = Manager::new(&cfg, [0; 4]);
+        let first = preview_slots.current(3);
+        preview_slots.cycle(3, 1);
+        assert_eq!(
+            preview_slots.current(3),
+            slots.current(3),
+            "the preview cycle route lands on the same module as the physical route"
+        );
+        preview_slots.cycle(3, -1);
+        assert_eq!(preview_slots.current(3), first, "and it cycles back");
+    }
 
     #[test]
     fn network_overlay_options_preserve_directional_ceilings() {
@@ -1664,37 +1750,6 @@ mod tests {
         assert!(!snapshot.gpu_temp.valid);
         assert!(!snapshot.network_in.valid);
         assert!(!snapshot.audio_volume.valid);
-    }
-
-    #[test]
-    fn bottleneck_inputs_require_native_core_data_and_use_peak_and_disk_sum() {
-        let at = SystemTime::UNIX_EPOCH;
-        let mut readings = ReadingsSnapshot {
-            metrics: vec![
-                Reading::current_percent(MetricKey::CPUPeakUtilization, 91.0, "cpu", at),
-                Reading::current_percent(MetricKey::RAMUtilization, 50.0, "ram", at),
-                Reading::current_number(
-                    MetricKey::DiskReadBytesPerSec,
-                    crate::model::ValueKind::ByteRate,
-                    300_000_000.0,
-                    "disk",
-                    at,
-                ),
-                Reading::current_number(
-                    MetricKey::DiskWriteBytesPerSec,
-                    crate::model::ValueKind::ByteRate,
-                    250_000_000.0,
-                    "disk",
-                    at,
-                ),
-            ],
-            ..Default::default()
-        };
-        let input = bottleneck_inputs(&readings);
-        assert_eq!(input.cpu_peak_percent, Some(91.0));
-        assert_eq!(input.disk_mbps, Some(550.0));
-        readings.metrics[2].freshness = Freshness::Stale;
-        assert_eq!(bottleneck_inputs(&readings).disk_mbps, None);
     }
 
     #[test]
@@ -1898,17 +1953,6 @@ mod tests {
     }
 
     #[test]
-    fn temperature_pane_warning_requires_both_legacy_and_category_switches() {
-        let mut cfg = Config::default();
-        assert!(temperature_pane_warning(&cfg));
-        cfg.warning = false;
-        assert!(!temperature_pane_warning(&cfg));
-        cfg.warning = true;
-        cfg.temperature_warning_enabled = false;
-        assert!(!temperature_pane_warning(&cfg));
-    }
-
-    #[test]
     fn only_backend_settings_trigger_backend_reload() {
         let old = Config::default();
         let mut new = old.clone();
@@ -2048,7 +2092,6 @@ mod tests {
             ..Config::default()
         };
         let mut cpu = cpu::CpuLoadProvider::new();
-        let mut bottleneck = BottleneckDetector::default();
         let snapshot = build_snapshot(
             &cfg,
             &resolve_ccd_topology(&cfg),
@@ -2058,7 +2101,6 @@ mod tests {
                 connected: true,
                 ..Default::default()
             },
-            &mut bottleneck,
         );
         assert!(!snapshot.headset.present);
         assert!(!snapshot.discord.connected);
@@ -2118,8 +2160,11 @@ mod tests {
         assert_eq!(synced, Some(true));
     }
 
+    /// WO-REMOVE-ALERTS: with the acknowledgement detour retired, the physical release on
+    /// button 4 (index 3) performs the ordinary slot cycle, and safe mode still refuses every
+    /// terminate (the RIP safeguard is untouched).
     #[test]
-    fn safe_mode_cycles_acknowledges_and_never_calls_terminate() {
+    fn safe_mode_cycles_slot_four_normally_and_never_calls_terminate() {
         use std::cell::Cell;
 
         let cfg = Config {
@@ -2127,12 +2172,6 @@ mod tests {
             ..Config::default()
         };
         let mut slots = Manager::new(&cfg, [0; 4]);
-        let mut alerts = crate::alerts::Manager::default();
-        let mut snapshot = Snapshot {
-            gpu_temp: Metric::valid(91.0, SystemTime::UNIX_EPOCH),
-            ..Default::default()
-        };
-        alerts.evaluate(&mut snapshot, &cfg, Instant::now());
         let kills = Cell::new(0);
         let mut hold = hang::HoldState::default();
 
@@ -2144,8 +2183,6 @@ mod tests {
             &mut hold,
             &mut slots,
             &cfg,
-            &mut alerts,
-            &mut snapshot,
             |_, _| {
                 kills.set(kills.get() + 1);
                 hang::ActionReport::bare(hang::ActionOutcome::Success)
@@ -2161,14 +2198,16 @@ mod tests {
             &mut hold,
             &mut slots,
             &cfg,
-            &mut alerts,
-            &mut snapshot,
             |_, _| {
                 kills.set(kills.get() + 1);
                 hang::ActionReport::bare(hang::ActionOutcome::Success)
             },
         );
-        assert!(snapshot.alerts[0].acknowledged);
+        assert_eq!(
+            slots.current(3),
+            "POWER_LIMIT",
+            "slot 4 cycles its own configured list, with no acknowledgement detour"
+        );
 
         apply_hold_command_with(
             hang::HoldCommand::Terminate(crate::model::HungTarget {
@@ -2183,8 +2222,6 @@ mod tests {
             &mut hold,
             &mut slots,
             &cfg,
-            &mut alerts,
-            &mut snapshot,
             |_, _| {
                 kills.set(kills.get() + 1);
                 hang::ActionReport::bare(hang::ActionOutcome::Success)
@@ -2198,8 +2235,6 @@ mod tests {
         let cfg = Config::default();
         let slots = Manager::new(&cfg, [0; 4]);
         let mut snapshot = Snapshot::default();
-        snapshot.bottleneck.state = crate::model::BottleneckState::None;
-        snapshot.bottleneck.freshness = Freshness::Current;
         assert_eq!(slots.current(2), "PROC_HANG");
         assert_eq!(
             effective_slot_modules(&slots, &snapshot, &cfg)[2],
@@ -2214,15 +2249,25 @@ mod tests {
         );
 
         let mut dynamic = cfg;
-        dynamic.slots[0] = vec!["BOTTLENECK".into(), "PROC_HANG".into()];
+        dynamic.slots[0] = vec!["PROC_HANG".into(), "GPU_TEMP".into()];
         dynamic.slots[2] = vec!["GPU_TEMP".into()];
         let slots = Manager::new(&dynamic, [0; 4]);
         snapshot.hung.clear();
         assert_eq!(
             effective_slot_modules(&slots, &snapshot, &dynamic)[0],
-            "CLEAR"
+            "GPU_TEMP",
+            "the retired BOTTLENECK term is gone; PROC_HANG alone drives the fall-through"
         );
-        assert_eq!(slots.current(0), "BOTTLENECK");
+        assert_eq!(slots.current(0), "PROC_HANG", "selection is never mutated");
+
+        let mut sole_hang = dynamic.clone();
+        sole_hang.slots[0] = vec!["PROC_HANG".into()];
+        let slots = Manager::new(&sole_hang, [0; 4]);
+        assert_eq!(
+            effective_slot_modules(&slots, &snapshot, &sole_hang)[0],
+            "CLEAR",
+            "an all-unavailable list keeps the internal CLEAR fallback"
+        );
     }
 
     #[test]
@@ -2322,15 +2367,15 @@ mod tests {
         }
 
         let mut cfg = Config::default();
-        cfg.slots[0] = ["FPS_CURRENT", "PROC_HANG", "BOTTLENECK", "GPU_TEMP"]
+        cfg.slots[0] = ["FPS_CURRENT", "PROC_HANG", "GPU_TEMP"]
             .map(str::to_string)
             .to_vec();
         let slots = Manager::new(&cfg, [0; 4]);
-        let mut unavailable = Snapshot::default();
-        unavailable.bottleneck.freshness = Freshness::Current;
+        let unavailable = Snapshot::default();
         assert_eq!(
             effective_slot_modules(&slots, &unavailable, &cfg)[0],
-            "GPU_TEMP"
+            "GPU_TEMP",
+            "the deferral skip-list keeps PROC_HANG, the sole dynamic module, out"
         );
 
         cfg.slots[0].pop();
@@ -2681,9 +2726,7 @@ mod tests {
         );
         assert_eq!(cache.resolutions, 2, "startup + the reload scan");
         // EC-3: the consumer-bit input is still the slot modules, not the cache.
-        let mut snapshot = Snapshot::default();
-        snapshot.bottleneck.state = crate::model::BottleneckState::None;
-        snapshot.bottleneck.freshness = Freshness::Current;
+        let snapshot = Snapshot::default();
         assert_eq!(
             effective_slot_modules(&slots, &snapshot, &cfg)[2],
             "DISK_IO",
@@ -2738,8 +2781,6 @@ mod tests {
         hold: &mut hang::HoldState,
         slots: &mut Manager,
         cfg: &Config,
-        alerts: &mut crate::alerts::Manager,
-        snapshot: &mut Snapshot,
     ) {
         match &command {
             hang::HoldCommand::None => {}
@@ -2752,7 +2793,7 @@ mod tests {
             }
         }
         // The injectable terminator keeps the probe away from any real process.
-        apply_hold_command_with(command, hold, slots, cfg, alerts, snapshot, |_, _| {
+        apply_hold_command_with(command, hold, slots, cfg, |_, _| {
             hang::ActionReport::bare(hang::ActionOutcome::Success)
         });
     }
@@ -2764,8 +2805,9 @@ mod tests {
     /// the cache. The site order mirrors `run()`: startup bind; per iteration the
     /// top-of-loop site + `reconcile`, the end-of-loop site + `reconcile` +
     /// `tick` command; per button event the command, the site; per UI cycle the
-    /// cycle (the alert-ack path cycles nothing and reaches no site) + the site;
-    /// per reload `cancel_reload`, `slots.apply`, the site.
+    /// cycle + the site (WO-REMOVE-ALERTS: the retired acknowledgement branch
+    /// cycled nothing and reached no site, so every UI cycle now cycles and
+    /// reaches its site); per reload `cancel_reload`, `slots.apply`, the site.
     fn ec4_drive_sites<CHANGED, SITE>(
         script: &[Step],
         cfg: &mut Config,
@@ -2781,22 +2823,15 @@ mod tests {
     {
         let mut out = Vec::new();
         let mut sites = 0;
-        let mut alerts = crate::alerts::Manager::default();
-        let mut snapshot = Snapshot {
-            gpu_temp: Metric::valid(91.0, SystemTime::UNIX_EPOCH),
-            ..Default::default()
-        };
         let started = Instant::now();
-        alerts.evaluate(&mut snapshot, cfg, started);
         // app.rs startup bind.
         ec4_site(&mut out, &mut sites, &mut site, slots, hold);
         for step in script {
             match *step {
                 Step::Tick(i) => {
                     let now = started + Duration::from_millis(100 * i);
-                    // app.rs top-of-loop site, then alerts and reconcile.
+                    // app.rs top-of-loop site, then reconcile.
                     ec4_site(&mut out, &mut sites, &mut site, slots, hold);
-                    alerts.evaluate(&mut snapshot, cfg, now);
                     if let Some(audit) = hold.reconcile(cfg, targets, true) {
                         out.push(ec4_audit_line(&audit));
                     }
@@ -2806,24 +2841,11 @@ mod tests {
                         out.push(ec4_audit_line(&audit));
                     }
                     let command = hold.tick(now, cfg, targets, true);
-                    ec4_record_command(
-                        &mut out,
-                        command,
-                        hold,
-                        slots,
-                        cfg,
-                        &mut alerts,
-                        &mut snapshot,
-                    );
+                    ec4_record_command(&mut out, command, hold, slots, cfg);
                     // The command can cycle a slot (app.rs end-of-loop apply).
                     changed();
                 }
                 Step::CycleUi { slot, delta } => {
-                    // The alert-ack branch cycles nothing and reaches no site.
-                    if slot == 3 && alerts.acknowledge_highest(&mut snapshot) {
-                        out.push("ack".to_string());
-                        continue;
-                    }
                     slots.cycle(slot, delta);
                     changed();
                     ec4_site(&mut out, &mut sites, &mut site, slots, hold);
@@ -2835,15 +2857,7 @@ mod tests {
                         targets,
                         true,
                     );
-                    ec4_record_command(
-                        &mut out,
-                        command,
-                        hold,
-                        slots,
-                        cfg,
-                        &mut alerts,
-                        &mut snapshot,
-                    );
+                    ec4_record_command(&mut out, command, hold, slots, cfg);
                     changed();
                     ec4_site(&mut out, &mut sites, &mut site, slots, hold);
                 }
@@ -2866,7 +2880,7 @@ mod tests {
 
     /// EC-4 acceptance (4): audit-fire parity. One scripted sequence (render
     /// ticks, slot cycles, presses/releases, config reload, safe-mode toggles,
-    /// alert ack, terminate window) is replayed through the pre-EC-4 site order
+    /// slot-4 UI cycle, terminate window) is replayed through the pre-EC-4 site order
     /// (owner rescanned at every site) and the EC-4 order (owner resolved once per
     /// slot-configuration change); the recorded audit stream must be identical,
     /// and the EC-4 run must scan far fewer times than it visits sites.
@@ -3034,9 +3048,13 @@ mod tests {
             legacy.iter().any(|line| line.starts_with("cmd-audit:")),
             "release audits must fire: {legacy:?}"
         );
-        // EC-4 scan win on this script: 21 owner scans cover the 29 mutation
+        // EC-4 scan win on this script: 21 owner scans cover the 30 mutation
         // hooks (consecutive mutations between two sites coalesce) plus the
-        // startup bind, while the pre-EC-4 shape scans at all 44 owner sites.
+        // startup bind, while the pre-EC-4 shape scans at all 45 owner sites.
+        // WO-REMOVE-ALERTS: the slot-4 UI cycle now reaches its own site and
+        // mutation hook (the retired acknowledgement branch skipped both), so the
+        // site/hook counts each gained one; the scan count, the audit stream, and
+        // the parity are unchanged.
         // The steady-tick case is pinned by
         // ec4_owner_cache_resolves_once_across_render_ticks.
         assert_eq!(
@@ -3082,38 +3100,6 @@ mod tests {
         assert!(!telemetry.cpu_temp.valid && !snapshot.cpu_temp.valid);
         assert!(!telemetry.gpu_temp.valid && !snapshot.gpu_temp.valid);
         assert!(telemetry.providers.is_empty() && snapshot.providers.is_empty());
-    }
-
-    #[test]
-    fn reload_invalidation_preserves_acknowledged_alert_until_fresh_recovery() {
-        let cfg = Config {
-            critical_alert_linger: Duration::ZERO,
-            telemetry_interval: Duration::from_secs(60),
-            ..Config::default()
-        };
-        let now = Instant::now();
-        let mut alerts = crate::alerts::Manager::default();
-        let mut snapshot = Snapshot {
-            gpu_temp: Metric::valid(91.0, SystemTime::UNIX_EPOCH),
-            ..Default::default()
-        };
-        alerts.evaluate(&mut snapshot, &cfg, now);
-        assert!(alerts.acknowledge_highest(&mut snapshot));
-
-        let mut telemetry = crate::telemetry::Update::default();
-        alerts.clear_disabled_categories(&cfg);
-        invalidate_telemetry_publication(&mut telemetry, &mut snapshot, 1);
-        alerts.evaluate(&mut snapshot, &cfg, now + cfg.telemetry_interval);
-        assert_eq!(snapshot.alerts.len(), 1);
-        assert!(snapshot.alerts[0].acknowledged);
-
-        snapshot.gpu_temp = Metric::valid(40.0, SystemTime::UNIX_EPOCH);
-        alerts.evaluate(
-            &mut snapshot,
-            &cfg,
-            now + cfg.telemetry_interval + Duration::from_secs(1),
-        );
-        assert!(snapshot.alerts.is_empty());
     }
 
     #[test]
@@ -3166,20 +3152,21 @@ mod tests {
     }
 
     #[test]
-    fn consumer_set_covers_slots_alerts_and_the_preview_surface() {
+    fn consumer_set_covers_slots_and_the_preview_surface() {
         let idle = slots_showing(["CLOCK", "CLEAR", "CLOCK", "CLOCK"]);
         // main_display 3 draws no fixed GPU/VRAM bar, so this table pins the
-        // slot/alert/preview contribution alone; the fixed-bar rule is covered
+        // slot/preview contribution alone; the fixed-bar rule is covered
         // by `fixed_main_display_gpu_bars_keep_the_gpu_provider_consumed`.
         // WO-TEL-D3-B1 (L1) PIN LOCKSTEP, DECLARED (not silent, no deletion): the layout-3
         // baseline rows here asserted "every gated provider quiescent" and single-provider
         // equalities. `gpu` is a CORE reading now, so the layout rule contributes the `gpu`
-        // bit in every row of this `main_display 3` fixture; the slot/alert/preview legs are
+        // bit in every row of this `main_display 3` fixture; the slot/preview legs are
         // byte-identical claims and stay exactly as shipped.
+        // WO-REMOVE-ALERTS: the alert-category legs (`temperature_alerts`, `headset_alerts`)
+        // are retired with the feature — no non-hang alarm can hold a provider at full
+        // cadence any more — and the `safe_mode` DG-4 row is retaken from a plain config.
         let quiescent = Config {
             main_display: 3,
-            temperature_warning_enabled: false,
-            memory_warning_enabled: false,
             headset_enabled: false,
             ..Config::default()
         };
@@ -3187,7 +3174,7 @@ mod tests {
         assert_eq!(
             provider_consumer_bits(&idle, &quiescent, false),
             gpu_bit,
-            "no slot, alert or snapshot consumer => every OPTIONAL provider quiescent; the core gpu demand rides the layout rule (WO-TEL-D3-B1 L1)"
+            "no slot or snapshot consumer => every OPTIONAL provider quiescent; the core gpu demand rides the layout rule (WO-TEL-D3-B1 L1)"
         );
 
         let disk = slots_showing(["CLOCK", "DISK_IO", "CLOCK", "CLOCK"]);
@@ -3210,47 +3197,20 @@ mod tests {
             crate::telemetry::ALL_CONSUMERS,
             "the availability surface consumes every gated provider"
         );
-
-        let temperature_alerts = Config {
-            main_display: 3,
-            temperature_warning_enabled: true,
-            memory_warning_enabled: false,
-            headset_enabled: false,
-            ..Config::default()
-        };
         assert_eq!(
-            provider_consumer_bits(&idle, &temperature_alerts, false),
-            crate::telemetry::consumer_bit("hwinfo")
-                | crate::telemetry::consumer_bit("lhm")
-                | crate::telemetry::consumer_bit("gpu"),
-            "an enabled alert category keeps its providers at full cadence"
-        );
-        assert_eq!(
-            provider_consumer_bits(&idle, &temperature_alerts, true),
+            provider_consumer_bits(&idle, &quiescent, true),
             crate::telemetry::ALL_CONSUMERS,
             "a visible preview is a snapshot consumer of everything"
         );
-        let headset_alerts = Config {
-            main_display: 3,
-            temperature_warning_enabled: false,
-            memory_warning_enabled: false,
-            headset_enabled: true,
-            safe_mode: false,
-            ..Config::default()
-        };
-        assert_eq!(
-            provider_consumer_bits(&idle, &headset_alerts, false),
-            crate::telemetry::consumer_bit("headset") | gpu_bit,
-            "an enabled headset alert keeps the headset provider consumed (L1 lockstep term: the core gpu demand rides the layout rule)"
-        );
         let safe = Config {
+            main_display: 3,
             safe_mode: true,
-            ..headset_alerts
+            ..Config::default()
         };
         assert_eq!(
             provider_consumer_bits(&idle, &safe, false),
             gpu_bit,
-            "L1 lockstep, DECLARED: the gated word is layout/slot/alert driven, so it carries the core gpu demand even under `safe_mode`; the provider parks because `enabled(cfg, \"gpu\")` is false under safe mode (`telemetry.rs:369-371`), and the shipped DG-4 exclusion row stays true (accepted: `safe_mode` stops gpu by design)"
+            "L1 lockstep, DECLARED: the gated word is layout/slot driven, so it carries the core gpu demand even under `safe_mode`; the provider parks because `enabled(cfg, \"gpu\")` is false under safe mode (`telemetry.rs:369-371`), and the shipped DG-4 exclusion row stays true (accepted: `safe_mode` stops gpu by design)"
         );
         assert!(
             preview_surface_active(
@@ -3265,7 +3225,7 @@ mod tests {
     #[test]
     fn fixed_main_display_gpu_bars_keep_the_gpu_provider_consumed() {
         // F-1: the reachable quiescent panel - layout 1 (the shipped default),
-        // idle slots, temperature/memory warnings off, headset off, and a
+        // idle slots, headset off, and a
         // connected panel so the auto preview hides. The fixed GPU/VRAM bars
         // (renderer.rs layout 1 = `dashboard` default arm L215-232, layout 2 =
         // `main_display_2` L270-287) read `MetricKey::GPUUtilization`/
@@ -3278,8 +3238,6 @@ mod tests {
         let idle = slots_showing(["CLOCK", "CLEAR", "CLOCK", "CLOCK"]);
         let quiescent = |main_display| Config {
             main_display,
-            temperature_warning_enabled: false,
-            memory_warning_enabled: false,
             headset_enabled: false,
             ..Config::default()
         };
@@ -3345,8 +3303,6 @@ mod tests {
         let idle = slots_showing(["CLOCK", "CLEAR", "CLOCK", "CLOCK"]);
         let core_off = |main_display| Config {
             main_display,
-            temperature_warning_enabled: false,
-            memory_warning_enabled: false,
             headset_enabled: false,
             ..Config::default()
         };
@@ -3384,8 +3340,6 @@ mod tests {
             network_probe_enabled: false,
             lhm_mode: "off".into(),
             headset_enabled: false,
-            temperature_warning_enabled: false,
-            memory_warning_enabled: false,
             ..Config::default()
         };
         let bits = provider_consumer_bits(&idle, &lazy_off, false);
@@ -3409,71 +3363,6 @@ mod tests {
             ),
             "the proof shape is reachable with the preview hidden (the demand is not preview-carried)"
         );
-    }
-
-    #[test]
-    fn alert_relevant_gated_provider_keeps_full_cadence_and_catches_the_crossing() {
-        // GPU temperature alerts are enabled while no displayed module reads GPU
-        // data: the consumer set must keep the gpu provider consumed, otherwise
-        // quiescence would slow the crossing beyond the configured cadence.
-        let cfg = Config {
-            slots: [
-                vec!["CLOCK".into()],
-                vec!["CLOCK".into()],
-                vec!["CLOCK".into()],
-                vec!["CLOCK".into()],
-            ],
-            temperature_warning_enabled: true,
-            memory_warning_enabled: false,
-            headset_enabled: false,
-            gpu_temp_warning: 85.0,
-            gpu_temp_critical: 90.0,
-            ..Config::default()
-        };
-        let modules =
-            effective_slot_modules(&Manager::new(&cfg, [0; 4]), &Snapshot::default(), &cfg);
-        let bits = provider_consumer_bits(&modules, &cfg, false);
-        for provider in ["hwinfo", "lhm", "gpu"] {
-            assert_ne!(
-                bits & crate::telemetry::consumer_bit(provider),
-                0,
-                "{provider} stays consumed for the enabled temperature alert"
-            );
-            assert_eq!(
-                crate::telemetry::sampling_interval(&cfg, bits, provider, cfg.telemetry_interval),
-                cfg.telemetry_interval,
-                "{provider} keeps the full cadence while the alert is enabled"
-            );
-        }
-        let gated = crate::telemetry::sampling_interval(&cfg, 0, "gpu", cfg.telemetry_interval);
-        assert!(
-            gated > cfg.telemetry_interval,
-            "gating is what this consumer set prevents"
-        );
-
-        // Episode-scoped crossing: sampled at full cadence, the alert appears in
-        // the same telemetry window in which the value crosses the threshold.
-        let mut manager = crate::alerts::Manager::default();
-        let mut snapshot = Snapshot::default();
-        let base = Instant::now();
-        let crossing = Duration::from_secs(5);
-        let mut caught = None;
-        let mut elapsed = Duration::ZERO;
-        while elapsed <= crossing + cfg.telemetry_interval * 2 {
-            let value = if elapsed >= crossing { 95.0 } else { 40.0 };
-            snapshot.gpu_temp = Metric::valid(value, SystemTime::now());
-            manager.evaluate(&mut snapshot, &cfg, base + elapsed);
-            if snapshot.alerts.iter().any(|alert| alert.id == "gpu-temp") {
-                caught.get_or_insert(elapsed);
-            }
-            elapsed += cfg.telemetry_interval;
-        }
-        let caught = caught.expect("threshold crossing must produce the alert");
-        assert!(
-            caught >= crossing && caught <= crossing + cfg.telemetry_interval,
-            "the crossing is caught within one full-cadence sample"
-        );
-        assert_eq!(snapshot.alerts[0].severity, 3);
     }
 
     /// F-EC5-a fix (WO-A1-06-FIX), the audit-recommended assertion shape: an
@@ -3539,14 +3428,12 @@ mod tests {
         let topology = resolve_ccd_topology(&cfg);
         assert!(topology.dual, "manual lists build the dual split");
         let mut cpu = cpu::CpuLoadProvider::new();
-        let mut bottleneck = BottleneckDetector::default();
         let snapshot = build_snapshot(
             &cfg,
             &topology,
             &mut cpu,
             &crate::telemetry::Update::default(),
             &DiscordState::default(),
-            &mut bottleneck,
         );
         let has_data = !cpu::CpuLoadProvider::new().update().is_empty();
         assert_eq!(
@@ -3665,8 +3552,9 @@ mod tests {
 
     /// WO-TEL-D2 (S1): the reading-keyed demand registry for the metering
     /// providers. Demand is keyed by the DISPLAYED reading (the effective slot
-    /// module), never by a configured slot alternative; the alert categories
-    /// add nothing to the extended word (they read gated providers only).
+    /// module), never by a configured slot alternative. WO-REMOVE-ALERTS: the
+    /// retired alert categories never entered this word (they read gated
+    /// providers only), and their gated-word leg is deleted with the feature.
     #[test]
     fn reading_demand_maps_displayed_modules_to_extended_providers() {
         let quiescent = Config {
@@ -3810,8 +3698,6 @@ mod tests {
         let idle = slots_showing(["CLOCK", "CLEAR", "CLOCK", "CLOCK"]);
         let quiescent3 = Config {
             main_display: 3,
-            temperature_warning_enabled: false,
-            memory_warning_enabled: false,
             headset_enabled: false,
             ..Config::default()
         };

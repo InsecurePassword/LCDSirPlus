@@ -48,7 +48,7 @@ last valid settings.
 
 Use the [instruction manual](docs/INSTRUCTION-MANUAL.md) for setup and
 troubleshooting, the [configuration reference](docs/CONFIGURATION.md) for every
-setting, and the [button option reference](modules.md) for all 53 LCD choices.
+setting, and the [button option reference](modules.md) for all 51 LCD choices.
 
 ## Safety And Privacy
 

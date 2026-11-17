@@ -21,7 +21,6 @@ src/render/                    160x43 frame, font, layouts, golden tests
 src/backends/                  G13 selection, SDK, HID, reconnect
 src/providers/                 Windows, GPU, sensor, device, network, Discord
 src/telemetry.rs               data-source workers and snapshot publication
-src/alerts.rs                  alert episodes and acknowledgement
 src/runtime.rs                 single instance, config path, startup ownership
 src/ui.rs                      preview and tray
 src/diagnostics.rs             offline redacted ZIP
@@ -34,7 +33,7 @@ src/slots.rs                   four slot lists and temporary display choice
 
 | Owner | Responsibility |
 |---|---|
-| Main thread | Active configuration, slot state, alerts, rendering, actions. |
+| Main thread | Active configuration, slot state, rendering, actions. |
 | G13 thread | Connection selection, HID handles, latest frame, button edges. |
 | SDK owner thread | Trusted Logitech DLL lifetime and all SDK calls. |
 | UI thread | Preview window, tray icon, mouse events. |
@@ -80,7 +79,7 @@ paths, performs no writes, and does not inspect competing processes.
 ```text
 Windows + GPU driver + optional HWiNFO/LibreHardwareMonitor/devices/PresentMon
     -> Snapshot + 30-second histories
-    -> selected main layout + effective slot values + overlays
+    -> selected main layout + effective slot values + the hung-window panel in its slot
     -> 160x43 Frame
     -> G13 transform/write and preview draw
 ```
@@ -91,19 +90,20 @@ All three main layouts share the header and four-button row. Golden hashes in
 
 The effective slot resolver normally uses the stored selection. Dynamic
 substitution temporarily renders another display value without mutating slot
-state in three cases:
+state in two cases:
 
 - `PROC_HANG` has no target;
-- `BOTTLENECK` currently reports `NONE`;
 - `presentmon_deferred 1` and the selected PresentMon value is unavailable.
 
-The scan skips `PROC_HANG` and `BOTTLENECK`. PresentMon deferral also skips
+The scan skips `PROC_HANG`. PresentMon deferral also skips
 other unavailable PresentMon values. No eligible value produces `CLEAR`.
 
-Button 4 acknowledges the highest active alert before ordinary cycling. A
+Button 4 cycles slot 4 like any other button. A
 selected `PROC_HANG` owns its physical slot button and exact press-bound target.
-Render priority is hung-action progress, unacknowledged alert, Discord speakers,
-then the dashboard.
+Every frame is the selected dashboard: the retired non-hang alert overlay, the
+Discord speaker takeover, the threshold pane inversion, and the acknowledgement
+step are deleted, so hung-action progress and the target panel in the
+`PROC_HANG` slot are the only attention surface, and nothing competes with them.
 
 ## Data-source rules
 
@@ -119,9 +119,10 @@ One resulting domain uses the single CPU bar; two use Cache and Frequency bars.
 The displayed CPU quantity is total-minus-idle busy time: `providers/cpu.rs::busy_percent`
 is the single derivation, forming per-logical-processor `idle`/`kernel`/`user` counter
 deltas and reporting `(d_kernel + d_user - d_idle) / (d_kernel + d_user)` as a percent.
-The CPU bar, the CPU load graph, history, the bottleneck peak input, and the Cache and
-Frequency split all consume that one derivation; no surface derives a CPU percentage on
-its own. Decision 2026-11-13 (EC-5): the shipped LCDSirReal app displays kernel+user
+The CPU bar, the CPU load graph, history, the published `CPUPeakUtilization` peak reading
+(WO-REMOVE-ALERTS retired its only consumer, the `BOTTLENECK` classifier), and
+the Cache and Frequency split all consume that one derivation; no surface derives a CPU
+percentage on its own. Decision 2026-11-13 (EC-5): the shipped LCDSirReal app displays
 busy-time deltas from its own sampler, and this product intentionally displays
 total-minus-idle. The Cache and Frequency split publishes `Metric::invalid()` when the
 per-logical-processor sample is empty, so the split path shares the CPU bar's

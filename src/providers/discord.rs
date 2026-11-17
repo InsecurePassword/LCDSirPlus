@@ -3986,14 +3986,17 @@ mod tests {
             state.speakers[1].stopped_at,
             Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_001_000))
         );
-        // The shipped consumers of this state are the renderer overlay and the health row. Their
-        // rules are pinned by the shipped renderer tests (discord_overlay_draws_border,
+        // The surviving consumer of this state is the `Discord` health row the app publishes
+        // from it (`app.rs`: connected AND authenticated). WO-REMOVE-ALERTS deleted the
+        // speaker-triggered renderer takeover (`visible_speakers` + `discord_overlay`) and the
+        // alert overlay that used to rank above it, together with the shipped renderer tests
+        // that pinned those surfaces (discord_overlay_draws_border,
         // discord_visibility_order_linger_self_and_restoration,
         // critical_alert_overrides_discord_and_dashboard,
-        // hung_hold_overrides_alert_and_discord_then_restores_exact_dashboard), which read exactly
-        // these fields; the consumer entry `visible_speakers` is module-private in
-        // `src/render/renderer.rs`, so this host-side pin asserts the projection and the health
-        // row the app publishes from it (renderer.rs:101-110, app.rs:1340-1343).
+        // hung_hold_overrides_alert_and_discord_then_restores_exact_dashboard, now
+        // hung_hold_is_the_only_attention_surface_and_restores_exact_dashboard). The projection
+        // below still supplies every field those routes read, so the provider contract is
+        // unchanged; no renderer entry any more consumes `speakers`.
         let health = state.connected && state.authenticated;
         assert!(
             health,

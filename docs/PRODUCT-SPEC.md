@@ -49,7 +49,7 @@ network telemetry/history are unchanged. The active legacy
 position. Later assignments win sequentially through includes; same-spelling
 duplicates within one file remain invalid.
 
-The button registry contains exactly 53 values in `src/config.rs` order. Their
+The button registry contains exactly 51 values in `src/config.rs` order. Their
 descriptions appear in the canonical [modules.md](../modules.md) quick reference
 and are mirrored exactly in the instruction manual/PDF. Graphs cover the trailing
 30 seconds. There is no layout editor or plug-in system.
@@ -59,18 +59,18 @@ and are mirrored exactly in the instruction manual/PDF. Graphs cover the trailin
 - Physical button 1 through 4 cycles its matching slot forward.
 - Preview left-click cycles forward; right-click cycles backward.
 - A changed slot list keeps the selected value when it still exists.
-- Button 4 acknowledges the highest active alert before ordinary cycling.
-- Safe mode keeps harmless cycling and acknowledgement available.
+- Button 4 cycles slot 4 like every other button; the retired acknowledgement
+  step owned no input.
+- Safe mode keeps harmless cycling available.
 
 The stored selection is not always the value rendered. Dynamic substitution in
 the shared slot resolver temporarily shows the next eligible configured value
 without changing slot state when:
 
 - selected `PROC_HANG` has no target;
-- selected `BOTTLENECK` reports current `NONE`;
 - `presentmon_deferred 1` and the selected PresentMon value is unavailable.
 
-The resolver skips inactive `PROC_HANG` and `BOTTLENECK`. PresentMon deferral
+The resolver skips inactive `PROC_HANG`. PresentMon deferral
 also skips other unavailable PresentMon values. No eligible value shows `CLEAR`.
 With `presentmon_deferred 0`, the selected PresentMon pane remains visible with
 its native inactive message.
@@ -157,21 +157,30 @@ executable, signature, and publisher are checked before use. Authorization opens
 no browser or callback listener. LCDSirPlus reads voice state only and publishes
 no Rich Presence.
 
-## Alerts and safe mode
+## No ordinary alerts, and safe mode
 
-Current CPU/GPU temperature, RAM/VRAM use, and headset battery can create alert
-episodes. Temperature and memory categories are independent and enabled by
-default. Stale or unavailable readings do not create an alert. Warning recovery
-is immediate; critical recovery uses `critical_alert_linger_ms`.
+LCDSirPlus displays readings; it does not judge them. The non-hang warning and
+alert subsystem and the bottleneck classifier were removed from the product, not
+disabled: no CPU/GPU temperature, RAM/VRAM, disk, or battery sample can create an
+alert episode, severity verdict, flash cycle, full-screen warning, sticky banner,
+or acknowledgement obligation, and no reading is classified as a bottleneck.
+Removing them also removed their exclusive cost: no provider is sampled, kept at
+full cadence, or woken for a deleted alarm, and no alarm state survives a
+configuration reload, because none exists.
 
-`warning 1` flashes selected temperature panes and suppresses full-screen
-temperature alerts. `warning 0` keeps those full-screen alerts. Memory and
-headset alerts are unchanged.
+Ordinary monitoring is unchanged. Every selected reading keeps its normal value,
+bar, graph, and explicit `N/A`/`STALE`/`UNAVAILABLE` state, including
+temperatures, THERMALS, headset/controller/system battery states, power, disk,
+network, FPS, audio, and stutter counts. `cpu_temp_max_c` and `gpu_temp_max_c`
+remain graph scales only.
+
+The hung-window feature below is the only permitted attention path, and no
+ordinary reading may intercept its input or cover its panel.
 
 Safe mode restricts the dashboard snapshot to Windows-local date/time, native
 CPU and RAM, the fixed layout shell, and the safe-mode health marker. It starts
 no optional data-source, Discord, probe, startup-change, hung-target, or
-termination work. Preview, slot cycling, and acknowledgement remain available.
+termination work. Preview and slot cycling remain available.
 
 ## Hung-window behavior
 

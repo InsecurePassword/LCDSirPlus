@@ -27,7 +27,7 @@ safe_mode               0
 slot_0  HEADSET_BATTERY CPU_TEMP CONTROLLER_BATTERY
 slot_1  FPS_CURRENT NET_BOTH NET_GRAPH FRAME_TIME SESSION_TIME
 slot_2  PROC_HANG FPS_1LOW DISK_IO DISK_IO_GRAPH GPU_TEMP PING JITTER AUDIO
-slot_3  BOTTLENECK THERMALS POWER_LIMIT
+slot_3  THERMALS POWER_LIMIT
 
 ##############################################################################
 # Dual-CCD Ryzen systems can show separate Cache and Frequency CPU bars.
@@ -135,8 +135,6 @@ headset_enabled         1
 headset_poll_ms         auto          # 15000
 headset_query_timeout_ms auto         # 1200
 headset_stale_ms        auto          # 45000
-headset_warn_percent    25
-headset_critical_percent 0
 
 # XInput controller battery.
 controller_enabled      1
@@ -159,17 +157,10 @@ network_graph_ceiling_upload_mbps 1000
 disk_graph_ceiling_mbps 1000
 fps_graph_ceiling       240
 
-# Temperature alerts. With both switches set to 1, render_interval_ms must be
-# 100 or lower.
-warning                 1
-temperature_warning_enabled 1
+# Temperature graph ceilings in degrees C: the graph scale only.
+# LCDSirPlus no longer warns, flashes, alarms or acknowledges anything.
 cpu_temp_max_c          90
 gpu_temp_max_c          90
-bottleneck_cpu_percent  90
-bottleneck_gpu_percent  95
-bottleneck_memory_percent 90
-bottleneck_disk_mbps    500
-bottleneck_sustain_ms   2000
 
 # Windows default audio devices.
 audio_enabled           1
@@ -201,17 +192,6 @@ hang_probe_timeout_ms   350
 hang_failures_required  3
 hang_minimum_ms         6000
 hang_ignore LCDSirPlus.exe explorer.exe dwm.exe winlogon.exe csrss.exe services.exe lsass.exe smss.exe fontdrvhost.exe sihost.exe taskhostw.exe
-
-# Alert categories and thresholds. Memory alerts default to 100%.
-memory_warning_enabled  1
-cpu_temp_warning        85
-cpu_temp_critical       95
-gpu_temp_warning        83
-gpu_temp_critical       90
-memory_warning          100
-vmem_warning            100
-# Critical alerts remain briefly after the reading recovers.
-critical_alert_linger_ms 3000
 
 ##############################################################################
 # Logging.

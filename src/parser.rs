@@ -436,10 +436,6 @@ impl ParseContext {
                 cfg.headset_query_timeout = ms_auto(v, Duration::from_millis(1200))?;
             }
             "headset_stale_ms" => cfg.headset_stale_after = ms_auto(v, Duration::from_secs(45))?,
-            "headset_warn_percent" => cfg.headset_warn_percent = checked_i32(key, intv(v)?)?,
-            "headset_critical_percent" => {
-                cfg.headset_critical_percent = checked_i32(key, intv(v)?)?
-            }
             "headset_estimate_hours" => cfg.headset_estimate_hours = boolv(v)?,
             "controller_enabled" => cfg.controller_enabled = boolv(v)?,
             "controller_index" => cfg.controller_index = checked_i32(key, intv(v)?)?,
@@ -467,15 +463,8 @@ impl ParseContext {
             }
             "disk_graph_ceiling_mbps" => cfg.disk_graph_ceiling_mbps = floatv(v)?,
             "fps_graph_ceiling" => cfg.fps_graph_ceiling = floatv(v)?,
-            "warning" => cfg.warning = boolv(v)?,
-            "temperature_warning_enabled" => cfg.temperature_warning_enabled = boolv(v)?,
             "cpu_temp_max_c" => cfg.cpu_temp_max_c = floatv(v)?,
             "gpu_temp_max_c" => cfg.gpu_temp_max_c = floatv(v)?,
-            "bottleneck_cpu_percent" => cfg.bottleneck_cpu_percent = floatv(v)?,
-            "bottleneck_gpu_percent" => cfg.bottleneck_gpu_percent = floatv(v)?,
-            "bottleneck_memory_percent" => cfg.bottleneck_memory_percent = floatv(v)?,
-            "bottleneck_disk_mbps" => cfg.bottleneck_disk_mbps = floatv(v)?,
-            "bottleneck_sustain_ms" => cfg.bottleneck_sustain = msv(v)?,
             "audio_enabled" => cfg.audio_enabled = boolv(v)?,
             "audio_poll_ms" => cfg.audio_poll = ms_auto(v, Duration::from_secs(1))?,
             "discord_enabled" => cfg.discord_enabled = boolv(v)?,
@@ -493,14 +482,6 @@ impl ParseContext {
             "hang_failures_required" => cfg.hang_failures = checked_i32(key, intv(v)?)?,
             "hang_minimum_ms" => cfg.hang_minimum = msv(v)?,
             "hang_ignore" => cfg.hang_ignore = v.to_vec(),
-            "cpu_temp_warning" => cfg.cpu_temp_warning = floatv(v)?,
-            "cpu_temp_critical" => cfg.cpu_temp_critical = floatv(v)?,
-            "gpu_temp_warning" => cfg.gpu_temp_warning = floatv(v)?,
-            "gpu_temp_critical" => cfg.gpu_temp_critical = floatv(v)?,
-            "memory_warning_enabled" => cfg.memory_warning_enabled = boolv(v)?,
-            "memory_warning" => cfg.memory_warning = floatv(v)?,
-            "vmem_warning" => cfg.vmem_warning = floatv(v)?,
-            "critical_alert_linger_ms" => cfg.critical_alert_linger = msv(v)?,
             "log_level" => cfg.log_level = lower_one(v)?,
             "log_max_bytes" => {
                 let n = intv(v)?;
@@ -715,8 +696,7 @@ mod tests {
     #[test]
     fn auto_intervals_map_to_defaults() {
         let cfg =
-            parse_standalone(b"warning 0\ntelemetry_interval_ms auto\nrender_interval_ms 250\n")
-                .unwrap();
+            parse_standalone(b"telemetry_interval_ms auto\nrender_interval_ms 250\n").unwrap();
         assert_eq!(cfg.telemetry_interval, Duration::from_millis(300));
         assert_eq!(cfg.render_interval, Duration::from_millis(250));
     }
@@ -733,35 +713,70 @@ mod tests {
         }
     }
 
+    /// WO-REMOVE-ALERTS: `render_interval_ms` keeps its own grammar and `25..5000` bound; the
+    /// retired rule that coupled a slow cadence to the temperature-warning switches is gone.
     #[test]
-    fn warning_render_interval_accepts_auto_and_rejects_slow_cadence() {
-        let cfg = parse_standalone(b"warning 1\nrender_interval_ms auto\n").unwrap();
+    fn render_interval_accepts_auto_and_its_own_bounds_without_any_warning_rule() {
+        let cfg = parse_standalone(b"render_interval_ms auto\n").unwrap();
         assert_eq!(cfg.render_interval, Duration::from_millis(100));
-        assert!(parse_standalone(b"warning 1\nrender_interval_ms 101\n").is_err());
-        assert!(parse_standalone(b"warning 0\nrender_interval_ms 5000\n").is_ok());
-        assert!(parse_standalone(
-            b"warning 1\ntemperature_warning_enabled 0\nrender_interval_ms 5000\n"
-        )
-        .is_ok());
+        for value in ["101", "5000"] {
+            assert!(
+                parse_standalone(format!("render_interval_ms {value}\n").as_bytes()).is_ok(),
+                "rejected {value} with no warning setting present"
+            );
+        }
+        for value in ["24", "5001"] {
+            assert!(
+                parse_standalone(format!("render_interval_ms {value}\n").as_bytes()).is_err(),
+                "accepted the out-of-bound {value}"
+            );
+        }
     }
 
+    /// WO-REMOVE-ALERTS (S3): the 17 retired settings are ordinary unknown keys — no
+    /// ignored-key list, no compatibility shim, no obsolete-key warning path.
     #[test]
-    fn parses_independent_warning_categories_and_legacy_thresholds() {
-        let cfg = parse_standalone(
-            b"warning 0\ntemperature_warning_enabled off\nmemory_warning_enabled yes\nmemory_warning 0\nvmem_warning 75\n",
-        )
-        .unwrap();
-        assert!(!cfg.warning);
-        assert!(!cfg.temperature_warning_enabled);
-        assert!(cfg.memory_warning_enabled);
-        assert_eq!(cfg.memory_warning, 0.0);
-        assert_eq!(cfg.vmem_warning, 75.0);
-
-        for key in ["temperature_warning_enabled", "memory_warning_enabled"] {
-            let error = parse_standalone(format!("{key} maybe\n").as_bytes()).unwrap_err();
-            assert_eq!(error.line, 1);
-            assert!(error.message.contains(key));
+    fn retired_alert_and_bottleneck_keys_are_rejected_as_unknown() {
+        for key in [
+            "bottleneck_cpu_percent",
+            "bottleneck_gpu_percent",
+            "bottleneck_memory_percent",
+            "bottleneck_disk_mbps",
+            "bottleneck_sustain_ms",
+            "warning",
+            "temperature_warning_enabled",
+            "memory_warning_enabled",
+            "cpu_temp_warning",
+            "cpu_temp_critical",
+            "gpu_temp_warning",
+            "gpu_temp_critical",
+            "memory_warning",
+            "vmem_warning",
+            "critical_alert_linger_ms",
+            "headset_warn_percent",
+            "headset_critical_percent",
+        ] {
+            let error = parse_standalone(format!("{key} 1\n").as_bytes()).unwrap_err();
+            assert!(error.message.contains("unknown key"), "{key}: {error}");
+            assert_eq!(error.line, 1, "{key}");
         }
+    }
+
+    /// WO-REMOVE-ALERTS (S3): `ALERTS`/`BOTTLENECK` are not selectable modules any more, in any
+    /// spelling, while the replacement and surviving options parse.
+    #[test]
+    fn retired_module_tokens_are_rejected_in_slot_lists() {
+        for token in ["ALERTS", "alerts", "BOTTLENECK", "bottleneck"] {
+            let error =
+                parse_standalone(format!("slot_3 {token} THERMALS\n").as_bytes()).unwrap_err();
+            assert!(
+                error.message.contains("unknown button option")
+                    && error.message.to_uppercase().contains(&token.to_uppercase()),
+                "{token}: {error}"
+            );
+        }
+        assert!(parse_standalone(b"slot_3 THERMALS POWER_LIMIT\n").is_ok());
+        assert!(parse_standalone(b"slot_2 PROC_HANG FPS_1LOW\n").is_ok());
     }
 
     #[test]
@@ -844,18 +859,18 @@ mod tests {
     #[test]
     fn parses_module_expansion_contract_and_keeps_old_configs_valid() {
         let cfg = parse_standalone(
-            b"warning 0\ncpu_temp_max_c 88\ngpu_temp_max_c 89\ndisk_graph_ceiling_mbps 2000\nfps_graph_ceiling 360\ncpu_fan_max_rpm 1800\nhwinfo_cpu_temp_sensor \"CPU Exact Case\"\nhwinfo_cpu_temp_reading \"CPU Package\"\nhwinfo_total_power_sensor System\nhwinfo_total_power_reading Total\nbottleneck_sustain_ms 0\nslot_0 cpu_load_graph system_battery bottleneck\n",
+            b"cpu_temp_max_c 88\ngpu_temp_max_c 89\ndisk_graph_ceiling_mbps 2000\nfps_graph_ceiling 360\ncpu_fan_max_rpm 1800\nhwinfo_cpu_temp_sensor \"CPU Exact Case\"\nhwinfo_cpu_temp_reading \"CPU Package\"\nhwinfo_total_power_sensor System\nhwinfo_total_power_reading Total\nslot_0 cpu_load_graph system_battery power_limit\n",
         )
         .unwrap();
-        assert!(!cfg.warning);
         assert_eq!(
             cfg.slots[0],
-            vec!["CPU_LOAD_GRAPH", "SYSTEM_BATTERY", "BOTTLENECK"]
+            vec!["CPU_LOAD_GRAPH", "SYSTEM_BATTERY", "POWER_LIMIT"]
         );
+        assert_eq!(cfg.cpu_temp_max_c, 88.0);
+        assert_eq!(cfg.gpu_temp_max_c, 89.0);
         assert_eq!(cfg.cpu_fan_max_rpm, 1800);
         assert_eq!(cfg.hwinfo_cpu_temp_sensor, "CPU Exact Case");
         assert_eq!(cfg.hwinfo_cpu_temp_reading, "CPU Package");
-        assert_eq!(cfg.bottleneck_sustain, Duration::ZERO);
         assert!(parse_standalone(b"preview_scale 2\nhang_button 3\n").is_ok());
         assert!(parse_standalone(b"hwinfo_cpu_temp_sensor CPU\n").is_err());
         assert!(parse_standalone(b"hwinfo_cpu_power_sensor CPU\n").is_err());
@@ -878,8 +893,6 @@ mod tests {
         for key in [
             "preview_scale",
             "main_display",
-            "headset_warn_percent",
-            "headset_critical_percent",
             "controller_index",
             "network_probe_window",
             "discord_max_speakers",

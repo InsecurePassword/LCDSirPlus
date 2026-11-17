@@ -3,7 +3,7 @@
 //! are release invariants requiring explicit review when changed.
 #![allow(clippy::too_many_arguments)] // Direct drawing signatures cover legacy and Rust layouts.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use super::font::{fit_text, text_width};
@@ -11,8 +11,7 @@ use super::Frame;
 use crate::history::Series;
 use crate::model::{
     session_duration, AcState, Availability, DeviceStatus, Freshness, HardwareKind, HardwareRole,
-    HeadsetBattery, HungTarget, Metric, MetricKey, ReadingsSnapshot, Snapshot, Speaker, ValueKind,
-    WIDTH,
+    HeadsetBattery, HungTarget, Metric, MetricKey, ReadingsSnapshot, Snapshot, ValueKind, WIDTH,
 };
 use crate::telemetry::PROBE_INDETERMINATE;
 
@@ -20,36 +19,24 @@ use crate::telemetry::PROBE_INDETERMINATE;
 #[derive(Clone, Copy, Debug)]
 pub struct OverlayOptions {
     pub main_display: i32,
-    pub discord_linger: Duration,
-    pub discord_max_speakers: usize,
-    pub discord_show_self: bool,
-    pub discord_show_channel: bool,
     pub network_graph_ceiling_download_mbps: f64,
     pub network_graph_ceiling_upload_mbps: f64,
     pub disk_graph_ceiling_mbps: f64,
     pub fps_graph_ceiling: f64,
     pub cpu_temp_max_c: f64,
     pub gpu_temp_max_c: f64,
-    pub warning: bool,
-    pub warning_phase: bool,
 }
 
 impl Default for OverlayOptions {
     fn default() -> Self {
         OverlayOptions {
             main_display: 1,
-            discord_linger: Duration::from_millis(700),
-            discord_max_speakers: 2,
-            discord_show_self: false,
-            discord_show_channel: false,
             network_graph_ceiling_download_mbps: 1000.0,
             network_graph_ceiling_upload_mbps: 1000.0,
             disk_graph_ceiling_mbps: 1000.0,
             fps_graph_ceiling: 240.0,
             cpu_temp_max_c: 90.0,
             gpu_temp_max_c: 90.0,
-            warning: false,
-            warning_phase: false,
         }
     }
 }
@@ -60,7 +47,6 @@ pub struct View {
     pub hung_index: usize,
     pub hung_detail: bool,
     pub hung_hold: f64,
-    pub alert_acknowledged: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -85,29 +71,12 @@ impl Renderer {
     pub fn render(&mut self, s: &Snapshot, opts: OverlayOptions, v: &View) -> Frame {
         self.now = s.now;
         self.capture(s);
+        // WO-REMOVE-ALERTS: the full-screen takeovers are deleted — the non-hang
+        // critical-alert overlay and the speaker-triggered Discord overlay — so every
+        // frame is the user's selected dashboard. The hung-process target and action
+        // progress are presented by the `PROC_HANG` slot arm (`hang_slot`), the one
+        // attention path the product keeps, and it draws inside this same frame.
         let mut f = Frame::new();
-        if !s.hung.is_empty()
-            && v.slot_modules
-                .iter()
-                .any(|module| module.eq_ignore_ascii_case("PROC_HANG"))
-        {
-            self.dashboard(&mut f, s, v, &opts);
-            return f;
-        }
-        if let Some(alert) = highest_critical(&s.alerts, &v.alert_acknowledged, opts.warning) {
-            alert_overlay(&mut f, alert);
-            return f;
-        }
-        let speakers = visible_speakers(
-            &s.discord,
-            s.now,
-            opts.discord_linger,
-            opts.discord_show_self,
-        );
-        if !speakers.is_empty() {
-            discord_overlay(&mut f, &s.discord, &speakers, &opts);
-            return f;
-        }
         self.dashboard(&mut f, s, v, &opts);
         f
     }
@@ -235,13 +204,6 @@ impl Renderer {
         }
         for i in 0..4usize {
             self.slot(f, i, &v.slot_modules[i], s, opts, v);
-            if opts.warning
-                && opts.warning_phase
-                && slot_temperature_warning(&v.slot_modules[i], s, opts)
-            {
-                let (x, w) = slot_bounds(i);
-                f.invert_rect(x, 26, w, 17);
-            }
         }
     }
 
@@ -614,7 +576,6 @@ impl Renderer {
                 "GAME",
                 &first_non_empty(&[&s.game.game_name, &s.game.process_name], "N/A"),
             ),
-            "ALERTS" => alert_slot(f, left, width, &s.alerts),
             "PROVIDER_STATUS" => provider_slot(f, left, width, &s.providers, &s.device_status),
             "CPU_LOAD_GRAPH" => self.fixed_graph_slot(
                 f,
@@ -769,7 +730,6 @@ impl Renderer {
                 &system_battery_text(s.system_battery),
             ),
             "HARD_FAULTS" => hard_faults_slot(f, left, width, &s.readings),
-            "BOTTLENECK" => self.text_slot(f, left, width, "BOTTLENECK", bottleneck_text(s)),
             "PROC_HANG" => hang_slot(f, i, &s.hung, v),
             "CLEAR" => self.text_slot(f, left, width, "STATUS", "CLEAR"),
             other => {
@@ -1567,38 +1527,6 @@ fn hard_faults_slot(f: &mut Frame, x: i32, w: i32, readings: &ReadingsSnapshot) 
     }
 }
 
-fn bottleneck_text(s: &Snapshot) -> &'static str {
-    if s.bottleneck.freshness == Freshness::Stale {
-        "STALE"
-    } else {
-        s.bottleneck.state.token().unwrap_or("N/A")
-    }
-}
-
-fn current_at_or_above(metric: Metric, threshold: f64) -> bool {
-    metric_state(metric) == DisplayState::Current && metric.value >= threshold
-}
-
-fn slot_temperature_warning(module: &str, s: &Snapshot, opts: &OverlayOptions) -> bool {
-    match module.to_ascii_uppercase().as_str() {
-        "CPU_TEMP" | "CPU_TEMP_GRAPH" => current_at_or_above(s.cpu_temp, opts.cpu_temp_max_c),
-        "CPU_CACHE_TEMP" => current_at_or_above(
-            canonical_cpu_domain_temperature(&s.readings, HardwareRole::Cache),
-            opts.cpu_temp_max_c,
-        ),
-        "CPU_FREQ_TEMP" => current_at_or_above(
-            canonical_cpu_domain_temperature(&s.readings, HardwareRole::Frequency),
-            opts.cpu_temp_max_c,
-        ),
-        "GPU_TEMP" | "GPU_TEMP_GRAPH" => current_at_or_above(s.gpu_temp, opts.gpu_temp_max_c),
-        "THERMALS" => {
-            current_at_or_above(s.cpu_temp, opts.cpu_temp_max_c)
-                || current_at_or_above(s.gpu_temp, opts.gpu_temp_max_c)
-        }
-        _ => false,
-    }
-}
-
 fn format_network_rate(bytes_per_second: f64) -> String {
     if !bytes_per_second.is_finite() {
         return "N/A".into();
@@ -1891,34 +1819,6 @@ fn controller_slot(f: &mut Frame, x: i32, w: i32, b: &crate::model::ControllerBa
     );
 }
 
-fn alert_slot(f: &mut Frame, x: i32, w: i32, alerts: &[crate::model::Alert]) {
-    f.text_centered(x, w, 27, "ALERTS", 1, true);
-    let mut n = 0;
-    let mut max = 0;
-    for a in alerts {
-        if !a.acknowledged {
-            n += 1;
-            if a.severity > max {
-                max = a.severity;
-            }
-        }
-    }
-    if n == 0 {
-        f.text_centered(x, w, 35, "CLEAR", 1, true);
-    } else {
-        f.text_centered(x, w, 35, &format_alert_summary(n, max, w), 1, true);
-    }
-}
-
-fn format_alert_summary(count: i32, severity: i32, max_width: i32) -> String {
-    let text = format!("{count} L {severity}");
-    if text_width(&text, 1) <= max_width {
-        text
-    } else {
-        format!(">9 L {}", severity.clamp(0, 9))
-    }
-}
-
 fn provider_slot(
     f: &mut Frame,
     x: i32,
@@ -2065,103 +1965,10 @@ fn compact_iec_number(value: &str) -> String {
     }
 }
 
-fn visible_speakers(
-    d: &crate::model::DiscordState,
-    now: Option<SystemTime>,
-    linger: Duration,
-    show_self: bool,
-) -> Vec<Speaker> {
-    if !d.connected || !d.authenticated {
-        return Vec::new();
-    }
-    let Some(now) = now else {
-        return Vec::new();
-    };
-    let mut out: Vec<Speaker> = d
-        .speakers
-        .iter()
-        .filter(|s| {
-            if s.is_self && !show_self {
-                return false;
-            }
-            s.speaking
-                || s.stopped_at
-                    .map(|stopped| now.duration_since(stopped).unwrap_or(Duration::ZERO) <= linger)
-                    .unwrap_or(false)
-        })
-        .cloned()
-        .collect();
-    out.sort_by(|a, b| {
-        b.speaking
-            .cmp(&a.speaking)
-            .then_with(|| b.started_at.cmp(&a.started_at))
-            .then_with(|| a.user_id.cmp(&b.user_id))
-    });
-    out
-}
-
-fn discord_overlay(
-    f: &mut Frame,
-    d: &crate::model::DiscordState,
-    speakers: &[Speaker],
-    opts: &OverlayOptions,
-) {
-    f.rect(0, 0, 160, 43, true);
-    let mut title = "DISCORD".to_string();
-    if opts.discord_show_channel && !d.channel_name.is_empty() {
-        title = fit_text(&d.channel_name, 154, 1);
-    }
-    f.text_centered(3, 154, 2, &title, 1, true);
-    let max = opts.discord_max_speakers.min(speakers.len());
-    if max == 1 {
-        let name = fit_text(&speakers[0].name, 152, 2);
-        f.text_centered(4, 152, 16, &name, 2, true);
-    } else {
-        let mut y = 11;
-        for speaker in speakers.iter().take(max) {
-            let name = fit_text(&speaker.name, 152, 1);
-            f.text_centered(4, 152, y, &name, 1, true);
-            y += 8;
-        }
-    }
-    if speakers.len() > max {
-        f.text_right(156, 36, &format!("+{}", speakers.len() - max), true);
-    }
-}
-
-fn highest_critical<'a>(
-    alerts: &'a [crate::model::Alert],
-    ack: &HashSet<String>,
-    suppress_temperature: bool,
-) -> Option<&'a crate::model::Alert> {
-    let mut best: Option<&crate::model::Alert> = None;
-    for a in alerts {
-        if a.severity < 2
-            || a.acknowledged
-            || ack.contains(&a.id)
-            || (suppress_temperature && matches!(a.id.as_str(), "cpu-temp" | "gpu-temp"))
-        {
-            continue;
-        }
-        match best {
-            None => best = Some(a),
-            Some(b) if a.severity > b.severity => best = Some(a),
-            _ => {}
-        }
-    }
-    best
-}
-
-fn alert_overlay(f: &mut Frame, a: &crate::model::Alert) {
-    f.rect(0, 0, 160, 43, true);
-    f.text_centered(3, 154, 3, &fit_text(&a.title, 154, 2), 2, true);
-    f.text_centered(3, 154, 30, &fit_text(&a.detail, 154, 1), 1, true);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Alert, ControllerBattery, GameStats, Reading};
+    use crate::model::{ControllerBattery, GameStats, Reading};
     use std::time::{Duration, SystemTime};
 
     const GOLDEN_NORMAL: &str = "a2f36db6c54c09adcd459756677a6fc348f181d01e0810a9c7e4d9c3c998c20c";
@@ -2261,26 +2068,12 @@ mod tests {
             percent: 100,
         };
         snapshot.providers.insert("discord".into(), false);
-        snapshot.alerts = vec![
-            Alert {
-                severity: 3,
-                ..Default::default()
-            },
-            Alert {
-                severity: 2,
-                ..Default::default()
-            },
-        ];
         snapshot.system_battery = crate::model::SystemBattery {
             ac: AcState::Online,
             battery_present: Some(true),
             percent: Some(73),
             freshness: Freshness::Current,
             ..Default::default()
-        };
-        snapshot.bottleneck = crate::model::BottleneckReading {
-            state: crate::model::BottleneckState::Gpu,
-            freshness: Freshness::Current,
         };
         snapshot.readings.hardware = vec![
             crate::model::HardwareDescriptor {
@@ -2396,12 +2189,6 @@ mod tests {
         snapshot.providers = (0..100)
             .map(|index| (format!("provider-{index}"), false))
             .collect();
-        snapshot.alerts = (0..100)
-            .map(|_| Alert {
-                severity: 3,
-                ..Default::default()
-            })
-            .collect();
         for reading in &mut snapshot.readings.metrics {
             match reading.kind {
                 ValueKind::Percent => reading.number = 100.0,
@@ -2441,9 +2228,7 @@ mod tests {
         snapshot.game.process_name.clear();
         snapshot.headset.stale = true;
         snapshot.controller = ControllerBattery::default();
-        snapshot.alerts.clear();
         snapshot.system_battery.freshness = Freshness::Stale;
-        snapshot.bottleneck.freshness = Freshness::Stale;
         snapshot
     }
 
@@ -3138,112 +2923,6 @@ mod tests {
     }
 
     #[test]
-    fn discord_overlay_draws_border() {
-        let mut s = sample_snapshot();
-        s.discord.connected = true;
-        s.discord.authenticated = true;
-        s.discord.speakers.push(Speaker {
-            user_id: "1".into(),
-            name: "Nezumi".into(),
-            speaking: true,
-            started_at: s.now,
-            ..Default::default()
-        });
-        let f = Renderer::new().render(&s, OverlayOptions::default(), &View::default());
-        assert!(f.get(0, 0) && f.get(159, 42), "missing overlay border");
-    }
-
-    #[test]
-    fn discord_visibility_order_linger_self_and_restoration() {
-        let mut s = sample_snapshot();
-        let dashboard = render_dashboard(&s);
-        let now = s.now.unwrap();
-        s.discord.connected = true;
-        s.discord.authenticated = true;
-        s.discord.channel_name = "General".into();
-        s.discord.speakers = vec![
-            Speaker {
-                user_id: "2".into(),
-                name: "Older".into(),
-                speaking: true,
-                started_at: Some(now - Duration::from_secs(2)),
-                ..Default::default()
-            },
-            Speaker {
-                user_id: "1".into(),
-                name: "Newer".into(),
-                speaking: true,
-                started_at: Some(now - Duration::from_secs(1)),
-                ..Default::default()
-            },
-            Speaker {
-                user_id: "self".into(),
-                name: "Self".into(),
-                speaking: true,
-                is_self: true,
-                started_at: Some(now),
-                ..Default::default()
-            },
-            Speaker {
-                user_id: "linger".into(),
-                name: "Linger".into(),
-                stopped_at: Some(now - Duration::from_millis(700)),
-                ..Default::default()
-            },
-        ];
-        let visible = visible_speakers(&s.discord, s.now, Duration::from_millis(700), false);
-        assert_eq!(
-            visible
-                .iter()
-                .map(|speaker| speaker.user_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["1", "2", "linger"]
-        );
-        assert_eq!(
-            visible_speakers(&s.discord, s.now, Duration::from_millis(699), false).len(),
-            2
-        );
-        assert_eq!(
-            visible_speakers(&s.discord, s.now, Duration::from_millis(700), true).len(),
-            4
-        );
-
-        let one = Renderer::new().render(
-            &s,
-            OverlayOptions {
-                discord_max_speakers: 1,
-                discord_show_channel: true,
-                ..Default::default()
-            },
-            &golden_view(),
-        );
-        let many = Renderer::new().render(
-            &s,
-            OverlayOptions {
-                discord_max_speakers: 2,
-                discord_show_channel: true,
-                ..Default::default()
-            },
-            &golden_view(),
-        );
-        assert!(
-            !one.equal(&many),
-            "one/two speaker and +N layouts must differ"
-        );
-
-        for speaker in &mut s.discord.speakers {
-            speaker.speaking = false;
-            speaker.stopped_at = Some(now - Duration::from_millis(701));
-        }
-        assert!(
-            Renderer::new()
-                .render(&s, OverlayOptions::default(), &golden_view())
-                .equal(&dashboard),
-            "expired overlay must restore the exact dashboard"
-        );
-    }
-
-    #[test]
     fn iec_formatting_matches_go() {
         let cases = [
             (20u64 << 30, 32u64 << 30, 38, "20/32GiB"),
@@ -3627,33 +3306,12 @@ mod tests {
         assert_eq!(single.hash_hex(), render_dashboard(&s).hash_hex());
     }
 
+    /// WO-REMOVE-ALERTS: the alert/discord takeover paths are deleted, so the hung-process
+    /// panel is the only attention surface. A bound press draws its progress inside the
+    /// selected dashboard, renders identically through a fresh renderer (nothing competes for
+    /// the frame any more), and clearing the target restores the exact pre-press dashboard.
     #[test]
-    fn critical_alert_overrides_discord_and_dashboard() {
-        let mut s = sample_snapshot();
-        s.discord.connected = true;
-        s.discord.authenticated = true;
-        s.discord.speakers.push(Speaker {
-            user_id: "1".into(),
-            name: "Nezumi".into(),
-            speaking: true,
-            started_at: s.now,
-            ..Default::default()
-        });
-        let base = render_dashboard(&s);
-        s.alerts.push(Alert {
-            id: "cpu".into(),
-            title: "CPU HOT".into(),
-            detail: "95C".into(),
-            severity: 2,
-            acknowledged: false,
-        });
-        let alert_frame = render_dashboard(&s);
-        assert!(!alert_frame.equal(&base));
-        assert!(alert_frame.get(0, 0) && alert_frame.get(159, 42));
-    }
-
-    #[test]
-    fn hung_hold_overrides_alert_and_discord_then_restores_exact_dashboard() {
+    fn hung_hold_is_the_only_attention_surface_and_restores_exact_dashboard() {
         let mut normal = sample_snapshot();
         let view = golden_view();
         let mut renderer = Renderer::new();
@@ -3668,36 +3326,85 @@ mod tests {
             title: "Game".into(),
             ..Default::default()
         });
-        normal.alerts.push(Alert {
-            severity: 2,
-            title: "CRITICAL".into(),
-            ..Default::default()
-        });
-        normal.discord.connected = true;
-        normal.discord.authenticated = true;
-        normal.discord.speakers.push(Speaker {
-            user_id: "1".into(),
-            name: "speaker".into(),
-            speaking: true,
-            ..Default::default()
-        });
         let mut hold_view = view.clone();
         hold_view.slot_modules[2] = "PROC_HANG".into();
         hold_view.hung_hold = 0.5;
         let with_priority = renderer.render(&normal, OverlayOptions::default(), &hold_view);
 
-        let mut only_hung = normal.clone();
-        only_hung.alerts.clear();
-        only_hung.discord = Default::default();
-        let expected = Renderer::new().render(&only_hung, OverlayOptions::default(), &hold_view);
+        let expected = Renderer::new().render(&normal, OverlayOptions::default(), &hold_view);
         assert!(with_priority.equal(&expected));
         assert!((81..100).all(|x| with_priority.get(x, 26)));
 
         normal.hung.clear();
-        normal.alerts.clear();
-        normal.discord = Default::default();
         let restored = renderer.render(&normal, OverlayOptions::default(), &view);
         assert!(restored.equal(&dashboard));
+    }
+
+    /// WO-REMOVE-ALERTS (S5, "display-only data retained"): extreme readings — temperatures at
+    /// and above the graph ceilings, full RAM/VRAM, a nearly empty headset battery and a low
+    /// system battery — render the ordinary dashboard. No frame border (the deleted full-screen
+    /// takeover), no pane inversion (the deleted threshold flash) and no modal surface exist;
+    /// the graph ceiling is a scale, not a threshold, and the bars/numbers stay real readings.
+    #[test]
+    fn extreme_readings_render_the_dashboard_with_no_takeover_no_border_and_no_inversion() {
+        let mut s = sample_snapshot();
+        let at = s.now.unwrap();
+        s.cpu_temp = Metric::valid(150.0, at);
+        s.gpu_temp = Metric::valid(145.0, at);
+        s.headset = crate::model::HeadsetBattery {
+            present: true,
+            online: true,
+            percent: 1,
+            ..Default::default()
+        };
+        s.system_battery = crate::model::SystemBattery {
+            ac: AcState::Offline,
+            battery_present: Some(true),
+            percent: Some(2),
+            freshness: Freshness::Current,
+            ..Default::default()
+        };
+        for reading in &mut s.readings.metrics {
+            if matches!(
+                reading.key,
+                MetricKey::RAMUtilization | MetricKey::VRAMUtilization
+            ) {
+                reading.number = 100.0;
+            }
+        }
+        let view = View {
+            slot_modules: [
+                "CPU_TEMP".into(),
+                "GPU_TEMP".into(),
+                "THERMALS".into(),
+                "SYSTEM_BATTERY".into(),
+            ],
+            ..Default::default()
+        };
+        // `cpu_temp_max_c`/`gpu_temp_max_c` are graph ceilings: they no longer gate a warning,
+        // so a value above them draws the ordinary temperature module and the scaled graph.
+        let frame = Renderer::new().render(
+            &s,
+            OverlayOptions {
+                cpu_temp_max_c: 90.0,
+                gpu_temp_max_c: 90.0,
+                ..Default::default()
+            },
+            &view,
+        );
+        assert!(
+            !(frame.get(0, 0) && frame.get(159, 42)),
+            "a full-screen takeover border must not be drawn"
+        );
+        let plain = Renderer::new().render(&s, OverlayOptions::default(), &view);
+        assert!(
+            plain.equal(&frame),
+            "the ceiling knobs must not change the drawn pixels"
+        );
+        assert!(
+            frame.pixels.iter().any(|&pixel| pixel != 0),
+            "the panel is never blanked by the readings"
+        );
     }
 
     #[test]
@@ -3731,7 +3438,8 @@ mod tests {
 
     #[test]
     fn canonical_registry_dispatches_all_modules_with_bounded_frames() {
-        assert_eq!(crate::config::MODULES.len(), 53);
+        // WO-REMOVE-ALERTS: 53 -> 51 (ALERTS and BOTTLENECK retired with their features).
+        assert_eq!(crate::config::MODULES.len(), 51);
         let normal = audit_snapshot();
         let edge = edge_snapshot();
         let status = status_snapshot();
@@ -3822,21 +3530,6 @@ mod tests {
             assert_row(&frame, 27, expected);
             assert_space(&frame, 27, expected, 3);
         }
-
-        let alerts = vec![
-            Alert {
-                severity: 3,
-                ..Default::default()
-            },
-            Alert {
-                severity: 2,
-                ..Default::default()
-            },
-        ];
-        let mut frame = Frame::new();
-        alert_slot(&mut frame, 1, 38, &alerts);
-        assert_row(&frame, 35, "2 L 3");
-        assert_space(&frame, 35, "2 L 3", 3);
 
         let mut frame = Frame::new();
         thermals_slot(
@@ -3963,7 +3656,6 @@ mod tests {
             format_network_graph_rate("I", f64::MAX, 38),
             format_network_graph_rate("O", 0.0, 38),
             format_disk_graph_rates(1_250_000.0, 842_000.0, 38),
-            format_alert_summary(i32::MAX, 3, 38),
         ] {
             assert!(text_width(&text, 1) <= 38, "formatter overflow: {text}");
         }
@@ -3974,7 +3666,6 @@ mod tests {
             format_disk_graph_rates(1_250_000.0, 842_000.0, 38),
             "R 1M/W 1M"
         );
-        assert_eq!(format_alert_summary(i32::MAX, 3, 38), ">9 L 3");
     }
 
     #[test]
@@ -4045,132 +3736,6 @@ mod tests {
     }
 
     #[test]
-    fn warning_is_inclusive_current_and_inverts_only_its_slot_pane() {
-        let mut snapshot = sample_snapshot();
-        snapshot.cpu_temp.value = 90.0;
-        let view = View {
-            slot_modules: [
-                "CPU_TEMP".into(),
-                "CLOCK".into(),
-                "CLOCK".into(),
-                "CLOCK".into(),
-            ],
-            ..Default::default()
-        };
-        let base = Renderer::new().render(
-            &snapshot,
-            OverlayOptions {
-                warning: true,
-                cpu_temp_max_c: 90.0,
-                ..Default::default()
-            },
-            &view,
-        );
-        let flashed = Renderer::new().render(
-            &snapshot,
-            OverlayOptions {
-                warning: true,
-                warning_phase: true,
-                cpu_temp_max_c: 90.0,
-                ..Default::default()
-            },
-            &view,
-        );
-        for y in 0..43 {
-            for x in 0..160 {
-                assert_eq!(
-                    flashed.get(x, y),
-                    if x < 40 && y >= 26 {
-                        !base.get(x, y)
-                    } else {
-                        base.get(x, y)
-                    }
-                );
-            }
-        }
-        snapshot.cpu_temp.stale = true;
-        let stale = Renderer::new().render(
-            &snapshot,
-            OverlayOptions {
-                warning: true,
-                warning_phase: true,
-                cpu_temp_max_c: 90.0,
-                ..Default::default()
-            },
-            &view,
-        );
-        let stale_base = Renderer::new().render(
-            &snapshot,
-            OverlayOptions {
-                warning: true,
-                cpu_temp_max_c: 90.0,
-                ..Default::default()
-            },
-            &view,
-        );
-        assert!(stale.equal(&stale_base));
-
-        snapshot.cpu_temp.stale = false;
-        let category_disabled = Renderer::new().render(
-            &snapshot,
-            OverlayOptions {
-                warning: false,
-                warning_phase: true,
-                cpu_temp_max_c: 90.0,
-                ..Default::default()
-            },
-            &view,
-        );
-        let disabled_base = Renderer::new().render(
-            &snapshot,
-            OverlayOptions {
-                warning: false,
-                cpu_temp_max_c: 90.0,
-                ..Default::default()
-            },
-            &view,
-        );
-        assert!(category_disabled.equal(&disabled_base));
-    }
-
-    #[test]
-    fn warning_suppresses_only_temperature_full_screen_alerts() {
-        let mut snapshot = sample_snapshot();
-        let dashboard = render_dashboard(&snapshot);
-        snapshot.alerts.push(Alert {
-            id: "cpu-temp".into(),
-            severity: 3,
-            title: "CPU HOT".into(),
-            ..Default::default()
-        });
-        let suppressed = Renderer::new().render(
-            &snapshot,
-            OverlayOptions {
-                warning: true,
-                ..Default::default()
-            },
-            &golden_view(),
-        );
-        assert!(suppressed.equal(&dashboard));
-        snapshot.alerts.push(Alert {
-            id: "memory".into(),
-            severity: 2,
-            title: "MEMORY HIGH".into(),
-            ..Default::default()
-        });
-        let other = Renderer::new().render(
-            &snapshot,
-            OverlayOptions {
-                warning: true,
-                ..Default::default()
-            },
-            &golden_view(),
-        );
-        assert!(!other.equal(&dashboard));
-        assert!(other.get(0, 0) && other.get(159, 42));
-    }
-
-    #[test]
     fn expansion_state_formatters_are_truthful_and_compact() {
         assert_eq!(format_byte_rate(1_250_000.0), "1.2MB/s");
         assert_eq!(format_byte_rate(0.0), "0B/s");
@@ -4202,25 +3767,6 @@ mod tests {
         );
         assert_eq!(graph_height(200.0, 100.0, 7), 7);
         assert_eq!(graph_height(-1.0, 100.0, 7), 0);
-    }
-
-    #[test]
-    fn bottleneck_text_maps_every_state_and_stale_precedence() {
-        let mut snapshot = Snapshot::default();
-        snapshot.bottleneck.freshness = Freshness::Current;
-        for (state, expected) in [
-            (crate::model::BottleneckState::Unavailable, "N/A"),
-            (crate::model::BottleneckState::None, "NONE"),
-            (crate::model::BottleneckState::Cpu, "CPU"),
-            (crate::model::BottleneckState::Gpu, "GPU"),
-            (crate::model::BottleneckState::Mem, "RAM"),
-            (crate::model::BottleneckState::DiskIo, "DISK I/O"),
-        ] {
-            snapshot.bottleneck.state = state;
-            assert_eq!(bottleneck_text(&snapshot), expected);
-        }
-        snapshot.bottleneck.freshness = Freshness::Stale;
-        assert_eq!(bottleneck_text(&snapshot), "STALE");
     }
 
     #[test]

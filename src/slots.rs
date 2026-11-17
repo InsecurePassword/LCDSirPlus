@@ -148,11 +148,17 @@ mod tests {
         let manager = Manager::new(&Config::default(), [0; 4]);
         assert_eq!(manager.current(2), "PROC_HANG");
         assert_eq!(
-            manager.next_except(2, &["PROC_HANG", "BOTTLENECK"]),
+            manager.next_except(2, &["PROC_HANG"]),
             Some("FPS_1LOW".into())
         );
         assert_eq!(manager.current(2), "PROC_HANG");
-        let manager = Manager::new(&cfg_with(0, &["PROC_HANG", "BOTTLENECK"]), [0; 4]);
-        assert_eq!(manager.next_except(0, &["PROC_HANG", "BOTTLENECK"]), None);
+        let manager = Manager::new(&cfg_with(0, &["PROC_HANG"]), [0; 4]);
+        assert_eq!(manager.next_except(0, &["PROC_HANG"]), None);
+        // WO-REMOVE-ALERTS: the migrated default slot 4 lists only surviving readings.
+        assert_eq!(
+            Manager::new(&Config::default(), [0; 4]).current(3),
+            "THERMALS",
+            "default slot 4 = THERMALS POWER_LIMIT"
+        );
     }
 }
