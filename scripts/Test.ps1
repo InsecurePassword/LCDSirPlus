@@ -308,9 +308,23 @@ if ($LASTEXITCODE -ne 0) { throw 'cargo clippy failed' }
 $warnings = @($clippyOutput | Where-Object { $_ -match 'warning:' })
 if ($warnings.Count -gt 0) { throw "clippy emitted $($warnings.Count) warnings; zero-warning policy violated" }
 
+# F-4: workspace suite adjacency. cargo test --workspace leaves a bare-name
+# deps\lcdsirplus_discord.dll beside the app test binary, where the component loader finds it
+# and a running Discord Desktop answers authorize => the Missing premise inverts. Move it aside
+# for the suite only; root release\lcdsirplus_discord.dll (the ABI-smoke load site) is untouched.
+$f4DepsDll = Join-Path $targetRoot 'release\deps\lcdsirplus_discord.dll'
+$f4DepsAside = "$f4DepsDll.f4aside"
+if ([IO.File]::Exists($f4DepsDll)) { Move-Item -LiteralPath $f4DepsDll -Destination $f4DepsAside -Force }
 Write-Host '== cargo test ==' -ForegroundColor Cyan
-cargo test --workspace --release --locked -j 1
-if ($LASTEXITCODE -ne 0) { throw 'cargo test failed' }
+try {
+    cargo test --workspace --release --locked -j 1
+    $f4SuiteExit = $LASTEXITCODE
+}
+finally {
+    if ([IO.File]::Exists($f4DepsDll)) { Remove-Item -LiteralPath $f4DepsAside -Force -ErrorAction SilentlyContinue }
+    elseif ([IO.File]::Exists($f4DepsAside)) { Move-Item -LiteralPath $f4DepsAside -Destination $f4DepsDll -Force }
+}
+if ($f4SuiteExit -ne 0) { throw 'cargo test failed' }
 
 if ($ReleaseOnly) { return }
 
