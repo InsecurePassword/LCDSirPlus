@@ -3224,6 +3224,13 @@ mod tests {
     /// V1(a): the disabled / unconfigured case performs NO component call, spawns NO worker thread
     /// and touches NO credential. At `42ad35f` this was RED: `spawn` always started the worker
     /// thread and the parked loop published per iteration.
+    ///
+    /// WO-TEL-D3-E (audit F-1): every claim is read from the per-Runtime census at CONSTRUCTION,
+    /// so no assertion depends on thread scheduling. `spawn_worker` increments `census.spawns` on
+    /// the CALLING thread (L1195) and every census counter is `fetch_add`-monotonic, so
+    /// `spawns == 0` proves "NO worker thread exists" without sampling a live thread: the
+    /// spawn-at-disabled mutation is RED deterministically, not a race between a mutated worker's
+    /// publish (L1238) and its end (L1377).
     #[test]
     fn discord_disabled_never_loads_never_spawns_a_worker_never_touches_credentials() {
         for (label, config) in [
@@ -3262,6 +3269,31 @@ mod tests {
             ),
         ] {
             let runtime = spawn_with(&config, stub_v1::loader);
+            // The construction-time census read: deterministic (monotonic per-Runtime counters, no
+            // liveness sampling), and it is the load-bearing form.
+            let census = runtime.census_snapshot();
+            assert_eq!(
+                census.spawns, 0,
+                "{label}: NO worker thread is created at disabled"
+            );
+            assert!(
+                !runtime.worker_running(),
+                "{label}: NO worker thread exists"
+            );
+            assert_eq!(
+                census.load_attempts, 0,
+                "{label}: the loader is never called"
+            );
+            assert_eq!(census.loads, 0, "{label}: the module is never loaded");
+            assert_eq!(census.starts, 0, "{label}: the component is never started");
+            assert_eq!(
+                runtime.credential_calls(),
+                0,
+                "{label}: no credential callback ran"
+            );
+            // The publish claim: the disabled arm sends the parked state synchronously
+            // (L1170-1172), so it arrives with the shipped reason, never stale-as-fresh, and it is
+            // the ONLY publish: no thread exists to publish again.
             let update = runtime
                 .updates
                 .recv_timeout(Duration::from_secs(1))
@@ -3275,31 +3307,32 @@ mod tests {
                 "{label}: never stale-as-fresh"
             );
             assert!(
-                !runtime.worker_running(),
-                "{label}: NO worker thread exists"
+                runtime.updates.try_recv().is_err(),
+                "{label}: exactly ONE publish, never the per-tick stream"
             );
+            // A reload that stays disabled must not create a worker, load, start, touch a
+            // credential or publish; the same monotonic census proves it, construction-shape.
+            runtime.update_config(&config);
             let census = runtime.census_snapshot();
             assert_eq!(
-                census.load_attempts, 0,
-                "{label}: the loader is never called"
+                census.spawns, 0,
+                "{label}: a disabled reload spawns nothing"
             );
-            assert_eq!(census.loads, 0, "{label}: the module is never loaded");
-            assert_eq!(census.starts, 0, "{label}: the component is never started");
+            assert!(
+                !runtime.worker_running(),
+                "{label}: a disabled reload leaves no worker"
+            );
+            assert_eq!(census.load_attempts, 0, "{label}: still no load");
+            assert_eq!(census.loads, 0, "{label}: still no module load");
+            assert_eq!(census.starts, 0, "{label}: still no start");
             assert_eq!(
                 runtime.credential_calls(),
                 0,
-                "{label}: no credential callback ran"
+                "{label}: still no credential callback"
             );
-            // A reload that stays disabled must not create a worker either.
-            runtime.update_config(&config);
             assert!(
-                !runtime.worker_running(),
-                "{label}: a disabled reload spawns nothing"
-            );
-            assert_eq!(
-                runtime.census_snapshot().load_attempts,
-                0,
-                "{label}: still no load"
+                runtime.updates.try_recv().is_err(),
+                "{label}: the disabled reload publishes nothing"
             );
             drained(&runtime);
         }
@@ -3679,7 +3712,28 @@ mod tests {
         let path = component_path().unwrap();
         for cycle in 0..50 {
             runtime.update_config(&on);
-            std::thread::sleep(Duration::from_millis(20));
+            // WO-TEL-D3-E (F-1 class, pre-existing at `4ef030a`): the activation edge's load
+            // attempt is OBSERVED in the monotonic per-Runtime census, bounded, instead of sampling
+            // the thread 20 ms after the edge. Under the parallel suite shape a freshly spawned
+            // worker is not always scheduled inside a fixed 20 ms window, so that cycle legitimately
+            // records no attempt and the shipped `load_attempts == 50` claim becomes a scheduling
+            // race (measured red at HEAD content, `flakewatch.txt` head rows). Observing the attempt
+            // before the disable edge is what makes "one attempt per activation edge, no more"
+            // testable deterministically; it adds no activation edge of its own. The bound is 10 s,
+            // the shipped alloc-window bound, because a measured suite-shape starved a 2 s bound at
+            // cycle 0 (`paircached-full-cached-2.log`: left 0 / right 1 at `3729`); overrunning the
+            // bound is a FAIL-CLOSED red naming the cycle, never a silent skip.
+            let attempt_deadline = Instant::now() + Duration::from_secs(10);
+            while runtime.census_snapshot().load_attempts < cycle + 1
+                && Instant::now() < attempt_deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                runtime.census_snapshot().load_attempts,
+                cycle + 1,
+                "cycle {cycle}: the activation edge made exactly one attempt"
+            );
             runtime.update_config(&off);
             let deadline = Instant::now() + Duration::from_secs(2);
             while runtime.worker_running() && Instant::now() < deadline {
