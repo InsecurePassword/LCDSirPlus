@@ -493,10 +493,38 @@ pub fn status_name(code: i32) -> &'static str {
     }
 }
 
+/// F-H-2 (the F-4 class): the component lookup root that a premise test controls. A workspace
+/// build puts the built cdylib in `release\deps\`, i.e. BESIDE the app test binary, so "the
+/// component is not installed beside the executable" is NOT a property of the machine that runs
+/// the suite: the loader would find a build artifact, and a running Discord Desktop answers the
+/// authorize handshake, inverting the premise. The tests that assert the premise create their own
+/// EMPTY lookup directory and point this override at it (`AbsentComponentFixture`), so
+/// `cargo test --workspace` is reliable with any pre-existing artifacts and no harness moves any
+/// build output. `cfg(test)`: neither static is compiled into the shipped binary, and the
+/// production arm of `component_path` below is the shipped code verbatim.
+#[cfg(test)]
+static COMPONENT_LOOKUP_ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// F-H-2: how many premise tests are holding a lookup fixture. The root is released by the LAST
+/// fixture to leave, so one fixture's Drop can never expose the production lookup to a premise
+/// test that is still running on a parallel suite thread.
+#[cfg(test)]
+static COMPONENT_LOOKUP_FIXTURES: AtomicUsize = AtomicUsize::new(0);
+
 /// The exact module path beside the running executable (`runtime::canonical_executable`, the
 /// app-startup canonicalization already used at `src/app.rs:127`). No PATH, no current directory,
 /// no module-name search: the only lookup this order performs.
 pub fn component_path() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    {
+        let root = COMPONENT_LOOKUP_ROOT
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(root) = root {
+            return Ok(root.join(COMPONENT_NAME));
+        }
+    }
     let executable = crate::runtime::canonical_executable()?;
     let directory = executable
         .parent()
@@ -2313,6 +2341,44 @@ mod tests {
         }
     }
 
+    /// F-H-2: the lookup directory a component-absence premise OWNS. `TestDir::new` creates an
+    /// empty temp directory and this fixture points the test-only `COMPONENT_LOOKUP_ROOT` seam at
+    /// it for its whole lifetime, so the production loader resolves `COMPONENT_NAME` inside a
+    /// directory the test made and removes, whatever the workspace build left beside the test
+    /// binary. Drop releases the seam (last fixture out clears it), then `TestDir`'s Drop removes
+    /// the directory. The fixture is deliberately empty: no dll, so the premise holds by
+    /// construction, with no file manipulation by any harness.
+    struct AbsentComponentFixture {
+        directory: TestDir,
+    }
+
+    impl AbsentComponentFixture {
+        fn new() -> Self {
+            let directory = TestDir::new();
+            COMPONENT_LOOKUP_FIXTURES.fetch_add(1, Ordering::Relaxed);
+            *COMPONENT_LOOKUP_ROOT
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = Some(directory.0.clone());
+            Self { directory }
+        }
+
+        /// The exact component path the seam now resolves: `COMPONENT_NAME` inside this fixture's
+        /// own (empty) directory.
+        fn expected_path(&self) -> PathBuf {
+            self.directory.0.join(COMPONENT_NAME)
+        }
+    }
+
+    impl Drop for AbsentComponentFixture {
+        fn drop(&mut self) {
+            if COMPONENT_LOOKUP_FIXTURES.fetch_sub(1, Ordering::Relaxed) == 1 {
+                *COMPONENT_LOOKUP_ROOT
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+    }
+
     /// WO-TEL-D3-C relocation note: the record codec (encode/decode/validate_for) moved with the
     /// OAuth region into the component, so the host file layer is exercised with an opaque record
     /// blob. Every shipped claim stays: per-account file independence, the path-binding rule, the
@@ -3187,15 +3253,6 @@ mod tests {
             })
         }
 
-        pub fn loader_missing(
-            diagnostic: &mut [u8; LOADER_DIAGNOSTIC_CAPACITY],
-        ) -> Result<Module, LoadFault> {
-            let message = LoadFault::Missing.diagnostic();
-            let bytes = message.as_bytes();
-            diagnostic[..bytes.len()].copy_from_slice(bytes);
-            Err(LoadFault::Missing)
-        }
-
         pub fn loader_handshake(
             diagnostic: &mut [u8; LOADER_DIAGNOSTIC_CAPACITY],
         ) -> Result<Module, LoadFault> {
@@ -3425,13 +3482,14 @@ mod tests {
     }
 
     /// V1(d): a module that cannot be found yields ONE bounded diagnostic: a single load
-    /// attempt, zero starts, zero worker spawns, no retry loop, explicit unavailability.
+    /// attempt, zero starts, zero worker spawns, no retry loop, explicit unavailability. The
+    /// premise is test-owned (F-H-2): `AbsentComponentFixture` plus the real production loader, so
+    /// this drives `component_path` -> `LoadLibraryExW` against an empty fixture directory; a
+    /// workspace-built dll beside the test binary can never satisfy the load.
     #[test]
     fn discord_missing_module_reports_once_and_never_retries() {
-        let runtime = spawn_with(
-            &enabled_config("123456789012345678"),
-            stub_v1::loader_missing,
-        );
+        let _fixture = AbsentComponentFixture::new();
+        let runtime = spawn_with(&enabled_config("123456789012345678"), load_production_table);
         let update = wait_for_state(&runtime, |state| {
             state.error == "discord module unavailable"
         })
@@ -3532,35 +3590,13 @@ mod tests {
         drop(runtime);
     }
 
-    fn missing_component_fixture() -> PathBuf {
-        static PATH: OnceLock<PathBuf> = OnceLock::new();
-        PATH.get_or_init(|| {
-            std::env::temp_dir()
-                .join(format!(
-                    "lcdsirplus-absent-component-{}-{}",
-                    std::process::id(),
-                    random_nonce().unwrap()
-                ))
-                .join(COMPONENT_NAME)
-        })
-        .clone()
-    }
-
-    fn missing_component_loader(
-        diagnostic: &mut [u8; LOADER_DIAGNOSTIC_CAPACITY],
-    ) -> Result<Module, LoadFault> {
-        let path = missing_component_fixture();
-        assert!(
-            !path.exists(),
-            "the absent-module fixture must remain absent"
-        );
-        load_table_from(&path, diagnostic)
-    }
-
     /// V1(c): a missing / corrupt module is a non-fatal, classified failure with ONE bounded,
-    /// secret-free diagnostic and no retry loop.
+    /// secret-free diagnostic and no retry loop. F-H-2: the whole test runs inside an
+    /// `AbsentComponentFixture`, so the loader's own lookup site is a directory this test created
+    /// and removes (empty: no dll), never the deployment directory beside the test binary.
     #[test]
     fn discord_missing_dll_is_non_fatal_with_one_bounded_diagnostic_and_no_retry() {
+        let fixture = AbsentComponentFixture::new();
         let mut diagnostic = [0u8; LOADER_DIAGNOSTIC_CAPACITY];
         let temp = std::env::temp_dir().join(format!(
             "lcdsirplus-d3c-missing-{}-{}.dll",
@@ -3597,21 +3633,34 @@ mod tests {
         let _ = std::fs::remove_file(&corrupt);
         assert!(
             component_path().is_ok(),
-            "the exact module path beside the executable always resolves"
+            "the component lookup always resolves to one exact path"
         );
         let path = component_path().unwrap();
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),
             Some(COMPONENT_NAME),
-            "the loader resolves ONE exact file name beside the executable (no search path)"
+            "the loader resolves ONE exact file name (no PATH, no search order)"
         );
-        // Exercise the real loader against an owned absent path. A workspace build may
-        // legitimately leave its DLL beside the test executable; do not move that DLL.
-        let path = missing_component_fixture();
-        let runtime = spawn_with(
-            &enabled_config("123456789012345678"),
-            missing_component_loader,
+        // F-H-2, the load-bearing shape of the cure, measured while the workspace-built dll sits
+        // BESIDE the test binary: the lookup resolves into a test-owned fixture directory (the
+        // suite runs test threads in parallel, so any live premise fixture qualifies) and the file
+        // is absent there, so the build adjacency can never satisfy the "not installed" premise.
+        let exe_directory = crate::runtime::canonical_executable()
+            .ok()
+            .and_then(|executable| executable.parent().map(Path::to_path_buf));
+        assert_ne!(
+            path.parent(),
+            exe_directory.as_deref(),
+            "F-H-2: the lookup root is a test-owned directory, never the build directory beside the test binary"
         );
+        assert!(
+            !path.exists() && !fixture.expected_path().exists(),
+            "F-H-2: no component dll exists at the resolved lookup path or in this test's fixture"
+        );
+        // The real production loader, through the seam, against the fixture's owned EMPTY
+        // directory. A workspace build legitimately leaves its dll beside the test executable;
+        // nothing moves it, and the premise cannot be satisfied by it.
+        let runtime = spawn_with(&enabled_config("123456789012345678"), load_production_table);
         let update = wait_for_state(&runtime, |state| {
             state.error == "discord module unavailable"
         })
@@ -3620,10 +3669,11 @@ mod tests {
         assert_eq!(runtime.census_snapshot().load_attempts, 1);
         assert_eq!(runtime.census_snapshot().diagnostics, 1);
         assert!(
-            !component_loaded(&path),
+            !component_loaded(&fixture.expected_path()),
             "the module is NOT present when it is not installed"
         );
         drop(runtime);
+        drop(fixture);
     }
 
     /// V1(d): the 50-cycle enable/disable census. One worker spawn + join and one load/start/
@@ -3760,26 +3810,32 @@ mod tests {
         // is not attributable to this provider, so it is reported above, and the per-cycle
         // module-handle claim is carried by the exact per-Runtime census (unloads == 50,
         // retained == 0, module_retained() false every cycle) plus GetModuleHandleW at rest below.
-        let path = missing_component_fixture();
+        let fixture = AbsentComponentFixture::new();
         assert!(
-            !component_loaded(&path),
+            !component_loaded(&fixture.expected_path()),
             "the injected lifecycle loader never loads the absent image"
         );
         drop(runtime);
+        drop(fixture);
     }
 
     /// V1(d) module-presence half, production loader: with the module ABSENT (the shipped default
-    /// deployment for a disabled profile) 50 cycles never make the module appear.
+    /// deployment for a disabled profile) 50 cycles never make the module appear. F-H-2: the
+    /// absence is the test's own empty fixture directory (`AbsentComponentFixture`) resolved by the
+    /// REAL `component_path`/`load_production_table` chain through the test-only seam, so a
+    /// workspace-built dll beside the test binary cannot satisfy the premise and no harness has to
+    /// move it.
     #[test]
     fn discord_module_is_absent_across_toggle_cycles_when_not_installed() {
+        let fixture = AbsentComponentFixture::new();
         let on = enabled_config("123456789012345678");
         let off = Config {
             discord_enabled: false,
             discord_client_id: "123456789012345678".into(),
             ..Config::default()
         };
-        let runtime = spawn_with(&off, missing_component_loader);
-        let path = missing_component_fixture();
+        let runtime = spawn_with(&off, load_production_table);
+        let path = fixture.expected_path();
         for cycle in 0..50 {
             runtime.update_config(&on);
             // WO-TEL-D3-E (F-1 class, pre-existing at `4ef030a`): the activation edge's load
@@ -3825,6 +3881,7 @@ mod tests {
         );
         assert_eq!(census.diagnostics, 50, "one diagnostic per activation edge");
         drop(runtime);
+        drop(fixture);
     }
 
     /// V1: the refuse-unload-if-inflight policy. A component that reports work in flight is NOT
@@ -3976,9 +4033,13 @@ mod tests {
 
     /// V1: `authorize` is the documented temporary load: one component authorize call, and the
     /// module is unloaded on the same thread. With no module installed it fails as a classified,
-    /// bounded message (the CLI prints it), never a crash.
+    /// bounded message (the CLI prints it), never a crash. F-H-2: the "no module installed" premise
+    /// is this test's own empty fixture directory, resolved through the test-only seam by the
+    /// production `component_path`, so a workspace-built dll beside the test binary and a live
+    /// Discord Desktop can never answer the handshake and invert it (the F-4 failure mode).
     #[test]
     fn discord_authorize_is_a_documented_temporary_load_and_clear_needs_none() {
+        let _fixture = AbsentComponentFixture::new();
         // The unconfigured guard is checked before any load (the shipped order is kept).
         let unconfigured = Config {
             discord_enabled: true,
@@ -3993,7 +4054,7 @@ mod tests {
         let result = authorize(&enabled_config("123456789012345678"), "secret");
         assert!(
             result.is_err(),
-            "with no component installed the CLI reports a failure (no Discord running here)"
+            "with no component installed the CLI reports a failure (the fixture root holds no dll)"
         );
         let message = result.unwrap_err();
         assert_eq!(
