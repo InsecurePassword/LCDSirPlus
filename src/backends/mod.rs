@@ -716,6 +716,16 @@ type ProbeCandidates = fn(BackendKind) -> bool;
 
 fn open_physical(kind: BackendKind, friendly_name: &str) -> Result<PhysicalDevice, LossError> {
     if sdk::circuit_open() {
+        // F-REC-1 (WO-U45A-REC-RECOVERY): the ladder pass is the recovery
+        // tick clock - one tick per pass, so fresh-open attempts can never
+        // run faster than the configured reconnect cadence. The resolver
+        // authorizes at most one fresh open per episode window and the first
+        // successful call through the fresh owner closes the circuit; a
+        // refusal publishes the byte-identical circuit-open row, so the
+        // 11/18 ladder shape is unchanged.
+        if let Some(device) = sdk::try_circuit_recovery(friendly_name) {
+            return Ok(PhysicalDevice::Sdk(device));
+        }
         return Err(LossError::new(
             LossCause::CircuitOpen,
             "physical backend circuit is open after an unreturning SDK owner".into(),
@@ -2772,5 +2782,203 @@ mod tests {
             health, 2,
             "a healthy established worker must keep reporting completed I/O progress"
         );
+    }
+
+    #[test]
+    fn the_circuit_open_ladder_keeps_its_row_shape_and_never_terminalizes() {
+        // F-REC-1 evidence shape (the 11/18 natural incident): every ladder
+        // pass publishes the circuit-open disconnect row, and CircuitOpen is
+        // not DeviceAbsent, so the ladder never enters the Absent terminal.
+        // The WO-U45A resolver tick rides this same ladder, so the recovery
+        // window stays live at the capped cadence and the row shape the
+        // incident recorded is byte-pinned here.
+        static CIRCUIT_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+        fn open_circuit_open(
+            _kind: BackendKind,
+            _friendly_name: &str,
+        ) -> Result<PhysicalDevice, LossError> {
+            CIRCUIT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            Err(LossError::new(
+                LossCause::CircuitOpen,
+                "physical backend circuit is open after an unreturning SDK owner".into(),
+            ))
+        }
+        let base = Duration::from_millis(1);
+        CIRCUIT_ATTEMPTS.store(0, Ordering::SeqCst);
+        let (commands, wake) = command_queue();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_commands = Arc::clone(&commands);
+        let thread = std::thread::spawn(move || {
+            physical_worker(
+                BackendKind::Auto,
+                &worker_commands,
+                &wake,
+                &tx,
+                base,
+                base * 16,
+                base,
+                base,
+                "normal".into(),
+                false,
+                String::new(),
+                open_circuit_open,
+                probe_never,
+            )
+        });
+        let rows = 8usize;
+        let budget = Instant::now() + Duration::from_secs(10);
+        for row in 0..rows {
+            let left = budget.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "the circuit-open rows stopped at {row}");
+            match rx
+                .recv_timeout(left)
+                .expect("a circuit-open row per ladder pass")
+            {
+                Message::State(BackendState::Disconnected { cause, reason }) => {
+                    assert_eq!(cause, LossCause::CircuitOpen, "row {row}");
+                    assert_eq!(
+                        reason,
+                        "circuit-open: physical backend circuit is open after an unreturning SDK owner",
+                        "row {row} is byte-identical to the 11/18 ladder rows"
+                    );
+                }
+                Message::State(BackendState::Absent { reason }) => {
+                    panic!("row {row}: the circuit-open ladder terminalized: {reason}")
+                }
+                _ => panic!("row {row}: expected the circuit-open disconnect publication"),
+            }
+        }
+        // Bounded settle window (500 ms): the circuit-open ladder publishes
+        // rows at the capped cadence FOREVER by design - exactly the 11/18
+        // shape - so an unbounded drain never closes. Assert: no Absent
+        // publication (CircuitOpen passes never accumulate the
+        // zero-candidate count), and the rows keep coming.
+        let drain_deadline = Instant::now() + Duration::from_millis(500);
+        let mut extra_absent = 0usize;
+        let mut extra_rows = 0usize;
+        loop {
+            let left = drain_deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(left) {
+                Ok(Message::State(BackendState::Absent { .. })) => extra_absent += 1,
+                Ok(Message::State(BackendState::Disconnected { .. })) => extra_rows += 1,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            extra_absent, 0,
+            "the circuit-open ladder never terminalizes"
+        );
+        assert!(
+            extra_rows > 0,
+            "the ladder keeps publishing rows at the capped cadence (the 11/18 window)"
+        );
+        assert!(
+            CIRCUIT_ATTEMPTS.load(Ordering::SeqCst) >= rows,
+            "opens keep running on the ladder, so the recovery window stays live"
+        );
+        commands.shutdown();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn the_worker_publishes_connected_and_health_when_a_circuit_open_episode_reopens() {
+        // The WO-U45A hunk in `open_physical` returns `Ok` on a fresh
+        // session from a ladder pass that began with the refusal shape. The
+        // recovery publish is the worker's EXISTING machinery: `Connected`,
+        // then `PhysicalHealthy` (consumed at app.rs by recovery.healthy,
+        // which clears the loss labels on real health only). No new message,
+        // state, log label or journal vocabulary exists on this path.
+        static REOPEN_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn open_refuse_then_reopen(
+            _kind: BackendKind,
+            _friendly_name: &str,
+        ) -> Result<PhysicalDevice, LossError> {
+            if REOPEN_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(LossError::new(
+                    LossCause::CircuitOpen,
+                    "physical backend circuit is open after an unreturning SDK owner".into(),
+                ));
+            }
+            Ok(PhysicalDevice::Scripted(ScriptedDevice {
+                scenario: "scripted-circuit-reopen",
+                session: 1,
+            }))
+        }
+        let base = Duration::from_millis(1);
+        REOPEN_CALLS.store(0, Ordering::SeqCst);
+        let (commands, wake) = command_queue();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_commands = Arc::clone(&commands);
+        let thread = std::thread::spawn(move || {
+            physical_worker(
+                BackendKind::Hid,
+                &worker_commands,
+                &wake,
+                &tx,
+                base,
+                base,
+                base,
+                base,
+                "normal".into(),
+                false,
+                String::new(),
+                open_refuse_then_reopen,
+                probe_never,
+            )
+        });
+        let budget = Instant::now() + Duration::from_secs(10);
+        let remaining = || budget.saturating_duration_since(Instant::now());
+        // (1) The refusal publishes the circuit-open row (unchanged shape).
+        loop {
+            let left = remaining();
+            assert!(
+                !left.is_zero(),
+                "the circuit-open refusal row never arrived"
+            );
+            if let Ok(Message::State(BackendState::Disconnected { cause, reason })) =
+                rx.recv_timeout(left)
+            {
+                assert_eq!(cause, LossCause::CircuitOpen);
+                assert!(reason.starts_with("circuit-open: "), "{reason}");
+                break;
+            }
+        }
+        // (2) The reopen publishes Connected: the existing recovery surface.
+        let mut connected = false;
+        while !connected {
+            let left = remaining();
+            assert!(
+                !left.is_zero(),
+                "the reopened session never published Connected"
+            );
+            if let Ok(Message::State(BackendState::Connected { kind })) = rx.recv_timeout(left) {
+                assert_eq!(
+                    kind,
+                    BackendKind::Hid,
+                    "the scripted fresh session reports its kind"
+                );
+                connected = true;
+            }
+        }
+        // (3) Real health rides the existing cadence: a frame submit makes
+        // the session write; the completed poll reports the health message.
+        commands.submit(&pixels(3));
+        let mut health = 0usize;
+        while health < 1 {
+            let left = remaining();
+            assert!(
+                !left.is_zero(),
+                "the reopened session published no health message"
+            );
+            if let Ok(Message::PhysicalHealthy(_)) = rx.recv_timeout(left) {
+                health += 1;
+            }
+        }
+        commands.shutdown();
+        thread.join().unwrap();
     }
 }

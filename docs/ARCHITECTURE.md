@@ -63,6 +63,23 @@ The SDK DLL is loaded from the signed canonical LCore installation after path,
 file identity, AMD64 image, export, version, company, product, signer, and
 certificate checks. The loaded module must still match the checked file.
 
+A non-returning native call quarantines the SDK owner and opens the backend
+circuit, and opens are refused while the episode is unresolved (a trust-pipeline
+failure that blocks the DLL stays permanently refused). Since 2026-11-18
+(WO-U45A-REC-RECOVERY) every circuit-open refusal pass on the reconnect ladder
+is also a recovery tick: the ladder observes device presence via the existing
+LCore identity discovery and LCore aliveness via the existing bounded read-only
+probe, and after three consecutive present-and-responsive ticks it authorizes
+exactly one fresh open through the same trusted open path, with one attempt per
+authorization and an attempt gap that grows exponentially, bounded, on the
+ladder's own clock. The quarantined owner thread stays detached (its call is
+unreturnable), at most one may be in flight per episode, and if it ever returns
+it self-retires. The first successful send or poll through the fresh owner
+closes the circuit, emits one recovery audit line, and the worker's existing
+Connected and completed-work health publications carry the recovery to the
+app, which clears the loss labels on real health only. LCore is never
+terminated on this path, and the ladder's row shape and cadence are unchanged.
+
 Direct HID requires both exact `LCore.exe` and
 `logi_lamparray_service.AMD64.exe` to be absent and fails closed if process
 enumeration fails. Both names are checked before open, after open, and before

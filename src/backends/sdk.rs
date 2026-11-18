@@ -14,6 +14,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -72,6 +73,162 @@ const EXPORTS: [&str; 6] = [
 static CIRCUIT_OPEN: AtomicBool = AtomicBool::new(false);
 static SDK_OWNER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RECOVERY_BLOCKED: AtomicBool = AtomicBool::new(false);
+/// F-REC-1 (WO-U45A-REC-RECOVERY): the episode marker for an owner
+/// quarantined by a non-returning native call (the 11/18 livelock class).
+/// Trust-pipeline circuit openings set `RECOVERY_BLOCKED` beside the flag,
+/// never this, so the resolver only ever resolves the quarantine class.
+static OWNER_QUARANTINED: AtomicBool = AtomicBool::new(false);
+/// Fresh-owner recovery state machine, ticked once per ladder pass by
+/// `try_circuit_recovery` (one tick per pass, so no action is ever faster
+/// than the configured reconnect cadence).
+static CIRCUIT_RECOVERY: Mutex<CircuitRecovery> = Mutex::new(CircuitRecovery {
+    responsive_ticks: 0,
+    attempts: 0,
+    in_flight: 0,
+    detached: 0,
+});
+
+/// Consecutive device-present + LCore-responsive ticks required before the
+/// first fresh-open attempt (N=3, config-free).
+const RECOVERY_PROBE_TICKS: usize = 3;
+/// Cap of the exponential attempt gap, in consecutive ticks: 16 × N, so a
+/// permanently failing resolver stops attempting after 48 ladder passes
+/// between attempts at any cadence.
+const RECOVERY_ATTEMPT_GAP_CAP_TICKS: usize = 48;
+
+/// The one recovery audit line. The journal's event vocabulary
+/// (`application-*`, `logitech-*`, `finished`) is untouched; the line rides
+/// the existing `loss-cause=` detail convention (RC-1) with the
+/// `circuit-open` label, mirroring the RC-3 label rule.
+pub const CIRCUIT_RECOVERY_AUDIT: &str = "Logitech SDK circuit closed: the fresh owner completed a call after the unreturning-owner episode; loss-cause=circuit-open";
+
+#[derive(Default)]
+struct CircuitRecovery {
+    /// Consecutive ticks that saw the device present AND LCore responsive.
+    responsive_ticks: usize,
+    /// Fresh-open attempts spent in this episode.
+    attempts: usize,
+    /// The recovery window: at most ONE quarantined owner (slot exclusivity,
+    /// WO-U45A-FIX binding amendment). `quarantined` registers the slot, it
+    /// never stacks, so a second poisoning of the fresh owner cannot lock the
+    /// window the way the F-1 counter increment did.
+    in_flight: usize,
+    /// Owner threads the resolver displaced out of the slot (their calls are
+    /// unreturnable, so they are detached). Tracked separately from the
+    /// window: they never gate authorization, and a thread that ever returns
+    /// self-retires out of this census, restoring headroom.
+    detached: usize,
+}
+
+impl CircuitRecovery {
+    /// One owner quarantined by a timed-out native call. Slot exclusivity:
+    /// the window registers the ONE quarantined owner, so a repeat
+    /// quarantine - the fresh owner's own call timing out - keeps the window
+    /// live (F-1 repair) instead of stacking a permanent block.
+    fn quarantined(&mut self) {
+        self.in_flight = 1;
+        self.responsive_ticks = 0;
+    }
+
+    /// The resolver took the slot away from a live owner: that thread is
+    /// displaced/detached, counted apart from the window.
+    fn displaced(&mut self) {
+        self.detached += 1;
+    }
+
+    /// A thread that had no window slot to release returned cleanly (the
+    /// self-retire tail): it leaves the detached census, restoring headroom.
+    /// The window owner's return goes through the `in_flight` arm.
+    fn retired(&mut self) {
+        if self.in_flight == 1 {
+            self.in_flight = 0;
+        } else {
+            self.detached = self.detached.saturating_sub(1);
+        }
+    }
+
+    /// The episode is over: the shape resets to the shipped baseline.
+    fn recovered(&mut self) {
+        *self = Self::default();
+    }
+
+    /// One ladder tick. Returns true only on the tick that authorizes the
+    /// one fresh-open attempt: the streak must be unbroken (`device-present`
+    /// and responsive every tick; any miss restarts it), at most one
+    /// quarantined owner may be in flight (cap = 1), and the gap between
+    /// attempts grows exponentially, bounded, in ladder ticks - the
+    /// `telemetry::backoff_interval` shape on the ladder's own clock.
+    fn tick(&mut self, present: bool, responsive: bool) -> bool {
+        if !present || !responsive {
+            self.responsive_ticks = 0;
+            return false;
+        }
+        self.responsive_ticks += 1;
+        if self.in_flight != 1 {
+            return false;
+        }
+        let gap =
+            (RECOVERY_PROBE_TICKS << self.attempts.min(15)).min(RECOVERY_ATTEMPT_GAP_CAP_TICKS);
+        if self.responsive_ticks < gap {
+            return false;
+        }
+        self.attempts += 1;
+        self.responsive_ticks = 0;
+        true
+    }
+}
+
+/// Quarantine bookkeeping beside the circuit flag: the episode marker plus
+/// the in-flight count, registered at most once per abandoned session so a
+/// drain of timed-out calls on one owner counts one owner, not many.
+fn owner_quarantined(abandoned: &AtomicBool) {
+    OWNER_QUARANTINED.store(true, Ordering::Release);
+    if !abandoned.swap(true, Ordering::AcqRel) {
+        CIRCUIT_RECOVERY.lock().unwrap().quarantined();
+    }
+}
+
+/// A completed native call is device health: the first one through an open
+/// circuit closes the circuit, resets the episode, and writes the one
+/// recovery audit line. Steady health on a closed circuit is silent.
+fn circuit_closed_on_health() {
+    if CIRCUIT_OPEN.swap(false, Ordering::AcqRel) {
+        OWNER_QUARANTINED.store(false, Ordering::Release);
+        CIRCUIT_RECOVERY.lock().unwrap().recovered();
+        crate::log_info!("{CIRCUIT_RECOVERY_AUDIT}");
+    }
+}
+
+/// The fresh-owner resolver for a quarantine episode (F-REC-1), called by
+/// the ladder's `open_physical` at the head of its circuit-open refusal, so
+/// the refusal row shape and the 1/min cadence stay verbatim. One tick per
+/// pass: presence via the existing LCore identity discovery, responsiveness
+/// via the existing RC-3 bounded read-only probe (LCore is never touched),
+/// then the machine's authorization. Returns Some only when a fresh owner
+/// session opened; its first successful call closes the circuit, and the
+/// worker's existing `Connected`/`PhysicalHealthy` publications are the
+/// recovery publish.
+pub fn try_circuit_recovery(friendly_name: &str) -> Option<SdkDevice> {
+    if !CIRCUIT_OPEN.load(Ordering::Acquire)
+        || !OWNER_QUARANTINED.load(Ordering::Acquire)
+        || recovery_blocked()
+    {
+        return None;
+    }
+    let owner = match lcore() {
+        Ok(Some(owner)) => owner,
+        _ => {
+            CIRCUIT_RECOVERY.lock().unwrap().tick(false, false);
+            return None;
+        }
+    };
+    let responsive = classify_lcore(true, probe_aliveness(&mut NativeAliveness, owner.pid))
+        == LcoreClass::Responsive;
+    if !CIRCUIT_RECOVERY.lock().unwrap().tick(true, responsive) {
+        return None;
+    }
+    open_session(&owner, friendly_name, true).ok()
+}
 
 pub fn circuit_open() -> bool {
     CIRCUIT_OPEN.load(Ordering::Acquire)
@@ -1278,6 +1435,11 @@ pub struct SdkDevice {
     /// keeps its buffer inside the envelope (quarantine rule intact); the next
     /// send starts from a fresh Vec (cold path).
     payload: Mutex<Option<Vec<u8>>>,
+    /// F-REC-1: set once when this session's owner is abandoned by a
+    /// timed-out call (quarantine), consumed by the owner thread's
+    /// self-retire tail, so the in-flight count registers an owner exactly
+    /// once and releases it on return.
+    abandoned: Arc<AtomicBool>,
 }
 
 impl SdkDevice {
@@ -1289,76 +1451,118 @@ impl SdkDevice {
             ));
         }
         claim_sdk_owner()?;
-        let expected_owner = owner.clone();
-        let friendly_name = friendly_name.to_string();
-        let (requests, receiver) = mpsc::sync_channel(1);
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let spawn = std::thread::Builder::new()
-            .name("lcdsirplus-sdk-owner".into())
-            .spawn(move || unsafe {
-                let result = match lcore() {
-                    Ok(Some(current))
-                        if current.pid == expected_owner.pid
-                            && current.path == expected_owner.path =>
-                    {
-                        discover_pinned(&current)
-                            .inspect_err(|_| {
-                                RECOVERY_BLOCKED.store(true, Ordering::Release);
-                            })
-                            .map_err(|error| LossError::new(LossCause::ProbeFail, error))
-                    }
-                    Ok(_) => Err(LossError::new(
-                        LossCause::ProbeFail,
-                        "LCore.exe identity changed before SDK discovery".into(),
-                    )),
-                    Err(error) => Err(LossError::new(LossCause::ProbeFail, error)),
-                };
-                match result.and_then(|pinned| Native::load(pinned, &friendly_name)) {
-                    Ok(native) => {
-                        let _ = ready_tx.send(Ok(()));
-                        owner_loop(Box::new(native), receiver);
-                    }
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error));
-                    }
+        open_session(owner, friendly_name, false)
+    }
+}
+
+/// The open body behind the circuit gate and the owner claim.
+/// `quarantined_owner_allowed` is the fresh-open resolver path
+/// (F-REC-1): the claim slot is held by the episode's quarantined owner,
+/// so the resolver takes the slot directly (slot exclusivity: exactly one
+/// session owns it). The owner thread it displaces is unreturnable, so it is
+/// DETACHED and counted in the machine's detached census, never in the
+/// recovery window: the window keeps its ONE quarantined owner, so a
+/// poisoning of the fresh owner re-arms instead of locking (F-1, WO-U45A-FIX
+/// binding amendment). The trust pipeline, path-boundary, identity and
+/// LCore-identity checks inside are the existing open path, unchanged.
+fn open_session(
+    owner: &LCore,
+    friendly_name: &str,
+    quarantined_owner_allowed: bool,
+) -> Result<SdkDevice, LossError> {
+    if quarantined_owner_allowed && SDK_OWNER_ACTIVE.swap(true, Ordering::AcqRel) {
+        CIRCUIT_RECOVERY.lock().unwrap().displaced();
+    }
+    let expected_owner = owner.clone();
+    let friendly_name = friendly_name.to_string();
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let closure_abandoned = Arc::clone(&abandoned);
+    let (requests, receiver) = mpsc::sync_channel(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let spawn = std::thread::Builder::new()
+        .name("lcdsirplus-sdk-owner".into())
+        .spawn(move || unsafe {
+            let result = match lcore() {
+                Ok(Some(current))
+                    if current.pid == expected_owner.pid && current.path == expected_owner.path =>
+                {
+                    discover_pinned(&current)
+                        .inspect_err(|_| {
+                            RECOVERY_BLOCKED.store(true, Ordering::Release);
+                        })
+                        .map_err(|error| LossError::new(LossCause::ProbeFail, error))
                 }
-                SDK_OWNER_ACTIVE.store(false, Ordering::Release);
-            });
-        if let Err(error) = spawn {
-            SDK_OWNER_ACTIVE.store(false, Ordering::Release);
-            return Err(LossError::new(
-                LossCause::ProbeFail,
-                format!("spawn Logitech SDK owner: {error}"),
-            ));
-        }
-        match wait_ready(&ready_rx, CALL_TIMEOUT) {
-            Ok(()) => {
-                let device = Self {
-                    requests: Some(requests),
-                    payload: Mutex::new(None),
-                };
-                let deadline = Instant::now() + Duration::from_secs(5);
-                loop {
-                    match device.poll() {
-                        Ok((true, _)) => return Ok(device),
-                        Ok((false, _)) if Instant::now() < deadline => {
-                            std::thread::sleep(Duration::from_millis(750));
-                        }
-                        Ok((false, _)) => {
-                            return Err(LossError::new(
-                                LossCause::DeviceAbsent,
-                                "Logitech SDK monochrome LCD did not connect within 5 seconds"
-                                    .into(),
-                            ))
-                        }
-                        Err(error) => return Err(error),
-                    }
+                Ok(_) => Err(LossError::new(
+                    LossCause::ProbeFail,
+                    "LCore.exe identity changed before SDK discovery".into(),
+                )),
+                Err(error) => Err(LossError::new(LossCause::ProbeFail, error)),
+            };
+            match result.and_then(|pinned| Native::load(pinned, &friendly_name)) {
+                Ok(native) => {
+                    let _ = ready_tx.send(Ok(()));
+                    owner_loop(Box::new(native), receiver);
+                }
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
                 }
             }
-            Err(error) => Err(error),
+            // Self-retire cleanly (WO-U45A): a thread that ever returns
+            // self-retires before clearing the claim, and the machine routes
+            // it - the window owner releases the ONE in-flight slot, a thread
+            // with no slot to release leaves the detached census (F-1,
+            // WO-U45A-FIX binding amendment: self-retire restores headroom).
+            if closure_abandoned.swap(false, Ordering::AcqRel) {
+                CIRCUIT_RECOVERY.lock().unwrap().retired();
+            }
+            // F-5 (WO-U45A-FIX): this store also clears a claim the resolver's fresh session now holds, because a returning detached owner keeps no slot of its own - the flag is advisory (the single backend worker is the only opener), and the window/detached censuses above are the exact accounting.
+            SDK_OWNER_ACTIVE.store(false, Ordering::Release);
+        });
+    if let Err(error) = spawn {
+        SDK_OWNER_ACTIVE.store(false, Ordering::Release);
+        return Err(LossError::new(
+            LossCause::ProbeFail,
+            format!("spawn Logitech SDK owner: {error}"),
+        ));
+    }
+    match wait_ready(&ready_rx, CALL_TIMEOUT) {
+        Ok(()) => {
+            let device = SdkDevice {
+                requests: Some(requests),
+                payload: Mutex::new(None),
+                abandoned,
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match device.poll() {
+                    Ok((true, _)) => return Ok(device),
+                    Ok((false, _)) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(750));
+                    }
+                    Ok((false, _)) => {
+                        return Err(LossError::new(
+                            LossCause::DeviceAbsent,
+                            "Logitech SDK monochrome LCD did not connect within 5 seconds".into(),
+                        ))
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Err(error) => {
+            // The `wait_ready` timeout quarantines the owner thread that is
+            // still running the trusted init: register the episode beside
+            // its circuit store.
+            OWNER_QUARANTINED.store(true, Ordering::Release);
+            if !abandoned.swap(true, Ordering::AcqRel) {
+                CIRCUIT_RECOVERY.lock().unwrap().quarantined();
+            }
+            Err(error)
         }
     }
+}
 
+impl SdkDevice {
     fn call(&self, request: Request) -> Result<Reply, LossError> {
         self.call_timeout(request, CALL_TIMEOUT)
     }
@@ -1385,6 +1589,7 @@ impl SdkDevice {
                 }
                 Err(TrySendError::Full(_)) => {
                     CIRCUIT_OPEN.store(true, Ordering::Release);
+                    owner_quarantined(&self.abandoned);
                     return Err(LossError::new(
                         LossCause::CircuitOpen,
                         "Logitech SDK request dispatch timed out; circuit opened".into(),
@@ -1398,13 +1603,27 @@ impl SdkDevice {
                 }
             }
         }
-        reply_rx.recv_timeout(timeout).map_err(|_| {
-            CIRCUIT_OPEN.store(true, Ordering::Release);
-            LossError::new(
-                LossCause::CallTimeout,
-                "Logitech SDK native call timed out; owner quarantined and circuit opened".into(),
-            )
-        })
+        match reply_rx.recv_timeout(timeout) {
+            Ok(reply) => {
+                // A Unit/Poll completion is a native call that returned: the
+                // first one through an open circuit closes it (WO-U45A:
+                // "first successful send/poll through the fresh owner closes
+                // the circuit"). A semantic Error reply is not health.
+                if !matches!(reply, Reply::Error(_)) {
+                    circuit_closed_on_health();
+                }
+                Ok(reply)
+            }
+            Err(_) => {
+                CIRCUIT_OPEN.store(true, Ordering::Release);
+                owner_quarantined(&self.abandoned);
+                Err(LossError::new(
+                    LossCause::CallTimeout,
+                    "Logitech SDK native call timed out; owner quarantined and circuit opened"
+                        .into(),
+                ))
+            }
+        }
     }
 
     /// EC-2: take the session payload buffer for one send. The caller clears
@@ -1950,7 +2169,10 @@ mod tests {
 
     /// WO-QA-06 conversion of the Q-4 residue (WO-QA-04 R2 case H + the sibling sites
     /// `2015:9`/`2056:9`): `CIRCUIT_OPEN` and `SDK_OWNER_ACTIVE` are suite-global production
-    /// statics, and the three tests below are the ONLY test-region writers. libtest runs them
+    /// statics; the WO-QA-06 trio below was the complete test-region writer census, and
+    /// WO-U45A-REC-RECOVERY extended the circuit family (`OWNER_QUARANTINED`, `RECOVERY_BLOCKED`,
+    /// `CIRCUIT_RECOVERY`) - every WO-U45A scenario that writes it takes `circuit_scenario_guard()`
+    /// per this standing contract (R-1), so the trio's bodies stay byte-identical. libtest runs them
     /// on parallel threads, so a sibling's `store(false)` can land between production's
     /// `store(true)` (1381) and this family's `circuit_open()` reads - WO-QA-06 measured it
     /// live: 15% of 32-way-load windows, the registered site `1964:9` fired under load, 0% at
@@ -1997,6 +2219,7 @@ mod tests {
         let mut device = SdkDevice {
             requests: Some(requests),
             payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
         };
         let error = device
             .call_timeout(Request::Submit(vec![0; PIXELS]), Duration::from_millis(1))
@@ -2246,6 +2469,7 @@ mod tests {
         let mut device = SdkDevice {
             requests: Some(dev_tx),
             payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
         };
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -2289,6 +2513,7 @@ mod tests {
         let mut device = SdkDevice {
             requests: Some(tx),
             payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
         };
 
         // WO-QA-01 (F-1): arm the window on this test thread; the recording owner
@@ -2425,5 +2650,574 @@ mod tests {
         assert!(!lcore_name(
             &"LCore.exe ".encode_utf16().collect::<Vec<_>>()
         ));
+    }
+
+    // WO-U45A-REC-RECOVERY seams: the fresh-owner recovery machine is pure
+    // (driven ticks; no clock, no real discovery, no probe of a live LCore),
+    // and the guarded scenarios below take `circuit_scenario_guard()` per
+    // the R-1 standing contract because they write the circuit statics.
+
+    /// Scenario-normalizing reset of the circuit episode state. Guarded
+    /// callers only: it writes the circuit family.
+    fn circuit_episode_reset() {
+        CIRCUIT_OPEN.store(false, Ordering::Release);
+        OWNER_QUARANTINED.store(false, Ordering::Release);
+        RECOVERY_BLOCKED.store(false, Ordering::Release);
+        CIRCUIT_RECOVERY.lock().unwrap().recovered();
+    }
+
+    #[test]
+    fn fresh_open_authorizes_after_three_responsive_present_ticks_and_caps_at_one() {
+        // Design floor (1)+(2): N=3 consecutive device-present AND
+        // LCore-responsive ticks authorize ONE fresh-open attempt, and the
+        // quarantined-owner cap is 1: a second owner in flight closes the
+        // window until one self-retires.
+        let mut machine = CircuitRecovery::default();
+        machine.quarantined();
+        assert!(!machine.tick(true, true), "tick 1 of 3");
+        assert!(!machine.tick(true, true), "tick 2 of 3");
+        assert!(
+            machine.tick(true, true),
+            "the third consecutive tick authorizes the one fresh-open attempt"
+        );
+        // WO-U45A-FIX (audit F-1, binding amendment - per-in-flight
+        // invariant): the attempt's own owner times out and quarantines too.
+        // Slot exclusivity keeps the window at ONE quarantined owner (the
+        // displaced thread is counted in the detached census, never in the
+        // window), so the episode RE-ARMS: the grown gap (3 << 1 = 6) refuses
+        // five healthy ticks and the sixth authorizes attempt 2.
+        machine.quarantined();
+        assert_eq!(
+            machine.in_flight, 1,
+            "no overlap: a second quarantine never stacks the window"
+        );
+        for tick in 0..5 {
+            assert!(
+                !machine.tick(true, true),
+                "re-arm: pre-gap tick {tick} refuses, the gap is 3 << 1 = 6"
+            );
+        }
+        assert!(
+            machine.tick(true, true),
+            "a second poisoning re-arms the window: attempt 2 fires on the sixth healthy tick"
+        );
+        // From the reset streak, attempt 3 needs gap 12: eleven refuse,
+        // the twelfth authorizes.
+        for tick in 0..11 {
+            assert!(!machine.tick(true, true), "gap 12: tick {tick} refuses");
+        }
+        assert!(
+            machine.tick(true, true),
+            "the twelfth consecutive tick authorizes attempt 3"
+        );
+    }
+
+    #[test]
+    fn a_not_responsive_or_absent_tick_never_authorizes_and_clears_the_streak() {
+        // Design floor (1) arms: probe-not-responsive => NO attempt;
+        // device-absent => NO attempt. Both clear the streak, so the
+        // attempt window needs N=3 unbroken healthy ticks.
+        let mut machine = CircuitRecovery::default();
+        machine.quarantined();
+        assert!(!machine.tick(true, true));
+        assert!(
+            !machine.tick(true, false),
+            "an unresponsive probe tick never authorizes"
+        );
+        assert!(!machine.tick(true, true), "the streak restarted at 1");
+        assert!(
+            !machine.tick(false, true),
+            "a device-absent tick never authorizes"
+        );
+        assert!(!machine.tick(true, true));
+        assert!(!machine.tick(true, true));
+        assert!(
+            machine.tick(true, true),
+            "three unbroken ticks authorize after the misses"
+        );
+    }
+
+    #[test]
+    fn the_attempt_gap_is_exponential_bounded_and_never_faster_than_the_cadence() {
+        // Design floor (2): attempts follow the provider-outcome backoff
+        // shape (`telemetry::backoff_interval`: doubling, clamped, bounded)
+        // on the ladder's own tick clock, so the span between attempts is
+        // always >= N ladder passes >= the configured reconnect cadence.
+        let mut machine = CircuitRecovery::default();
+        machine.quarantined();
+        let mut previous = 0usize;
+        for attempt in 0..12usize {
+            let gap = (RECOVERY_PROBE_TICKS << attempt).min(RECOVERY_ATTEMPT_GAP_CAP_TICKS);
+            assert!(gap >= RECOVERY_PROBE_TICKS, "never faster than N ticks");
+            assert!(gap <= RECOVERY_ATTEMPT_GAP_CAP_TICKS, "bounded");
+            assert!(
+                gap > previous || gap == RECOVERY_ATTEMPT_GAP_CAP_TICKS,
+                "exponential, then flat at the cap"
+            );
+            previous = gap;
+            for tick in 0..(gap - 1) {
+                assert!(
+                    !machine.tick(true, true),
+                    "attempt {attempt}: pre-gap tick {tick} refuses"
+                );
+            }
+            assert!(
+                machine.tick(true, true),
+                "attempt {attempt}: the gap tick authorizes"
+            );
+        }
+    }
+
+    #[test]
+    fn recovered_resets_the_episode_to_the_shipped_shape() {
+        let mut machine = CircuitRecovery::default();
+        machine.quarantined();
+        machine.quarantined();
+        machine.tick(true, true);
+        machine.recovered();
+        assert_eq!(
+            (
+                machine.responsive_ticks,
+                machine.attempts,
+                machine.in_flight
+            ),
+            (0, 0, 0),
+            "a closed circuit starts the next episode from N=3, attempt 0"
+        );
+        machine.quarantined();
+        assert!(!machine.tick(true, true));
+        assert!(!machine.tick(true, true));
+        assert!(machine.tick(true, true));
+    }
+
+    #[test]
+    fn the_first_successful_call_on_an_open_circuit_closes_it_and_resets_the_episode() {
+        // Design floor (3): the first successful send/poll closes the
+        // circuit, clears the episode marker and resets the machine; steady
+        // health on a closed circuit stays silent (no second transition).
+        let _guard = circuit_scenario_guard();
+        circuit_episode_reset();
+        CIRCUIT_OPEN.store(true, Ordering::Release);
+        OWNER_QUARANTINED.store(true, Ordering::Release);
+        CIRCUIT_RECOVERY.lock().unwrap().quarantined();
+        let (requests, receiver) = mpsc::sync_channel(1);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let thread = std::thread::spawn(move || owner_loop(Box::new(Fake(calls)), receiver));
+        let device = SdkDevice {
+            requests: Some(requests),
+            payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(device.poll().is_ok(), "the scripted poll completes");
+        assert!(
+            !circuit_open(),
+            "the first successful poll closed the circuit"
+        );
+        assert!(
+            !OWNER_QUARANTINED.load(Ordering::Acquire),
+            "the episode marker cleared with the circuit"
+        );
+        {
+            let machine = CIRCUIT_RECOVERY.lock().unwrap();
+            assert_eq!(
+                (
+                    machine.responsive_ticks,
+                    machine.attempts,
+                    machine.in_flight
+                ),
+                (0, 0, 0),
+                "the recovery reset the machine to the shipped shape"
+            );
+        }
+        assert!(device.poll().is_ok());
+        assert!(
+            !circuit_open(),
+            "steady health never re-opens the transition"
+        );
+        drop(device);
+        thread.join().unwrap();
+        circuit_episode_reset();
+    }
+
+    #[test]
+    fn an_error_reply_is_not_health_and_keeps_the_circuit_open() {
+        // The send-path vs circuit-flag census (panel question): the send
+        // path is NOT flag-gated - a returning owner's call lands. Only a
+        // completion that is health (Unit/Poll/SubmitDone) closes the flag;
+        // a semantic error reply keeps the episode open.
+        let _guard = circuit_scenario_guard();
+        circuit_episode_reset();
+        CIRCUIT_OPEN.store(true, Ordering::Release);
+        let (requests, receiver) = mpsc::sync_channel(1);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let thread = std::thread::spawn(move || owner_loop(Box::new(Fake(calls)), receiver));
+        let mut device = SdkDevice {
+            requests: Some(requests),
+            payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
+        };
+        // Fake::execute answers an empty-payload Submit with Reply::Error.
+        let error = device
+            .submit(Vec::new())
+            .expect_err("the injected error rides back");
+        assert_eq!(error.cause, LossCause::TransferIncomplete { code: 0 });
+        assert!(
+            circuit_open(),
+            "a semantic error reply is not health: the circuit stays open"
+        );
+        device.close(true).expect("the scripted close completes");
+        assert!(
+            !circuit_open(),
+            "the first Unit completion through the same owner closes the circuit"
+        );
+        thread.join().unwrap();
+        circuit_episode_reset();
+    }
+
+    #[test]
+    fn a_full_dispatch_window_quarantines_once_and_the_returning_owner_self_retires() {
+        // WO-U45A floor (2): the in-flight count registers the abandoned
+        // owner exactly once (a second timed-out call on the same session
+        // adds zero), and the owner's self-retire tail releases the slot
+        // when its call returns - cap = 1 per episode, detached,
+        // retire-on-return.
+        let _guard = circuit_scenario_guard();
+        circuit_episode_reset();
+        let (requests, receiver) = mpsc::sync_channel(1);
+        // A gated, non-returning Submit enters the owner (announced), a
+        // second Poll fills the single slot behind it, so the next dispatch
+        // sees a Full channel; the 1 ms bound fires the dispatch-window
+        // quarantine site without any 3 s wall term.
+        let (stall_reply_a, _stall_receive_a) = mpsc::sync_channel(1);
+        let (stall_reply_b, _stall_receive_b) = mpsc::sync_channel(1);
+        let (running_tx, running_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        requests
+            .try_send(Envelope {
+                request: Request::Submit(vec![0; PIXELS]),
+                reply: stall_reply_a,
+            })
+            .expect("the channel starts empty");
+        let thread = std::thread::spawn(move || {
+            owner_loop(
+                Box::new(Unreturning {
+                    inner: Slow,
+                    running: running_tx,
+                    release: release_rx,
+                }),
+                receiver,
+            )
+        });
+        running_rx
+            .recv_timeout(DRIVEN_HANDSHAKE_BUDGET)
+            .expect("the gated owner dequeued the Submit and announced itself");
+        requests
+            .try_send(Envelope {
+                request: Request::Poll,
+                reply: stall_reply_b,
+            })
+            .expect("the single slot fills behind the gated owner");
+        let mut device = SdkDevice {
+            requests: Some(requests),
+            payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
+        };
+        let error = device
+            .call_timeout(Request::Poll, Duration::from_millis(1))
+            .err()
+            .unwrap();
+        assert_eq!(error.cause, LossCause::CircuitOpen, "{error}");
+        assert!(
+            error.detail.contains("request dispatch timed out"),
+            "{error}"
+        );
+        assert!(
+            circuit_open() && OWNER_QUARANTINED.load(Ordering::Acquire),
+            "the full dispatch window quarantines the owner and opens the circuit"
+        );
+        // A second timed-out call on the same session must not count twice.
+        let _ = device.call_timeout(Request::Poll, Duration::from_millis(1));
+        assert_eq!(
+            CIRCUIT_RECOVERY.lock().unwrap().in_flight,
+            1,
+            "cap: exactly one in-flight quarantined owner per abandoned session"
+        );
+        // The owner returns: release the gate, close through the drained
+        // slot; the Unit close closes the circuit and the self-retire tail
+        // releases the in-flight slot.
+        release_tx
+            .try_send(())
+            .expect("the gated owner accepted the release");
+        device
+            .close(true)
+            .expect("the drained owner answers the close");
+        assert!(
+            !circuit_open(),
+            "the first successful call through the returning owner closed the circuit"
+        );
+        thread.join().unwrap();
+        assert_eq!(
+            CIRCUIT_RECOVERY.lock().unwrap().in_flight,
+            0,
+            "the quarantined owner self-retired cleanly"
+        );
+        circuit_episode_reset();
+    }
+
+    #[test]
+    fn the_resolver_refuses_every_arm_outside_the_quarantine_episode() {
+        // Design floor (4): the circuit-open refusal of opens stays while
+        // the episode is unresolved - the resolver is the only way through
+        // the gate, and every refused arm returns BEFORE any real
+        // discovery/probe, so tests never touch the live LCore.
+        let _guard = circuit_scenario_guard();
+        circuit_episode_reset();
+        assert!(
+            try_circuit_recovery("fixture").is_none(),
+            "circuit closed: no episode"
+        );
+        CIRCUIT_OPEN.store(true, Ordering::Release);
+        assert!(
+            try_circuit_recovery("fixture").is_none(),
+            "circuit open without an owner quarantine (trust/identity class): the refusal stays"
+        );
+        OWNER_QUARANTINED.store(true, Ordering::Release);
+        RECOVERY_BLOCKED.store(true, Ordering::Release);
+        assert!(
+            try_circuit_recovery("fixture").is_none(),
+            "a trust-blocked episode never fresh-opens"
+        );
+        RECOVERY_BLOCKED.store(false, Ordering::Release);
+        OWNER_QUARANTINED.store(false, Ordering::Release);
+        // Normal opens stay refused while the circuit is open.
+        let owner = LCore {
+            path: PathBuf::from(r"C:\fixture\Logitech Gaming Software\LCore.exe"),
+            pid: 0,
+        };
+        assert_eq!(
+            SdkDevice::open(&owner, "fixture").err().unwrap().cause,
+            LossCause::CircuitOpen
+        );
+        let machine = CIRCUIT_RECOVERY.lock().unwrap();
+        assert_eq!(
+            (
+                machine.responsive_ticks,
+                machine.attempts,
+                machine.in_flight
+            ),
+            (0, 0, 0),
+            "the refused arms recorded no ticks and consumed no attempts"
+        );
+        drop(machine);
+        circuit_episode_reset();
+    }
+
+    #[test]
+    fn the_recovery_audit_line_is_one_emit_and_names_no_journal_event() {
+        // Design floor (3)+(5): ONE recovery audit line; the journal event
+        // vocabulary is untouched (labels ride the detail, the RC-3 rule),
+        // and the line carries the existing `loss-cause=` detail convention.
+        // The needle is assembled at runtime so this test's own text can
+        // never match the census.
+        let source = include_str!("./sdk.rs");
+        let needle = ["log_info!(\"", "{CIRCUIT_RECOVERY_AUDIT}", "\")"].concat();
+        assert_eq!(
+            source.matches(needle.as_str()).count(),
+            1,
+            "exactly one recovery audit emit site in the file"
+        );
+        for event in [
+            "healthy",
+            "finished",
+            "disconnected",
+            "logitech-attempt",
+            "logitech-result",
+            "logitech-wait-timeout",
+            "application-attempt",
+            "application-launched",
+            "application-resumed",
+        ] {
+            assert!(
+                !CIRCUIT_RECOVERY_AUDIT.contains(event),
+                "the audit line names no journal event: {event}"
+            );
+        }
+        assert!(
+            CIRCUIT_RECOVERY_AUDIT.contains("loss-cause=circuit-open"),
+            "the audit rides the existing loss-cause detail convention"
+        );
+    }
+
+    // WO-U45A-FIX (audit F-1, binding amendment) regression set: the
+    // per-in-flight safety invariant - at most ONE quarantined owner in the
+    // recovery window, displaced/detached owner threads counted apart, and
+    // attempts bounded by the existing 3 << attempts / 48-tick backoff.
+
+    #[test]
+    fn a_second_unreturning_quarantine_rearms_the_resolver() {
+        // (a) Re-arming after a SECOND poisoning, on per-in-flight
+        // authorization (not any lifetime count): two unreturning owners keep
+        // the window at one owner, so the N=3 trigger fires, and a third
+        // poisoning re-arms again on the grown gap.
+        let mut machine = CircuitRecovery::default();
+        machine.quarantined();
+        machine.quarantined();
+        assert_eq!(
+            machine.in_flight, 1,
+            "authorization reads the window, and the window holds one owner"
+        );
+        assert!(!machine.tick(true, true), "tick 1 of 3");
+        assert!(!machine.tick(true, true), "tick 2 of 3");
+        assert!(
+            machine.tick(true, true),
+            "two poisonings, one window: the third healthy tick authorizes the fresh open"
+        );
+        machine.quarantined();
+        for tick in 0..5 {
+            assert!(
+                !machine.tick(true, true),
+                "third poisoning: pre-gap tick {tick} refuses, the gap is 3 << 1 = 6"
+            );
+        }
+        assert!(
+            machine.tick(true, true),
+            "a third poisoning re-arms too: attempt 2 fires on the gap tick"
+        );
+        assert_eq!(machine.in_flight, 1, "never an overlap, at any poisoning");
+    }
+
+    #[test]
+    fn repeated_healthy_ticks_rearm_at_the_grown_gap_and_never_before() {
+        // (b) Repeated healthy-tick semantics: every authorization resets the
+        // streak, so the next attempt waits the FULL grown gap (3 << attempts,
+        // capped at 48 ticks) - no premature attempt, and that bounded shape
+        // is what keeps a single episode's attempts bounded. Detached owners
+        // are census-only: they never gate a tick.
+        let mut machine = CircuitRecovery::default();
+        machine.quarantined();
+        machine.displaced();
+        machine.displaced();
+        for attempt in 0..6usize {
+            let gap = (RECOVERY_PROBE_TICKS << attempt).min(RECOVERY_ATTEMPT_GAP_CAP_TICKS);
+            for tick in 0..(gap - 1) {
+                assert!(
+                    !machine.tick(true, true),
+                    "attempt {attempt}: pre-gap healthy tick {tick} of {gap} refuses"
+                );
+            }
+            assert!(
+                machine.tick(true, true),
+                "attempt {attempt}: the {gap}th consecutive healthy tick authorizes"
+            );
+        }
+        assert_eq!(machine.attempts, 6, "exactly one attempt per gap");
+        assert_eq!(
+            machine.in_flight, 1,
+            "the window stayed one owner across all six gaps"
+        );
+        assert_eq!(
+            machine.detached, 2,
+            "detached owners never gate authorization, so the gaps ran"
+        );
+    }
+
+    #[test]
+    fn a_second_overlapping_quarantine_can_never_stack_the_window() {
+        // (c) In-flight cap enforcement (safety property 1): the window
+        // registers the ONE quarantined owner, so an overlapping quarantine
+        // is structurally impossible; displaced owners live in a separate
+        // census, and a self-retire routes to the census that holds the slot.
+        let mut machine = CircuitRecovery::default();
+        for round in 0..8 {
+            machine.quarantined();
+            assert_eq!(
+                machine.in_flight, 1,
+                "round {round}: a repeat quarantine never stacks the window"
+            );
+        }
+        machine.displaced();
+        machine.displaced();
+        assert_eq!(
+            (machine.in_flight, machine.detached),
+            (1, 2),
+            "displaced threads are tracked apart from the window"
+        );
+        machine.retired();
+        assert_eq!(
+            (machine.in_flight, machine.detached),
+            (0, 2),
+            "the window owner's self-retire releases the slot (headroom restored)"
+        );
+        machine.retired();
+        assert_eq!(
+            (machine.in_flight, machine.detached),
+            (0, 1),
+            "a thread with no slot retires out of the detached census, not the window"
+        );
+        assert!(
+            !machine.tick(true, true),
+            "an empty window is no episode: the resolver authorizes nothing"
+        );
+    }
+
+    #[test]
+    fn the_closed_episode_closes_cleanly_and_the_next_episode_is_rearmable() {
+        // (d) End-to-end recovery behavior: the first successful call through
+        // a healthy owner closes the circuit, clears the episode marker and
+        // resets BOTH censuses, on the single audit line; the next quarantine
+        // re-arms from the shipped shape, so recovery is not a one-shot.
+        let _guard = circuit_scenario_guard();
+        circuit_episode_reset();
+        CIRCUIT_OPEN.store(true, Ordering::Release);
+        OWNER_QUARANTINED.store(true, Ordering::Release);
+        {
+            let mut machine = CIRCUIT_RECOVERY.lock().unwrap();
+            machine.quarantined();
+            machine.displaced();
+        }
+        let (requests, receiver) = mpsc::sync_channel(1);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let thread = std::thread::spawn(move || owner_loop(Box::new(Fake(calls)), receiver));
+        let device = SdkDevice {
+            requests: Some(requests),
+            payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
+        };
+        device.poll().expect("the scripted poll completes");
+        assert!(!circuit_open(), "the first success closed the circuit");
+        assert!(
+            !OWNER_QUARANTINED.load(Ordering::Acquire),
+            "the episode marker cleared with the circuit"
+        );
+        {
+            let machine = CIRCUIT_RECOVERY.lock().unwrap();
+            assert_eq!(
+                (
+                    machine.responsive_ticks,
+                    machine.attempts,
+                    machine.in_flight,
+                    machine.detached
+                ),
+                (0, 0, 0, 0),
+                "the closed episode resets the window AND the detached census"
+            );
+        }
+        let needle = ["log_info!(\"", "{CIRCUIT_RECOVERY_AUDIT}", "\")"].concat();
+        assert_eq!(
+            include_str!("./sdk.rs").matches(needle.as_str()).count(),
+            1,
+            "the recovery audit stays exactly one emit site"
+        );
+        let mut machine = CircuitRecovery::default();
+        machine.quarantined();
+        assert!(!machine.tick(true, true), "next episode: tick 1 of 3");
+        assert!(!machine.tick(true, true), "next episode: tick 2 of 3");
+        assert!(
+            machine.tick(true, true),
+            "the next episode is re-armable at the shipped N=3 cadence"
+        );
+        drop(device);
+        thread.join().unwrap();
+        circuit_episode_reset();
     }
 }
