@@ -1,1 +1,2 @@
-* text=auto eol=lf
+*.rs text eol=lf
+*.diff text eol=lf
