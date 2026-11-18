@@ -418,6 +418,9 @@ extern "system" fn lcsd_stub_error(_out: *mut u8, _out_cap: u32) -> i32 {
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::FreeLibrary;
+use windows::Win32::System::Diagnostics::Debug::{
+    SetErrorMode, SEM_FAILCRITICALERRORS, THREAD_ERROR_MODE,
+};
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
@@ -525,6 +528,26 @@ fn validate_table(raw: *const c_void) -> Option<&'static LcsdV1> {
     unsafe { Some(&*(raw as *const LcsdV1)) }
 }
 
+/// The OS hard-error mode, saved and restored around one component load. `Drop` runs on every
+/// exit path, so a classified failure never leaves the mode raised. The mode is process-wide; the
+/// only production load site is the single Discord worker thread (`spawn_worker`, whose loop owns
+/// the `loader` call), so no two component loads are in flight inside the running app.
+struct SilentComponentLoadErrors(THREAD_ERROR_MODE);
+
+impl SilentComponentLoadErrors {
+    fn new() -> Self {
+        Self(unsafe { SetErrorMode(SEM_FAILCRITICALERRORS) })
+    }
+}
+
+impl Drop for SilentComponentLoadErrors {
+    fn drop(&mut self) {
+        unsafe {
+            SetErrorMode(self.0);
+        }
+    }
+}
+
 /// Load + handshake. Split from the path resolution so a test can drive every failure arm with a
 /// path that does not depend on the deployment layout.
 pub fn load_table_from(
@@ -532,12 +555,16 @@ pub fn load_table_from(
     diagnostic: &mut [u8; LOADER_DIAGNOSTIC_CAPACITY],
 ) -> Result<Module, LoadFault> {
     let wide_path = wide(path.as_os_str());
-    let library = unsafe {
-        LoadLibraryExW(
-            PCWSTR(wide_path.as_ptr()),
-            None,
-            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
-        )
+    // component loads are demand-driven against a user-installable file: classify failures silently; SEM_FAILCRITICALERRORS prevents the OS Bad-Image modal dialog (INCIDENT-002)
+    let library = {
+        let _silent = SilentComponentLoadErrors::new();
+        unsafe {
+            LoadLibraryExW(
+                PCWSTR(wide_path.as_ptr()),
+                None,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        }
     }
     .map_err(|error| {
         // The Win32 codes distinguish "not found" from an unreadable/rejected image; both are
