@@ -12,7 +12,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -71,7 +71,24 @@ const EXPORTS: [&str; 6] = [
     "LogiLcdShutdown",
 ];
 static CIRCUIT_OPEN: AtomicBool = AtomicBool::new(false);
-static SDK_OWNER_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// F-REC-3 (WO-U46A P1): the active-owner claim is a GENERATION slot, not a
+/// boolean. `NO_OWNER` (0) means unclaimed; any other value is the generation
+/// of the ONE authorized owner thread. Every claim transition is an identity
+/// operation: a claim takes the slot for a fresh generation, the resolver's
+/// swap takes it for the recovery generation (and registers the generation it
+/// displaced), and the only writer that clears it is the identity-gated
+/// `release_sdk_owner`, whose compare-exchange can never drop a newer owner's
+/// claim. This replaces the frozen tree's unconditional tail clear
+/// (`src/backends/sdk.rs:1519` on 42132a7, red-proven by
+/// `a_stale_return_never_clears_the_active_owner_claim`).
+static SDK_OWNER_ACTIVE: AtomicU64 = AtomicU64::new(NO_OWNER);
+/// Monotonic owner-generation allocator. `next_owner_generation` is its only
+/// writer; generations are never recycled (u64, and the app lives far shorter
+/// than 2^64 owner sessions), so an identity registered today can never
+/// collide with a future owner's.
+static SDK_OWNER_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// The empty identity: no claim, no window registration, no census entry.
+const NO_OWNER: u64 = 0;
 static RECOVERY_BLOCKED: AtomicBool = AtomicBool::new(false);
 /// F-REC-1 (WO-U45A-REC-RECOVERY): the episode marker for an owner
 /// quarantined by a non-returning native call (the 11/18 livelock class).
@@ -85,7 +102,10 @@ static CIRCUIT_RECOVERY: Mutex<CircuitRecovery> = Mutex::new(CircuitRecovery {
     responsive_ticks: 0,
     attempts: 0,
     in_flight: 0,
+    window_generation: NO_OWNER,
     detached: 0,
+    detached_generations: Vec::new(),
+    bound_reported: false,
 });
 
 /// Consecutive device-present + LCore-responsive ticks required before the
@@ -95,12 +115,50 @@ const RECOVERY_PROBE_TICKS: usize = 3;
 /// permanently failing resolver stops attempting after 48 ladder passes
 /// between attempts at any cadence.
 const RECOVERY_ATTEMPT_GAP_CAP_TICKS: usize = 48;
+/// F-REC-2 (WO-U46A P2): the resource bound on simultaneously RETAINED
+/// detached owner threads. A detached owner is not free memory: it keeps its
+/// worker thread (a 1 MiB default stack reservation), its half of the
+/// `sync_channel` with the queued `Envelope` (a `PIXELS` = 6,880 B payload),
+/// its `PinnedSdk` file handles (`dll` + `_lcore` + the pinned parent chain,
+/// ~7 handles for the Logitech Gaming Software path), one reference on the
+/// loaded `LogitechLcd.dll` module, and the native call frame it is blocked in
+/// inside LCore (LCore keeps the `LogiLcdInit` session for it, so the thread
+/// and everything it references live until the call returns, i.e. the
+/// process's lifetime).
+///
+/// Budget: 8 retained owners add at most 8 threads to the 19-25-thread live
+/// shape (instance 66676: 19 threads, 390 handles, priv 45-46 MB; the recorded
+/// live shape band is 20-25 threads / 478 handles) = +~35% threads, 8 MiB of
+/// stack reservation = ~17% of the live private set, ~56 handles = +~12%, and
+/// ~56 KB of queued payloads. Reaching the bound takes at least 8 native
+/// timeouts, each gated by the `3 << attempts` / 48-tick backoff, so it marks
+/// a genuinely pathological device, not a transient: the 54984 incident class
+/// (unbounded accumulation, process live until reboot) is what the frozen
+/// saturating counter (`src/backends/sdk.rs:120`/`src/backends/sdk.rs:146` on
+/// 42132a7) allowed.
+///
+/// Below the bound recovery stays fully re-armable (the census releases as
+/// owners return). At the bound the resolver FAILS CLOSED: no fresh open is
+/// authorized, and exactly one `log_warn` records it (recorded, silent-to-
+/// desktop - the desktop notification path is app.rs's own). No thread is ever
+/// force-terminated and no memory a pending native call references is freed;
+/// LCore is never touched and the app never restarts.
+const DETACHED_OWNER_BOUND: usize = 8;
 
 /// The one recovery audit line. The journal's event vocabulary
 /// (`application-*`, `logitech-*`, `finished`) is untouched; the line rides
 /// the existing `loss-cause=` detail convention (RC-1) with the
 /// `circuit-open` label, mirroring the RC-3 label rule.
 pub const CIRCUIT_RECOVERY_AUDIT: &str = "Logitech SDK circuit closed: the fresh owner completed a call after the unreturning-owner episode; loss-cause=circuit-open";
+
+/// F-REC-2 (WO-U46A P2): the one-shot detached-owner bound diagnostic. It rides
+/// the existing `log_warn` channel (recorded in the log; the desktop
+/// notification path is app.rs's own, so this line is silent-to-desktop), keeps
+/// the `loss-cause=` detail convention (RC-1), and names no journal event
+/// vocabulary (the RC-3 label rule). The number in the text is the bound the
+/// resolver actually enforces (pinned by
+/// `the_detached_owner_bound_stops_authorizing_and_reports_once`).
+const DETACHED_OWNER_BOUND_AUDIT: &str = "Logitech SDK recovery suspended: 8 detached owner threads are retained at the resource bound, so no fresh owner is authorized until one returns; no thread is terminated; loss-cause=circuit-open";
 
 #[derive(Default)]
 struct CircuitRecovery {
@@ -109,45 +167,99 @@ struct CircuitRecovery {
     /// Fresh-open attempts spent in this episode.
     attempts: usize,
     /// The recovery window: at most ONE quarantined owner (slot exclusivity,
-    /// WO-U45A-FIX binding amendment). `quarantined` registers the slot, it
-    /// never stacks, so a second poisoning of the fresh owner cannot lock the
-    /// window the way the F-1 counter increment did.
+    /// WO-U45A-FIX binding amendment). `quarantine` registers the slot by
+    /// assignment, it never stacks, so a second poisoning of the fresh owner
+    /// cannot lock the window the way the F-1 counter increment did.
     in_flight: usize,
+    /// F-REC-3 (WO-U46A P1): the IDENTITY the window slot is registered to -
+    /// the generation of the owner whose native call is unreturning. A return
+    /// may release the window only when it carries this generation, so a
+    /// displaced owner returning late can never clear the live owner's window
+    /// (the frozen count-based `retired`, `src/backends/sdk.rs:142` on 42132a7,
+    /// did exactly that).
+    window_generation: u64,
     /// Owner threads the resolver displaced out of the slot (their calls are
     /// unreturnable, so they are detached). Tracked separately from the
-    /// window: they never gate authorization, and a thread that ever returns
-    /// self-retires out of this census, restoring headroom.
+    /// window: they never gate authorization below the bound, and a thread
+    /// that ever returns self-retires out of this census, restoring headroom.
+    /// F-REC-2 (WO-U46A P2): this census is also the resource bound
+    /// (`DETACHED_OWNER_BOUND`) - at the cap, authorization fails closed.
     detached: usize,
+    /// F-REC-3 (WO-U46A P1): the identity of each retained detached owner, so
+    /// a returning thread releases exactly its own entry (`swap_remove` on a
+    /// generation match) and never a newer owner's. Its length is the
+    /// `detached` census: the bound gates the only site that appends
+    /// (the resolver's displacement), so the census is bounded by
+    /// `DETACHED_OWNER_BOUND` structurally.
+    detached_generations: Vec<u64>,
+    /// F-REC-2: latch for the ONE-shot bound diagnostic; set when the census
+    /// reaches the bound, consumed by `take_bound_report`, cleared by
+    /// `recovered` so the next episode that reaches the bound reports again.
+    bound_reported: bool,
 }
 
 impl CircuitRecovery {
-    /// One owner quarantined by a timed-out native call. Slot exclusivity:
-    /// the window registers the ONE quarantined owner, so a repeat
-    /// quarantine - the fresh owner's own call timing out - keeps the window
-    /// live (F-1 repair) instead of stacking a permanent block.
-    fn quarantined(&mut self) {
+    /// One owner quarantined by a timed-out native call, registered by
+    /// identity. Slot exclusivity: the window registers the ONE quarantined
+    /// owner, so a repeat quarantine - the fresh owner's own call timing out -
+    /// keeps the window live (F-1 repair, assignment-only) instead of stacking
+    /// a permanent block, and it re-homes the window on the owner that is
+    /// actually in flight.
+    fn quarantine(&mut self, generation: u64) {
         self.in_flight = 1;
+        self.window_generation = generation;
         self.responsive_ticks = 0;
     }
 
     /// The resolver took the slot away from a live owner: that thread is
-    /// displaced/detached, counted apart from the window.
-    fn displaced(&mut self) {
+    /// displaced/detached, counted apart from the window, under its own
+    /// identity. Reaching the bound latches the one-shot diagnostic.
+    fn detach(&mut self, generation: u64) {
         self.detached += 1;
-    }
-
-    /// A thread that had no window slot to release returned cleanly (the
-    /// self-retire tail): it leaves the detached census, restoring headroom.
-    /// The window owner's return goes through the `in_flight` arm.
-    fn retired(&mut self) {
-        if self.in_flight == 1 {
-            self.in_flight = 0;
-        } else {
-            self.detached = self.detached.saturating_sub(1);
+        if generation != NO_OWNER {
+            self.detached_generations.push(generation);
+        }
+        if self.detached >= DETACHED_OWNER_BOUND {
+            self.bound_reported = true;
         }
     }
 
-    /// The episode is over: the shape resets to the shipped baseline.
+    /// F-REC-3 (WO-U46A P1): a returning thread retires ONLY the bookkeeping
+    /// that carries its own generation - its window registration and/or its
+    /// detached census entry. A generation that owns neither retires nothing
+    /// (a stale return is a no-op on a newer owner's window, census and
+    /// headroom), which is the exact repair of the frozen tree's count-based
+    /// routing (F-REC-3).
+    fn retire(&mut self, generation: u64) {
+        if self.window_generation == generation {
+            self.in_flight = 0;
+            self.window_generation = NO_OWNER;
+        }
+        if let Some(index) = self
+            .detached_generations
+            .iter()
+            .position(|&owner| owner == generation)
+        {
+            self.detached_generations.swap_remove(index);
+            self.detached -= 1;
+        }
+    }
+
+    /// F-REC-2: the census is at the detached-owner bound: no fresh open may be
+    /// authorized (fail closed).
+    fn bound_hit(&self) -> bool {
+        self.detached >= DETACHED_OWNER_BOUND
+    }
+
+    /// Consume the one-shot bound report: true exactly once per reaching of the
+    /// bound. Called outside the machine lock, so the log line is emitted with
+    /// no lock held.
+    fn take_bound_report(&mut self) -> bool {
+        std::mem::replace(&mut self.bound_reported, false)
+    }
+
+    /// The episode is over: the shape resets to the shipped baseline, window
+    /// identity, census identities and the report latch included.
     fn recovered(&mut self) {
         *self = Self::default();
     }
@@ -155,16 +267,18 @@ impl CircuitRecovery {
     /// One ladder tick. Returns true only on the tick that authorizes the
     /// one fresh-open attempt: the streak must be unbroken (`device-present`
     /// and responsive every tick; any miss restarts it), at most one
-    /// quarantined owner may be in flight (cap = 1), and the gap between
-    /// attempts grows exponentially, bounded, in ladder ticks - the
-    /// `telemetry::backoff_interval` shape on the ladder's own clock.
+    /// quarantined owner may be in flight (cap = 1), the detached-owner census
+    /// must be under the bound (F-REC-2: at the cap the resolver fails closed),
+    /// and the gap between attempts grows exponentially, bounded, in ladder
+    /// ticks - the `telemetry::backoff_interval` shape on the ladder's own
+    /// clock.
     fn tick(&mut self, present: bool, responsive: bool) -> bool {
         if !present || !responsive {
             self.responsive_ticks = 0;
             return false;
         }
         self.responsive_ticks += 1;
-        if self.in_flight != 1 {
+        if self.in_flight != 1 || self.bound_hit() {
             return false;
         }
         let gap =
@@ -176,21 +290,57 @@ impl CircuitRecovery {
         self.responsive_ticks = 0;
         true
     }
-}
 
-/// Quarantine bookkeeping beside the circuit flag: the episode marker plus
-/// the in-flight count, registered at most once per abandoned session so a
-/// drain of timed-out calls on one owner counts one owner, not many.
-fn owner_quarantined(abandoned: &AtomicBool) {
-    OWNER_QUARANTINED.store(true, Ordering::Release);
-    if !abandoned.swap(true, Ordering::AcqRel) {
-        CIRCUIT_RECOVERY.lock().unwrap().quarantined();
+    // The identity-free seams of the frozen 45a scenario set (WO-U46A): the
+    // 45a tests drive the anonymous shape, where the window is "the one
+    // registered owner" and the census is a count. They exist for tests only,
+    // so production is always identity-bound.
+
+    #[cfg(test)]
+    fn quarantined(&mut self) {
+        self.quarantine(NO_OWNER);
+    }
+
+    #[cfg(test)]
+    fn displaced(&mut self) {
+        self.detach(NO_OWNER);
+    }
+
+    #[cfg(test)]
+    fn retired(&mut self) {
+        if self.in_flight == 1 {
+            self.in_flight = 0;
+            self.window_generation = NO_OWNER;
+        } else {
+            self.detached = self.detached.saturating_sub(1);
+        }
     }
 }
 
-/// A completed native call is device health: the first one through an open
-/// circuit closes the circuit, resets the episode, and writes the one
-/// recovery audit line. Steady health on a closed circuit is silent.
+/// The next owner generation: monotonic and never `NO_OWNER`.
+fn next_owner_generation() -> u64 {
+    SDK_OWNER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Quarantine bookkeeping beside the circuit flag: the episode marker plus the
+/// in-flight window registration, registered at most once per abandoned
+/// session (a drain of timed-out calls on one owner counts one owner, not
+/// many) and under that owner's OWN generation, so the window is homed on the
+/// session that is actually in flight (F-REC-3, WO-U46A P1).
+fn owner_quarantined(abandoned: &AtomicBool, generation: u64) {
+    OWNER_QUARANTINED.store(true, Ordering::Release);
+    if !abandoned.swap(true, Ordering::AcqRel) {
+        CIRCUIT_RECOVERY.lock().unwrap().quarantine(generation);
+    }
+}
+
+/// Verified device recovery: a health-publishing round-trip (a poll, or a
+/// finished display update) completed by the CURRENT authorized owner
+/// generation. The first such completion through an open circuit closes the
+/// circuit, resets the episode, and writes the one recovery audit line. Steady
+/// health on a closed circuit is silent. A completed native call by itself is
+/// NOT health (WO-U46A P3): the caller's `is_device_health` gate excludes the
+/// close/shutdown completion, semantic errors and a displaced owner's success.
 fn circuit_closed_on_health() {
     if CIRCUIT_OPEN.swap(false, Ordering::AcqRel) {
         OWNER_QUARANTINED.store(false, Ordering::Release);
@@ -205,7 +355,8 @@ fn circuit_closed_on_health() {
 /// pass: presence via the existing LCore identity discovery, responsiveness
 /// via the existing RC-3 bounded read-only probe (LCore is never touched),
 /// then the machine's authorization. Returns Some only when a fresh owner
-/// session opened; its first successful call closes the circuit, and the
+/// session opened; its first health-publishing round-trip closes the circuit
+/// (WO-U46A P3 - the close/shutdown completion is not health), and the
 /// worker's existing `Connected`/`PhysicalHealthy` publications are the
 /// recovery publish.
 pub fn try_circuit_recovery(friendly_name: &str) -> Option<SdkDevice> {
@@ -224,10 +375,17 @@ pub fn try_circuit_recovery(friendly_name: &str) -> Option<SdkDevice> {
     };
     let responsive = classify_lcore(true, probe_aliveness(&mut NativeAliveness, owner.pid))
         == LcoreClass::Responsive;
-    if !CIRCUIT_RECOVERY.lock().unwrap().tick(true, responsive) {
+    let authorized = CIRCUIT_RECOVERY.lock().unwrap().tick(true, responsive);
+    // F-REC-2 (WO-U46A P2): the bound diagnostic is ONE recorded line per
+    // reaching of the bound, taken from the machine latch with no lock held,
+    // on the ladder's own cadence (never per tick, never per attempt).
+    if CIRCUIT_RECOVERY.lock().unwrap().take_bound_report() {
+        crate::log_warn!("{DETACHED_OWNER_BOUND_AUDIT}");
+    }
+    if !authorized {
         return None;
     }
-    open_session(&owner, friendly_name, true).ok()
+    open_session(&owner, friendly_name, next_owner_generation(), true).ok()
 }
 
 pub fn circuit_open() -> bool {
@@ -238,16 +396,57 @@ pub fn recovery_blocked() -> bool {
     RECOVERY_BLOCKED.load(Ordering::Acquire)
 }
 
-fn claim_sdk_owner() -> Result<(), LossError> {
+/// Take the active-owner claim for a NEW generation (the normal open path).
+/// The claim is a generation slot, so the returned identity is what every
+/// later bookkeeping step - quarantine, displacement, retirement, release -
+/// is bound to (F-REC-3, WO-U46A P1). One claim holder at a time: a second
+/// opener is refused (the shape the single-opener gate in
+/// `src/backends/mod.rs:718` relies on).
+fn claim_sdk_owner() -> Result<u64, LossError> {
+    let generation = next_owner_generation();
     SDK_OWNER_ACTIVE
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map(|_| ())
+        .compare_exchange(NO_OWNER, generation, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| generation)
         .map_err(|_| {
             LossError::new(
                 LossCause::OwnerConflict,
                 "Logitech SDK discovery/owner operation is already active".into(),
             )
         })
+}
+
+/// The resolver's claim (the fresh-open path): take the slot for the recovery
+/// generation. The generation it displaces is registered in the detached
+/// census BY IDENTITY, so only that owner's own return can release it
+/// (F-REC-3). An empty slot displaces nobody: no census entry is invented.
+fn claim_sdk_owner_for_recovery(generation: u64) {
+    let displaced = SDK_OWNER_ACTIVE.swap(generation, Ordering::AcqRel);
+    if displaced != NO_OWNER {
+        CIRCUIT_RECOVERY.lock().unwrap().detach(displaced);
+    }
+}
+
+/// The ONLY writer that clears the active-owner claim, and only for the
+/// generation that holds it: a compare-exchange, so a displaced owner's return
+/// can never drop a newer owner's claim (the frozen tree's unconditional
+/// `store(false)` tail did). Returns whether this generation released the slot.
+fn release_sdk_owner(generation: u64) -> bool {
+    SDK_OWNER_ACTIVE
+        .compare_exchange(generation, NO_OWNER, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// The owner thread's self-retire tail (WO-U46A P1), shared by the spawned
+/// owner and its tests: retire ONLY the bookkeeping this thread's generation
+/// owns (window registration and/or detached census entry), then release the
+/// claim if - and only if - this thread still holds it. A stale (displaced)
+/// owner's return is a no-op on the live owner's window, census entry,
+/// headroom and claim.
+fn owner_self_retire(abandoned: &AtomicBool, generation: u64) {
+    if abandoned.swap(false, Ordering::AcqRel) {
+        CIRCUIT_RECOVERY.lock().unwrap().retire(generation);
+    }
+    release_sdk_owner(generation);
 }
 
 fn wait_ready(
@@ -1437,9 +1636,15 @@ pub struct SdkDevice {
     payload: Mutex<Option<Vec<u8>>>,
     /// F-REC-1: set once when this session's owner is abandoned by a
     /// timed-out call (quarantine), consumed by the owner thread's
-    /// self-retire tail, so the in-flight count registers an owner exactly
-    /// once and releases it on return.
+    /// self-retire tail, so the window registers an owner exactly once and
+    /// releases it on return.
     abandoned: Arc<AtomicBool>,
+    /// F-REC-3 (WO-U46A P1): this session's owner IDENTITY - the generation it
+    /// claimed the active-owner slot with. Every bookkeeping step of the
+    /// session (quarantine registration, retirement, claim release) is bound to
+    /// it, and the health gate (WO-U46A P3) reads it: only the generation that
+    /// currently holds the claim can declare device recovery.
+    generation: u64,
 }
 
 impl SdkDevice {
@@ -1450,28 +1655,29 @@ impl SdkDevice {
                 "Logitech SDK circuit is open after an unreturning native owner".into(),
             ));
         }
-        claim_sdk_owner()?;
-        open_session(owner, friendly_name, false)
+        let generation = claim_sdk_owner()?;
+        open_session(owner, friendly_name, generation, false)
     }
 }
 
-/// The open body behind the circuit gate and the owner claim.
-/// `quarantined_owner_allowed` is the fresh-open resolver path
-/// (F-REC-1): the claim slot is held by the episode's quarantined owner,
-/// so the resolver takes the slot directly (slot exclusivity: exactly one
-/// session owns it). The owner thread it displaces is unreturnable, so it is
-/// DETACHED and counted in the machine's detached census, never in the
-/// recovery window: the window keeps its ONE quarantined owner, so a
-/// poisoning of the fresh owner re-arms instead of locking (F-1, WO-U45A-FIX
-/// binding amendment). The trust pipeline, path-boundary, identity and
-/// LCore-identity checks inside are the existing open path, unchanged.
+/// The open body behind the circuit gate and the owner claim. `generation` is
+/// the OWNER IDENTITY this session runs under: the normal path brings the
+/// generation `claim_sdk_owner` took; `quarantined_owner_allowed` is the
+/// fresh-open resolver path (F-REC-1), which takes the slot for its own
+/// generation and registers the owner it displaces in the detached census BY
+/// IDENTITY (slot exclusivity: exactly one session owns the claim). A detached
+/// owner is never in the recovery window: the window keeps its ONE quarantined
+/// owner, so a poisoning of the fresh owner re-arms instead of locking (F-1,
+/// WO-U45A-FIX binding amendment). The trust pipeline, path-boundary, identity
+/// and LCore-identity checks inside are the existing open path, unchanged.
 fn open_session(
     owner: &LCore,
     friendly_name: &str,
+    generation: u64,
     quarantined_owner_allowed: bool,
 ) -> Result<SdkDevice, LossError> {
-    if quarantined_owner_allowed && SDK_OWNER_ACTIVE.swap(true, Ordering::AcqRel) {
-        CIRCUIT_RECOVERY.lock().unwrap().displaced();
+    if quarantined_owner_allowed {
+        claim_sdk_owner_for_recovery(generation);
     }
     let expected_owner = owner.clone();
     let friendly_name = friendly_name.to_string();
@@ -1507,19 +1713,20 @@ fn open_session(
                     let _ = ready_tx.send(Err(error));
                 }
             }
-            // Self-retire cleanly (WO-U45A): a thread that ever returns
-            // self-retires before clearing the claim, and the machine routes
-            // it - the window owner releases the ONE in-flight slot, a thread
-            // with no slot to release leaves the detached census (F-1,
-            // WO-U45A-FIX binding amendment: self-retire restores headroom).
-            if closure_abandoned.swap(false, Ordering::AcqRel) {
-                CIRCUIT_RECOVERY.lock().unwrap().retired();
-            }
-            // F-5 (WO-U45A-FIX): this store also clears a claim the resolver's fresh session now holds, because a returning detached owner keeps no slot of its own - the flag is advisory (the single backend worker is the only opener), and the window/detached censuses above are the exact accounting.
-            SDK_OWNER_ACTIVE.store(false, Ordering::Release);
+            // Self-retire cleanly (WO-U45A, identity-bound by WO-U46A P1): a
+            // thread that ever returns self-retires BEFORE releasing the claim,
+            // and the machine releases only the bookkeeping that carries THIS
+            // thread's generation - its window registration and/or its own
+            // detached census entry (F-1 amendment: self-retire restores
+            // headroom). The frozen tree's unconditional claim clear (F-5,
+            // `src/backends/sdk.rs:1519` on 42132a7) is gone: a returning
+            // displaced owner can no longer drop the claim the resolver's fresh
+            // session holds, so the single-owner claim invariant is structural
+            // and not merely advisory.
+            owner_self_retire(&closure_abandoned, generation);
         });
     if let Err(error) = spawn {
-        SDK_OWNER_ACTIVE.store(false, Ordering::Release);
+        release_sdk_owner(generation);
         return Err(LossError::new(
             LossCause::ProbeFail,
             format!("spawn Logitech SDK owner: {error}"),
@@ -1531,6 +1738,7 @@ fn open_session(
                 requests: Some(requests),
                 payload: Mutex::new(None),
                 abandoned,
+                generation,
             };
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
@@ -1552,10 +1760,10 @@ fn open_session(
         Err(error) => {
             // The `wait_ready` timeout quarantines the owner thread that is
             // still running the trusted init: register the episode beside
-            // its circuit store.
+            // its circuit store, under this session's generation.
             OWNER_QUARANTINED.store(true, Ordering::Release);
             if !abandoned.swap(true, Ordering::AcqRel) {
-                CIRCUIT_RECOVERY.lock().unwrap().quarantined();
+                CIRCUIT_RECOVERY.lock().unwrap().quarantine(generation);
             }
             Err(error)
         }
@@ -1563,6 +1771,33 @@ fn open_session(
 }
 
 impl SdkDevice {
+    /// WO-U46A P3: the circuit-close semantics. Health is a DEVICE ROUND-TRIP -
+    /// a poll (`Reply::Poll`: `LogiLcdUpdate`, `LogiLcdIsConnected` and
+    /// `LogiLcdIsButtonPressed` all returned) or a finished display update
+    /// (`Reply::SubmitDone`: `LogiLcdMonoSetBackground` + `LogiLcdUpdate`
+    /// returned and the payload buffer was released) - completed by the owner
+    /// that CURRENTLY holds the active-owner claim (`self.generation` equals
+    /// the claim's generation, F-REC-3 identity). Excluded by construction:
+    ///
+    /// - `Reply::Unit`: the only Unit that reaches a session is the close/
+    ///   shutdown completion (`src/backends/sdk.rs:1386` on 42132a7) - a
+    ///   completed shutdown is not verified device recovery. A Submit's Unit is
+    ///   `owner_loop`'s EC-2 conversion into `SubmitDone` before it lands.
+    /// - `Reply::Error`: a semantic native failure, never health.
+    /// - a displaced/stale owner's completion: its generation no longer owns
+    ///   the claim, so its success is not the episode's recovery.
+    ///
+    /// A scripted session with no claim at all (generation `NO_OWNER` while the
+    /// slot is empty) is the shipped test shape and stays authorized.
+    fn is_device_health(&self, reply: &Reply) -> bool {
+        match reply {
+            Reply::Poll { .. } | Reply::SubmitDone(_) => {
+                SDK_OWNER_ACTIVE.load(Ordering::Acquire) == self.generation
+            }
+            Reply::Unit | Reply::Error(_) => false,
+        }
+    }
+
     fn call(&self, request: Request) -> Result<Reply, LossError> {
         self.call_timeout(request, CALL_TIMEOUT)
     }
@@ -1589,7 +1824,7 @@ impl SdkDevice {
                 }
                 Err(TrySendError::Full(_)) => {
                     CIRCUIT_OPEN.store(true, Ordering::Release);
-                    owner_quarantined(&self.abandoned);
+                    owner_quarantined(&self.abandoned, self.generation);
                     return Err(LossError::new(
                         LossCause::CircuitOpen,
                         "Logitech SDK request dispatch timed out; circuit opened".into(),
@@ -1605,18 +1840,22 @@ impl SdkDevice {
         }
         match reply_rx.recv_timeout(timeout) {
             Ok(reply) => {
-                // A Unit/Poll completion is a native call that returned: the
-                // first one through an open circuit closes it (WO-U45A:
-                // "first successful send/poll through the fresh owner closes
-                // the circuit"). A semantic Error reply is not health.
-                if !matches!(reply, Reply::Error(_)) {
+                // WO-U46A P3: a completed native call is not automatically
+                // device recovery. Only a health-publishing round-trip
+                // completed by the CURRENT authorized owner closes the circuit
+                // (WO-U45A's "first successful send/poll through the fresh
+                // owner closes the circuit"). The close/shutdown `Reply::Unit`,
+                // a semantic `Error`, and a displaced owner's completion are
+                // not health, so they leave the episode, the window census and
+                // the audit line untouched.
+                if self.is_device_health(&reply) {
                     circuit_closed_on_health();
                 }
                 Ok(reply)
             }
             Err(_) => {
                 CIRCUIT_OPEN.store(true, Ordering::Release);
-                owner_quarantined(&self.abandoned);
+                owner_quarantined(&self.abandoned, self.generation);
                 Err(LossError::new(
                     LossCause::CallTimeout,
                     "Logitech SDK native call timed out; owner quarantined and circuit opened"
@@ -2220,6 +2459,7 @@ mod tests {
             requests: Some(requests),
             payload: Mutex::new(None),
             abandoned: Arc::new(AtomicBool::new(false)),
+            generation: NO_OWNER,
         };
         let error = device
             .call_timeout(Request::Submit(vec![0; PIXELS]), Duration::from_millis(1))
@@ -2286,7 +2526,7 @@ mod tests {
     fn stalled_owned_discovery_opens_circuit_and_blocks_overlap() {
         let _guard = circuit_scenario_guard();
         CIRCUIT_OPEN.store(false, Ordering::Release);
-        SDK_OWNER_ACTIVE.store(false, Ordering::Release);
+        SDK_OWNER_ACTIVE.store(NO_OWNER, Ordering::Release);
         claim_sdk_owner().unwrap();
         assert_eq!(
             claim_sdk_owner().err().unwrap().cause,
@@ -2311,7 +2551,7 @@ mod tests {
                 .expect("the gated owner was released by the test");
             assert_eq!(owned, "owned validation data");
             let _ = ready.send(Ok(()));
-            SDK_OWNER_ACTIVE.store(false, Ordering::Release);
+            SDK_OWNER_ACTIVE.store(NO_OWNER, Ordering::Release);
         });
         running_rx
             .recv_timeout(DRIVEN_HANDSHAKE_BUDGET)
@@ -2470,6 +2710,7 @@ mod tests {
             requests: Some(dev_tx),
             payload: Mutex::new(None),
             abandoned: Arc::new(AtomicBool::new(false)),
+            generation: NO_OWNER,
         };
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -2514,6 +2755,7 @@ mod tests {
             requests: Some(tx),
             payload: Mutex::new(None),
             abandoned: Arc::new(AtomicBool::new(false)),
+            generation: NO_OWNER,
         };
 
         // WO-QA-01 (F-1): arm the window on this test thread; the recording owner
@@ -2658,11 +2900,15 @@ mod tests {
     // the R-1 standing contract because they write the circuit statics.
 
     /// Scenario-normalizing reset of the circuit episode state. Guarded
-    /// callers only: it writes the circuit family.
+    /// callers only: it writes the circuit family - WO-U46A P1 extends the
+    /// family to the owner-claim slot, so a guarded scenario starts from
+    /// "no owner claimed" and a `generation: NO_OWNER` scripted owner is the
+    /// authorized owner of its own scenario.
     fn circuit_episode_reset() {
         CIRCUIT_OPEN.store(false, Ordering::Release);
         OWNER_QUARANTINED.store(false, Ordering::Release);
         RECOVERY_BLOCKED.store(false, Ordering::Release);
+        SDK_OWNER_ACTIVE.store(NO_OWNER, Ordering::Release);
         CIRCUIT_RECOVERY.lock().unwrap().recovered();
     }
 
@@ -2807,6 +3053,7 @@ mod tests {
             requests: Some(requests),
             payload: Mutex::new(None),
             abandoned: Arc::new(AtomicBool::new(false)),
+            generation: NO_OWNER,
         };
         assert!(device.poll().is_ok(), "the scripted poll completes");
         assert!(
@@ -2843,18 +3090,20 @@ mod tests {
     fn an_error_reply_is_not_health_and_keeps_the_circuit_open() {
         // The send-path vs circuit-flag census (panel question): the send
         // path is NOT flag-gated - a returning owner's call lands. Only a
-        // completion that is health (Unit/Poll/SubmitDone) closes the flag;
-        // a semantic error reply keeps the episode open.
+        // completion that is health (POLL/SUBMITDONE from the current owner;
+        // WO-U46A P3 removed the close-only `Unit` from that set) closes the
+        // flag; a semantic error reply keeps the episode open.
         let _guard = circuit_scenario_guard();
         circuit_episode_reset();
         CIRCUIT_OPEN.store(true, Ordering::Release);
         let (requests, receiver) = mpsc::sync_channel(1);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let thread = std::thread::spawn(move || owner_loop(Box::new(Fake(calls)), receiver));
-        let mut device = SdkDevice {
+        let device = SdkDevice {
             requests: Some(requests),
             payload: Mutex::new(None),
             abandoned: Arc::new(AtomicBool::new(false)),
+            generation: NO_OWNER,
         };
         // Fake::execute answers an empty-payload Submit with Reply::Error.
         let error = device
@@ -2865,11 +3114,17 @@ mod tests {
             circuit_open(),
             "a semantic error reply is not health: the circuit stays open"
         );
-        device.close(true).expect("the scripted close completes");
+        // WO-U46A P3 (legitimate 45a extension): this test's closing step was
+        // `close(true)` + "the first Unit completion closes the circuit", which
+        // asserted exactly the close-only-completion semantics P3 corrects. The
+        // health-publishing round-trip takes its place; the error-not-health
+        // property above is unchanged.
+        device.poll().expect("the scripted poll completes");
         assert!(
             !circuit_open(),
-            "the first Unit completion through the same owner closes the circuit"
+            "the first health-publishing completion through the same owner closes the circuit"
         );
+        drop(device);
         thread.join().unwrap();
         circuit_episode_reset();
     }
@@ -2921,6 +3176,7 @@ mod tests {
             requests: Some(requests),
             payload: Mutex::new(None),
             abandoned: Arc::new(AtomicBool::new(false)),
+            generation: NO_OWNER,
         };
         let error = device
             .call_timeout(Request::Poll, Duration::from_millis(1))
@@ -2942,9 +3198,13 @@ mod tests {
             1,
             "cap: exactly one in-flight quarantined owner per abandoned session"
         );
-        // The owner returns: release the gate, close through the drained
-        // slot; the Unit close closes the circuit and the self-retire tail
-        // releases the in-flight slot.
+        // The owner returns: release the gate, drain the queued slot, close.
+        // WO-U46A P3 (legitimate 45a extension): the frozen test asserted
+        // "the first successful call through the returning owner closed the
+        // circuit" on that drained `close(true)` completion, which is the
+        // close-only `Reply::Unit` - P3 rules a completed shutdown out of the
+        // health set, so the episode now provably survives it and recovery
+        // lands on the fresh owner's health round-trip below.
         release_tx
             .try_send(())
             .expect("the gated owner accepted the release");
@@ -2952,10 +3212,29 @@ mod tests {
             .close(true)
             .expect("the drained owner answers the close");
         assert!(
-            !circuit_open(),
-            "the first successful call through the returning owner closed the circuit"
+            circuit_open(),
+            "the close-only completion through the returning owner is not health: the episode stays live"
         );
         thread.join().unwrap();
+        let (fresh_requests, fresh_receiver) = mpsc::sync_channel(1);
+        let fresh_calls = Arc::new(Mutex::new(Vec::new()));
+        let fresh_thread =
+            std::thread::spawn(move || owner_loop(Box::new(Fake(fresh_calls)), fresh_receiver));
+        let fresh_device = SdkDevice {
+            requests: Some(fresh_requests),
+            payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
+            generation: NO_OWNER,
+        };
+        fresh_device
+            .poll()
+            .expect("the fresh owner's health round-trip lands");
+        assert!(
+            !circuit_open(),
+            "the first health-publishing call through the fresh owner closes the circuit"
+        );
+        drop(fresh_device);
+        fresh_thread.join().unwrap();
         assert_eq!(
             CIRCUIT_RECOVERY.lock().unwrap().in_flight,
             0,
@@ -3182,6 +3461,7 @@ mod tests {
             requests: Some(requests),
             payload: Mutex::new(None),
             abandoned: Arc::new(AtomicBool::new(false)),
+            generation: NO_OWNER,
         };
         device.poll().expect("the scripted poll completes");
         assert!(!circuit_open(), "the first success closed the circuit");
@@ -3219,5 +3499,841 @@ mod tests {
         drop(device);
         thread.join().unwrap();
         circuit_episode_reset();
+    }
+
+    // WO-U46A-OWNER-GENERATION regression set (Step 0: applicability proof).
+    //
+    // Every test in this block was FIRST run red against the frozen tree
+    // 42132a7 in the frozen API shape - the count-based `CircuitRecovery`
+    // seams, the boolean `SDK_OWNER_ACTIVE` claim, the 3-field `SdkDevice`
+    // literal, and statement-for-statement mirrors of the indicted production
+    // sites - so each red row is the defect and never a compile error. The
+    // reds are recorded in `u46a-prefix-reds.log` (per-name `--exact` runs,
+    // `RED_EXIT[..]=101`). The final forms below bind the same scenarios to
+    // the repaired identity seams (`quarantine`/`detach`/`retire` by
+    // generation, `claim_sdk_owner_for_recovery`, `release_sdk_owner`,
+    // `owner_self_retire`, the generation-bearing `SdkDevice`), keeping each
+    // scenario, name and assertion.
+    //
+    // Indicted frozen sites: the boolean claim (`src/backends/sdk.rs:74`), the
+    // count-based `retired` routing (`src/backends/sdk.rs:142`), the saturating
+    // detached census (`src/backends/sdk.rs:120`), the resolver's claim swap +
+    // displacement (`src/backends/sdk.rs:1473`), the self-retire tail and its
+    // unconditional claim clear (`src/backends/sdk.rs:1515`,
+    // `src/backends/sdk.rs:1519`), the health rule that accepts any non-Error
+    // completion (`src/backends/sdk.rs:1612`), and the close-only
+    // `Reply::Unit` completion (`src/backends/sdk.rs:1386`).
+
+    /// WO-U46A P2: the storm scale the 54984 incident witnessed (unbounded
+    /// detached owners, the process lives until reboot). The bound tests drive
+    /// the census through the counting seams; no test spawns thousands of real
+    /// threads (the real-thread tests below use at most 2 each, disclosed).
+    const DETACHED_OWNER_STORM: usize = 16;
+
+    #[test]
+    fn a_returning_owner_leaves_a_healthy_replacement_in_full_possession() {
+        // P1 permutation 1: A poisons, the resolver displaces A and B opens
+        // healthy, then A's late native call returns. A's self-retire tail
+        // retires ONLY A's own bookkeeping; B's window, census and claim
+        // survive, so the single-opener gate keeps exactly one active claim.
+        // FROZEN RED: `sdk.rs:3279` `(0, 1) != (0, 0)` - the count-based retire
+        // released the window and left A's census entry, and the mirrored tail
+        // cleared B's claim (`RED_EXIT=101`).
+        let _guard = circuit_scenario_guard();
+        circuit_episode_reset();
+        let a_generation = claim_sdk_owner().expect("A opens as the authorized owner");
+        // A poisons: the window registers A's own identity.
+        CIRCUIT_RECOVERY.lock().unwrap().quarantine(a_generation);
+        // The resolver displaces A: the swap registers A's generation in the
+        // detached census and installs B as the claim holder.
+        let b_generation = next_owner_generation();
+        claim_sdk_owner_for_recovery(b_generation);
+        assert_eq!(
+            SDK_OWNER_ACTIVE.load(Ordering::Acquire),
+            b_generation,
+            "the replacement owner B holds the claim"
+        );
+        // A's thread returns late, through the production self-retire tail.
+        let a_abandoned = Arc::new(AtomicBool::new(true));
+        let (running_tx, running_rx) = mpsc::sync_channel(1);
+        let thread = {
+            let a_abandoned = Arc::clone(&a_abandoned);
+            std::thread::spawn(move || {
+                owner_self_retire(&a_abandoned, a_generation);
+                running_tx
+                    .try_send(())
+                    .expect("the returning owner announced its tail");
+            })
+        };
+        running_rx
+            .recv_timeout(DRIVEN_HANDSHAKE_BUDGET)
+            .expect("the returning owner ran its tail");
+        thread.join().unwrap();
+        {
+            let machine = CIRCUIT_RECOVERY.lock().unwrap();
+            assert_eq!(
+                (
+                    machine.in_flight,
+                    machine.window_generation,
+                    machine.detached
+                ),
+                (0, NO_OWNER, 0),
+                "A's return releases BOTH of A's registrations and nothing of B's"
+            );
+            assert!(
+                machine.detached_generations.is_empty(),
+                "the census holds no ghost of a retired owner"
+            );
+        }
+        assert_eq!(
+            SDK_OWNER_ACTIVE.load(Ordering::Acquire),
+            b_generation,
+            "a stale return can never clear the live replacement owner's claim"
+        );
+        assert_eq!(
+            claim_sdk_owner().err().unwrap().cause,
+            LossCause::OwnerConflict,
+            "exactly one active claim survives a stale return (the single-opener gate)"
+        );
+        assert!(
+            release_sdk_owner(b_generation),
+            "the claim's own generation releases it"
+        );
+    }
+
+    #[test]
+    fn a_returning_displaced_owner_cannot_clear_the_live_owners_window() {
+        // P1 permutation 2: A returns while B is quarantined. A's retirement
+        // cannot clear B's window registration, and B's episode stays bounded
+        // and re-armable on the existing gap.
+        // FROZEN RED: `sdk.rs:3307` `0 != 1` - A's `retired()` took the
+        // `in_flight == 1` arm and cleared B's window (F-REC-3).
+        let mut machine = CircuitRecovery::default();
+        let a_generation = next_owner_generation();
+        let b_generation = next_owner_generation();
+        machine.quarantine(a_generation); // A poisons: the window registers A
+        machine.detach(a_generation); // A is displaced into the detached census
+        machine.quarantine(b_generation); // B's own poisoning re-homes the window
+        machine.retire(a_generation); // A's late return
+        assert_eq!(
+            (machine.in_flight, machine.window_generation),
+            (1, b_generation),
+            "a stale return cannot clear the live owner B's window registration"
+        );
+        assert_eq!(
+            (machine.detached, machine.detached_generations.len()),
+            (0, 0),
+            "A's retirement released A's own census entry (headroom restored)"
+        );
+        assert!(!machine.tick(true, true), "B's episode: tick 1 of 3");
+        assert!(!machine.tick(true, true), "B's episode: tick 2 of 3");
+        assert!(
+            machine.tick(true, true),
+            "B's episode stays bounded and re-armable after a stale return"
+        );
+    }
+
+    #[test]
+    fn a_stale_return_cannot_consume_a_newer_owner_s_census_entry() {
+        // P1 permutation 3: B recovers before A returns, a next episode
+        // registers C, and only then does A come back. A retires nothing: C's
+        // window and C's census entry both survive, and the resolver keeps
+        // authorizing for C's episode.
+        // FROZEN RED: `sdk.rs:3336` `(0, 1) != (1, 1)` - A's retirement ate
+        // C's window registration.
+        let mut machine = CircuitRecovery::default();
+        let a_generation = next_owner_generation();
+        let c_generation = next_owner_generation();
+        machine.quarantine(a_generation); // A poisons
+        machine.detach(a_generation); // A displaced by B
+        machine.recovered(); // B's health round-trip closed the episode
+        machine.quarantine(c_generation); // C poisons in the next episode
+        machine.detach(c_generation); // C displaced by D
+        machine.retire(a_generation); // A's late return
+        assert_eq!(
+            (
+                machine.in_flight,
+                machine.window_generation,
+                machine.detached
+            ),
+            (1, c_generation, 1),
+            "a stale return retires no window and no census entry it does not own"
+        );
+        assert_eq!(
+            machine.detached_generations,
+            vec![c_generation],
+            "the census keeps exactly the owner that is still retained"
+        );
+        assert!(!machine.tick(true, true), "C's episode: tick 1 of 3");
+        assert!(!machine.tick(true, true), "C's episode: tick 2 of 3");
+        assert!(
+            machine.tick(true, true),
+            "the episode the stale return landed in keeps its authorization"
+        );
+    }
+
+    #[test]
+    fn a_stale_return_never_clears_the_active_owner_claim() {
+        // P1: a retirement whose identity does not own the claim is a NO-OP on
+        // the claim (stale retirement = no-op on a newer claim), and it retires
+        // only its own census entry.
+        // FROZEN RED: `sdk.rs:3359` - the frozen tail's unconditional claim
+        // clear dropped B's claim, so a second opener was accepted.
+        let _guard = circuit_scenario_guard();
+        circuit_episode_reset();
+        let b_generation = claim_sdk_owner().expect("the replacement owner B claims the slot");
+        let a_generation = next_owner_generation(); // A: a displaced identity
+        {
+            let mut machine = CIRCUIT_RECOVERY.lock().unwrap();
+            machine.quarantine(b_generation);
+            machine.detach(a_generation); // A is the retained detached owner
+        }
+        // A returns through the production self-retire tail.
+        let a_abandoned = Arc::new(AtomicBool::new(true));
+        owner_self_retire(&a_abandoned, a_generation);
+        assert_eq!(
+            SDK_OWNER_ACTIVE.load(Ordering::Acquire),
+            b_generation,
+            "the claim of the current generation owner survives a stale owner's return"
+        );
+        {
+            let machine = CIRCUIT_RECOVERY.lock().unwrap();
+            assert_eq!(
+                (machine.in_flight, machine.window_generation),
+                (1, b_generation),
+                "a stale retirement is a no-op on the live window registration"
+            );
+            assert_eq!(
+                machine.detached, 0,
+                "the stale retirement released only A's own census entry"
+            );
+        }
+        assert!(
+            !release_sdk_owner(a_generation),
+            "the identity-gated release refuses a generation that does not own the claim"
+        );
+        assert_eq!(
+            SDK_OWNER_ACTIVE.load(Ordering::Acquire),
+            b_generation,
+            "a refused release leaves the claim untouched"
+        );
+        assert!(
+            release_sdk_owner(b_generation),
+            "the owning generation releases its own claim"
+        );
+        assert_eq!(
+            SDK_OWNER_ACTIVE.load(Ordering::Acquire),
+            NO_OWNER,
+            "the slot is empty again"
+        );
+    }
+
+    #[test]
+    fn the_active_owner_claim_has_exactly_one_generation_gated_writer() {
+        // P1 structural census: the claim has NO unconditional writer in
+        // production - exactly two identity-gated compare-exchanges (claim,
+        // release) and one swap (the resolver's displacement) - and the runtime
+        // census keeps exactly one claim holder at a time.
+        // FROZEN RED: `sdk.rs:3373` `10 != 0` - the frozen tree wrote the
+        // claim unconditionally (production tail + spawn rollback, plus the
+        // scenario sites), and its CAS count was 1, not 2.
+        let source = include_str!("./sdk.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("the test module marker");
+        // rustfmt wraps method chains at the column boundary, so the writer
+        // census glues every `.`-prefixed continuation back onto its receiver:
+        // each claim transition counts as one token sequence, wrapped or not.
+        let flat: String = production
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace(" .", ".");
+        assert_eq!(
+            flat.matches("SDK_OWNER_ACTIVE.store(").count(),
+            0,
+            "no production site writes the owner claim unconditionally"
+        );
+        assert_eq!(
+            flat.matches("SDK_OWNER_ACTIVE.compare_exchange").count(),
+            2,
+            "the claim has exactly two writers: the identity-gated claim and release"
+        );
+        assert_eq!(
+            flat.matches("SDK_OWNER_ACTIVE.swap(").count(),
+            1,
+            "the claim has exactly one taker: the resolver's displacement swap"
+        );
+        assert_eq!(
+            flat.matches("SDK_OWNER_ACTIVE.load(").count(),
+            1,
+            "the claim has exactly one reader: the health gate"
+        );
+        assert!(
+            production.contains("fn release_sdk_owner"),
+            "the claim clear lives in the identity-gated release"
+        );
+        assert!(
+            production.contains("fn owner_self_retire"),
+            "the self-retire tail is one shared production function"
+        );
+        let _guard = circuit_scenario_guard();
+        circuit_episode_reset();
+        let first = claim_sdk_owner().expect("the slot is free");
+        assert_ne!(
+            first, NO_OWNER,
+            "a claim carries a real generation, never the empty identity"
+        );
+        assert_eq!(
+            SDK_OWNER_ACTIVE.load(Ordering::Acquire),
+            first,
+            "the claim is held by exactly that generation"
+        );
+        assert_eq!(
+            claim_sdk_owner().err().unwrap().cause,
+            LossCause::OwnerConflict,
+            "a second owner never shares the claim"
+        );
+        let second = next_owner_generation();
+        claim_sdk_owner_for_recovery(second);
+        assert_eq!(
+            SDK_OWNER_ACTIVE.load(Ordering::Acquire),
+            second,
+            "the resolver's swap installed the recovery generation as the one holder"
+        );
+        assert!(
+            !release_sdk_owner(first),
+            "the displaced generation cannot clear the new claim"
+        );
+        assert!(
+            release_sdk_owner(second),
+            "the holder releases its own claim"
+        );
+    }
+
+    #[test]
+    fn repeated_quarantine_cycles_never_stack_the_window_and_the_census_tracks() {
+        // P1 census preservation across repeated quarantine/replacement cycles:
+        // the window stays assignment-only (never stacks, always homed on the
+        // owner in flight) and the detached census tracks the retained owners
+        // exactly. Pre-red baseline: green on the frozen tree (the 45a
+        // amendment property, re-proven under identity binding).
+        let mut machine = CircuitRecovery::default();
+        for round in 0..8 {
+            let generation = next_owner_generation();
+            machine.quarantine(generation);
+            assert_eq!(
+                machine.in_flight, 1,
+                "round {round}: a repeat quarantine never stacks the window"
+            );
+            assert_eq!(
+                machine.window_generation, generation,
+                "round {round}: the window is registered to the owner in flight"
+            );
+        }
+        for round in 0..4 {
+            machine.detach(next_owner_generation());
+            assert_eq!(
+                (machine.in_flight, machine.detached),
+                (1, round + 1),
+                "round {round}: displaced owners land in the separate census"
+            );
+        }
+        assert!(
+            !machine.tick(true, false),
+            "an unresponsive tick never authorizes, at any census shape"
+        );
+        assert!(
+            !machine.tick(true, true),
+            "post-miss streak: tick 1 of 3 at any census shape under the bound"
+        );
+        assert!(
+            !machine.tick(true, true),
+            "post-miss streak: tick 2 of 3 at any census shape under the bound"
+        );
+        assert!(
+            machine.tick(true, true),
+            "the 45a amendment: authorization stays on the bounded N=3 gap"
+        );
+    }
+
+    #[test]
+    fn the_current_owner_s_successful_poll_closes_the_circuit() {
+        // P3 case 1: a poll round-trip from the authorized owner IS verified
+        // device health: it closes the circuit and clears the episode marker.
+        // Pre-red baseline: green on the frozen tree (the property P3 keeps).
+        let _guard = circuit_scenario_guard();
+        circuit_episode_reset();
+        CIRCUIT_OPEN.store(true, Ordering::Release);
+        OWNER_QUARANTINED.store(true, Ordering::Release);
+        let generation = claim_sdk_owner().expect("the owner holds the claim");
+        CIRCUIT_RECOVERY.lock().unwrap().quarantine(generation);
+        let (requests, receiver) = mpsc::sync_channel(1);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let thread = std::thread::spawn(move || owner_loop(Box::new(Fake(calls)), receiver));
+        let device = SdkDevice {
+            requests: Some(requests),
+            payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
+            generation,
+        };
+        device.poll().expect("the scripted poll round-trip lands");
+        assert!(
+            !circuit_open(),
+            "a successful poll from the current owner closes the circuit"
+        );
+        assert!(
+            !OWNER_QUARANTINED.load(Ordering::Acquire),
+            "the episode marker cleared with the circuit"
+        );
+        drop(device);
+        thread.join().unwrap();
+        release_sdk_owner(generation);
+        circuit_episode_reset();
+    }
+
+    #[test]
+    fn the_current_owner_s_successful_display_update_closes_the_circuit() {
+        // P3 case 2: a finished display update (`Reply::SubmitDone`: the native
+        // background + update calls completed and the buffer was released) is a
+        // health-publishing round-trip.
+        // Pre-red baseline: green on the frozen tree (the property P3 keeps).
+        let _guard = circuit_scenario_guard();
+        circuit_episode_reset();
+        CIRCUIT_OPEN.store(true, Ordering::Release);
+        OWNER_QUARANTINED.store(true, Ordering::Release);
+        let generation = claim_sdk_owner().expect("the owner holds the claim");
+        CIRCUIT_RECOVERY.lock().unwrap().quarantine(generation);
+        let (requests, receiver) = mpsc::sync_channel(1);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let thread = std::thread::spawn(move || owner_loop(Box::new(Fake(calls)), receiver));
+        let device = SdkDevice {
+            requests: Some(requests),
+            payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
+            generation,
+        };
+        device
+            .submit(vec![7; PIXELS])
+            .expect("the scripted display update round-trip lands");
+        assert!(
+            !circuit_open(),
+            "a successful display update from the current owner closes the circuit"
+        );
+        drop(device);
+        thread.join().unwrap();
+        release_sdk_owner(generation);
+        circuit_episode_reset();
+    }
+
+    #[test]
+    fn a_close_only_unit_completion_is_not_health_and_never_closes_the_circuit() {
+        // P3 case 3: the close/shutdown path completes with `Reply::Unit`
+        // (`src/backends/sdk.rs:1386` on 42132a7). A completed shutdown is not
+        // verified device recovery: the circuit, the episode marker and the
+        // window census all stay as they were.
+        // FROZEN RED: `sdk.rs:3513`, and the run emitted the recovery audit
+        // line from the close-only completion (the defect, in the log).
+        let _guard = circuit_scenario_guard();
+        circuit_episode_reset();
+        CIRCUIT_OPEN.store(true, Ordering::Release);
+        OWNER_QUARANTINED.store(true, Ordering::Release);
+        let generation = claim_sdk_owner().expect("the owner holds the claim");
+        CIRCUIT_RECOVERY.lock().unwrap().quarantine(generation);
+        let (requests, receiver) = mpsc::sync_channel(1);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let thread = std::thread::spawn(move || owner_loop(Box::new(Fake(calls)), receiver));
+        let mut device = SdkDevice {
+            requests: Some(requests),
+            payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
+            generation,
+        };
+        device
+            .close(true)
+            .expect("the scripted close-only completion lands");
+        thread.join().unwrap();
+        assert!(
+            circuit_open(),
+            "a close-only Reply::Unit is a completed shutdown, not device health"
+        );
+        assert!(
+            OWNER_QUARANTINED.load(Ordering::Acquire),
+            "the episode marker survives a close-only completion"
+        );
+        {
+            let machine = CIRCUIT_RECOVERY.lock().unwrap();
+            assert_eq!(
+                (machine.in_flight, machine.window_generation),
+                (1, generation),
+                "the window census survives a close-only completion"
+            );
+        }
+        device.requests.take();
+        // And real recovery still lands: a health round-trip closes the circuit.
+        let (poll_requests, poll_receiver) = mpsc::sync_channel(1);
+        let poll_calls = Arc::new(Mutex::new(Vec::new()));
+        let poll_thread =
+            std::thread::spawn(move || owner_loop(Box::new(Fake(poll_calls)), poll_receiver));
+        let poll_device = SdkDevice {
+            requests: Some(poll_requests),
+            payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
+            generation,
+        };
+        poll_device
+            .poll()
+            .expect("the scripted poll round-trip lands");
+        assert!(
+            !circuit_open(),
+            "a health-publishing round-trip closes the circuit the close-only completion left open"
+        );
+        drop(poll_device);
+        poll_thread.join().unwrap();
+        release_sdk_owner(generation);
+        circuit_episode_reset();
+    }
+
+    #[test]
+    fn a_semantic_error_completion_is_not_health_and_keeps_the_circuit_open() {
+        // P3 case 4: a semantic `Reply::Error` (the native call returned false)
+        // is a completed call, not device health.
+        // Pre-red baseline: green on the frozen tree (the property P3 keeps).
+        let _guard = circuit_scenario_guard();
+        circuit_episode_reset();
+        CIRCUIT_OPEN.store(true, Ordering::Release);
+        OWNER_QUARANTINED.store(true, Ordering::Release);
+        let generation = claim_sdk_owner().expect("the owner holds the claim");
+        CIRCUIT_RECOVERY.lock().unwrap().quarantine(generation);
+        let (requests, receiver) = mpsc::sync_channel(1);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let thread = std::thread::spawn(move || owner_loop(Box::new(Fake(calls)), receiver));
+        let device = SdkDevice {
+            requests: Some(requests),
+            payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
+            generation,
+        };
+        let error = device
+            .submit(Vec::new())
+            .expect_err("the injected semantic error rides back");
+        assert_eq!(error.cause, LossCause::TransferIncomplete { code: 0 });
+        assert!(
+            circuit_open(),
+            "a semantic error completion keeps the circuit open"
+        );
+        {
+            let machine = CIRCUIT_RECOVERY.lock().unwrap();
+            assert_eq!(
+                (machine.in_flight, machine.window_generation),
+                (1, generation),
+                "the episode census survives a semantic error"
+            );
+        }
+        drop(device);
+        thread.join().unwrap();
+        release_sdk_owner(generation);
+        circuit_episode_reset();
+    }
+
+    #[test]
+    fn a_stale_owner_success_is_not_recovery_and_keeps_the_circuit_open() {
+        // P3 case 5: a DISPLACED owner's successful call is not the episode's
+        // recovery. B holds the claim (the resolver's swap,
+        // `src/backends/sdk.rs:1473` on 42132a7); A's session completes a poll;
+        // the circuit, the episode marker, B's window and A's own census entry
+        // all survive it. Recovery then lands on B's own health round-trip.
+        // FROZEN RED: `sdk.rs:3608`, with the recovery audit line emitted for
+        // the stale owner's poll (the defect, in the log).
+        let _guard = circuit_scenario_guard();
+        circuit_episode_reset();
+        CIRCUIT_OPEN.store(true, Ordering::Release);
+        OWNER_QUARANTINED.store(true, Ordering::Release);
+        let stale_generation = next_owner_generation(); // A: displaced
+        let fresh_generation = claim_sdk_owner().expect("the replacement owner B holds the claim");
+        {
+            let mut machine = CIRCUIT_RECOVERY.lock().unwrap();
+            machine.quarantine(stale_generation);
+            machine.detach(stale_generation);
+        }
+        let (requests, receiver) = mpsc::sync_channel(1);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let thread = std::thread::spawn(move || owner_loop(Box::new(Fake(calls)), receiver));
+        let device = SdkDevice {
+            requests: Some(requests),
+            payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(true)), // A is the quarantined owner
+            generation: stale_generation,
+        };
+        device
+            .poll()
+            .expect("the displaced owner's call completes (the send path is not flag-gated)");
+        assert!(
+            circuit_open(),
+            "a stale owner's success never declares recovery"
+        );
+        assert!(
+            OWNER_QUARANTINED.load(Ordering::Acquire),
+            "the episode marker survives a stale owner's success"
+        );
+        {
+            let machine = CIRCUIT_RECOVERY.lock().unwrap();
+            assert_eq!(
+                (
+                    machine.in_flight,
+                    machine.window_generation,
+                    machine.detached
+                ),
+                (1, stale_generation, 1),
+                "the window registration and the census entry survive a stale success"
+            );
+        }
+        drop(device);
+        thread.join().unwrap();
+        // Actual recovery: the CURRENT generation owner's health round-trip.
+        let (fresh_requests, fresh_receiver) = mpsc::sync_channel(1);
+        let fresh_calls = Arc::new(Mutex::new(Vec::new()));
+        let fresh_thread =
+            std::thread::spawn(move || owner_loop(Box::new(Fake(fresh_calls)), fresh_receiver));
+        let fresh_device = SdkDevice {
+            requests: Some(fresh_requests),
+            payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
+            generation: fresh_generation,
+        };
+        fresh_device
+            .poll()
+            .expect("the fresh owner's health round-trip lands");
+        assert!(
+            !circuit_open(),
+            "the current generation owner's success closes the circuit the stale owner's success left open"
+        );
+        drop(fresh_device);
+        fresh_thread.join().unwrap();
+        release_sdk_owner(fresh_generation);
+        circuit_episode_reset();
+    }
+
+    #[test]
+    fn a_fresh_owner_success_closes_the_circuit_on_one_audit_line_and_clears_the_episode() {
+        // P3 case 6: actual recovery - the CURRENT (fresh) owner's success
+        // closes the circuit, clears the episode marker and resets BOTH
+        // censuses, on the single audit line.
+        // Pre-red baseline: green on the frozen tree (the recovery shape P3 keeps).
+        let _guard = circuit_scenario_guard();
+        circuit_episode_reset();
+        CIRCUIT_OPEN.store(true, Ordering::Release);
+        OWNER_QUARANTINED.store(true, Ordering::Release);
+        let stale_generation = next_owner_generation();
+        let fresh_generation = claim_sdk_owner().expect("the fresh owner B holds the claim");
+        {
+            let mut machine = CIRCUIT_RECOVERY.lock().unwrap();
+            machine.quarantine(stale_generation);
+            machine.detach(stale_generation);
+        }
+        let (requests, receiver) = mpsc::sync_channel(1);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let thread = std::thread::spawn(move || owner_loop(Box::new(Fake(calls)), receiver));
+        let device = SdkDevice {
+            requests: Some(requests),
+            payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
+            generation: fresh_generation,
+        };
+        device
+            .poll()
+            .expect("the fresh owner's poll round-trip lands");
+        assert!(
+            !circuit_open(),
+            "the fresh owner's success closes the circuit"
+        );
+        assert!(
+            !OWNER_QUARANTINED.load(Ordering::Acquire),
+            "the episode marker cleared"
+        );
+        {
+            let machine = CIRCUIT_RECOVERY.lock().unwrap();
+            assert_eq!(
+                (
+                    machine.responsive_ticks,
+                    machine.attempts,
+                    machine.in_flight,
+                    machine.detached,
+                    machine.detached_generations.len()
+                ),
+                (0, 0, 0, 0, 0),
+                "the closed episode resets the window AND the detached census"
+            );
+            assert!(
+                !machine.bound_hit(),
+                "a closed episode is under the bound: the next episode is armable"
+            );
+        }
+        let needle = ["log_info!(\"", "{CIRCUIT_RECOVERY_AUDIT}", "\")"].concat();
+        assert_eq!(
+            include_str!("./sdk.rs").matches(needle.as_str()).count(),
+            1,
+            "the recovery audit stays exactly one emit site"
+        );
+        drop(device);
+        thread.join().unwrap();
+        release_sdk_owner(fresh_generation);
+        circuit_episode_reset();
+    }
+
+    #[test]
+    fn the_detached_owner_bound_stops_authorizing_and_reports_once() {
+        // P2: the detached census is a resource bound, not a saturating
+        // counter. At the bound the resolver FAILS CLOSED: no fresh open is
+        // authorized at any gap, no attempt is consumed, and the diagnostic is
+        // ONE recorded line (a `log_warn`, silent-to-desktop).
+        // FROZEN RED: `sdk.rs:3690` "tick 2: at the bound no fresh open is
+        // authorized" - the frozen `tick` ignored the census and authorized
+        // with 16 retained owner threads.
+        let mut machine = CircuitRecovery::default();
+        machine.quarantine(next_owner_generation());
+        assert!(
+            !machine.bound_hit(),
+            "an empty census is under the bound: recovery is armable"
+        );
+        for owner in 0..DETACHED_OWNER_STORM {
+            machine.detach(next_owner_generation());
+            assert_eq!(
+                machine.detached,
+                owner + 1,
+                "the census counts the retained owners"
+            );
+        }
+        assert_eq!(
+            machine.detached_generations.len(),
+            DETACHED_OWNER_STORM,
+            "every retained owner is identified: the census IS the bound's state"
+        );
+        assert!(machine.bound_hit(), "the census is at the bound");
+        for tick in 0..(DETACHED_OWNER_STORM * 4) {
+            assert!(
+                !machine.tick(true, true),
+                "tick {tick}: at the bound no fresh open is authorized (fail closed)"
+            );
+        }
+        assert_eq!(
+            machine.attempts, 0,
+            "the bound consumed no attempts: authorization stopped before the gap"
+        );
+        assert!(
+            machine.take_bound_report(),
+            "reaching the bound is recorded exactly once"
+        );
+        assert!(
+            !machine.take_bound_report(),
+            "ONE log_warn: the latch stays consumed, never per tick"
+        );
+        // The bound's documented budget and the recorded line agree, and the
+        // line follows the journal-label rules (RC-1/RC-3 conventions).
+        assert!(
+            DETACHED_OWNER_BOUND < machine.detached,
+            "the incident storm scale exceeds the enforced bound, so the bound is what stopped it"
+        );
+        assert!(
+            DETACHED_OWNER_BOUND_AUDIT.contains(&format!(
+                "{DETACHED_OWNER_BOUND} detached owner threads are retained"
+            )),
+            "the recorded line names the bound the resolver enforces"
+        );
+        assert!(
+            DETACHED_OWNER_BOUND_AUDIT.contains("loss-cause=circuit-open"),
+            "the bound line rides the existing loss-cause detail convention"
+        );
+        for event in [
+            "healthy",
+            "finished",
+            "disconnected",
+            "logitech-attempt",
+            "logitech-result",
+            "logitech-wait-timeout",
+            "application-attempt",
+            "application-launched",
+            "application-resumed",
+        ] {
+            assert!(
+                !DETACHED_OWNER_BOUND_AUDIT.contains(event),
+                "the bound line names no journal event: {event}"
+            );
+        }
+        let needle = ["log_warn!(\"", "{DETACHED_OWNER_BOUND_AUDIT}", "\")"].concat();
+        assert_eq!(
+            include_str!("./sdk.rs")
+                .split("#[cfg(test)]\nmod tests {")
+                .next()
+                .expect("the test module marker")
+                .matches(needle.as_str())
+                .count(),
+            1,
+            "exactly one bound diagnostic emit site in production"
+        );
+        // The bound never touches the recovery machinery that stays live: the
+        // window keeps its one owner, and clearing the census re-arms.
+        assert_eq!(machine.in_flight, 1, "the window keeps exactly one owner");
+    }
+
+    #[test]
+    fn the_detached_owner_bound_restores_headroom_as_owners_return() {
+        // P2: below the bound recovery stays FULLY re-armable, and the census
+        // accounts exactly the owners that are still retained: a returning
+        // owner releases exactly its own entry.
+        // FROZEN RED: `sdk.rs:3712` `16 != 15` - the frozen `retired()` took
+        // the window arm first, so the returning owners released no census
+        // entry at all (and the storm's window died).
+        let mut machine = CircuitRecovery::default();
+        let episode_generation = next_owner_generation();
+        machine.quarantine(episode_generation);
+        let retained: Vec<u64> = (0..DETACHED_OWNER_STORM)
+            .map(|_| next_owner_generation())
+            .collect();
+        for generation in &retained {
+            machine.detach(*generation);
+        }
+        assert!(machine.bound_hit(), "the storm is at the bound");
+        for (index, generation) in retained
+            .iter()
+            .take(DETACHED_OWNER_STORM / 2 + 1)
+            .enumerate()
+        {
+            machine.retire(*generation); // half of them, plus one, return
+            assert_eq!(
+                machine.detached,
+                DETACHED_OWNER_STORM - index - 1,
+                "a returning owner releases exactly its own census entry"
+            );
+        }
+        assert!(
+            !machine.bound_hit(),
+            "the census is under the bound as owners return"
+        );
+        assert_eq!(
+            (machine.in_flight, machine.window_generation),
+            (1, episode_generation),
+            "the episode owner's window survived the storm and the returns"
+        );
+        assert!(!machine.tick(true, true), "under the bound: tick 1 of 3");
+        assert!(!machine.tick(true, true), "under the bound: tick 2 of 3");
+        assert!(
+            machine.tick(true, true),
+            "under the bound the resolver authorizes again (fully re-armable)"
+        );
+        for generation in &retained[DETACHED_OWNER_STORM / 2 + 1..] {
+            machine.retire(*generation);
+        }
+        machine.retire(episode_generation);
+        assert_eq!(
+            (
+                machine.in_flight,
+                machine.detached,
+                machine.detached_generations.len()
+            ),
+            (0, 0, 0),
+            "the closed episode leaves no census ghost, so the next episode starts at full headroom"
+        );
     }
 }
