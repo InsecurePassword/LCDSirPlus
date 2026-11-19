@@ -723,8 +723,15 @@ fn open_physical(kind: BackendKind, friendly_name: &str) -> Result<PhysicalDevic
         // successful call through the fresh owner closes the circuit; a
         // refusal publishes the byte-identical circuit-open row, so the
         // 11/18 ladder shape is unchanged.
-        if let Some(device) = sdk::try_circuit_recovery(friendly_name) {
-            return Ok(PhysicalDevice::Sdk(device));
+        // WO-U46B: the resolver OPENS an SDK device, so it is consulted only
+        // when the configured mode permits SDK ownership. An explicit `hid`
+        // selection (and `virtual`) takes the circuit-open refusal below and can
+        // never receive an SDK device; the resolver's own discovery/open
+        // contract is untouched.
+        if sdk_permits_ownership(kind) {
+            if let Some(device) = sdk::try_circuit_recovery(friendly_name) {
+                return Ok(PhysicalDevice::Sdk(device));
+            }
         }
         return Err(LossError::new(
             LossCause::CircuitOpen,
@@ -760,6 +767,13 @@ fn select_physical_kind(kind: BackendKind, lcore_present: bool) -> Result<Backen
             "virtual is not a physical backend".into(),
         )),
     }
+}
+
+/// Modes that may own an SDK device: `auto` (arbitration picks SDK when a
+/// trusted LCore is present) and `sdk` (explicit). `hid` and `virtual` never
+/// do, so the circuit-open recovery resolver is not consulted for them.
+fn sdk_permits_ownership(kind: BackendKind) -> bool {
+    matches!(kind, BackendKind::Auto | BackendKind::Sdk)
 }
 
 /// RC-6 candidate probe used while the ladder is terminal: reuse the open
@@ -2980,5 +2994,432 @@ mod tests {
         }
         commands.shutdown();
         thread.join().unwrap();
+    }
+
+    // ---- WO-U46B: backend-mode enforcement in the circuit-open recovery arm ----
+    // The finding: `open_physical` consults `sdk::try_circuit_recovery` (which
+    // opens an SDK device) BEFORE it honors `kind`, so a `sdk` -> `hid` config
+    // hot-reload taken while the process-global circuit is open lets an
+    // explicit `hid` selection receive an SDK device.
+    //
+    // The circuit flag is a private process-global static (`sdk.rs:73`
+    // `CIRCUIT_OPEN`, cleared only by `sdk.rs:344` `circuit_closed_on_health`),
+    // and `sdk.rs` is out of scope, so no test in this module can force it.
+    // The pre-red form mirrors the indicted arm statement-for-statement (the
+    // WO-U46A pre-red idiom) with the resolver's outcome injected through the
+    // LCore column, and the wiring is pinned on the production region itself
+    // with the `include_str!` census (`sdk.rs:3731` precedent).
+    const CIRCUIT_OPEN_DETAIL: &str =
+        "physical backend circuit is open after an unreturning SDK owner";
+    const CIRCUIT_OPEN_ROW: &str =
+        "circuit-open: physical backend circuit is open after an unreturning SDK owner";
+    const SDK_MODE_ABSENT_ROW: &str =
+        "device-absent: Logitech SDK mode requires a running trusted LCore.exe";
+    const HID_CONFLICT_ROW: &str =
+        "owner-conflict: direct HID is refused while competing process LCore.exe is running";
+    const VIRTUAL_NOT_PHYSICAL_ROW: &str = "probe-fail: virtual is not a physical backend";
+
+    /// The device class (the `Some` half) plus the published disconnect row
+    /// (empty when the cell opens a device) that `open_physical` yields for one
+    /// matrix cell: the mode gate decides the circuit-open arm, the existing
+    /// arbitration decides the circuit-closed arm.
+    fn recovery_arm_cell(
+        kind: BackendKind,
+        circuit_open: bool,
+        lcore_present: bool,
+    ) -> (Option<&'static str>, String) {
+        if circuit_open {
+            // The gated arm: `kind` is consulted BEFORE the resolver, then the
+            // 45a contract (`sdk.rs:362` `try_circuit_recovery`) yields a fresh
+            // SDK device exactly when a trusted, responsive LCore authorizes
+            // the one open per episode window.
+            if sdk_permits_ownership(kind) && lcore_present {
+                return (Some("sdk"), String::new());
+            }
+            return (
+                None,
+                published(&LossError::new(
+                    LossCause::CircuitOpen,
+                    CIRCUIT_OPEN_DETAIL.into(),
+                ))
+                .1,
+            );
+        }
+        match select_physical_kind(kind, lcore_present) {
+            Ok(BackendKind::Sdk) => (Some("sdk"), String::new()),
+            Ok(BackendKind::Hid) => (Some("hid"), String::new()),
+            Ok(other) => (None, format!("unexpected arbitration to {}", other.name())),
+            Err(error) => (None, published(&error).1),
+        }
+    }
+
+    /// One matrix row: label, mode, circuit state, LCore state, expected
+    /// device class (None = no device) and the expected published row
+    /// (empty = the cell opens a device, so it publishes no refusal).
+    type MatrixRow = (
+        &'static str,
+        BackendKind,
+        bool,
+        bool,
+        Option<&'static str>,
+        &'static str,
+    );
+
+    #[test]
+    fn the_backend_mode_gates_the_circuit_open_recovery_arm_for_every_mode_and_lcore_state() {
+        // Table: mode x circuit x LCore -> expected device class + published
+        // row. `virtual` never reaches `open_physical` in production (worker()
+        // routes it to `virtual_worker`, pinned by
+        // a_virtual_selection_never_reaches_the_physical_open_path), so its
+        // open-circuit cells pin the gate's decision as defense in depth.
+        let table: [MatrixRow; 16] = [
+            (
+                "auto/open/lcore",
+                BackendKind::Auto,
+                true,
+                true,
+                Some("sdk"),
+                "",
+            ),
+            (
+                "auto/open/no-lcore",
+                BackendKind::Auto,
+                true,
+                false,
+                None,
+                CIRCUIT_OPEN_ROW,
+            ),
+            (
+                "auto/closed/lcore",
+                BackendKind::Auto,
+                false,
+                true,
+                Some("sdk"),
+                "",
+            ),
+            (
+                "auto/closed/no-lcore",
+                BackendKind::Auto,
+                false,
+                false,
+                Some("hid"),
+                "",
+            ),
+            (
+                "sdk/open/lcore",
+                BackendKind::Sdk,
+                true,
+                true,
+                Some("sdk"),
+                "",
+            ),
+            (
+                "sdk/open/no-lcore",
+                BackendKind::Sdk,
+                true,
+                false,
+                None,
+                CIRCUIT_OPEN_ROW,
+            ),
+            (
+                "sdk/closed/lcore",
+                BackendKind::Sdk,
+                false,
+                true,
+                Some("sdk"),
+                "",
+            ),
+            (
+                "sdk/closed/no-lcore",
+                BackendKind::Sdk,
+                false,
+                false,
+                None,
+                SDK_MODE_ABSENT_ROW,
+            ),
+            (
+                "hid/open/lcore",
+                BackendKind::Hid,
+                true,
+                true,
+                None,
+                CIRCUIT_OPEN_ROW,
+            ),
+            (
+                "hid/open/no-lcore",
+                BackendKind::Hid,
+                true,
+                false,
+                None,
+                CIRCUIT_OPEN_ROW,
+            ),
+            (
+                "hid/closed/lcore",
+                BackendKind::Hid,
+                false,
+                true,
+                None,
+                HID_CONFLICT_ROW,
+            ),
+            (
+                "hid/closed/no-lcore",
+                BackendKind::Hid,
+                false,
+                false,
+                Some("hid"),
+                "",
+            ),
+            (
+                "virtual/open/lcore",
+                BackendKind::Virtual,
+                true,
+                true,
+                None,
+                CIRCUIT_OPEN_ROW,
+            ),
+            (
+                "virtual/open/no-lcore",
+                BackendKind::Virtual,
+                true,
+                false,
+                None,
+                CIRCUIT_OPEN_ROW,
+            ),
+            (
+                "virtual/closed/lcore",
+                BackendKind::Virtual,
+                false,
+                true,
+                None,
+                VIRTUAL_NOT_PHYSICAL_ROW,
+            ),
+            (
+                "virtual/closed/no-lcore",
+                BackendKind::Virtual,
+                false,
+                false,
+                None,
+                VIRTUAL_NOT_PHYSICAL_ROW,
+            ),
+        ];
+        for (label, mode, circuit_open, lcore_present, want_device, want_row) in table {
+            let (device, row) = recovery_arm_cell(mode, circuit_open, lcore_present);
+            assert_eq!(device, want_device, "cell {label}: device class");
+            assert_eq!(row, want_row, "cell {label}: published row");
+        }
+        for mode in [BackendKind::Hid, BackendKind::Virtual] {
+            for lcore_present in [true, false] {
+                assert_ne!(
+                    recovery_arm_cell(mode, true, lcore_present).0,
+                    Some("sdk"),
+                    "a {mode:?} selection under an open circuit never receives the resolver's SDK device"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_circuit_open_recovery_arm_consults_the_backend_mode_before_the_sdk_resolver() {
+        // FROZEN RED on the pre-fix tree (`u46b-prefix-reds.log`): `left: 0,
+        // right: 1` - the arm had no mode gate, so the resolver's SDK device
+        // was reachable for any configured mode.
+        let source = include_str!("./mod.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("the test module marker");
+        let arm = production
+            .split("fn open_physical")
+            .nth(1)
+            .and_then(|rest| rest.split("fn select_physical_kind").next())
+            .expect("the open_physical production body");
+        // rustfmt wraps at the column boundary, so the census joins every
+        // whitespace run onto one line (the sdk.rs:3748 normalization).
+        let flat: String = production
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace(" .", ".");
+        let arm_flat: String = arm
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace(" .", ".");
+        assert_eq!(
+            arm_flat.matches("sdk::circuit_open()").count(),
+            1,
+            "the arm is gated on the process-global circuit flag"
+        );
+        assert_eq!(
+            arm_flat
+                .matches("sdk::try_circuit_recovery(friendly_name)")
+                .count(),
+            1,
+            "the arm consults the fresh-open resolver exactly once"
+        );
+        assert_eq!(
+            arm_flat.matches("PhysicalDevice::Sdk(device)").count(),
+            1,
+            "the resolver's device is the only SDK construction in the arm"
+        );
+        assert_eq!(
+            arm_flat.matches(CIRCUIT_OPEN_DETAIL).count(),
+            1,
+            "the circuit-open refusal row stays the arm's only published row"
+        );
+        assert_eq!(
+            arm_flat.matches("sdk_permits_ownership(kind)").count(),
+            1,
+            "the arm asks the configured mode before the resolver may open an SDK device"
+        );
+        let gate = arm_flat
+            .find("sdk_permits_ownership(kind)")
+            .expect("the mode gate lives in the circuit-open arm");
+        let resolver = arm_flat
+            .find("sdk::try_circuit_recovery(friendly_name)")
+            .expect("the resolver call lives in the circuit-open arm");
+        assert!(
+            gate < resolver,
+            "the mode gate precedes the resolver, so a refused mode cannot reach an SDK device"
+        );
+        assert_eq!(
+            flat.matches("fn sdk_permits_ownership(kind: BackendKind) -> bool")
+                .count(),
+            1,
+            "the gate is one production function over the existing BackendKind"
+        );
+    }
+
+    #[test]
+    fn an_explicit_hid_ladder_under_an_open_circuit_publishes_the_circuit_open_row_never_a_connected_sdk(
+    ) {
+        // The same cell at the ladder: a `kind = hid` pass whose open yields the
+        // gated circuit-open refusal publishes the 11/18 row byte-identically
+        // and never a `Connected{Sdk}`. The open is the RC-6 injected seam, so
+        // no hardware, LCore or SDK state is touched.
+        static HID_CIRCUIT_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+        fn open_hid_circuit_open(
+            kind: BackendKind,
+            _friendly_name: &str,
+        ) -> Result<PhysicalDevice, LossError> {
+            assert_eq!(
+                kind,
+                BackendKind::Hid,
+                "the ladder passes the configured mode down the open path"
+            );
+            assert!(
+                !sdk_permits_ownership(kind),
+                "the gate refuses SDK ownership for an explicit hid selection"
+            );
+            HID_CIRCUIT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            Err(LossError::new(
+                LossCause::CircuitOpen,
+                CIRCUIT_OPEN_DETAIL.into(),
+            ))
+        }
+        let base = Duration::from_millis(1);
+        HID_CIRCUIT_ATTEMPTS.store(0, Ordering::SeqCst);
+        let (commands, wake) = command_queue();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_commands = Arc::clone(&commands);
+        let thread = std::thread::spawn(move || {
+            physical_worker(
+                BackendKind::Hid,
+                &worker_commands,
+                &wake,
+                &tx,
+                base,
+                base * 16,
+                base,
+                base,
+                "normal".into(),
+                false,
+                String::new(),
+                open_hid_circuit_open,
+                probe_never,
+            )
+        });
+        let budget = Instant::now() + Duration::from_secs(10);
+        let left = || budget.saturating_duration_since(Instant::now());
+        let mut rows = 0usize;
+        while rows < 2 {
+            assert!(
+                !left().is_zero(),
+                "the hid circuit-open rows stopped at {rows}"
+            );
+            if let Ok(Message::State(BackendState::Disconnected { cause, reason })) =
+                rx.recv_timeout(left())
+            {
+                assert_eq!(cause, LossCause::CircuitOpen, "row {rows}");
+                assert_eq!(
+                    reason, CIRCUIT_OPEN_ROW,
+                    "row {rows} is byte-identical to the 11/18 ladder rows"
+                );
+                rows += 1;
+            }
+        }
+        // A bounded drain: an explicit hid selection publishes no Connected (it
+        // never gets a device) and the circuit-open pass never feeds the Absent
+        // terminal, so the recovery window stays live at the capped cadence.
+        let drain = Instant::now() + Duration::from_millis(300);
+        let mut connected = 0usize;
+        let mut absent = 0usize;
+        loop {
+            let left = drain.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(left) {
+                Ok(Message::State(BackendState::Connected { .. })) => connected += 1,
+                Ok(Message::State(BackendState::Absent { .. })) => absent += 1,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            connected, 0,
+            "an explicit hid selection never receives the resolver's SDK device"
+        );
+        assert_eq!(absent, 0, "the circuit-open ladder never terminalizes");
+        assert!(
+            HID_CIRCUIT_ATTEMPTS.load(Ordering::SeqCst) >= 2,
+            "the ladder keeps opening, so a later `sdk` reload can still recover"
+        );
+        commands.shutdown();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn a_virtual_selection_never_reaches_the_physical_open_path() {
+        // The `virtual` matrix cells pin the gate as defense in depth: `worker()`
+        // routes `virtual` to `virtual_worker`, so only the three physical modes
+        // ever reach `physical_worker` and its `open_physical` arm.
+        let source = include_str!("./mod.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("the test module marker");
+        let dispatch = production
+            .split("fn worker(")
+            .nth(1)
+            .and_then(|rest| rest.split("fn transform_pixels").next())
+            .expect("the worker dispatch body");
+        let flat: String = dispatch
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace(" .", ".");
+        assert_eq!(
+            flat.matches("BackendKind::Virtual => virtual_worker")
+                .count(),
+            1,
+            "virtual has its own worker, so it never opens a physical device"
+        );
+        assert_eq!(
+            flat.matches("BackendKind::Auto | BackendKind::Sdk | BackendKind::Hid =>")
+                .count(),
+            1,
+            "the physical arm is the only route to the recovery branch"
+        );
     }
 }
