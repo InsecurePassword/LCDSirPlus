@@ -908,8 +908,58 @@ fn provider_demand_bits(slots: &Manager, modules: &[String; 4], cfg: &Config) ->
                 bits |= crate::telemetry::extended_consumer_bit("presentmon");
             }
         }
+        // WO-U46C (PR review P2): the same guard also covers the PENDING
+        // fallbacks of the chain walk, so a slot the fall-through is serving
+        // cannot park the collection its own chain is waiting for.
+        if pending_presentmon_fallback_demand(slots, modules) {
+            bits |= crate::telemetry::extended_consumer_bit("presentmon");
+        }
     }
     bits
+}
+
+/// WO-U46C (PR review P2, "dynamic fallback selection can leave PresentMon
+/// permanently parked"): a PENDING, REACHABLE PresentMon-backed dynamic fallback
+/// is a consumer the panel is awaiting, so it demands collection.
+/// `effective_slot_modules` walks a slot's chain and displays the first module
+/// that resolves (`app.rs:786-798`); every PresentMon-backed module the walk
+/// skipped is a fallback the panel shows the moment FPS becomes current.
+/// Deriving the bit from the displayed module and the raw selection alone
+/// self-locks exactly the slot the fall-through is serving: with
+/// `PROC_HANG FPS_CURRENT GPU_TEMP`, no hung target and no FPS, the panel shows
+/// `GPU_TEMP` (no consumer) and `PROC_HANG` is selected (no consumer), so
+/// nothing is collected, so FPS never arrives, so the slot never leaves
+/// `GPU_TEMP`. The walk reproduces the shipped chain order (`slots.next_except`,
+/// `app.rs:789`) and STOPS at the module the panel landed on, so a PresentMon
+/// module that is only an ALTERNATIVE behind a displayable selection stays
+/// demand-on-select (the ratified rule: no eager collection), a chain with no
+/// PresentMon-backed module never sets the bit, and the demand releases - the
+/// park resumes - as soon as no panel displays, selects or awaits one. The
+/// caller keeps the shipped enablement guard, so `presentmon_enabled 0`,
+/// `safe_mode` and `presentmon_target_mode disabled` never collect, and the
+/// `effective_slot_modules` gating contract (`app.rs:752-759`) is untouched.
+fn pending_presentmon_fallback_demand(slots: &Manager, modules: &[String; 4]) -> bool {
+    for (slot, displayed) in modules.iter().enumerate() {
+        let selected = slots.current(slot);
+        if displayed.eq_ignore_ascii_case(&selected) {
+            continue; // the panel shows its own selection: nothing is pending
+        }
+        let mut excluded = vec![selected.clone()];
+        loop {
+            let excluded_refs: Vec<_> = excluded.iter().map(String::as_str).collect();
+            let Some(candidate) = slots.next_except(slot, &excluded_refs) else {
+                break;
+            };
+            if candidate.eq_ignore_ascii_case(displayed) {
+                break; // the chain ends where the panel landed
+            }
+            if module_extended_consumers(&candidate).contains(&"presentmon") {
+                return true;
+            }
+            excluded.push(candidate);
+        }
+    }
+    false
 }
 
 fn discord_display_demand(modules: &[String; 4]) -> bool {
@@ -2368,6 +2418,15 @@ mod tests {
         );
     }
 
+    /// WO-TEL-D2 (S2) + WO-U46C SUPERSESSION (the single permitted existing-test
+    /// semantic change, declared in `WO-U46C-RECEIPT.md`): the shipped claims
+    /// below are BYTE-IDENTICAL (every panel is checked, the dynamic fallback is
+    /// skipped by the DISPLAY, and the config gates keep the module unavailable).
+    /// What is superseded is the semantics the name encoded: a dynamic fallback
+    /// the deferral skips is not merely ignored, it is a PENDING, REACHABLE
+    /// consumer, so it DEMANDS the `presentmon` collection. The two demand rows
+    /// added below are the new half of that claim; the last one (the WO's
+    /// regression chain) is the defect cell and is RED without the chain leg.
     #[test]
     fn presentmon_deferred_checks_every_panel_and_skips_dynamic_fallbacks() {
         let modules = [
@@ -2410,6 +2469,19 @@ mod tests {
                 effective_slot_modules(&slots, &unavailable, &cfg)[0],
                 "GPU_TEMP",
                 "{module}"
+            );
+            // WO-U46C (new half of the superseded claim): the panel shows the
+            // fallback while the reading is unavailable, and the PresentMon
+            // module the deferral is awaiting keeps the collection demanded, so
+            // the fall-through is a transition and not a parking place.
+            assert_ne!(
+                provider_demand_bits(
+                    &slots,
+                    &effective_slot_modules(&slots, &unavailable, &cfg),
+                    &cfg
+                ) & crate::telemetry::extended_consumer_bit("presentmon"),
+                0,
+                "{module} unavailable: the deferred reading is awaited, so presentmon stays demanded"
             );
 
             unavailable = current.clone();
@@ -2458,6 +2530,33 @@ mod tests {
         assert_eq!(
             effective_slot_modules(&slots, &current, &cfg)[0],
             "GPU_TEMP"
+        );
+
+        // WO-U46C THE DEFECT CELL, the WO's verbatim regression chain
+        // `PROC_HANG FPS_CURRENT GPU_TEMP` with no hung target, no FPS and the
+        // provider row the park publishes: the DISPLAY half is the shipped
+        // priority, the DEMAND half is what the "skips dynamic fallbacks"
+        // semantics used to deny. This cell is RED without the chain leg.
+        let mut pending_cfg = Config::default();
+        pending_cfg.slots[0] = ["PROC_HANG", "FPS_CURRENT", "GPU_TEMP"]
+            .map(str::to_string)
+            .to_vec();
+        // The other panels are pinned PresentMon-free, so this cell measures the
+        // chain leg alone (the default slot 3 selection demands by the raw leg).
+        for slot in 1..4 {
+            pending_cfg.slots[slot] = vec!["CLOCK".to_string()];
+        }
+        let pending = Manager::new(&pending_cfg, [0; 4]);
+        let pending_shown = effective_slot_modules(&pending, &unavailable, &pending_cfg);
+        assert_eq!(
+            pending_shown[0], "GPU_TEMP",
+            "the shipped display priority is unchanged for the regression chain"
+        );
+        assert_ne!(
+            provider_demand_bits(&pending, &pending_shown, &pending_cfg)
+                & crate::telemetry::extended_consumer_bit("presentmon"),
+            0,
+            "WO-U46C: the skipped FPS_CURRENT fallback is pending and reachable, so the slot the fall-through serves keeps presentmon demanded instead of parking it forever"
         );
     }
 
@@ -3821,6 +3920,16 @@ mod tests {
         assert!(cfg.presentmon_enabled, "config.rs:294 default = enabled");
         assert_eq!(cfg.presentmon_target_mode, "presenting", "config.rs:298");
         let mut soak = Config::default();
+        // WO-U46C DECLARED FIXTURE LOCKSTEP (fixture lines added, every shipped
+        // assertion below byte-identical): WO-U46C makes a slot that the
+        // fall-through is serving demand the PresentMon module its chain skipped,
+        // and the untouched DEFAULT slot 3 (`PROC_HANG FPS_1LOW ...`) is exactly
+        // that shape, so it would hold the bit for its own reason. The shipped
+        // claim below is about slot 2's own chain, so the other panels are pinned
+        // to a PresentMon-free reading here; no assertion is weakened.
+        soak.slots[0] = vec!["CLOCK".to_string()];
+        soak.slots[2] = vec!["CLOCK".to_string()];
+        soak.slots[3] = vec!["CLOCK".to_string()];
         soak.slots[1] = vec!["FPS_CURRENT".to_string(), "NET_BOTH".to_string()];
         let slots = Manager::new(&soak, [0; 4]);
         assert_eq!(slots.current(1), "FPS_CURRENT", "the RAW current selection");
@@ -3931,6 +4040,226 @@ mod tests {
             "the app publishes the demand word at most every 100 ms => re-arm bound = 150 ms"
         );
     }
+
+    /// WO-U46C (PR review P2, "dynamic fallback selection can leave PresentMon
+    /// permanently parked"): the complete transition on the regression slot
+    /// `PROC_HANG FPS_CURRENT GPU_TEMP`. With no hung target and no FPS reading
+    /// the panel displays the `GPU_TEMP` fallback, and the `FPS_CURRENT` module
+    /// the deferral skipped is a PENDING, REACHABLE PresentMon-backed fallback:
+    /// the panel will show it the moment FPS is current, so it must demand the
+    /// `presentmon` collection. Step 3 is the pre-fix RED cell
+    /// (`u46c-prefix-reds.log`); steps 4-6 then prove the demand arms collection,
+    /// the display transitions, and the demand releases (park resumes) when no
+    /// panel displays/selects/awaits a PresentMon-backed module.
+    #[test]
+    fn a_pending_presentmon_backed_dynamic_fallback_demands_collection_and_releases() {
+        let mut cfg = Config {
+            main_display: 1,
+            ..Config::default()
+        };
+        assert!(cfg.presentmon_deferred, "the shipped default is deferred 1");
+        assert!(cfg.presentmon_enabled, "the shipped default is enabled");
+        assert_eq!(cfg.presentmon_target_mode, "presenting");
+        // The regression chain on slot 1; the other panels carry no PresentMon
+        // reading, so every row below measures this one slot.
+        cfg.slots[0] = ["PROC_HANG", "FPS_CURRENT", "GPU_TEMP"]
+            .map(str::to_string)
+            .to_vec();
+        for slot in 1..4 {
+            cfg.slots[slot] = vec!["CLOCK".to_string()];
+        }
+        let slots = Manager::new(&cfg, [0; 4]);
+        let pm_bit = crate::telemetry::extended_consumer_bit("presentmon");
+        assert_ne!(pm_bit, 0, "presentmon carries an extended demand bit");
+
+        // (1) no hung target, no FPS reading, and the health row the park publishes.
+        let mut snapshot = Snapshot::default();
+        snapshot.providers.insert("presentmon".to_string(), false);
+        assert!(snapshot.hung.is_empty(), "step 1: no hung target");
+        assert!(!snapshot.game.fps.valid, "step 1: no FPS reading");
+        assert_eq!(slots.current(0), "PROC_HANG", "the RAW selection");
+
+        // (2) the fallback priority is preserved: GPU_TEMP is what the panel shows.
+        let shown = effective_slot_modules(&slots, &snapshot, &cfg);
+        assert_eq!(
+            shown[0], "GPU_TEMP",
+            "step 2: the deferral walks past the unavailable FPS_CURRENT onto the next configured module"
+        );
+
+        // (3) PRE-FIX RED: the pending, reachable fallback demands collection.
+        assert_ne!(
+            provider_demand_bits(&slots, &shown, &cfg) & pm_bit,
+            0,
+            "step 3: a PENDING, REACHABLE PresentMon-backed fallback demands collection, so the park arm re-arms and FPS can become current"
+        );
+
+        // (4) the demand arms collection: the provider is present with a fresh valid metric.
+        snapshot.providers.insert("presentmon".to_string(), true);
+        snapshot.game.active = true;
+        snapshot.game.fps = crate::model::Metric::valid(60.0, SystemTime::now());
+
+        // (5) the display transitions to the FPS module.
+        let shown = effective_slot_modules(&slots, &snapshot, &cfg);
+        assert_eq!(
+            shown[0], "FPS_CURRENT",
+            "step 5: the pending fallback resolves, so FPS_CURRENT is displayed"
+        );
+        assert_ne!(
+            provider_demand_bits(&slots, &shown, &cfg) & pm_bit,
+            0,
+            "the displayed FPS reading keeps the shipped display-derived demand"
+        );
+
+        // (6a) cycle-away: the slot selects GPU_TEMP, so nothing is pending.
+        let mut cycled = Manager::new(&cfg, [0; 4]);
+        cycled.cycle(0, 1);
+        cycled.cycle(0, 1);
+        assert_eq!(
+            cycled.current(0),
+            "GPU_TEMP",
+            "step 6: the raw selection is the fallback itself"
+        );
+        let shown = effective_slot_modules(&cycled, &snapshot, &cfg);
+        assert_eq!(shown[0], "GPU_TEMP", "the panel shows its own selection");
+        assert_eq!(
+            provider_demand_bits(&cycled, &shown, &cfg) & pm_bit,
+            0,
+            "step 6a: no panel displays/selects/awaits a PresentMon-backed module => the demand releases and the park resumes"
+        );
+
+        // (6b) removal: the chain holds no PresentMon-backed fallback at all.
+        cfg.slots[0] = ["PROC_HANG", "GPU_TEMP"].map(str::to_string).to_vec();
+        let trimmed = Manager::new(&cfg, [0; 4]);
+        assert_eq!(
+            trimmed.current(0),
+            "PROC_HANG",
+            "the dynamic module, selected"
+        );
+        let shown = effective_slot_modules(&trimmed, &snapshot, &cfg);
+        assert_eq!(
+            shown[0], "GPU_TEMP",
+            "the hang fall-through lands on the only surviving module"
+        );
+        assert_eq!(
+            provider_demand_bits(&trimmed, &shown, &cfg) & pm_bit,
+            0,
+            "step 6b: a chain with no PresentMon-backed fallback demands nothing (no eager collection)"
+        );
+    }
+
+    /// WO-U46C (the negative cells): the pending-fallback demand stays inside the
+    /// shipped enablement guard and inside reachability. `presentmon_enabled 0`,
+    /// `presentmon_target_mode disabled` and `safe_mode` never set the bit; a
+    /// chain with no PresentMon-backed module never sets it; and a PresentMon
+    /// module that is only an ALTERNATIVE of a selection the panel can display -
+    /// never skipped by a fall-through - stays demand-on-select, so collection
+    /// stays parked (the deferred-mode semantics, no eager provider).
+    #[test]
+    fn a_pending_presentmon_fallback_never_demands_under_the_gates_or_without_a_fallback() {
+        fn regression_word(cfg: &Config) -> (u64, [String; 4]) {
+            let mut cfg = cfg.clone();
+            cfg.slots[0] = ["PROC_HANG", "FPS_CURRENT", "GPU_TEMP"]
+                .map(str::to_string)
+                .to_vec();
+            for slot in 1..4 {
+                cfg.slots[slot] = vec!["CLOCK".to_string()];
+            }
+            let slots = Manager::new(&cfg, [0; 4]);
+            let snapshot = Snapshot::default();
+            let shown = effective_slot_modules(&slots, &snapshot, &cfg);
+            (provider_demand_bits(&slots, &shown, &cfg), shown)
+        }
+        let pm_bit = crate::telemetry::extended_consumer_bit("presentmon");
+        let base = Config {
+            main_display: 1,
+            ..Config::default()
+        };
+
+        let (bits, shown) = regression_word(&base);
+        assert_eq!(shown[0], "GPU_TEMP", "the regression display shape");
+        assert_ne!(
+            bits & pm_bit,
+            0,
+            "control: enabled + deferred => the pending fallback demands collection"
+        );
+
+        let off = Config {
+            main_display: 1,
+            presentmon_enabled: false,
+            ..Config::default()
+        };
+        let (bits, shown) = regression_word(&off);
+        assert_eq!(
+            shown[0], "GPU_TEMP",
+            "presentmon off => the same display shape"
+        );
+        assert_eq!(
+            bits & pm_bit,
+            0,
+            "presentmon_enabled 0 => the bit is NEVER set: no target poll, no child retries"
+        );
+
+        let disabled = Config {
+            main_display: 1,
+            presentmon_target_mode: "disabled".into(),
+            ..Config::default()
+        };
+        let (bits, _) = regression_word(&disabled);
+        assert_eq!(
+            bits & pm_bit,
+            0,
+            "presentmon_target_mode disabled => the bit is NEVER set"
+        );
+
+        let safe = Config {
+            main_display: 1,
+            safe_mode: true,
+            ..Config::default()
+        };
+        let (bits, _) = regression_word(&safe);
+        assert_eq!(bits & pm_bit, 0, "safe_mode => the bit is NEVER set");
+
+        // A chain with no PresentMon-backed module: the hang fall-through has
+        // nothing to await, so nothing is collected.
+        let mut plain = base.clone();
+        plain.slots[0] = ["PROC_HANG", "GPU_TEMP"].map(str::to_string).to_vec();
+        for slot in 1..4 {
+            plain.slots[slot] = vec!["CLOCK".to_string()];
+        }
+        let plain_slots = Manager::new(&plain, [0; 4]);
+        let plain_shown = effective_slot_modules(&plain_slots, &Snapshot::default(), &plain);
+        assert_eq!(
+            plain_shown[0], "GPU_TEMP",
+            "the dynamic fall-through still serves the panel"
+        );
+        assert_eq!(
+            provider_demand_bits(&plain_slots, &plain_shown, &plain),
+            0,
+            "no PresentMon-backed fallback in any chain => the extended word stays empty (no eager demand)"
+        );
+
+        // Demand-on-select preserved: GPU_TEMP is the selection and displays, so
+        // the FPS_CURRENT behind it is an alternative, never a skipped fallback.
+        let mut alternative = base.clone();
+        alternative.slots[0] = ["GPU_TEMP", "FPS_CURRENT"].map(str::to_string).to_vec();
+        for slot in 1..4 {
+            alternative.slots[slot] = vec!["CLOCK".to_string()];
+        }
+        let alt_slots = Manager::new(&alternative, [0; 4]);
+        let alt_snapshot = Snapshot::default();
+        let alt_shown = effective_slot_modules(&alt_slots, &alt_snapshot, &alternative);
+        assert_eq!(alt_slots.current(0), "GPU_TEMP", "the selection");
+        assert_eq!(
+            alt_shown[0], "GPU_TEMP",
+            "the selection resolves, so no fall-through runs"
+        );
+        assert_eq!(
+            provider_demand_bits(&alt_slots, &alt_shown, &alternative) & pm_bit,
+            0,
+            "demand-on-select: an FPS alternative that is not the selection and was never skipped demands no presentmon"
+        );
+    }
+
     #[test]
     fn idle_production_dispatch_keeps_hang_owner_cached_until_a_real_cycle() {
         let cfg = Config::default();
