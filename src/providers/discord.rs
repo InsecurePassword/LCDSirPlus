@@ -419,7 +419,7 @@ extern "system" fn lcsd_stub_error(_out: *mut u8, _out_cap: u32) -> i32 {
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::FreeLibrary;
 use windows::Win32::System::Diagnostics::Debug::{
-    SetErrorMode, SEM_FAILCRITICALERRORS, THREAD_ERROR_MODE,
+    SetThreadErrorMode, SEM_FAILCRITICALERRORS, THREAD_ERROR_MODE,
 };
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
@@ -556,22 +556,46 @@ fn validate_table(raw: *const c_void) -> Option<&'static LcsdV1> {
     unsafe { Some(&*(raw as *const LcsdV1)) }
 }
 
-/// The OS hard-error mode, saved and restored around one component load. `Drop` runs on every
-/// exit path, so a classified failure never leaves the mode raised. The mode is process-wide; the
-/// only production load site is the single Discord worker thread (`spawn_worker`, whose loop owns
-/// the `loader` call), so no two component loads are in flight inside the running app.
-struct SilentComponentLoadErrors(THREAD_ERROR_MODE);
+/// The calling thread's hard-error mode, saved and restored around one component load. `Drop` runs
+/// on every exit path, so a classified failure never leaves the mode raised. The set is the
+/// thread-scoped `SetThreadErrorMode`, the API Microsoft Learn directs callers to favor over the
+/// process-wide `SetErrorMode` ("Windows 7: Callers should favor SetThreadErrorMode over
+/// SetErrorMode since it is less disruptive to the normal behavior of the system"), and the mode to
+/// restore is taken from that call's own out-parameter, so only this thread's mode is ever touched:
+/// a load on the Discord worker thread cannot raise the hard-error suppression another thread sees
+/// through `GetErrorMode`, which the process-wide wrapper did (probe `u46d-probe-p2.log`:
+/// `A_setErrorMode ... process=1 new_process=1` vs `B_setThreadErrorMode ... self=1 process=0`).
+/// A set that FAILS is recorded, never assumed: the guard then restores nothing, the load proceeds
+/// under the thread's existing mode (the dialog risk of the pre-u44 status quo) and the
+/// classification, publish, `log_warn` and census all continue.
+struct SilentComponentLoadErrors {
+    previous: Option<THREAD_ERROR_MODE>,
+}
 
 impl SilentComponentLoadErrors {
     fn new() -> Self {
-        Self(unsafe { SetErrorMode(SEM_FAILCRITICALERRORS) })
+        let mut previous = THREAD_ERROR_MODE::default();
+        match unsafe { SetThreadErrorMode(SEM_FAILCRITICALERRORS, Some(&mut previous)) } {
+            Ok(()) => Self {
+                previous: Some(previous),
+            },
+            Err(error) => {
+                crate::log_warn!(
+                    "Discord component load-error suppression refused: {} (load proceeds with the default error mode)",
+                    error
+                );
+                Self { previous: None }
+            }
+        }
     }
 }
 
 impl Drop for SilentComponentLoadErrors {
     fn drop(&mut self) {
-        unsafe {
-            SetErrorMode(self.0);
+        if let Some(previous) = self.previous {
+            // A failed restore leaves the mode raised (the benign direction, suppression only), and
+            // no load outcome depends on it, so it is not classified.
+            let _ = unsafe { SetThreadErrorMode(previous, None) };
         }
     }
 }
@@ -3674,6 +3698,167 @@ mod tests {
         );
         drop(runtime);
         drop(fixture);
+    }
+
+    /// WO-U46D (PR finding P3): the load-time suppression is THREAD-scoped. `GetThreadErrorMode`
+    /// is the documented per-thread read ("Retrieves the error mode for the calling thread") and
+    /// `GetErrorMode` the process view ("To retrieve the process error mode, use the GetErrorMode
+    /// function"), and a thread inherits the process view ("A thread inherits the error mode of the
+    /// process in which it is running"), so a thread created INSIDE the guard window, read through
+    /// both views, is the scope proof. `join()` is the only synchronization: no sleeps.
+    ///
+    /// PRE-FIX STATUS: RED against the unit-44 guard, at the in-window process-view assertion.
+    /// Measured on this host by the WO-U46D Step-0 probe (`u46d-probe-p2.log`):
+    /// `A_setErrorMode prev=0 self=0 process=1 new_thread=0 new_process=1` - the process view is
+    /// raised for the whole window and a thread created in it inherits the raised bit, while
+    /// `B_setThreadErrorMode ... self=1 process=0 new_thread=0 new_process=0` confines it to the
+    /// calling thread. So this assertion pins a real scope narrowing, not only the API spelling.
+    #[test]
+    fn discord_load_error_suppression_is_thread_scoped_and_restored() {
+        use windows::Win32::System::Diagnostics::Debug::{GetErrorMode, GetThreadErrorMode};
+        let base_thread = unsafe { GetThreadErrorMode() };
+        let base_process = unsafe { GetErrorMode() };
+        {
+            let _guard = SilentComponentLoadErrors::new();
+            assert_eq!(
+                unsafe { GetErrorMode() },
+                base_process,
+                "the guard window does not raise the process error mode"
+            );
+            let concurrent =
+                std::thread::spawn(|| unsafe { (GetThreadErrorMode(), GetErrorMode()) })
+                    .join()
+                    .unwrap();
+            assert_eq!(
+                concurrent.0, base_thread,
+                "a thread created inside the window keeps its own inherited thread mode"
+            );
+            assert_eq!(
+                concurrent.1, base_process,
+                "a thread created inside the window inherits an untouched process mode"
+            );
+            assert_ne!(
+                unsafe { GetThreadErrorMode() } & SEM_FAILCRITICALERRORS.0,
+                0,
+                "the suppression is live on the thread that performs the load"
+            );
+        }
+        assert_eq!(
+            unsafe { GetThreadErrorMode() },
+            base_thread,
+            "the calling thread's mode is restored exactly at the scope exit"
+        );
+        assert_eq!(
+            unsafe { GetErrorMode() },
+            base_process,
+            "the process view is still what it was before the guard"
+        );
+    }
+
+    /// WO-U46D: the RAII restore fires on the production load's failure exits, where the
+    /// INCIDENT-002 dialog risk lives (a missing file and a corrupt image both run the load inside
+    /// the guard). PRE-FIX STATUS: green - the unit-44 guard also restored on these paths; it
+    /// pinned the thread view, which the pre-fix form never raised. It stays as the every-failure-
+    /// exit pin for the new form.
+    #[test]
+    fn discord_guarded_load_restores_the_thread_error_mode_on_every_failure_exit() {
+        use windows::Win32::System::Diagnostics::Debug::GetThreadErrorMode;
+        let baseline = unsafe { GetThreadErrorMode() };
+        let mut diagnostic = [0u8; LOADER_DIAGNOSTIC_CAPACITY];
+        let missing = std::env::temp_dir().join(format!(
+            "lcdsirplus-u46d-missing-{}-{}.dll",
+            std::process::id(),
+            random_nonce().unwrap()
+        ));
+        assert_eq!(
+            load_table_from(&missing, &mut diagnostic).err(),
+            Some(LoadFault::Missing),
+            "an absent file is a classified Missing failure"
+        );
+        assert_eq!(
+            unsafe { GetThreadErrorMode() },
+            baseline,
+            "the Missing exit leaves the thread mode as it was"
+        );
+        let corrupt = std::env::temp_dir().join(format!(
+            "lcdsirplus-u46d-corrupt-{}-{}.dll",
+            std::process::id(),
+            random_nonce().unwrap()
+        ));
+        std::fs::write(&corrupt, b"this is not a PE image").unwrap();
+        let image = load_table_from(&corrupt, &mut diagnostic);
+        assert!(
+            matches!(
+                image.err(),
+                Some(LoadFault::Image) | Some(LoadFault::Missing)
+            ),
+            "a non-image file is a classified failure, never a crash and never a dialog"
+        );
+        let _ = std::fs::remove_file(&corrupt);
+        assert_eq!(
+            unsafe { GetThreadErrorMode() },
+            baseline,
+            "the corrupt-image exit leaves the thread mode as it was"
+        );
+    }
+
+    /// WO-U46D: structural pin of the guard's SHAPE, the part no runtime test can reach - every
+    /// return path of the load function is covered by the RAII scope, and the process-wide
+    /// `SetErrorMode` wrapper is gone from the shipped production text.
+    #[test]
+    fn discord_component_load_guard_covers_every_return_path_structurally() {
+        let source = shipped_production_region();
+        assert_eq!(
+            source.matches("SetErrorMode(").count(),
+            0,
+            "the process-wide SetErrorMode wrapper is no longer called in production"
+        );
+        assert_eq!(
+            source.matches("SetThreadErrorMode(").count(),
+            2,
+            "exactly two thread-scoped calls: the guard's set and its restore"
+        );
+        let body = fn_body_at(&source, "pub fn load_table_from");
+        let opened = body
+            .find("let library = {")
+            .expect("the load call sits in a guard scope block");
+        let closed = opened
+            + body[opened..]
+                .find("\n    }\n    .map_err")
+                .expect("the guard scope block closes before the classification");
+        let scope = &body[opened..closed];
+        assert!(
+            scope.contains("SilentComponentLoadErrors::new()"),
+            "the guard is constructed inside the scope that owns the load"
+        );
+        assert!(
+            scope.contains("LoadLibraryExW"),
+            "the load call is the only work inside the guard scope"
+        );
+        assert_eq!(
+            scope.matches("SilentComponentLoadErrors::new()").count(),
+            1,
+            "one guard per load, no nested window"
+        );
+        for needle in [
+            "?;",
+            "return Err(LoadFault::Symbol);",
+            "return Err(LoadFault::Handshake);",
+            "Ok(Module {",
+        ] {
+            let at = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("the load function carries `{needle}`"));
+            assert!(
+                at > closed,
+                "`{needle}` is an exit AFTER the guard scope closed, so Drop has already restored"
+            );
+        }
+        let drop_body = fn_body_at(&source, "impl Drop for SilentComponentLoadErrors");
+        assert!(
+            drop_body.contains("SetThreadErrorMode(previous, None)"),
+            "the restore goes through the thread-scoped API with no out-parameter"
+        );
     }
 
     /// V1(d): the 50-cycle enable/disable census. One worker spawn + join and one load/start/
