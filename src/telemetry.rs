@@ -179,6 +179,9 @@ struct Worker {
     battery_success: Option<Instant>,
     hwinfo_success: Option<Instant>,
     network_success: Option<Instant>,
+    // WO-U46I (#3b): the presentmon worker's last accepted, current-generation, AVAILABLE
+    // publication; the same success-stamp shape as `gpu_success` / `network_success`.
+    presentmon_success: Option<Instant>,
     controller_attempt: Option<Instant>,
     audio_attempt: Option<Instant>,
     net_attempt: Option<Instant>,
@@ -327,6 +330,15 @@ pub fn demanded(consumers: u64, provider: &str) -> bool {
 
 fn gpu_stale_after(cfg: &Config) -> Duration {
     cfg.telemetry_interval
+        .saturating_mul(3)
+        .max(Duration::from_secs(3))
+}
+
+/// WO-U46I (#3b): the presentmon staleness bound, derived from the provider's own publication
+/// cadence exactly as `gpu_stale_after` and the network-probe arm derive theirs (no new config
+/// surface): `presentmon_interval * 3`, floored at 3 s.
+fn presentmon_stale_after(cfg: &Config) -> Duration {
+    cfg.presentmon_interval
         .saturating_mul(3)
         .max(Duration::from_secs(3))
 }
@@ -623,7 +635,7 @@ impl Worker {
             applied = true;
         }
         while let Ok(update) = self.presentmon_rx.try_recv() {
-            self.apply_presentmon_update(update, generation);
+            self.apply_presentmon_update(update, generation, now);
             applied = true;
         }
         while let Ok(update) = self.hang_rx.try_recv() {
@@ -706,6 +718,7 @@ impl Worker {
         self.battery_success = None;
         self.hwinfo_success = None;
         self.network_success = None;
+        self.presentmon_success = None;
         self.controller_attempt = None;
         self.audio_attempt = None;
         self.net_attempt = None;
@@ -770,12 +783,26 @@ impl Worker {
         }
     }
 
-    fn apply_presentmon_update(&mut self, update: presentmon::Update, generation: u64) {
+    fn apply_presentmon_update(
+        &mut self,
+        update: presentmon::Update,
+        generation: u64,
+        now: Instant,
+    ) {
         if update.generation != generation {
             return;
         }
         self.update.game = update.game;
         self.set_provider("presentmon", update.available);
+        // WO-U46I (#3b): the success stamp advances ONLY on an accepted, current-generation
+        // publication that reports the provider AVAILABLE — the shipped rule of
+        // `apply_network_update` (`if update.available { self.network_success = Some(now) }`) and
+        // of `apply_gpu`'s Ok arm. A stale generation returned above; an `available: false`
+        // publication (park, no target, disabled, expired capture) is not a success, so it can
+        // never keep a silent worker's last FPS looking fresh.
+        if update.available {
+            self.presentmon_success = Some(now);
+        }
         if !update.available && !update.detail.is_empty() {
             if update.error {
                 crate::log_warn!("PresentMon unavailable: {}", update.detail);
@@ -1285,8 +1312,32 @@ impl Worker {
         }
         self.update.cpu_temp = prefer_cpu_temperature(self.hwinfo_cpu_temp, self.lhm_cpu_temp);
         self.update.gpu_temp = prefer_native_temperature(self.native_gpu_temp, self.lhm_gpu_temp);
-        if !enabled(cfg, "presentmon") {
+        if enabled(cfg, "presentmon") {
+            // WO-U46I (#3b): presentmon joins the freshness contract on its own success stamp,
+            // the shipped shape of the arms above. Past the provider's bound the DISPLAYED rows
+            // (FPS, 1%-low, 0.1%-low, frame time) read stale; past twice that bound they read
+            // unavailable, the 1x/2x doubling the provider's own `stale_projection` uses
+            // (`providers/presentmon.rs:2220-2247`), so a silent worker's last number can never
+            // keep presenting as live. A recovery publication replaces `update.game` wholesale,
+            // which clears the stale marks: fresh again.
+            let bound = presentmon_stale_after(cfg);
+            let is_stale = stale(self.presentmon_success, bound, now);
+            let expired = stale(self.presentmon_success, bound.saturating_mul(2), now);
+            for metric in [
+                &mut self.update.game.fps,
+                &mut self.update.game.one_percent,
+                &mut self.update.game.point_one_low,
+                &mut self.update.game.frame_time_ms,
+            ] {
+                if expired {
+                    *metric = Metric::invalid();
+                } else {
+                    metric.stale = metric.valid && (metric.stale || is_stale);
+                }
+            }
+        } else {
             self.update.game = GameStats::default();
+            self.presentmon_success = None;
             self.remove_provider("presentmon");
         }
         if enabled(cfg, "network_probe") {
@@ -1818,6 +1869,13 @@ fn spawn_gpu(
                 if generation != last_generation {
                     last_generation = generation;
                     last_attempt = None;
+                    // WO-U46I (#16): a config apply bumps the generation AND clears the
+                    // coordinator's published row set (`reset_state`), so a loop parked across
+                    // that apply must be able to restate the explicit core-unavailable rows for
+                    // the NEW generation. Without this reset the new generation shows silent
+                    // absence for the core readings until demand returns; stale-generation
+                    // publications stay rejected by the coordinator's generation guard.
+                    parked_published = false;
                 }
                 // WO-TEL-D2 (S4, U-10): streak survives a bump (same rule as the
                 // LHM loop above); the cleared stamp samples immediately.
@@ -1946,6 +2004,7 @@ pub fn spawn(cfg: &Config, initial_consumers: u64) -> Telemetry {
         battery_success: None,
         hwinfo_success: None,
         network_success: None,
+        presentmon_success: None,
         controller_attempt: None,
         audio_attempt: None,
         net_attempt: None,
@@ -2165,6 +2224,7 @@ mod tests {
             battery_success: None,
             hwinfo_success: None,
             network_success: None,
+            presentmon_success: None,
             controller_attempt: None,
             audio_attempt: None,
             net_attempt: None,
@@ -2289,6 +2349,7 @@ mod tests {
                 ..Default::default()
             },
             2,
+            Instant::now(),
         );
         worker.apply_hang_update(
             hang::Update {
@@ -3293,7 +3354,12 @@ mod tests {
         // structural claims as shipped.
         const READ: &str =
             "let (generation, cfg) = cached_request(&config, &generation, &mut request);";
-        const BRANCH: &str = "if generation != last_generation {\n                    last_generation = generation;\n                    last_attempt = None;\n                }";
+        // WO-U46I (#16): the gpu loop's generation branch gained the park-flag reset, so the
+        // shipped three-line text is claimed as the branch PREFIX (branch head + generation
+        // store + cadence clear, exactly once) for every loop, and the park reset is pinned
+        // explicitly on the branch body below. Nothing is weakened: one branch, one clear, the
+        // same order, and the gpu-only reset is now a stated claim.
+        const BRANCH: &str = "if generation != last_generation {\n                    last_generation = generation;\n                    last_attempt = None;";
         for (fn_head, event) in [
             ("fn spawn_headset(", "SlowEvent::Headset(generation,"),
             ("fn spawn_lhm(", "SlowEvent::Lhm(generation,"),
@@ -3310,6 +3376,19 @@ mod tests {
                 loop_src.matches(BRANCH).count(),
                 1,
                 "{fn_head}: the cadence clear exists exactly once, inside the generation-change branch"
+            );
+            let branch_at = loop_src
+                .find(BRANCH)
+                .expect("{fn_head}: the generation-change branch");
+            let branch_body = &loop_src[branch_at
+                ..branch_at
+                    + loop_src[branch_at..]
+                        .find("\n                }")
+                        .expect("{fn_head}: the generation-change branch closes")];
+            assert_eq!(
+                branch_body.matches("parked_published = false;").count(),
+                usize::from(fn_head == "fn spawn_gpu("),
+                "{fn_head}: the park-flag reset exists exactly once, in the gpu loop's generation branch only"
             );
             assert_eq!(
                 loop_src.matches("last_attempt = None;").count(),
@@ -5038,6 +5117,7 @@ mod tests {
             battery_success: None,
             hwinfo_success: None,
             network_success: None,
+            presentmon_success: None,
             controller_attempt: None,
             audio_attempt: None,
             net_attempt: None,
@@ -5495,5 +5575,268 @@ mod tests {
         let runtime = spawn(&cfg, 0);
         // Drop must wake the native park tokens even when no configuration changed.
         drop(runtime);
+    }
+
+    // WO-U46I (#16) park republication + (#3b) presentmon coordinator freshness. The park proof
+    // runs the REAL `spawn_gpu` body through the shipped sampler seam (only the sampler injected,
+    // WO-TEL-C pattern, every budget a bounded `recv_timeout`); the freshness proof runs the
+    // production `apply_presentmon_update` + `apply_freshness` path on synthetic `now`s, the same
+    // shape as `published_flag_record` (WO-TEL-D2).
+
+    static PARKGEN_GPU_SAMPLER: OnceLock<ScriptedSampler<Result<gpu::Sample, String>>> =
+        OnceLock::new();
+
+    fn parkgen_gpu_sampler(
+        _provider: &mut gpu::Provider,
+        _selector: &str,
+    ) -> Result<gpu::Sample, String> {
+        sampled_in_slot(&PARKGEN_GPU_SAMPLER)
+    }
+
+    /// WO-U46I (#16) PRE-RED. A config apply while the gpu loop is PARKED bumps the generation,
+    /// and `reset_state` clears the published core-unavailable row set, so the park must restate
+    /// the explicit unavailable rows for the NEW generation. Pre-fix the generation branch cleared
+    /// `last_attempt` only, so a parked loop went SILENT for the new generation (the silent
+    /// absence the WO-TEL-D3-B1 publish-once rule was built to remove) => RED: step (iii) times
+    /// out. The same-generation publish-once rule, the stale-generation rejection and the
+    /// demand-return re-arm are asserted to stay as accepted.
+    #[test]
+    fn telemetry_gpu_park_republishes_after_a_generation_bump() {
+        assert_injected_sampler_is_io_free("parkgen_gpu_sampler");
+        let (enter_rx, release_tx) = install_scripted_sampler(
+            &PARKGEN_GPU_SAMPLER,
+            vec![Ok(gpu::Sample {
+                backend: "synthetic-park-resume".into(),
+                readings: Vec::new(),
+                temperature: Metric::invalid(),
+                power_w: None,
+                sampled_at: marker_time(7),
+            })],
+        );
+        let config = Arc::new(RwLock::new(Config {
+            // The park here is the DEMAND park (`consumers = 0`), with the provider itself
+            // enabled, so step (vi) can prove normal collection resumes.
+            gpu_provider: "nvapi".into(),
+            telemetry_interval: BEHAVIORAL_DRIVEN,
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let consumers = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(8);
+        let loop_thread = spawn_gpu(
+            Arc::clone(&config),
+            Arc::clone(&generation),
+            Arc::clone(&consumers),
+            Arc::clone(&shutdown),
+            tx,
+            parkgen_gpu_sampler,
+        );
+        let (gen1, outcome1) = gpu_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(i) the park publishes its explicit core-unavailable event"),
+        );
+        assert_eq!(gen1, 1, "(i) the park event carries the live generation");
+        assert!(
+            outcome1.is_err(),
+            "(i) the park event states the core-unavailable reason (an Err payload)"
+        );
+        assert!(
+            rx.recv_timeout(BEHAVIORAL_SUPPRESS_WINDOW).is_err(),
+            "(ii) one publication per park transition: an unchanged generation stays quiet"
+        );
+        // (iii) the config apply while parked: `update_config` bumps the generation.
+        generation.fetch_add(1, Ordering::SeqCst);
+        loop_thread.thread().unpark();
+        let (gen2, outcome2) = gpu_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(iii) the bump re-arms the park statement for the new generation"),
+        );
+        assert_eq!(
+            gen2, 2,
+            "(iii) the republished park event carries the NEW generation"
+        );
+        assert!(
+            outcome2.is_err(),
+            "(iii) the republished event is the explicit unavailable statement"
+        );
+        // (iv) repeated applies repeat the statement, each on its own generation.
+        generation.fetch_add(1, Ordering::SeqCst);
+        loop_thread.thread().unpark();
+        let (gen3, outcome3) =
+            gpu_event(rx.recv_timeout(BEHAVIORAL_WAIT).expect(
+                "(iv) a second bump republishes again (no lifetime lockout of the park row)",
+            ));
+        assert_eq!(gen3, 3, "(iv) the second republish carries generation 3");
+        assert!(
+            outcome3.is_err(),
+            "(iv) still the explicit unavailable statement"
+        );
+        // (v) the shipped stale-generation rejection is preserved on the coordinator side.
+        let mut worker = test_worker(Config::default());
+        let stale_event = SlowEvent::Gpu(
+            99,
+            Ok(gpu::Sample {
+                backend: "synthetic-stale-generation".into(),
+                readings: Vec::new(),
+                temperature: Metric::invalid(),
+                power_w: None,
+                sampled_at: marker_time(8),
+            }),
+        );
+        worker.apply_slow_event(stale_event, 3, Instant::now());
+        assert!(
+            worker.update.gpu_readings.is_empty(),
+            "(v) a stale-generation park/sample event is still rejected by the generation guard"
+        );
+        // (vi) demand returns: normal collection resumes through the real loop.
+        consumers.store(consumer_bit("gpu"), Ordering::Relaxed);
+        loop_thread.thread().unpark();
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(vi) the demand-return re-arm enters the sampler");
+        release_tx.send(()).expect("(vi) release the scripted Ok");
+        let (gen4, outcome4) = gpu_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(vi) the resumed loop publishes a real sample"),
+        );
+        assert_eq!(
+            gen4, 3,
+            "(vi) the resumed sample carries the live generation"
+        );
+        assert_eq!(
+            outcome4
+                .expect("(vi) the payload is the injected Ok sample")
+                .0,
+            "synthetic-park-resume",
+            "(vi) parking does not break the collection path"
+        );
+        shutdown.store(true, Ordering::Release);
+        loop_thread.thread().unpark();
+        loop_thread
+            .join()
+            .expect("the GPU loop joins within the sampler's loud 5 s budget");
+    }
+
+    /// WO-U46I (#3b) PRE-RED (the FPS-stays-fresh defect): presentmon joins the coordinator's
+    /// success-stamp + `apply_freshness` contract. Production path, driven with synthetic `now`s
+    /// exactly as `gpu_success` is driven in `published_flag_record`: an accepted,
+    /// current-generation publication stamps success; worker SILENCE past the provider's own
+    /// bound marks the displayed FPS / 1%-low / 0.1%-low / frame-time rows stale, and past twice
+    /// that bound unavailable (the provider's own `stale_projection` doubling); a stale-generation
+    /// publication and an `available: false` (empty/park) publication never advance the stamp; a
+    /// later accepted publication makes the rows fresh again. Pre-fix there is NO presentmon stamp
+    /// and `apply_freshness` never touches `update.game`, so a dead worker's last FPS keeps
+    /// displaying fresh forever => RED at step (ii).
+    #[test]
+    fn presentmon_metrics_fresh_stale_unavailable_on_worker_silence() {
+        let cfg = Config::default();
+        let bound = cfg
+            .presentmon_interval
+            .saturating_mul(3)
+            .max(Duration::from_secs(3));
+        let mut worker = test_worker(cfg.clone());
+        let game = |worker: &Worker| {
+            [
+                worker.update.game.fps,
+                worker.update.game.one_percent,
+                worker.update.game.point_one_low,
+                worker.update.game.frame_time_ms,
+            ]
+        };
+        let update = |generation: u64, available: bool| presentmon::Update {
+            generation,
+            available,
+            game: GameStats {
+                active: true,
+                process_name: "game.exe".into(),
+                fps: Metric::valid(60.0, SystemTime::UNIX_EPOCH),
+                one_percent: Metric::valid(55.0, SystemTime::UNIX_EPOCH),
+                point_one_low: Metric::valid(50.0, SystemTime::UNIX_EPOCH),
+                frame_time_ms: Metric::valid(16.7, SystemTime::UNIX_EPOCH),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let base = Instant::now();
+        worker.apply_presentmon_update(update(1, true), 1, base);
+        worker.apply_freshness(&cfg, base);
+        let stamped = worker
+            .presentmon_success
+            .expect("(i) an accepted current-generation publication stamps the success");
+        assert_eq!(
+            stamped, base,
+            "(i) the stamp is the publication's own `now`"
+        );
+        assert!(
+            game(&worker)
+                .iter()
+                .all(|metric| metric.valid && !metric.stale),
+            "(i) an accepted current-generation publication shows the rows FRESH"
+        );
+        // (ii) a stale-generation publication is rejected, so it cannot advance the stamp: after
+        // the provider's own silence bound the rows must read STALE, not fresh.
+        worker.apply_presentmon_update(update(2, true), 1, base + Duration::from_secs(1));
+        assert_eq!(
+            worker.presentmon_success,
+            Some(stamped),
+            "(ii) a stale-generation publication never advances the stamp"
+        );
+        let silent = base + bound + Duration::from_secs(1);
+        worker.apply_freshness(&cfg, silent);
+        assert!(
+            game(&worker).iter().all(|metric| metric.valid && metric.stale),
+            "(ii) worker silence past the bound marks every presentmon row STALE (displayed outcome)"
+        );
+        // (iii) an `available: false` publication (park / no target / expired capture) that
+        // carries fresh-looking values is NOT a success: it must not advance the stamp.
+        worker.apply_presentmon_update(update(1, false), 1, silent);
+        assert_eq!(
+            worker.presentmon_success,
+            Some(stamped),
+            "(iii) an unavailable (empty/park) publication never advances the stamp"
+        );
+        worker.apply_freshness(&cfg, silent);
+        assert!(
+            game(&worker).iter().all(|metric| metric.stale),
+            "(iii) an unavailable publication does not make a silent worker look fresh again"
+        );
+        // (iv) silence past twice the bound: the rows become UNAVAILABLE (no value to display),
+        // the same 2x bound the provider's own stale projection uses.
+        let expired = base + bound.saturating_mul(2) + Duration::from_secs(1);
+        worker.apply_freshness(&cfg, expired);
+        assert!(
+            game(&worker).iter().all(|metric| !metric.valid),
+            "(iv) past twice the bound the rows are stated unavailable, never a stale number"
+        );
+        // (v) recovery: an accepted current-generation publication makes them fresh again.
+        let recovered = expired + Duration::from_secs(1);
+        worker.apply_presentmon_update(update(1, true), 1, recovered);
+        assert_eq!(
+            worker.presentmon_success,
+            Some(recovered),
+            "(v) the accepted recovery publication advances the stamp"
+        );
+        worker.apply_freshness(&cfg, recovered);
+        assert!(
+            game(&worker)
+                .iter()
+                .all(|metric| metric.valid && !metric.stale),
+            "(v) the recovered worker's accepted publication shows the rows FRESH again"
+        );
+        // (vi) the disable arm clears the stamp and the rows, as every other provider does.
+        let disabled = Config {
+            presentmon_enabled: false,
+            ..Config::default()
+        };
+        worker.apply_freshness(&disabled, recovered);
+        assert!(
+            game(&worker).iter().all(|metric| !metric.valid),
+            "(vi) a disabled presentmon publishes no game rows"
+        );
+        assert_eq!(
+            worker.presentmon_success, None,
+            "(vi) the disabled arm clears the success stamp"
+        );
     }
 }

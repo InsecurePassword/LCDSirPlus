@@ -2090,7 +2090,7 @@ impl Capture {
     fn stop_with(
         &mut self,
         stop_child: impl FnOnce(&mut Child) -> Result<ChildExit, String>,
-        cleanup: impl FnOnce(&str) -> Result<(), String>,
+        mut cleanup: impl FnMut(&str) -> Result<(), String>,
     ) -> String {
         let mut shutdown = Vec::new();
         self.stop_diagnostic.clear();
@@ -2098,6 +2098,13 @@ impl Capture {
             if let Err(error) = stop_child(&mut child) {
                 self.stop_diagnostic = format!("teardown: {error}");
                 self.child = Some(child);
+                // WO-U46I (#13): an unconfirmed child stop keeps the child handle (the retry
+                // ladder owns that resource), but the ETW session is THIS instance's own named
+                // registration, and the presenting-mode child carries no `--terminate_on_proc_exit`
+                // (`presentmon_args`), so the session must not stay registered behind the retry.
+                // The cleanup is attempted here and its outcome is reported as a SEPARATE segment
+                // next to the child-stop outcome.
+                self.cleanup_owned_session(&mut cleanup);
                 return String::new();
             }
         }
@@ -2118,6 +2125,24 @@ impl Capture {
         if !shutdown.is_empty() {
             self.stop_diagnostic = format!("shutdown: {}", shutdown.join("; "));
         }
+        self.cleanup_owned_session(&mut cleanup);
+        self.target = ProcessInfo::default();
+        self.key.clear();
+        self.stats = None;
+        self.activity = ActivityTracker::default();
+        self.catalog = CatalogCache::default();
+        self.challenger = None;
+        self.last_frame = None;
+        self.last_publish = None;
+        self.started_at = None;
+        stderr
+    }
+
+    /// WO-U46I (#13): clean up exactly THIS instance's owned named session. Idempotent (a cleared
+    /// `owned_session` is never cleaned again) and never an unrelated session. The child-handle
+    /// ownership is a separate resource and is not part of this outcome; a refused cleanup keeps
+    /// the claim so `teardown_pending` schedules the retry, as shipped.
+    fn cleanup_owned_session(&mut self, cleanup: &mut impl FnMut(&str) -> Result<(), String>) {
         let cleanup_error = self
             .owned_session
             .as_deref()
@@ -2131,16 +2156,6 @@ impl Capture {
         } else {
             self.owned_session = None;
         }
-        self.target = ProcessInfo::default();
-        self.key.clear();
-        self.stats = None;
-        self.activity = ActivityTracker::default();
-        self.catalog = CatalogCache::default();
-        self.challenger = None;
-        self.last_frame = None;
-        self.last_publish = None;
-        self.started_at = None;
-        stderr
     }
 
     fn teardown_pending(&self) -> bool {
@@ -2536,7 +2551,15 @@ fn validate_executable(path: &Path) -> Result<PinnedExecutable, String> {
         return Err("path is not a PresentMon console executable".into());
     }
     let pinned = pin_canonical_executable(canonical)?;
-    verify_authenticode(&pinned.file, &pinned.path)?;
+    // WO-U46I (#3a): the signature check goes through the bounded wrapper, so the 50 ms worker
+    // never blocks on `WinVerifyTrustEx`. The wrapper receives an OWNED duplicate of the pinned
+    // handle, so the pinned-identity and SHA-256 checks below keep the shipped order and content.
+    verify_authenticode_bounded(
+        &pinned.path,
+        pinned.file.try_clone().map_err(|error| {
+            format!("open the pinned PresentMon for signature verification: {error}")
+        })?,
+    )?;
     if pinned.identity.size != PRESENTMON_SIZE
         || held_sha256(&pinned.file, pinned.identity.size)? != PRESENTMON_SHA256
     {
@@ -2809,6 +2832,85 @@ fn held_sha256(file: &File, size: u64) -> Result<String, String> {
         offset += read as u64;
     }
     Ok(crate::sha256::hex(&hash.finish()))
+}
+
+/// WO-U46I (#3a): the 50 ms capture worker must not block on `WinVerifyTrustEx` — the trust call
+/// performs verification work with no OS bound, and it is reached from the capture start inside
+/// the worker loop. The check runs on a dedicated verifier thread and the worker waits a BOUNDED
+/// time. The gate slot bounds OUTSTANDING WORK per provider instance: at most one verifier thread
+/// is ever in flight, and a timeout fails closed while KEEPING the in-flight thread counted, so a
+/// later attempt declines instead of stranding a new thread per timeout. The gate is consumed by
+/// the verifier's COMPLETION, never by a timeout-ack, so nothing accumulates across polling,
+/// retries or reconfiguration. The bounded precedent is `providers/discord.rs:2205-2226`, whose
+/// single-outstanding flag is cleared ONLY by the verifier thread, so after one timeout the flag
+/// stays set forever (a permanent lockout); that latch defect is not replicated here.
+const VERIFIER_BOUND: Duration = Duration::from_secs(5);
+const VERIFIER_BUSY: &str =
+    "PresentMon Authenticode verifier is already running; capture not started";
+const VERIFIER_TIMEOUT: &str = "PresentMon Authenticode verification timed out; the verifier is \
+                                still running; capture not started";
+
+thread_local! {
+    /// One gate slot per provider instance: `run` (the capture worker thread) is the only caller,
+    /// and a reconfiguration reuses that thread, so the slot spans reconfigures by construction.
+    static AUTHENTICODE_GATE: std::cell::RefCell<Option<mpsc::Receiver<Result<(), String>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The gate state machine: Idle (`None`) / Running (a receiver slot). See the const block above.
+fn run_bounded_verifier<R, F>(
+    gate: &mut Option<mpsc::Receiver<R>>,
+    bound: Duration,
+    work: F,
+) -> Result<R, String>
+where
+    R: Send + 'static,
+    F: FnOnce() -> R + Send + 'static,
+{
+    if let Some(pending) = gate.as_ref() {
+        match pending.try_recv() {
+            // The previous verifier returned (or died): THIS completion consumes the gate, so the
+            // current attempt is entitled to spawn its own verification.
+            Ok(_) | Err(mpsc::TryRecvError::Disconnected) => *gate = None,
+            // Still in flight: decline without spawning, so the outstanding count stays one.
+            Err(mpsc::TryRecvError::Empty) => return Err(VERIFIER_BUSY.into()),
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    let Ok(_verifier) = std::thread::Builder::new()
+        .name("presentmon-authenticode".into())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+    else {
+        return Err(
+            "PresentMon Authenticode verifier thread could not start; capture not started".into(),
+        );
+    };
+    let receiver = gate.insert(rx);
+    match receiver.recv_timeout(bound) {
+        Ok(result) => {
+            *gate = None;
+            Ok(result)
+        }
+        // FAIL CLOSED with the thread counted: the slot keeps the receiver, so the next attempt
+        // declines until this verifier actually returns, and the diagnostic names the outcome.
+        Err(_) => Err(VERIFIER_TIMEOUT.into()),
+    }
+}
+
+/// The bounded wrapper the capture start calls. The inputs are OWNED by the verifier thread (a
+/// duplicated file handle + an owned path), so no borrow crosses and the worker never blocks on
+/// the OS call itself.
+fn verify_authenticode_bounded(path: &Path, file: File) -> Result<(), String> {
+    let path = path.to_path_buf();
+    AUTHENTICODE_GATE
+        .with(|gate| {
+            run_bounded_verifier(&mut gate.borrow_mut(), VERIFIER_BOUND, move || {
+                verify_authenticode(&file, &path)
+            })
+        })
+        .and_then(|result| result)
 }
 
 fn verify_authenticode(file: &File, path: &Path) -> Result<(), String> {
@@ -5235,6 +5337,7 @@ mod tests {
             name: "game.exe".into(),
             image_path: String::new(),
         };
+        let cleanup_names: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         capture.stop_with(
             |_| {
                 Err(format!(
@@ -5242,12 +5345,26 @@ mod tests {
                     ChildExit::DidNotExitInTime.token()
                 ))
             },
-            |_| panic!("ETW cleanup must wait for confirmed child exit"),
+            |name| {
+                cleanup_names.lock().unwrap().push(name.to_string());
+                Ok(())
+            },
         );
         assert!(capture.child.is_some() && capture.reader.is_some());
+        // WO-U46I (#13) supersedes the shipped coupling "ETW cleanup must wait for a confirmed
+        // child exit": the named ETW session is THIS instance's own registration (and the
+        // presenting-mode child carries no `--terminate_on_proc_exit`), so a child that survives
+        // the bounded confirm must not leave it registered. The cleanup now runs in the same arm
+        // that retains the child, on the owned name only, as a SEPARATE reported outcome. The
+        // child/reader/target retention and the EC-6 token claims below are unchanged.
         assert_eq!(
-            capture.owned_session.as_deref(),
-            Some("LCDSirPlus-42-owned")
+            cleanup_names.lock().unwrap().as_slice(),
+            ["LCDSirPlus-42-owned".to_string()],
+            "(#13) the owned session is cleaned up on the retained-child path, exactly once"
+        );
+        assert_eq!(
+            capture.owned_session, None,
+            "(#13) a completed cleanup clears the claim"
         );
         assert_eq!(capture.target.pid, 42);
         // EC-6 acceptance (2): a child that survives the bounded confirm keeps its existing class,
@@ -5579,6 +5696,325 @@ mod tests {
             run.matches("std::thread::sleep(Duration::from_millis(50))").count(),
             4,
             "generation cleanup, demand park (cleanup-pending), demand park (settled) and the main loop all reuse the shipped 50 ms sleep"
+        );
+    }
+
+    /// WO-U46I (#13) PRE-RED: the `stop_with` early-return arm (an unconfirmed child stop) restored
+    /// the child handle and returned, skipping the ETW cleanup of the session THIS instance created.
+    /// The child handle is a per-capture resource whose retry is owned by the retention ladder; the
+    /// named ETW session is a system-wide registration, so leaving it registered on every unconfirmed
+    /// stop is the defect. The fix attempts the cleanup in the same arm and reports the child-stop and
+    /// session-cleanup outcomes as SEPARATE segments; ownership, retention and the retry ladder stay.
+    /// Pre-fix: the cleanup seam is never called => RED at step (i).
+    #[test]
+    fn presentmon_child_stop_failure_still_cleans_the_owned_session() {
+        use std::sync::atomic::AtomicUsize;
+        let child = Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut capture = Capture::default();
+        capture.child = Some(child);
+        capture.owned_session = Some("LCDSirPlus-99-owned".into());
+        let calls = AtomicUsize::new(0);
+        let names: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        capture.stop_with(
+            |_| Err("injected child stop failure: child is still running".to_string()),
+            |name| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                names.lock().unwrap().push(name.to_string());
+                Ok(())
+            },
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "(i) the owned ETW session is cleaned up exactly once even when the child stop is unconfirmed"
+        );
+        assert_eq!(
+            names.lock().unwrap().as_slice(),
+            ["LCDSirPlus-99-owned".to_string()],
+            "(ii) cleanup runs on THIS instance's owned session name, never an unrelated session"
+        );
+        assert!(
+            capture.child.is_some(),
+            "(iii) the child-handle retention on a stop failure is unchanged (the retry ladder owns it)"
+        );
+        assert_eq!(
+            capture.owned_session, None,
+            "(iv) a completed cleanup clears the ownership claim"
+        );
+        assert!(
+            capture
+                .stop_diagnostic
+                .contains("teardown: injected child stop failure"),
+            "(v) the child-stop outcome is named on its own: {}",
+            capture.stop_diagnostic
+        );
+        assert!(
+            !capture.stop_diagnostic.contains("ETW cleanup:"),
+            "(v) a successful session cleanup adds no cleanup outcome: {}",
+            capture.stop_diagnostic
+        );
+        // (vi) idempotence: the cleared session is never cleaned a second time.
+        capture.stop_with(
+            |_| Err("injected child stop failure again".to_string()),
+            |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "(vi) a second stop does not repeat the completed cleanup"
+        );
+        assert!(
+            capture.child.is_some(),
+            "(vi) the child handle stays retained across repeats"
+        );
+        // (vii) a cleanup failure is reported as a SEPARATE outcome next to the child-stop outcome,
+        // and the session claim is kept for the retry (the shipped `teardown_pending` rule).
+        capture.owned_session = Some("LCDSirPlus-99-owned".into());
+        capture.stop_with(
+            |_| Err("child stop failed".to_string()),
+            |_| Err("session stop refused".to_string()),
+        );
+        assert!(
+            capture
+                .stop_diagnostic
+                .contains("teardown: child stop failed"),
+            "(vii) the child-stop outcome: {}",
+            capture.stop_diagnostic
+        );
+        assert!(
+            capture
+                .stop_diagnostic
+                .contains("ETW cleanup: session stop refused"),
+            "(vii) the session-cleanup outcome is reported separately: {}",
+            capture.stop_diagnostic
+        );
+        assert_eq!(
+            capture.owned_session.as_deref(),
+            Some("LCDSirPlus-99-owned"),
+            "(vii) a refused cleanup keeps the session claim so the retry re-attempts it"
+        );
+    }
+
+    /// WO-U46I (#3a) PRE-RED, STRUCTURAL FORM (the runtime form needs the gate runner, which has
+    /// no home pre-fix, and the WO bans real certificate hangs / real OS thread exhaustion): the
+    /// capture start in the 50 ms worker loop must not run `WinVerifyTrustEx` synchronously. The
+    /// shipped shape calls the unbounded verifier straight from `validate_executable`, so one
+    /// revocation/OCSP stall blocks the worker (and the provider) with no bound. The fix routes the
+    /// check through a bounded wrapper with a one-outstanding-thread gate. Pre-fix: the synchronous
+    /// call site is present and the wrapper is absent => RED (the anchor panics on the missing
+    /// runner, the same loud form the WO discloses).
+    #[test]
+    fn presentmon_verifier_call_site_is_bounded() {
+        let source = include_str!("presentmon.rs").replace("\r\n", "\n");
+        let body = |head: &str| -> String {
+            let start = source
+                .find(head)
+                .unwrap_or_else(|| panic!("(#3a) the source carries `{head}`"));
+            let end = source[start..]
+                .find("\n}")
+                .unwrap_or_else(|| panic!("`{head}` closes at column zero"))
+                + start
+                + 2;
+            source[start..end].to_string()
+        };
+        let validate = body("fn validate_executable(path: &Path)");
+        assert!(
+            !validate.contains("verify_authenticode(&pinned.file, &pinned.path)"),
+            "(#3a) the 50 ms worker path must not call the unbounded verifier synchronously"
+        );
+        assert!(
+            validate.contains("verify_authenticode_bounded("),
+            "(#3a) the Authenticode check runs through the bounded wrapper"
+        );
+        assert!(
+            validate.contains("held_sha256(&pinned.file, pinned.identity.size)"),
+            "(#3a) the SHA-256 and pinned-identity checks keep their shipped place"
+        );
+        let bounded = validate
+            .find("verify_authenticode_bounded(")
+            .unwrap_or(usize::MAX);
+        let hashed = validate
+            .find("held_sha256(&pinned.file")
+            .unwrap_or(usize::MAX);
+        assert!(
+            bounded < hashed,
+            "(#3a) the existing check ORDER is unchanged: signature, then pinned size + SHA-256"
+        );
+        let wrapper = body("fn verify_authenticode_bounded(");
+        assert!(
+            wrapper.contains("run_bounded_verifier("),
+            "(#3a) the wrapper delegates to the gate runner that owns the bound"
+        );
+        let runner = body("fn run_bounded_verifier<");
+        assert!(
+            runner.contains("recv_timeout"),
+            "(#3a) the worker waits a BOUNDED time for the verifier thread"
+        );
+        assert!(
+            runner.contains("TryRecvError::Empty"),
+            "(#3a) an in-flight verifier DECLINES a new attempt: at most one thread is outstanding"
+        );
+        assert!(
+            runner.contains("*gate = None"),
+            "(#3a) the gate is cleared by the verifier's COMPLETION, never by a timeout-ack"
+        );
+        assert!(
+            !runner.contains(".expect("),
+            "(#3a) the runner never panics on a spawn failure: it fails closed"
+        );
+    }
+
+    /// WO-U46I (#3a) BEHAVIORAL + THREAD CENSUS: the gate runner facing a WEDGED verifier (the
+    /// deterministic seam; the WO bans real certificate hangs). The first attempt times out and
+    /// FAILS CLOSED with a recorded diagnostic; every later attempt while that verifier is wedged
+    /// declines, and the census shows the outstanding verifier-thread count stays exactly ONE — no
+    /// thread is stranded per timeout and nothing accumulates. When the wedged verifier returns,
+    /// the gate is consumed by that COMPLETION (never by a timeout-ack) and the next attempt spawns.
+    #[test]
+    fn presentmon_bounded_verifier_keeps_one_outstanding_thread() {
+        use std::sync::atomic::AtomicUsize;
+        let entered = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let mut gate: Option<mpsc::Receiver<Result<(), String>>> = None;
+        let bound = Duration::from_millis(20);
+        let counted = Arc::clone(&entered);
+        let first = run_bounded_verifier(&mut gate, bound, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let _ = release_rx.recv();
+            Ok(())
+        });
+        let detail = first.expect_err("(#3a) a wedged verifier makes the attempt fail closed");
+        assert!(
+            detail.contains("timed out"),
+            "(#3a) the timeout is the recorded diagnostic: {detail}"
+        );
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "(#3a) exactly one verifier thread entered"
+        );
+        assert!(
+            gate.is_some(),
+            "(#3a) the timeout keeps the in-flight thread COUNTED"
+        );
+        for attempt in 2..=6 {
+            let declined = run_bounded_verifier(&mut gate, bound, || Ok(()));
+            assert!(
+                declined.is_err(),
+                "(#3a) attempt {attempt} declines while a verifier is in flight"
+            );
+            assert_eq!(
+                entered.load(Ordering::SeqCst),
+                1,
+                "(#3a) census: NO new verifier thread per timeout (attempt {attempt})"
+            );
+        }
+        let released = release_tx.send(());
+        assert!(
+            released.is_ok(),
+            "(#3a) the release reaches the wedged verifier's own receiver: {released:?}"
+        );
+        // The completion is observed THROUGH the gate, which is exactly the contract: an attempt
+        // declines while the verifier is still in flight (the release above is asynchronous, so the
+        // number of declines is scheduling, never a bound on outstanding threads), and the first
+        // attempt that sees the completion clears the slot and spawns. Each decline is an instant
+        // `try_recv`, so this loop adds no sleep; it is capped loudly.
+        let mut declines = 0usize;
+        let outcome = loop {
+            // The census counts EVERY verifier thread that starts, so the post-completion
+            // attempt's work is counted too: exactly one new entry proves one new thread.
+            let counted = Arc::clone(&entered);
+            match run_bounded_verifier(&mut gate, Duration::from_secs(2), move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }) {
+                Ok(result) => break result,
+                Err(declined) => {
+                    assert!(
+                        declined.contains("already running"),
+                        "(#3a) the release must only ever decline as in-flight: {declined}"
+                    );
+                    declines += 1;
+                    // A cooperative yield so the released verifier gets scheduled; never a sleep,
+                    // and the cap below is loud, not a bound on the production behavior.
+                    std::thread::yield_now();
+                    assert!(
+                        declines <= 100,
+                        "(#3a) the released verifier never released the gate: declines={declines} \
+                         entered={} gate_owned={}",
+                        entered.load(Ordering::SeqCst),
+                        gate.is_some()
+                    );
+                }
+            }
+        };
+        assert!(
+            outcome.is_ok(),
+            "(#3a) the new verification is answered: {outcome:?}"
+        );
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            2,
+            "(#3a) exactly one new thread, for the new attempt"
+        );
+        assert!(
+            gate.is_none(),
+            "(#3a) a completed verification clears the gate"
+        );
+    }
+
+    /// WO-U46I (#3a): a verifier that COMPLETES reports its own result and clears the gate, so a
+    /// later attempt re-verifies (the discord precedent's latch, whose gate stays set forever
+    /// after a timeout, is not replicated). A verifier thread that DIES is counted, fails closed,
+    /// and its completion (the disconnected channel) releases the gate for the next attempt.
+    #[test]
+    fn presentmon_bounded_verifier_reports_results_and_clears_the_gate() {
+        let mut gate: Option<mpsc::Receiver<Result<(), String>>> = None;
+        let accepted = run_bounded_verifier(&mut gate, VERIFIER_BOUND, || Ok(()))
+            .expect("(#3a) a verifier that completes is answered inside the bound");
+        assert!(
+            accepted.is_ok(),
+            "(#3a) the verification result is the caller's outcome"
+        );
+        assert!(gate.is_none(), "(#3a) the gate is cleared by completion");
+        let rejected = run_bounded_verifier(&mut gate, VERIFIER_BOUND, || {
+            Err("PresentMon Authenticode signature is not valid: 0x800b0109".into())
+        })
+        .expect("(#3a) a rejecting verifier is answered inside the bound");
+        assert_eq!(
+            rejected.expect_err("(#3a) the signature failure reaches the capture start"),
+            "PresentMon Authenticode signature is not valid: 0x800b0109",
+            "(#3a) the shipped diagnostic text is preserved, not synthesized"
+        );
+        assert!(
+            gate.is_none(),
+            "(#3a) a completed rejection also clears the gate (re-verification stays possible)"
+        );
+        let dead = run_bounded_verifier(&mut gate, VERIFIER_BOUND, || {
+            panic!("( #3a) injected verifier thread death: the runner must fail closed")
+        });
+        assert!(
+            dead.is_err(),
+            "(#3a) a verifier thread that dies fails the attempt closed"
+        );
+        assert!(
+            gate.is_some(),
+            "(#3a) the dead thread stays counted until its completion is observed"
+        );
+        let revived = run_bounded_verifier(&mut gate, VERIFIER_BOUND, || Ok(()))
+            .expect("(#3a) the dead verifier's completion releases the gate for the next attempt");
+        assert!(revived.is_ok(), "(#3a) the next attempt re-verifies");
+        assert!(
+            gate.is_none(),
+            "(#3a) the gate ends cleared: no permanent latch"
         );
     }
 }

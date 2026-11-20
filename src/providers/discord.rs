@@ -909,8 +909,20 @@ fn state_from_pod(pod: &LcsdState) -> DiscordState {
         let len = (len as usize).min(bytes.len());
         String::from_utf8_lossy(&bytes[..len]).into_owned()
     };
+    // WO-U46I (#8): the component's `*_unix_ms` fields carry any u64 MILLISECOND count (writer
+    // side, read-only check: `components/lcdsirplus_discord/src/types.rs:51-59` `unix_ms` =
+    // `duration_since(UNIX_EPOCH).map(|age| age.as_millis() as u64).unwrap_or_default()`, written
+    // at `types.rs:126`/`:134`/`:135`; ABI fields `updated_unix_ms`/`started_unix_ms`/
+    // `stopped_unix_ms`, `components/lcdsirplus_discord/src/abi.rs:176-177, 215`). The conversion
+    // is therefore CHECKED: an overflowing value is an invalid value, so the state carries NO
+    // timestamp — documented semantics, never a clamped year-9999 fabrication. The shipped `+`
+    // panicked here; on the worker thread that unwinds out of the stop -> join -> release order,
+    // drops `module` while the component is live and leaves `worker_running` set forever.
+    // Zero stays the sentinel: `None`.
     let time = |ms: u64| -> Option<SystemTime> {
-        (ms != 0).then(|| SystemTime::UNIX_EPOCH + Duration::from_millis(ms))
+        (ms != 0)
+            .then(|| SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms)))
+            .flatten()
     };
     DiscordState {
         connected: pod.connected != 0,
@@ -1203,7 +1215,12 @@ impl Runtime {
                 self.census.worker_joins.fetch_add(1, Ordering::Relaxed);
             }
             let config = current_config(&self.config);
-            *slot = Some(spawn_worker(self, &config));
+            // WO-U46I (#18): the enable edge consumes the spawn outcome. On failure there is no
+            // handle to store, `worker_running` is already rolled back and the unavailable state
+            // is published, so the next demand edge re-enters this arm and may retry.
+            if let Ok(worker) = spawn_worker(self, &config) {
+                *slot = Some(worker);
+            }
             return;
         }
         if !self.running.load(Ordering::Relaxed) {
@@ -1253,8 +1270,13 @@ pub fn spawn_with(config: &Config, loader: TableLoader) -> Runtime {
         tx,
     };
     if provider_enabled(config) {
-        let worker = spawn_worker(&runtime, config);
-        *runtime.thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker);
+        // WO-U46I (#18): a spawn failure is an outcome, not a startup abort. The `Runtime` is
+        // constructed either way; on failure it owns NO thread, and `spawn_worker` published the
+        // provider-unavailable state, so the app shows a named unavailable row and a later demand
+        // edge can start the worker.
+        if let Ok(worker) = spawn_worker(&runtime, config) {
+            *runtime.thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker);
+        }
     } else {
         // The disabled / unconfigured case: NO thread, NO component call, NO provider state beyond
         // the descriptors above; the parked disabled state is published exactly once.
@@ -1265,12 +1287,50 @@ pub fn spawn_with(config: &Config, loader: TableLoader) -> Runtime {
     runtime
 }
 
+// WO-U46I (#18): the test-only spawn-injection seam, THREAD-LOCAL so a parallel sibling's worker
+// spawn can never consume a token (the WO-U46G `SPAWN_FAILURE_TOKENS` pattern in
+// `src/backends/mod.rs:395-421`). Production never reads it — the WO bans real OS thread
+// exhaustion — and the injected failure keeps the production `std::io::Error` shape the failure
+// arm consumes. A doc comment on a macro call is unused, so this note is a plain comment.
+#[cfg(test)]
+thread_local! {
+    // The injection tokens, consumed one per `spawn_worker` call.
+    static SPAWN_FAILURE_TOKENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub fn inject_discord_spawn_failures(tokens: usize) {
+    SPAWN_FAILURE_TOKENS.with(|cell| cell.set(tokens));
+}
+
+#[cfg(test)]
+fn take_spawn_failure_token() -> Option<std::io::Error> {
+    let left = SPAWN_FAILURE_TOKENS.with(|cell| cell.get());
+    if left == 0 {
+        return None;
+    }
+    SPAWN_FAILURE_TOKENS.with(|cell| cell.set(left - 1));
+    // OS code 8 (ERROR_NOT_ENOUGH_MEMORY) is the shape a real thread-creation failure carries.
+    Some(std::io::Error::from_raw_os_error(8))
+}
+
+#[cfg(not(test))]
+fn take_spawn_failure_token() -> Option<std::io::Error> {
+    // Production has no injection: the real `Builder::spawn` result is the only failure source.
+    None
+}
+
 /// The Discord worker: the host-side loop that drives the component synchronously. It is the only
 /// thread that touches the module, so the unload order has no concurrent caller. The
 /// WO-TEL-D3-B1 (L3/L4) loop-head cached read, the cache seed and the publish-once park are the
 /// accepted bodies, relocated coherently into this worker; the config gate (`provider_enabled`)
 /// and the backoff ladder are byte-identical.
-fn spawn_worker(runtime: &Runtime, config: &Config) -> std::thread::JoinHandle<()> {
+///
+/// WO-U46I (#18): the spawn is an OUTCOME (`Result`), never an `expect`. On the reconcile path an
+/// `expect` aborts the process on the app's config thread, and a panic after the
+/// `worker_running` store would leave the flag set with no worker, i.e. a permanently dead
+/// provider, because the enable edge early-returns on that flag.
+fn spawn_worker(runtime: &Runtime, config: &Config) -> Result<std::thread::JoinHandle<()>, String> {
     let worker_config = runtime.config.clone();
     let worker_generation = runtime.generation.clone();
     let worker_shutdown = runtime.shutdown.clone();
@@ -1283,11 +1343,11 @@ fn spawn_worker(runtime: &Runtime, config: &Config) -> std::thread::JoinHandle<(
     // The cache seed: the `Config` `spawn` received, as an `Arc` the worker owns (the shipped
     // loops seed their cache the same way, from `current_config`).
     let seed = Arc::new(config.clone());
-    runtime.census.spawns.fetch_add(1, Ordering::Relaxed);
     runtime.running.store(true, Ordering::SeqCst);
-    std::thread::Builder::new()
-        .name("lcdsirplus-discord".into())
-        .spawn(move || {
+    let builder = std::thread::Builder::new().name("lcdsirplus-discord".into());
+    let started = match take_spawn_failure_token() {
+        Some(error) => Err(error),
+        None => builder.spawn(move || {
             let mut state = DiscordState::default();
             let mut request = (0u64, seed);
             let mut backoff = Duration::from_secs(1);
@@ -1468,8 +1528,32 @@ fn spawn_worker(runtime: &Runtime, config: &Config) -> std::thread::JoinHandle<(
                 unload_module(&mut module, &mut handle, &worker_census, &worker_retained);
             }
             worker_running.store(false, Ordering::SeqCst);
-        })
-        .expect("spawn Discord worker")
+        }),
+    };
+    match started {
+        Ok(handle) => {
+            // The census counts threads that ACTUALLY started, and it is incremented on the
+            // CALLING thread, so the WO-TEL-D3-C V1(a) proof ("`spawns == 0` proves NO worker
+            // thread exists") stays scheduling-free, now with the failure case distinguished.
+            runtime.census.spawns.fetch_add(1, Ordering::Relaxed);
+            Ok(handle)
+        }
+        Err(error) => {
+            // WO-U46I (#18): the failure is an outcome. Roll the gates back to the pre-spawn state
+            // (`worker_running` cleared, no handle in the caller's slot, no module load, `retained`
+            // untouched), publish the provider-unavailable state through the shipped
+            // classification/publish path, and hand the named detail back. The next demand edge
+            // (`update_config`, app-driven) may retry, so one failure never latches the provider
+            // closed, and one edge costs exactly one attempt: no restart storm.
+            runtime.running.store(false, Ordering::SeqCst);
+            let detail = format!("Discord worker thread could not start: {error}");
+            let _ = runtime
+                .tx
+                .send(unavailable(&DiscordState::default(), &detail));
+            crate::log_warn!("Discord provider unavailable: {detail}");
+            Err(detail)
+        }
+    }
 }
 
 /// Reads the component's state POD and publishes it only when the component's own revision moved
@@ -2899,9 +2983,17 @@ mod tests {
         let head = source
             .find("fn spawn_worker(")
             .expect("the worker body has one home (the D3-C relocation)");
+        // WO-U46I (#18) ANCHOR UPDATE (disclosed, no claim weakened): the tail anchor was the
+        // `.expect("spawn Discord worker")` row, which that unit replaced with the spawn OUTCOME.
+        // The worker body is now bounded by the outcome match that closes it, and the absence of
+        // the expect is asserted on the same source span.
         let tail = source
-            .find(".expect(\"spawn Discord worker\")")
-            .expect("the shipped worker thread closes the loop");
+            .find("\n    match started {")
+            .expect("the worker thread's outcome match closes the loop");
+        assert!(
+            !source[..tail].contains(".expect(\"spawn Discord worker\")"),
+            "the worker spawn is an outcome, never a panic-shaped call"
+        );
         assert!(
             tail > head,
             "the worker body sits between the worker head and its thread handle"
@@ -2962,10 +3054,17 @@ mod tests {
             &source,
             "pub fn spawn_with(config: &Config, loader: TableLoader) -> Runtime {",
         );
+        // WO-U46I (#18) text update (disclosed, same claim): construction creates the worker ONLY
+        // under the accepted gate, and the spawn OUTCOME is consumed there, so the gate arm has no
+        // panic path. The "no thread when disabled" claim below is unchanged.
         assert!(
             gated.contains("if provider_enabled(config) {")
-                && gated.contains("let worker = spawn_worker(&runtime, config);"),
-            "the worker is created ONLY when the accepted gate is true (spawn-on-enable)"
+                && gated.contains("if let Ok(worker) = spawn_worker(&runtime, config) {"),
+            "the worker is created ONLY when the accepted gate is true (spawn-on-enable), through the outcome-consuming arm"
+        );
+        assert!(
+            !gated.contains(".expect("),
+            "(#18) the construction path has no panic-shaped call"
         );
         assert!(
             gated.contains(".send(unavailable(&DiscordState::default(), \"disabled\"))")
@@ -3274,6 +3373,72 @@ mod tests {
             Ok(Module {
                 library: windows::Win32::Foundation::HMODULE(std::ptr::null_mut()),
                 table: &TABLE_RETAINED as *const LcsdV1,
+            })
+        }
+
+        /// WO-U46I (#8): a state POD carrying the extreme `*_unix_ms` values a component writer can
+        /// emit. Units + sentinel come from the writer side, quoted:
+        /// `components/lcdsirplus_discord/src/types.rs:51-59` `unix_ms` =
+        /// `duration_since(UNIX_EPOCH).map(|age| age.as_millis() as u64).unwrap_or_default()`
+        /// (unix MILLISECONDS, `None`/pre-epoch => 0 = the sentinel), written at
+        /// `types.rs:126` (`out.updated_unix_ms`), `:134`/`:135` (speaker started/stopped); the ABI
+        /// fields are named `updated_unix_ms` / `started_unix_ms` / `stopped_unix_ms`
+        /// (`components/lcdsirplus_discord/src/abi.rs:176-177, 215`). The host must therefore accept
+        /// any `u64` millisecond count.
+        extern "system" fn stub_state_extreme(
+            handle: *mut c_void,
+            out: *mut LcsdState,
+            capacity: u32,
+        ) -> i32 {
+            if handle.is_null()
+                || out.is_null()
+                || (capacity as usize) < std::mem::size_of::<LcsdState>()
+            {
+                return LCSD_E_SIZE;
+            }
+            let pod = unsafe { &mut *out };
+            *pod = LcsdState::default();
+            pod.size = std::mem::size_of::<LcsdState>() as u32;
+            pod.revision = CALLS.revision.load(Ordering::Relaxed) as u64;
+            pod.connected = 1;
+            pod.authenticated = 1;
+            pod.updated_unix_ms = u64::MAX;
+            pod.speaker_count = 3;
+            pod.speakers[0].user_id[..3].copy_from_slice(b"111");
+            pod.speakers[0].user_id_len = 3;
+            pod.speakers[0].started_unix_ms = 0;
+            pod.speakers[0].stopped_unix_ms = u64::MAX;
+            pod.speakers[1].user_id[..3].copy_from_slice(b"222");
+            pod.speakers[1].user_id_len = 3;
+            pod.speakers[1].started_unix_ms = 1_700_000_000_000;
+            pod.speakers[1].stopped_unix_ms = 9_223_372_036_854_775_807;
+            pod.speakers[2].user_id[..3].copy_from_slice(b"333");
+            pod.speakers[2].user_id_len = 3;
+            pod.speakers[2].started_unix_ms = 9_223_372_036_854_775_807;
+            pod.speakers[2].stopped_unix_ms = 0;
+            LCSD_OK
+        }
+
+        pub static TABLE_EXTREME: LcsdV1 = LcsdV1 {
+            size: std::mem::size_of::<LcsdV1>() as u32,
+            start: stub_start,
+            set_config: stub_set_config,
+            poll_io: stub_poll,
+            state: stub_state_extreme,
+            stop: stub_stop,
+            join: stub_join,
+            release: stub_release,
+            authorize: stub_authorize,
+            verify_client: stub_verify_client,
+            last_error: stub_last_error,
+        };
+
+        pub fn loader_extreme(
+            _diagnostic: &mut [u8; LOADER_DIAGNOSTIC_CAPACITY],
+        ) -> Result<Module, LoadFault> {
+            Ok(Module {
+                library: windows::Win32::Foundation::HMODULE(std::ptr::null_mut()),
+                table: &TABLE_EXTREME as *const LcsdV1,
             })
         }
 
@@ -4625,5 +4790,287 @@ mod tests {
             Duration::from_secs(30),
             "and the ladder stays at the cap, so the growth constants are untouched"
         );
+    }
+
+    /// WO-U46I (#8) PRE-RED (form: the extreme row PANICS the test, which is exactly what the
+    /// shipped `SystemTime::UNIX_EPOCH + Duration::from_millis(ms)` does on the worker thread):
+    /// the component-supplied `*_unix_ms` conversions are checked arithmetic. Zero stays the
+    /// sentinel -> `None`; a normal value converts exactly; the `i64::MAX`-millisecond boundary
+    /// converts and round-trips; `u64::MAX` overflows -> `None`, i.e. NO timestamp (documented
+    /// invalid-value semantics), never a clamped year-9999 fabrication and never a panic.
+    #[test]
+    fn discord_component_timestamps_convert_without_panic() {
+        let boundary: u64 = 9_223_372_036_854_775_807;
+        let mut pod = LcsdState {
+            size: std::mem::size_of::<LcsdState>() as u32,
+            revision: 1,
+            ..Default::default()
+        };
+        pod.updated_unix_ms = 0;
+        let state = state_from_pod(&pod);
+        assert_eq!(
+            state.updated, None,
+            "(zero) the 0 sentinel means no timestamp"
+        );
+        pod.updated_unix_ms = 1_700_000_000_000;
+        let state = state_from_pod(&pod);
+        assert_eq!(
+            state.updated,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)),
+            "(normal) a real unix-millisecond value converts exactly"
+        );
+        pod.updated_unix_ms = 9_999_999_999_999;
+        let state = state_from_pod(&pod);
+        assert_eq!(
+            state.updated,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(9_999_999_999_999)),
+            "(large-fits) a value inside the SystemTime range converts exactly, never clamped"
+        );
+        pod.updated_unix_ms = boundary;
+        let state = state_from_pod(&pod);
+        assert_eq!(
+            state.updated,
+            None,
+            "(boundary) i64::MAX milliseconds lies past the SystemTime range: NO timestamp, never a \
+             fabricated value, and the defining property is that this row no longer panics"
+        );
+        pod.updated_unix_ms = u64::MAX;
+        let state = state_from_pod(&pod);
+        assert_eq!(
+            state.updated, None,
+            "(extreme) u64::MAX overflows: no timestamp, never a fabricated stamp, never a panic"
+        );
+        // The speaker rows run through the same conversion.
+        pod.speaker_count = 2;
+        pod.speakers[0].started_unix_ms = u64::MAX;
+        pod.speakers[0].stopped_unix_ms = 0;
+        pod.speakers[1].started_unix_ms = boundary;
+        pod.speakers[1].stopped_unix_ms = 1_700_000_000_001;
+        let state = state_from_pod(&pod);
+        assert_eq!(
+            state.speakers[0].started_at, None,
+            "(extreme) a speaker's overflowing start is no timestamp"
+        );
+        assert_eq!(
+            state.speakers[0].stopped_at, None,
+            "(zero) a speaker's 0 stop stays the sentinel"
+        );
+        assert_eq!(
+            state.speakers[1].stopped_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_001)),
+            "(normal) a speaker's stop time converts exactly"
+        );
+        assert_eq!(
+            state.speakers[1].started_at, None,
+            "(boundary) the speaker start past the SystemTime range is no timestamp, no panic"
+        );
+    }
+
+    /// WO-U46I (#8) lifecycle proof (VERIFIED, not assumed): the extreme timestamps are driven
+    /// through the REAL worker on the REAL component-boundary path (`spawn_with` + the stub v1
+    /// table), because the shipped panic happens on the WORKER thread, where it drops `module`
+    /// outside the stop -> join -> release order and leaves `worker_running` set. With no panic
+    /// path the shipped orders must hold: one stop/join/release + unload per session, `running`
+    /// cleared on the disable edge, and the enable edge restarting a fresh worker.
+    #[test]
+    fn discord_extreme_timestamps_keep_the_stop_join_release_lifecycle() {
+        let config = enabled_config("synthetic-u46i-extreme");
+        let runtime = spawn_with(&config, stub_v1::loader_extreme);
+        let state = wait_for_state(&runtime, |state| state.speakers.len() == 3).expect(
+            "(#8) the worker published the extreme-timestamp state; pre-fix the conversion panics \
+             on the worker thread, so this stream never starts",
+        );
+        assert_eq!(
+            state.updated, None,
+            "(#8) the extreme state projects with no timestamp, no panic, no fabricated stamp"
+        );
+        assert!(
+            !runtime.module_retained(),
+            "(#8) the module is not retained: the worker never unwound through a panic"
+        );
+        // The disable edge: stop -> join -> release, then the worker thread ENDS.
+        runtime.update_config(&Config {
+            discord_enabled: false,
+            ..config.clone()
+        });
+        let census = runtime.census_snapshot();
+        assert_eq!(
+            census.stops, 1,
+            "(#8) exactly one stop ran on the disable edge"
+        );
+        assert_eq!(census.joins, 1, "(#8) exactly one join, after the stop");
+        assert_eq!(
+            census.releases, 1,
+            "(#8) exactly one release, after the join"
+        );
+        assert_eq!(
+            census.unloads, 1,
+            "(#8) the module unloads only once every step returned OK"
+        );
+        assert!(
+            !runtime.worker_running(),
+            "(#8) `worker_running` is cleared by the exiting worker (the shipped restart rule)"
+        );
+        // The enable edge: a fresh worker faces the same extreme input.
+        runtime.update_config(&config);
+        assert!(
+            runtime.worker_running(),
+            "(#8) the enable edge restarts the worker: no lifetime lockout from the extreme state"
+        );
+        let second = wait_for_state(&runtime, |state| state.speakers.len() == 3)
+            .expect("(#8) the restarted worker publishes the extreme state again");
+        assert_eq!(
+            second.updated, None,
+            "(#8) the conversion is stable across a restart"
+        );
+        drop(runtime);
+    }
+
+    /// WO-U46I (#18) PRE-RED, STRUCTURAL FORM (the runtime form needs the injected spawn seam,
+    /// which has no home pre-fix, and the WO bans real OS thread exhaustion): the reconcile
+    /// (runtime) path must not `expect` a thread spawn. `.expect("spawn Discord worker")` aborts
+    /// the process on the app's config thread, and even reaching the store it follows would leave
+    /// `worker_running` set with no worker, i.e. a permanently dead provider (the early return in
+    /// `reconcile` is gated on that flag).
+    #[test]
+    fn discord_worker_spawn_is_never_an_expect_on_the_reconcile_path() {
+        let source = include_str!("discord.rs").replace("\r\n", "\n");
+        let worker = fn_body_at(&source, "fn spawn_worker(");
+        assert!(
+            !worker.contains(".expect(\"spawn Discord worker\")"),
+            "(#18) the worker spawn is not a panic-shaped call on the runtime path"
+        );
+        assert!(
+            worker.contains("-> Result<std::thread::JoinHandle<()>, String>"),
+            "(#18) the spawn outcome is a Result the callers must handle"
+        );
+        assert!(
+            worker.contains("running.store(false"),
+            "(#18) `worker_running` is rolled back on a spawn failure"
+        );
+        assert!(
+            worker.contains("unavailable(&DiscordState::default(), &detail)"),
+            "(#18) the failure publishes the provider-unavailable state through the shipped path"
+        );
+        assert!(
+            worker.contains("worker thread could not start"),
+            "(#18) the outcome is named, never silence"
+        );
+        let reconcile = source
+            .find("fn reconcile(&self) {")
+            .expect("(#18) the lifecycle edge exists");
+        let reconcile_body = &source[reconcile
+            ..reconcile
+                + source[reconcile..]
+                    .find("\n    }\n")
+                    .expect("the edge closes")];
+        assert!(
+            reconcile_body.contains("spawn_worker(self, &config)"),
+            "(#18) the enable edge goes through the spawn outcome"
+        );
+        assert!(
+            !reconcile_body.contains(".expect("),
+            "(#18) the reconcile path handles the outcome, it never panics"
+        );
+    }
+
+    /// WO-U46I (#18) BEHAVIORAL: driven on the production construction + reconcile path with the
+    /// injected spawn seam (thread-local, deterministic, NO real OS thread exhaustion). A spawn
+    /// failure publishes the provider-unavailable outcome through the shipped classification path,
+    /// rolls `worker_running` back, claims no spawn in the census and leaves no thread; the NEXT
+    /// demand edge starts a real worker, so one failure never latches the provider closed.
+    #[test]
+    fn discord_worker_spawn_failure_publishes_unavailable_and_rolls_back() {
+        inject_discord_spawn_failures(1);
+        let config = enabled_config("synthetic-u46i-spawn-failure");
+        let runtime = spawn_with(&config, stub_v1::loader);
+        assert!(
+            !runtime.worker_running(),
+            "(#18) no worker is claimed: `worker_running` is rolled back"
+        );
+        let census = runtime.census_snapshot();
+        assert_eq!(
+            census.spawns, 0,
+            "(#18) `spawns` counts threads that ACTUALLY started"
+        );
+        assert_eq!(
+            census.loads, 0,
+            "(#18) no worker exists, so no component load ran"
+        );
+        assert!(!runtime.module_retained(), "(#18) nothing is retained");
+        let states = drained(&runtime);
+        assert!(
+            states.iter().any(|state| !state.connected
+                && !state.authenticated
+                && state
+                    .error
+                    .contains("Discord worker thread could not start")),
+            "(#18) the failure publishes the named unavailable state: {states:?}"
+        );
+        // The next demand edge retries: the token is spent, so the real worker starts.
+        runtime.update_config(&enabled_config("synthetic-u46i-spawn-failure-retry"));
+        assert!(
+            runtime.worker_running(),
+            "(#18) a later demand edge spawns: no lifetime lockout"
+        );
+        assert_eq!(
+            runtime.census_snapshot().spawns,
+            1,
+            "(#18) exactly one worker thread exists after the retry"
+        );
+        let state = wait_for_state(&runtime, |state| state.speakers.len() == 1)
+            .expect("(#18) the retried worker reaches the component and publishes");
+        assert!(
+            state.connected,
+            "(#18) the provider recovers on the retry, so the failure is not terminal"
+        );
+        drop(runtime);
+    }
+
+    /// WO-U46I (#18): the retry is per demand EDGE. N edges carrying N injected failures cost N
+    /// attempts and ZERO threads, and the edge after the tokens run out succeeds: one named
+    /// outcome per failed edge (no publish storm, the loop never re-attempts by itself) and no
+    /// lockout.
+    #[test]
+    fn discord_worker_spawn_failures_stay_bounded_per_demand_edge() {
+        inject_discord_spawn_failures(2);
+        let runtime = spawn_with(&enabled_config("edge-one"), stub_v1::loader);
+        assert!(!runtime.worker_running(), "(#18) edge 1 declined");
+        runtime.update_config(&enabled_config("edge-two"));
+        assert!(!runtime.worker_running(), "(#18) edge 2 declined");
+        runtime.update_config(&enabled_config("edge-three"));
+        assert!(
+            runtime.worker_running(),
+            "(#18) edge 3, with no token left, spawns for real"
+        );
+        let census = runtime.census_snapshot();
+        assert_eq!(
+            census.spawns, 1,
+            "(#18) three edges created exactly one thread"
+        );
+        // Both declined edges published their named outcome on the calling thread, so the rows are
+        // drained BEFORE waiting on the surviving worker (whose own publishes share the channel).
+        let declines = drained(&runtime)
+            .into_iter()
+            .filter(|state| {
+                state
+                    .error
+                    .contains("Discord worker thread could not start")
+            })
+            .count();
+        assert_eq!(
+            declines, 2,
+            "(#18) exactly one named unavailable outcome per failed edge, no publish storm"
+        );
+        // The load is the worker's own first step, so it is read once the worker has actually
+        // reached the component: no scheduling-dependent census claim on a live thread.
+        wait_for_state(&runtime, |state| state.speakers.len() == 1)
+            .expect("(#18) the surviving worker reached the component");
+        assert_eq!(
+            runtime.census_snapshot().loads,
+            1,
+            "(#18) the module is loaded by that worker, exactly once"
+        );
+        drop(runtime);
     }
 }
