@@ -185,8 +185,20 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
 
     let mut watcher = ConfigWatcher::new(&watched_files);
 
-    let mut last_telemetry = Instant::now() - cfg.telemetry_interval;
-    let mut last_render = Instant::now() - cfg.render_interval;
+    // WO-U46H #2: the shipped seed was `Instant::now() - cfg.telemetry_interval`.
+    // `Instant - Duration` is a documented panic on underflow (release builds
+    // abort, no dialog): on a clock based at boot time it fires when uptime <
+    // interval. Measured on this host, Windows keeps ~292 years of headroom, so a
+    // LEGAL interval (100..10000 / 25..5000 ms) cannot reach it here - the form is
+    // a latent panic, so it is removed. ONE `now` is captured for both seeds and
+    // the initial state is the explicit never-stamped marker, so the first
+    // collection and the first render stay immediate - a fallback to `now` would
+    // delay each of them by a full interval.
+    let startup_now = Instant::now();
+    let mut last_telemetry = cadence_initial_state(startup_now, cfg.telemetry_interval);
+    let mut last_render = cadence_initial_state(startup_now, cfg.render_interval);
+    // WO-U46H #4: the last reload-rejection identity (see `reload_rejection_is_new`).
+    let mut last_reload_rejection: Option<String> = None;
     let mut running = true;
     let mut backend_state = BackendState::Discovering;
     // RC-5: the label last published to the panel/log surface, so a change is
@@ -224,7 +236,10 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
         // Reload before input so a same-loop hold cannot use stale action policy.
         if now.duration_since(watcher.last_check) >= cfg.config_refresh {
             watcher.last_check = now;
-            if watcher.changed() {
+            // WO-U46H #9: `detect` returns the DETECTION-TIME signature snapshot,
+            // which `install` records on success, so bytes that arrive after
+            // detection can never be recorded as applied.
+            if let Some(observed) = watcher.detect() {
                 crate::log_info!("configuration changed on disk; reloading");
                 match crate::parser::load(&config_path) {
                     Ok(loaded) => {
@@ -255,7 +270,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                         if let Some(audit) = hang_owner.bind(&slots, &mut hang_hold) {
                             log_hang_audit(&audit);
                         }
-                        watcher.replace(&files);
+                        watcher.install(&files, &observed);
                         if backend_changed {
                             recovery.suspend();
                             match backend.reconfigure(
@@ -285,20 +300,35 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                         if !opts.preview_always {
                             apply_preview_policy(&ui, &cfg, &backend_state);
                         }
+                        // WO-U46H #4: a successful reload clears the suppression, so
+                        // any later rejection logs again, even the identical one.
+                        last_reload_rejection = None;
                         crate::log_info!("configuration reloaded");
                     }
                     Err(e) => {
-                        crate::log_error!(
-                            "configuration reload rejected: {} (last valid config stays active)",
-                            e
-                        );
+                        // WO-U46H #4: the reload attempt keeps running every refresh
+                        // tick (repair stays detected), so a permanently-invalid
+                        // watched config would otherwise emit one ERROR row per tick
+                        // and rotate the 2 MiB diagnostic ring away in minutes. The
+                        // row is emitted once per rejection identity - the parse
+                        // error's own `file:line: message`, i.e. the trigger plus the
+                        // reason - and a changed reason is a new identity. Bounded
+                        // state: one identity string, replaced in place.
+                        let identity = e.to_string();
+                        if reload_rejection_is_new(&mut last_reload_rejection, &identity) {
+                            crate::log_error!(
+                                "configuration reload rejected: {} (last valid config stays active)",
+                                e
+                            );
+                        }
                     }
                 }
             }
         }
 
-        if now.duration_since(last_telemetry) >= cfg.telemetry_interval {
-            last_telemetry = now;
+        let telemetry_elapsed = last_telemetry.map(|last| now.duration_since(last));
+        if cadence_due(telemetry_elapsed, cfg.telemetry_interval) {
+            last_telemetry = Some(now);
             snapshot = build_snapshot(&cfg, &topology, &mut cpu_provider, &telemetry, &discord);
         }
         let telemetry_generation = telemetry_runtime.generation();
@@ -334,8 +364,9 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
         }
         snapshot.device_status = device_status;
 
-        if now.duration_since(last_render) >= cfg.render_interval {
-            last_render = now;
+        let render_elapsed = last_render.map(|last| now.duration_since(last));
+        if cadence_due(render_elapsed, cfg.render_interval) {
+            last_render = Some(now);
             let slot_modules = effective_slot_modules(&slots, &snapshot, &cfg);
             let demanded = discord_display_demand(&slot_modules);
             if demanded != discord_demanded {
@@ -1567,8 +1598,64 @@ where
     false
 }
 
+/// WO-U46H #2: the cadence seed seam. The shipped seed `Instant::now() -
+/// interval` panics when the monotonic clock's base is closer than the
+/// interval, so the initial state is the explicit never-stamped marker `None`
+/// and no subtraction happens at all. The parameters keep the shipped call
+/// shape; nothing about the clock base may enter the decision.
+fn cadence_initial_state(_now: Instant, _interval: Duration) -> Option<Instant> {
+    None
+}
+
+/// WO-U46H #2: the cadence boundary in `Duration` space, so the seam test is
+/// exact with no clock framework and no boot-time dependence: never stamped is
+/// due at once (the first collection and the first render stay immediate), a
+/// stamp is due once `elapsed >= interval`.
+fn cadence_due(elapsed: Option<Duration>, interval: Duration) -> bool {
+    elapsed.is_none_or(|elapsed| elapsed >= interval)
+}
+
+/// WO-U46H #4: one reload-rejection row per rejection identity - true (log the
+/// row) when `identity` differs from the last logged one, and record it; the
+/// caller clears the state on a successful reload. Bounded: a single
+/// `Option<String>` replaced in place, so no failure collection grows.
+fn reload_rejection_is_new(last: &mut Option<String>, identity: &str) -> bool {
+    if last.as_deref() == Some(identity) {
+        return false;
+    }
+    *last = Some(identity.to_string());
+    true
+}
+
+/// WO-U46H #14: the bounded content recheck period, in refresh sweeps. Between
+/// full rechecks a sweep is metadata-only, so a write that keeps BOTH size and
+/// mtime is found by the recheck, never later.
+const WATCHER_FULL_RECHECK_CHECKS: u32 = 16;
+
+/// WO-U46H #9 + #14: the watched-file watcher.
+///
+/// Cost (#14): a refresh sweep calls `fs::metadata` per watched file while the
+/// stored size and mtime still match - no read, no SHA-256 - instead of hashing
+/// the whole include graph every tick on the render loop. A complete signature
+/// (content digest) is taken when metadata moves, which is also what separates
+/// a touch from an edit, and on every `WATCHER_FULL_RECHECK_CHECKS`-th sweep.
+///
+/// Detection latency: an ordinary edit is seen on the sweep after the write, so
+/// <= one `config_refresh_ms` (the legal 100..60000). A metadata-invisible
+/// write (same size AND same mtime) is seen at the next full recheck, so <=
+/// `WATCHER_FULL_RECHECK_CHECKS * config_refresh_ms` (1.6 s at the 100 ms
+/// floor, 16 min at the 60 s ceiling). An edit that lands after detection is
+/// applied one cycle later, by construction (#9).
+///
+/// Integrity (#9): `detect` returns the signatures it observed and `install`
+/// records exactly that snapshot on success. The shipped `replace` re-hashed the
+/// CURRENT disk after the parse, so a write that landed between the parse and
+/// the install was recorded as applied and never parsed. A path that is new to
+/// the include graph, or that was absent at detection (a recreated include),
+/// has no detection-time signature to install, so it is signed afresh.
 struct ConfigWatcher {
     files: Vec<(std::path::PathBuf, Option<FileSignature>)>,
+    checks: u32,
     pub last_check: Instant,
 }
 
@@ -1586,22 +1673,77 @@ impl ConfigWatcher {
                 .iter()
                 .map(|path| (path.clone(), file_signature(path)))
                 .collect(),
+            checks: 0,
             last_check: Instant::now(),
         }
     }
 
-    fn changed(&self) -> bool {
-        self.files
-            .iter()
-            .any(|(path, signature)| file_signature(path) != *signature)
+    /// One refresh sweep: `Some(snapshot)` when a watched file's content differs
+    /// from the recorded baseline, `None` when the graph is as recorded. A
+    /// metadata move with an unchanged digest is a touch, not a change, so its
+    /// stamp is adopted and the next sweep is cheap again. A change is NOT
+    /// adopted: a rejected reload keeps re-detecting, so a repair is detected.
+    fn detect(&mut self) -> Option<Vec<(std::path::PathBuf, Option<FileSignature>)>> {
+        let full = self.checks % WATCHER_FULL_RECHECK_CHECKS == WATCHER_FULL_RECHECK_CHECKS - 1;
+        self.checks = self.checks.wrapping_add(1);
+        let mut changed = false;
+        let mut snapshot = Vec::with_capacity(self.files.len());
+        for index in 0..self.files.len() {
+            let path = self.files[index].0.clone();
+            let stored = self.files[index].1.clone();
+            let observed = sweep_signature(&path, stored.as_ref(), full);
+            let is_change = match (&observed, &stored) {
+                (None, None) => false,
+                (Some(observed), Some(stored)) => observed.digest != stored.digest,
+                _ => true,
+            };
+            if is_change {
+                changed = true;
+            } else {
+                self.files[index].1 = observed.clone();
+            }
+            snapshot.push((path, observed));
+        }
+        changed.then_some(snapshot)
     }
 
-    fn replace(&mut self, paths: &[std::path::PathBuf]) {
+    /// Record the reloaded include graph from the detection-time snapshot;
+    /// graph changes (new, removed, recreated includes) are signed from disk.
+    fn install(
+        &mut self,
+        paths: &[std::path::PathBuf],
+        snapshot: &[(std::path::PathBuf, Option<FileSignature>)],
+    ) {
         self.files = paths
             .iter()
-            .map(|path| (path.clone(), file_signature(path)))
+            .map(|path| {
+                let signature = match snapshot.iter().find(|(seen, _)| seen == path) {
+                    Some((_, Some(signature))) => Some(signature.clone()),
+                    _ => file_signature(path),
+                };
+                (path.clone(), signature)
+            })
             .collect();
+        self.checks = 0;
     }
+}
+
+/// The sweep signature of one path: the stored signature while its metadata
+/// still matches and no full recheck is due, the complete content signature
+/// otherwise.
+fn sweep_signature(
+    path: &std::path::Path,
+    stored: Option<&FileSignature>,
+    full: bool,
+) -> Option<FileSignature> {
+    if !full {
+        if let (Some(stored), Some(metadata)) = (stored, std::fs::metadata(path).ok()) {
+            if stored.len == metadata.len() && metadata.modified().ok() == stored.modified {
+                return Some(stored.clone());
+            }
+        }
+    }
+    file_signature(path)
 }
 
 fn file_signature(path: &std::path::Path) -> Option<FileSignature> {
@@ -2163,8 +2305,8 @@ mod tests {
         );
         let loaded = valid.loaded.unwrap();
         assert_eq!(loaded.files.len(), 2);
-        let watcher = ConfigWatcher::new(&loaded.files);
-        assert!(!watcher.changed());
+        let mut watcher = ConfigWatcher::new(&loaded.files);
+        assert!(watcher.detect().is_none(), "a fresh graph is as recorded");
 
         std::fs::write(&primary, "unknown_setting 1\n").unwrap();
         let before = crate::parser::test_load_calls();
@@ -2194,28 +2336,360 @@ mod tests {
         std::fs::write(&include, "preview_scale 2\n").unwrap();
         let loaded = crate::parser::load(&primary).unwrap();
         let mut watcher = ConfigWatcher::new(&loaded.files);
-        assert!(!watcher.changed());
+        assert!(watcher.detect().is_none(), "a fresh graph is as recorded");
 
-        std::fs::write(&include, "preview_scale 3\n").unwrap();
-        assert!(watcher.changed(), "transitive include change is observed");
+        // The write changes the include's size, so the detection is deterministic
+        // on this filesystem: a same-size edit inside one file-timestamp tick is
+        // metadata-invisible and is owned by the bounded full recheck (pinned by
+        // `config_watcher_finds_a_same_size_edit_with_a_preserved_mtime_at_the_bounded_recheck`).
+        std::fs::write(&include, "preview_scale 3 # transitive\n").unwrap();
+        let observed = watcher
+            .detect()
+            .expect("transitive include change is observed");
         assert!(
-            watcher.changed(),
+            watcher.detect().is_some(),
             "failed reload does not commit the changed baseline"
         );
         let reloaded = crate::parser::load(&primary).unwrap();
-        watcher.replace(&reloaded.files);
-        assert!(!watcher.changed());
+        watcher.install(&reloaded.files, &observed);
+        assert!(watcher.detect().is_none(), "the committed graph is quiet");
 
         std::fs::remove_file(&include).unwrap();
-        assert!(watcher.changed(), "missing include triggers reload");
+        assert!(
+            watcher.detect().is_some(),
+            "missing include triggers reload"
+        );
         assert!(crate::parser::load(&primary).is_err());
-        assert!(watcher.changed(), "missing include keeps triggering retry");
+        assert!(
+            watcher.detect().is_some(),
+            "missing include keeps triggering retry"
+        );
         std::fs::write(&include, "preview_scale 4\n").unwrap();
-        assert!(watcher.changed(), "replacement include remains pending");
+        let observed = watcher
+            .detect()
+            .expect("replacement include remains pending");
         let reloaded = crate::parser::load(&primary).unwrap();
-        watcher.replace(&reloaded.files);
-        assert!(!watcher.changed());
+        watcher.install(&reloaded.files, &observed);
+        assert!(watcher.detect().is_none(), "the replacement is committed");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// WO-U46H: a private temp dir per watcher test (the shipped fixture shape).
+    fn watcher_fixture_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lcdsirplus-watcher-{}-{}-{:?}",
+            name,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// WO-U46H #9: the watcher must never record unparsed bytes as applied. The
+    /// interleaving is detection (t0), a write, the parse (t1), the install (t3).
+    /// The shipped `replace` signed the CURRENT disk at t3, so the late write was
+    /// recorded as applied and never parsed (lost). `install` records the t0
+    /// snapshot, so the late write is still pending, is re-detected, is parsed,
+    /// and the final edit is applied: eventual consistency, no lost write.
+    #[test]
+    fn config_watcher_records_the_detection_snapshot_so_a_late_write_is_never_applied_unparsed() {
+        let dir = watcher_fixture_dir("interleaving");
+        let primary = dir.join("main.txt");
+        std::fs::write(&primary, "preview_scale 2\n").unwrap();
+        let loaded = crate::parser::load(&primary).unwrap();
+        let mut watcher = ConfigWatcher::new(&loaded.files);
+        assert!(watcher.detect().is_none(), "the baseline graph is quiet");
+
+        // Each write changes the file size, so detection is deterministic: within
+        // one NTFS file-timestamp tick (~15.6 ms) consecutive writes share an
+        // mtime, and a same-size edit is then a metadata-invisible write, owned by
+        // the bounded full recheck (pinned by
+        // `config_watcher_finds_a_same_size_edit_with_a_preserved_mtime_at_the_bounded_recheck`).
+        std::fs::write(&primary, "preview_scale 3 # the detected edit\n").unwrap();
+        let observed = watcher.detect().expect("the first edit is detected");
+        // The late write is the metadata-visible shape too: a different length and a
+        // legal value, landing between the detection and the install.
+        std::fs::write(&primary, "preview_scale 4 # the late write\n").unwrap();
+        let parsed = crate::parser::load(&primary).unwrap();
+        watcher.install(&parsed.files, &observed);
+
+        let late = watcher.detect().expect(
+            "the write that landed between detection and install is NOT recorded as applied",
+        );
+        let reapplied = crate::parser::load(&primary).unwrap();
+        assert_eq!(
+            reapplied.config.preview_scale, 4,
+            "the late write is parsed"
+        );
+        watcher.install(&reapplied.files, &late);
+        assert!(
+            watcher.detect().is_none(),
+            "the final edit is eventually applied and the graph goes quiet"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// WO-U46H #14: the metadata fast path must not lose a write it cannot see.
+    /// A same-size edit with a preserved mtime is exactly that case, and the
+    /// bounded full recheck is what finds it: never before sweep
+    /// `WATCHER_FULL_RECHECK_CHECKS`, at that sweep, once, then quiet.
+    #[test]
+    fn config_watcher_finds_a_same_size_edit_with_a_preserved_mtime_at_the_bounded_recheck() {
+        let dir = watcher_fixture_dir("preserved-mtime");
+        let primary = dir.join("main.txt");
+        std::fs::write(&primary, "preview_scale 2\n").unwrap();
+        let loaded = crate::parser::load(&primary).unwrap();
+        let mut watcher = ConfigWatcher::new(&loaded.files);
+        let mtime = std::fs::metadata(&primary).unwrap().modified().unwrap();
+
+        std::fs::write(&primary, "preview_scale 3\n").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&primary)
+            .unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        drop(file);
+        let metadata = std::fs::metadata(&primary).unwrap();
+        assert_eq!(metadata.modified().unwrap(), mtime, "mtime preserved");
+        assert_eq!(metadata.len(), 16, "size preserved");
+
+        let mut found = 0;
+        for sweep in 1..=WATCHER_FULL_RECHECK_CHECKS {
+            if let Some(observed) = watcher.detect() {
+                assert_eq!(
+                    sweep, WATCHER_FULL_RECHECK_CHECKS,
+                    "the fast path reported the metadata-invisible edit early"
+                );
+                found += 1;
+                let reloaded = crate::parser::load(&primary).unwrap();
+                watcher.install(&reloaded.files, &observed);
+            }
+        }
+        assert_eq!(
+            found, 1,
+            "the bounded full recheck finds the metadata-invisible edit"
+        );
+        assert!(
+            watcher.detect().is_none(),
+            "the applied edit goes quiet, so the fast path cannot re-fire on it"
+        );
+        assert_eq!(
+            crate::parser::load(&primary).unwrap().config.preview_scale,
+            3,
+            "the panel gets the edited value"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// WO-U46H #9: include-graph changes are re-signatured correctly. A new
+    /// include has no detection-time signature and a recreated include was absent
+    /// at detection, so both are signed from disk; the file detection observed
+    /// keeps its detection-time signature.
+    #[test]
+    fn config_watcher_install_signs_added_and_recreated_includes() {
+        let dir = watcher_fixture_dir("graph-changes");
+        let primary = dir.join("main.txt");
+        let include = dir.join("local.txt");
+        std::fs::write(&primary, "preview_scale 2\n").unwrap();
+        let loaded = crate::parser::load(&primary).unwrap();
+        let mut watcher = ConfigWatcher::new(&loaded.files);
+
+        std::fs::write(&include, "preview_scale 3\n").unwrap();
+        std::fs::write(&primary, "include local.txt\npreview_scale 2\n").unwrap();
+        let observed = watcher
+            .detect()
+            .expect("the primary change that adds an include is detected");
+        assert_eq!(
+            observed.len(),
+            1,
+            "detection only knows the graph it recorded, before the parse"
+        );
+        let reloaded = crate::parser::load(&primary).unwrap();
+        assert_eq!(reloaded.files.len(), 2);
+        watcher.install(&reloaded.files, &observed);
+        assert!(
+            watcher.detect().is_none(),
+            "the new include is signed, so the grown graph is quiet"
+        );
+
+        std::fs::remove_file(&include).unwrap();
+        let observed = watcher
+            .detect()
+            .expect("the removed include is detected for a retry");
+        assert!(
+            crate::parser::load(&primary).is_err(),
+            "and the load is rejected"
+        );
+        std::fs::write(&include, "preview_scale 4\n").unwrap();
+        let reloaded = crate::parser::load(&primary).unwrap();
+        watcher.install(&reloaded.files, &observed);
+        assert!(
+            watcher.detect().is_none(),
+            "the recreated include is signed from disk, not installed as absent"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// WO-U46H #2: the seed seam performs NO arithmetic on the clock. Measured on
+    /// this host (`rustc -O` probe): `Instant::now().checked_sub` succeeds for a
+    /// 100-year interval and fails at 292 years, so the shipped
+    /// `Instant::now() - interval` form cannot underflow for the LEGAL intervals
+    /// (telemetry 100..10000 ms, render 25..5000 ms) on Windows - it is a latent
+    /// panic form, and on a clock whose base is the boot time the same expression
+    /// panics whenever uptime < interval. The seam must not panic for ANY
+    /// interval, so the boundary cell uses one the platform itself refuses to
+    /// subtract, and the first collection/render must stay immediate. No clock
+    /// framework, no boot-time dependence: the precondition is asserted.
+    #[test]
+    fn startup_cadence_seed_is_immediate_for_an_interval_beyond_any_uptime() {
+        let now = Instant::now();
+        let beyond_any_uptime = Duration::from_secs(60 * 60 * 24 * 365 * 1_000);
+        assert!(
+            now.checked_sub(beyond_any_uptime).is_none(),
+            "the platform itself refuses this subtraction, so the shipped seed form panics here"
+        );
+        let seed = cadence_initial_state(now, beyond_any_uptime);
+        assert!(
+            cadence_due(seed.map(|last| now.duration_since(last)), beyond_any_uptime),
+            "the first telemetry collection/render must fire immediately"
+        );
+        assert!(
+            !cadence_due(Some(Duration::ZERO), beyond_any_uptime),
+            "the seed is the explicit due state, not a `now` stamp that delays the first tick by a full interval"
+        );
+        assert!(
+            !cadence_due(
+                Some(beyond_any_uptime - Duration::from_nanos(1)),
+                beyond_any_uptime
+            ),
+            "one nanosecond short is not due"
+        );
+        assert!(
+            cadence_due(Some(beyond_any_uptime), beyond_any_uptime),
+            "exactly the interval is due"
+        );
+        for interval in [
+            Duration::from_millis(25),
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+            Duration::from_secs(10),
+        ] {
+            let seed = cadence_initial_state(now, interval);
+            assert!(
+                cadence_due(seed.map(|last| now.duration_since(last)), interval),
+                "{interval:?}: the first tick must not wait"
+            );
+        }
+    }
+
+    /// WO-U46H #4: the reload attempt continues on every refresh tick (a repair
+    /// must stay detected), so the ERROR row is deduplicated by rejection
+    /// identity: identical repeat, changed failure, repair, recurrence.
+    #[test]
+    fn reload_rejections_log_once_per_identity_and_a_repair_resets_the_suppression() {
+        let missing = "C:\\cfg\\lcdsirplus.txt:0: cannot read configuration: The system cannot find the file specified. (os error 2)";
+        let invalid = "C:\\cfg\\lcdsirplus.txt:0: preview_mode must be auto, always, or never";
+        let mut last: Option<String> = None;
+        let mut rows = 0;
+        for _ in 0..10 {
+            if reload_rejection_is_new(&mut last, missing) {
+                rows += 1;
+            }
+        }
+        assert_eq!(
+            rows, 1,
+            "ten identical rejections at the 100 ms floor log exactly one row"
+        );
+        for _ in 0..10 {
+            if reload_rejection_is_new(&mut last, invalid) {
+                rows += 1;
+            }
+        }
+        assert_eq!(rows, 2, "a changed rejection identity is a new row");
+        assert_eq!(
+            last.as_deref(),
+            Some(invalid),
+            "the state is one identity, replaced in place: it never grows"
+        );
+        last = None; // the successful reload path clears the suppression
+        for _ in 0..10 {
+            if reload_rejection_is_new(&mut last, missing) {
+                rows += 1;
+            }
+        }
+        assert_eq!(rows, 3, "after a repair the recurrence is reported again");
+    }
+
+    /// WO-U46H #10 ruling evidence: a repeated module in one slot is
+    /// observably the single-module list. Cycling, the availability walk, the
+    /// displayed panel, the demand words and validation all agree with the
+    /// ordinary case, so the duplicate is not a distinct defect.
+    #[test]
+    fn a_repeated_slot_module_is_observably_the_single_module_list() {
+        let shape = |modules: &[&str]| {
+            let mut cfg = Config::default();
+            cfg.slots[0] = modules.iter().map(|m| m.to_string()).collect();
+            cfg.presentmon_enabled = true;
+            cfg.presentmon_deferred = true;
+            cfg.safe_mode = false;
+            cfg
+        };
+        let unavailable = Snapshot::default();
+        let duplicate = shape(&["FPS_CURRENT", "FPS_CURRENT"]);
+        let single = shape(&["FPS_CURRENT"]);
+        assert!(
+            crate::config::validate(&duplicate).is_ok(),
+            "the shipped contract: only PROC_HANG carries a uniqueness rule"
+        );
+
+        let duplicate_slots = Manager::new(&duplicate, [0; 4]);
+        let single_slots = Manager::new(&single, [0; 4]);
+        assert_eq!(
+            effective_slot_modules(&duplicate_slots, &unavailable, &duplicate)[0],
+            effective_slot_modules(&single_slots, &unavailable, &single)[0],
+            "the unavailable duplicate and the unavailable single module land on the same panel"
+        );
+        assert_eq!(
+            effective_slot_modules(&duplicate_slots, &unavailable, &duplicate)[0],
+            "CLEAR"
+        );
+        let duplicate_shown = effective_slot_modules(&duplicate_slots, &unavailable, &duplicate);
+        let single_shown = effective_slot_modules(&single_slots, &unavailable, &single);
+        assert_eq!(
+            provider_demand_bits(&duplicate_slots, &duplicate_shown, &duplicate),
+            provider_demand_bits(&single_slots, &single_shown, &single),
+            "the demand words are identical, so the duplicate cannot park or wake a provider"
+        );
+        assert_eq!(
+            provider_consumer_bits(&duplicate_shown, &duplicate, false),
+            provider_consumer_bits(&single_shown, &single, false),
+            "the consumer words are identical"
+        );
+
+        // Cycling: a duplicate press lands on the same module, exactly as the
+        // legal one-option list does; the selection index is invisible.
+        let mut duplicate_cycler = Manager::new(&duplicate, [0; 4]);
+        let mut single_cycler = Manager::new(&single, [0; 4]);
+        for _ in 0..4 {
+            assert_eq!(
+                duplicate_cycler.cycle(0, 1),
+                single_cycler.cycle(0, 1),
+                "every press shows what the single-module list shows"
+            );
+        }
+        // A reload of a duplicate list preserves the same displayed module.
+        let before = duplicate_cycler.current(0);
+        duplicate_cycler.apply(&duplicate);
+        assert_eq!(
+            duplicate_cycler.current(0),
+            before,
+            "reload preserves the module"
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::config::{
     parse_processor_list, validate, validate_config_string, Config, MAX_CONFIG_AGGREGATE_BYTES,
     MAX_CONFIG_FILES, MAX_CONFIG_INCLUDE_DIRECTIVES, MAX_CONFIG_LINES, MAX_CONFIG_LIST_ITEMS,
-    MAX_CONFIG_TOKEN_BYTES, MAX_INCLUDES,
+    MAX_CONFIG_STRING_BYTES, MAX_CONFIG_TOKEN_BYTES, MAX_INCLUDES,
 };
 
 #[cfg(test)]
@@ -337,6 +337,20 @@ impl ParseContext {
         let joined = |v: &[String]| -> Result<String, String> {
             if v.is_empty() {
                 return Err(format!("{} requires a value", key));
+            }
+            // WO-U46H #17: `validate_config_string` runs per token, so the JOINED
+            // value was never measured: the widest legal directive (256 tokens of
+            // MAX_CONFIG_STRING_BYTES, plus the separators the join inserts) built
+            // a 1,048,831-byte value for a single setting. Cap the COMPLETE value
+            // at the documented per-byte limit - the same limit the processor-list
+            // joined value already carries (`config.rs:748`) - and reject on the
+            // summed token lengths, before the join allocates the value.
+            let total = v.iter().map(|token| token.len()).sum::<usize>() + v.len() - 1;
+            if total > MAX_CONFIG_STRING_BYTES {
+                return Err(format!(
+                    "{} exceeds limit of {} bytes",
+                    key, MAX_CONFIG_STRING_BYTES
+                ));
             }
             Ok(v.join(" "))
         };
@@ -684,6 +698,132 @@ mod tests {
         let cfg =
             parse_standalone(b"discord_redirect_uri https://legacy.invalid/callback\n").unwrap();
         assert_eq!(cfg.discord_redirect_uri, "https://legacy.invalid/callback");
+    }
+
+    /// WO-U46H #17: the joined value is capped, not only every token inside it.
+    /// The real bounds, recomputed from the parser's own consts: the widest legal
+    /// directive is `MAX_CONFIG_LIST_ITEMS` (256) tokens of
+    /// `MAX_CONFIG_STRING_BYTES` (4,096) bytes plus the `MAX_CONFIG_LIST_ITEMS - 1`
+    /// separators the join inserts = 1,048,831 bytes, which the shipped per-token
+    /// check accepted for `date_format`, `time_format`, `logitech_friendly_name`
+    /// and `presentmon_path`. The cap is `MAX_CONFIG_STRING_BYTES`, the unit the
+    /// processor-list joined value already carries (`config.rs:748`), and the
+    /// rejection happens on the summed token lengths, before the join allocates.
+    #[test]
+    fn joined_values_are_capped_at_the_documented_byte_limit() {
+        let limit = MAX_CONFIG_STRING_BYTES;
+        let read = |cfg: &Config, key: &str| -> String {
+            match key {
+                "date_format" => cfg.date_format.clone(),
+                "time_format" => cfg.time_format.clone(),
+                "logitech_friendly_name" => cfg.logitech_friendly_name.clone(),
+                "presentmon_path" => cfg.presentmon_path.clone(),
+                other => unreachable!("unmapped key {other}"),
+            }
+        };
+        for key in [
+            "date_format",
+            "time_format",
+            "logitech_friendly_name",
+            "presentmon_path",
+        ] {
+            // Exact limit as one token: accepted, and stored whole.
+            let exact = parse_standalone(format!("{key} {}\n", "a".repeat(limit)).as_bytes())
+                .unwrap_or_else(|error| panic!("{key} exact limit rejected: {error}"));
+            assert_eq!(read(&exact, key).len(), limit, "{key} exact limit");
+            // Exact limit spread over tokens: 2,047 + 1 + 2,048 = 4,096.
+            let joined = format!(
+                "{key} {} {}\n",
+                "b".repeat(limit / 2 - 1),
+                "c".repeat(limit / 2)
+            );
+            let exact = parse_standalone(joined.as_bytes())
+                .unwrap_or_else(|error| panic!("{key} exact joined limit rejected: {error}"));
+            assert_eq!(read(&exact, key).len(), limit, "{key} exact joined limit");
+            // Over the limit by one byte through the join: every token is legal
+            // per-token, so only the complete-value check can catch it.
+            let over = format!(
+                "{key} {} {}\n",
+                "b".repeat(limit / 2),
+                "c".repeat(limit / 2)
+            );
+            let error = reject(key, over);
+            assert_eq!(error.line, 1, "{key}");
+            assert_eq!(
+                error.message,
+                format!("{key} exceeds limit of {limit} bytes"),
+                "{key}: over-join must name the key and the limit"
+            );
+            // The widest shipped-legal token shape: 256 x 4,096 bytes.
+            let widest = format!(
+                "{key} {}\n",
+                vec!["a".repeat(limit); MAX_CONFIG_LIST_ITEMS].join(" ")
+            );
+            let error = reject(key, widest);
+            assert_eq!(
+                error.message,
+                format!("{key} exceeds limit of {limit} bytes"),
+                "{key}: the 1,048,831-byte value is refused, not built"
+            );
+        }
+        // Unicode length: the unit is bytes, so 2,048 two-byte runes land exactly
+        // on the limit and one more rune is over it.
+        let exact_unicode =
+            parse_standalone(format!("date_format {}\n", "\u{e9}".repeat(limit / 2)).as_bytes())
+                .unwrap();
+        assert_eq!(exact_unicode.date_format.chars().count(), limit / 2);
+        assert_eq!(exact_unicode.date_format.len(), limit);
+        let over_unicode = parse_standalone(
+            format!("date_format {}\n", "\u{e9}".repeat(limit / 2 + 1)).as_bytes(),
+        )
+        .unwrap_err();
+        assert!(
+            over_unicode.message.contains("exceeds limit of 4096 bytes"),
+            "{over_unicode}"
+        );
+        // Two multibyte tokens that each pass the per-token check, joined over it.
+        let joined_unicode = parse_standalone(
+            format!(
+                "date_format {} {}\n",
+                "\u{e9}".repeat(limit / 4),
+                "\u{e9}".repeat(limit / 4)
+            )
+            .as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            joined_unicode.message,
+            "date_format exceeds limit of 4096 bytes".to_string(),
+            "the joined multibyte value is 4,097 bytes"
+        );
+        // The processor-list keys keep the same cap and now report the key, since
+        // the complete value is checked before the list is parsed.
+        let ccd = parse_standalone(
+            format!(
+                "ccd_cache_processors {} {}\n",
+                "0".repeat(limit / 2),
+                "1".repeat(limit / 2)
+            )
+            .as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            ccd.message,
+            "ccd_cache_processors exceeds limit of 4096 bytes"
+        );
+        // A legal short multi-token value still joins, so the cap is not a ban.
+        let ok = parse_standalone(b"date_format dd MMM yyyy\ntime_format HH:mm:ss\n").unwrap();
+        assert_eq!(ok.date_format, "dd MMM yyyy");
+        assert_eq!(ok.time_format, "HH:mm:ss");
+    }
+
+    /// The parse error of a directive whose value is over the joined cap; a value
+    /// that parses is the defect this test is written for.
+    fn reject(key: &str, line: String) -> ParseError {
+        match parse_standalone(line.as_bytes()) {
+            Ok(_) => panic!("{key} accepted a value over the joined cap"),
+            Err(error) => error,
+        }
     }
 
     #[test]
