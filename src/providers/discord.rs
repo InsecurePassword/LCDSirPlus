@@ -4443,4 +4443,187 @@ mod tests {
             Duration::from_secs(16)
         );
     }
+
+    /// WO-U46F: structural pin of the SHAPE the codex P2 thread asked for, the part no runtime test
+    /// can reach on the shipped monotonic clock (the 30 s threshold would need 30 s of real
+    /// serving). The healthy-session reset must measure the CONNECTION LIFETIME, not one poll step:
+    /// the worker carries a session-start field across steps, arms it once per session, clears it
+    /// at every session edge, and applies the reset on the shared path BEFORE the status match, so
+    /// the disconnect-side wait is measured the same way. The pre-fix text (`941faf6^` - a per-step
+    /// `let started = Instant::now();` plus two inline `started.elapsed() >= 30 s` arms) fails the
+    /// first three claims, so this pin is the pre-fix red for the review's mechanism.
+    #[test]
+    fn discord_backoff_measures_the_session_not_the_poll_step_structurally() {
+        let source = shipped_production_region();
+        let body = fn_body_at(&source, "fn spawn_worker");
+        assert!(
+            !body.contains("let started = Instant::now();"),
+            "the per-step timestamp the review named is not in the worker"
+        );
+        assert!(
+            !body.contains("started.elapsed()"),
+            "no reset condition measures the age of one poll step"
+        );
+        assert_eq!(
+            body.matches("Duration::from_secs(30)").count(),
+            0,
+            "the threshold lives in the session measurement, not in inline step checks"
+        );
+        let loop_head = body
+            .find("while !worker_shutdown.load(Ordering::Relaxed)")
+            .expect("the worker body carries the shutdown loop");
+        let declared = body
+            .find("let mut connected_since = None;")
+            .expect("the worker declares a session-start field");
+        assert!(
+            declared < loop_head,
+            "the session start is declared outside the loop, so one timestamp spans the whole session"
+        );
+        let polled = body
+            .find("((*table).poll_io)(handle, timeout)")
+            .expect("the worker drives poll_io");
+        let armed = body
+            .find("connected_since.get_or_insert(now)")
+            .expect("a successful step arms the session start");
+        assert_eq!(
+            body.matches("connected_since.get_or_insert(now)").count(),
+            1,
+            "the session start is armed once per session, never re-stamped per step"
+        );
+        assert!(
+            armed > polled,
+            "the sample comes from a completed step, so a served step is the evidence of health"
+        );
+        let measured = body
+            .find("session_backoff(backoff, connected_since, now)")
+            .expect("the reset is measured from the session start");
+        let matched = body
+            .find("match code {")
+            .expect("the worker branches on the poll status");
+        assert!(
+            measured < matched,
+            "the reset is on the shared path, so the disconnect-side twin uses the same measurement"
+        );
+        let disconnect_wait = body
+            .rfind("let deadline = Instant::now() + backoff;")
+            .expect("a backoff-bounded wait follows the disconnect");
+        assert!(
+            disconnect_wait > matched,
+            "that deadline is the disconnect-side wait, taken AFTER the session-measured reset"
+        );
+        let arm_head = body
+            .find("Ok(started_handle) => {")
+            .expect("the connect-success arm records a started session");
+        let next_arm = body[arm_head..]
+            .find("Err(message) => {")
+            .expect("the connect-failure arm follows the success arm");
+        let arm = &body[arm_head..arm_head + next_arm];
+        assert!(
+            arm.contains("handle = started_handle;") && arm.contains("connected_since = None;"),
+            "the clear sits inside the connect-success arm, so a new session never inherits an old start"
+        );
+        let reset = fn_body_at(&source, "fn session_backoff");
+        assert!(
+            reset.contains("Duration::from_secs(30)") && reset.contains("connected_since"),
+            "the threshold is compared against the session start, the 1 s base is the reset value"
+        );
+    }
+
+    /// WO-U46F: the review's scenario on the deterministic time seam the reset exposes
+    /// (`session_backoff` takes the sample instant). 299 serving steps of 100 ms inside one session
+    /// keep the accumulated delay; the step that reaches 30 s of sustained serving returns the
+    /// ladder to the 1 s base, and the ladder regrows from that base. Pre-fix the same steps each
+    /// measured a 100 ms step, so the reset never fired.
+    #[test]
+    fn reconnect_backoff_resets_after_one_long_healthy_session() {
+        let session_start = Instant::now();
+        let mut backoff = Duration::from_secs(30);
+        for step in 1u64..=299 {
+            backoff = session_backoff(
+                backoff,
+                Some(session_start),
+                session_start + Duration::from_millis(100 * step),
+            );
+            assert_eq!(
+                backoff,
+                Duration::from_secs(30),
+                "step {step} of a session younger than the threshold keeps the accumulated delay"
+            );
+        }
+        assert_eq!(
+            session_backoff(
+                backoff,
+                Some(session_start),
+                session_start + Duration::from_millis(30_000)
+            ),
+            Duration::from_secs(1),
+            "the step that reaches 30 s of sustained serving resets the ladder to the base"
+        );
+        assert_eq!(
+            next_backoff(Duration::from_secs(1)),
+            Duration::from_secs(2),
+            "the growth sequence continues from the base, not from the cap"
+        );
+    }
+
+    /// WO-U46F: the negative control. A session younger than the threshold is not evidence of
+    /// health, and a connection that never completed a successful step never armed a start at all;
+    /// both keep the accumulated delay.
+    #[test]
+    fn reconnect_backoff_retained_while_the_session_is_short() {
+        let session_start = Instant::now();
+        let grown = Duration::from_secs(16);
+        for step in [1u64, 5, 100, 250, 299] {
+            assert_eq!(
+                session_backoff(
+                    grown,
+                    Some(session_start),
+                    session_start + Duration::from_millis(100 * step)
+                ),
+                grown,
+                "a {step}-step session is younger than the threshold, so the delay is retained"
+            );
+        }
+        assert_eq!(
+            session_backoff(grown, None, session_start + Duration::from_secs(60)),
+            grown,
+            "no session start means no evidence of health"
+        );
+    }
+
+    /// WO-U46F: the disconnect-side twin. The reset is applied before the status match, so both
+    /// the delay a disconnect sleeps on and the delay the ladder grows from are measured from the
+    /// session start: a long session returns the next retry to the ~1 s base, a young session keeps
+    /// the accumulated cap.
+    #[test]
+    fn reconnect_backoff_disconnect_twin_returns_to_the_base_after_a_long_session() {
+        let session_start = Instant::now();
+        let grown = Duration::from_secs(30);
+        let at_disconnect = session_start + Duration::from_secs(30) + Duration::from_millis(100);
+        let measured = session_backoff(grown, Some(session_start), at_disconnect);
+        assert_eq!(
+            measured,
+            Duration::from_secs(1),
+            "the disconnect-side wait is bounded by the base after a long healthy session"
+        );
+        assert_eq!(
+            next_backoff(measured),
+            Duration::from_secs(2),
+            "the retry ladder returns to the base, not the accumulated cap"
+        );
+        let young = session_backoff(
+            grown,
+            Some(session_start),
+            session_start + Duration::from_secs(5),
+        );
+        assert_eq!(
+            young, grown,
+            "a young session keeps the accumulated delay on the disconnect side"
+        );
+        assert_eq!(
+            next_backoff(young),
+            Duration::from_secs(30),
+            "and the ladder stays at the cap, so the growth constants are untouched"
+        );
+    }
 }
