@@ -124,10 +124,18 @@ impl std::fmt::Display for LossError {
 /// Single construction point for disconnect publications: the human-readable
 /// reason is derived from cause + code + origin detail.
 fn disconnect(error: &LossError) -> Message {
-    Message::State(BackendState::Disconnected {
+    Message::State(disconnect_state(error))
+}
+
+/// The `Disconnected` state of the single construction point, so a failure that
+/// never reached a worker publishes the SAME row shape the worker publishes for
+/// a transport loss (WO-U46G item 5: the `Backend::spawn` failure sites in
+/// app.rs). No new state, label or journal vocabulary exists on this path.
+pub fn disconnect_state(error: &LossError) -> BackendState {
+    BackendState::Disconnected {
         cause: error.cause,
         reason: error.to_string(),
-    })
+    }
 }
 
 /// Close failure on the shutdown exit: the loss is the requested shutdown.
@@ -369,11 +377,59 @@ impl CommandQueue {
     }
 }
 
+/// WO-U46G item 5 (audit finding #18): the named loss for a backend worker that
+/// could not be spawned. The frozen site was
+/// `.expect("spawn backend thread")` (`src/backends/mod.rs:414` on 12ff06d), so
+/// an OS thread-creation failure aborted the process. `ProbeFail` is the
+/// existing cause the SDK owner-spawn site already uses for the same failure
+/// (`src/backends/sdk.rs:1730`), so no new loss cause exists; the OS error rides
+/// in the detail. No ownership is claimed by `Backend::spawn` (the worker
+/// claims on its own thread), so the rollback is the channels dropping.
+fn spawn_failure_loss(error: std::io::Error) -> LossError {
+    LossError::new(
+        LossCause::ProbeFail,
+        format!("spawn backend worker thread: {error}"),
+    )
+}
+
+// WO-U46G item 5: the test-only injection seam, THREAD-LOCAL so a parallel
+// sibling's `Backend::spawn` can never consume a token. Production never reads
+// it: the WO bans real OS thread exhaustion, and the failure path keeps the
+// production `std::io::Error` shape. A doc comment on a macro call is unused,
+// so this note is a plain comment.
+#[cfg(test)]
+thread_local! {
+    // The injection tokens, consumed one per `Backend::spawn` call.
+    static SPAWN_FAILURE_TOKENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub fn inject_backend_spawn_failures(tokens: usize) {
+    SPAWN_FAILURE_TOKENS.with(|cell| cell.set(tokens));
+}
+
+#[cfg(test)]
+fn take_spawn_failure_token() -> bool {
+    SPAWN_FAILURE_TOKENS.with(|cell| {
+        let left = cell.get();
+        if left == 0 {
+            return false;
+        }
+        cell.set(left - 1);
+        true
+    })
+}
+
 impl Backend {
     /// Spawn the backend worker. `kind` comes from resolved configuration
     /// (`auto` resolves to Hid here; the worker falls back to Virtual when
     /// HID discovery cannot find a device).
-    pub fn spawn(kind: BackendKind, cfg: &Config) -> Backend {
+    ///
+    /// WO-U46G item 5: a spawn failure is a `Result` with the named loss, never
+    /// a panic. The callers (app.rs startup and reload) publish the established
+    /// `Disconnected` row; the reconnect ladder owns the re-attempts, so one
+    /// failure here starts no restart storm.
+    pub fn spawn(kind: BackendKind, cfg: &Config) -> Result<Backend, LossError> {
         let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
         let commands = Arc::new(CommandQueue {
             latest: Mutex::new(None),
@@ -394,6 +450,13 @@ impl Backend {
         let invert = cfg.logitech_invert;
         let friendly_name = cfg.logitech_friendly_name.clone();
         let worker_commands = Arc::clone(&commands);
+        #[cfg(test)]
+        if take_spawn_failure_token() {
+            // The worker never exists: the channels built above drop here.
+            // OS code 8 (ERROR_NOT_ENOUGH_MEMORY) is the shape a real
+            // thread-creation failure carries.
+            return Err(spawn_failure_loss(std::io::Error::from_raw_os_error(8)));
+        }
         let thread = std::thread::Builder::new()
             .name("lcdsirplus-backend".into())
             .spawn(move || {
@@ -411,12 +474,12 @@ impl Backend {
                     friendly_name,
                 )
             })
-            .expect("spawn backend thread");
-        Backend {
+            .map_err(spawn_failure_loss)?;
+        Ok(Backend {
             commands,
             msg_rx,
             thread: Some(thread),
-        }
+        })
     }
 
     pub fn submit(&self, frame: &crate::render::Frame) {
@@ -439,9 +502,15 @@ impl Backend {
         }
     }
 
-    pub fn reconfigure(&mut self, kind: BackendKind, cfg: &Config) {
+    /// WO-U46G item 5: the rebuild is a `Result`. `stop` runs first (the old
+    /// worker is joined, its channels closed), so on a spawn failure `self` is
+    /// the stopped backend: the app keeps its loop, publishes the named loss
+    /// row, submits drop into the shutdown queue, and no thread exists to
+    /// restart - the ladder owns re-attempts, so there is no restart storm.
+    pub fn reconfigure(&mut self, kind: BackendKind, cfg: &Config) -> Result<(), LossError> {
         self.stop();
-        *self = Self::spawn(kind, cfg);
+        *self = Self::spawn(kind, cfg)?;
+        Ok(())
     }
 }
 
@@ -715,7 +784,21 @@ type OpenPhysical = fn(BackendKind, &str) -> Result<PhysicalDevice, LossError>;
 type ProbeCandidates = fn(BackendKind) -> bool;
 
 fn open_physical(kind: BackendKind, friendly_name: &str) -> Result<PhysicalDevice, LossError> {
-    if sdk::circuit_open() {
+    // WO-U46G item 3 (audit finding #6) supersedes WO-U46B's refusal for a mode
+    // that cannot own the SDK: the circuit guards SDK calls only, so the branch
+    // is entered only by a mode that may own an SDK device. An explicit `hid`
+    // selection is the backend the user chose, and with the audit #1 wedge
+    // (circuit open, episode live, window empty) the flag was permanent after a
+    // transient SDK hang: `hid` was then refused forever while the G13 was
+    // reachable, panel blank until the process restarted. The 46b core property
+    // stands: the resolver stays inside this gate, so `hid`/`virtual` can never
+    // receive an SDK device, and `hid` still refuses the device while LCore
+    // owns it - `select_physical_kind` answers OwnerConflict below and
+    // `src/backends/hid.rs:359-370` re-checks ownership after the exclusive
+    // open. SDK/auto keep the 45a shape byte-identically, and `virtual` never
+    // reaches this function in production (`worker()` routes it to
+    // `virtual_worker`).
+    if sdk::circuit_open() && sdk_permits_ownership(kind) {
         // F-REC-1 (WO-U45A-REC-RECOVERY): the ladder pass is the recovery
         // tick clock - one tick per pass, so fresh-open attempts can never
         // run faster than the configured reconnect cadence. The resolver
@@ -723,15 +806,8 @@ fn open_physical(kind: BackendKind, friendly_name: &str) -> Result<PhysicalDevic
         // successful call through the fresh owner closes the circuit; a
         // refusal publishes the byte-identical circuit-open row, so the
         // 11/18 ladder shape is unchanged.
-        // WO-U46B: the resolver OPENS an SDK device, so it is consulted only
-        // when the configured mode permits SDK ownership. An explicit `hid`
-        // selection (and `virtual`) takes the circuit-open refusal below and can
-        // never receive an SDK device; the resolver's own discovery/open
-        // contract is untouched.
-        if sdk_permits_ownership(kind) {
-            if let Some(device) = sdk::try_circuit_recovery(friendly_name) {
-                return Ok(PhysicalDevice::Sdk(device));
-            }
+        if let Some(device) = sdk::try_circuit_recovery(friendly_name) {
+            return Ok(PhysicalDevice::Sdk(device));
         }
         return Err(LossError::new(
             LossCause::CircuitOpen,
@@ -1788,7 +1864,8 @@ mod tests {
             logitech_invert: true,
             ..Default::default()
         };
-        let mut backend = Backend::spawn(BackendKind::Virtual, &base);
+        let mut backend = Backend::spawn(BackendKind::Virtual, &base)
+            .expect("the virtual backend spawns (WO-U46G item 5: the signature row)");
         let mut frame = Frame::new();
         frame.set(3, 4, true);
         assert_ne!(
@@ -1806,7 +1883,9 @@ mod tests {
         );
 
         let before = Arc::clone(&backend.commands);
-        backend.reconfigure(BackendKind::Virtual, &rotated);
+        backend
+            .reconfigure(BackendKind::Virtual, &rotated)
+            .expect("the virtual backend reconfigures (WO-U46G item 5: the signature row)");
         // F-1: pin the fresh-queue intent. The send counter is per queue, so a
         // reused queue carrying a stale cache would read the same 1; the queue
         // identity is what makes the test sensitive to the mechanism.
@@ -3028,12 +3107,17 @@ mod tests {
         circuit_open: bool,
         lcore_present: bool,
     ) -> (Option<&'static str>, String) {
-        if circuit_open {
-            // The gated arm: `kind` is consulted BEFORE the resolver, then the
-            // 45a contract (`sdk.rs:362` `try_circuit_recovery`) yields a fresh
-            // SDK device exactly when a trusted, responsive LCore authorizes
-            // the one open per episode window.
-            if sdk_permits_ownership(kind) && lcore_present {
+        // WO-U46G item 3 (audit #6, supersession of the 46b model's shape): the
+        // circuit guards SDK calls only, so the arm is entered by a mode that
+        // MAY own an SDK device. `hid` (and the never-dispatched `virtual`)
+        // take the NORMAL arbitration, where the existing LCore-ownership guard
+        // (`hid.rs:359-370` post-open twin) keeps HID off a device LCore owns.
+        if circuit_open && sdk_permits_ownership(kind) {
+            // The gated arm: the 45a contract (`sdk.rs:362`
+            // `try_circuit_recovery`) yields a fresh SDK device exactly when a
+            // trusted, responsive LCore authorizes the one open per episode
+            // window; every other pass publishes the byte-identical refusal row.
+            if lcore_present {
                 return (Some("sdk"), String::new());
             }
             return (
@@ -3137,21 +3221,26 @@ mod tests {
                 None,
                 SDK_MODE_ABSENT_ROW,
             ),
+            // WO-U46G item 3 supersession (audit #6): the two `hid` open-circuit
+            // cells were `None, CIRCUIT_OPEN_ROW` - an SDK-scoped circuit flag
+            // refused the backend the user explicitly selected. They now reach
+            // the HID arbitration: the OwnerConflict row while LCore owns the
+            // device, the normal HID open when no LCore is present.
             (
                 "hid/open/lcore",
                 BackendKind::Hid,
                 true,
                 true,
                 None,
-                CIRCUIT_OPEN_ROW,
+                HID_CONFLICT_ROW,
             ),
             (
                 "hid/open/no-lcore",
                 BackendKind::Hid,
                 true,
                 false,
-                None,
-                CIRCUIT_OPEN_ROW,
+                Some("hid"),
+                "",
             ),
             (
                 "hid/closed/lcore",
@@ -3169,13 +3258,19 @@ mod tests {
                 Some("hid"),
                 "",
             ),
+            // WO-U46G item 3: the gate is mode-scoped, so the `virtual`
+            // open-circuit cells match the circuit-closed ones ("virtual is not
+            // a physical backend"). `worker()` routes `virtual` to
+            // `virtual_worker` BEFORE the ladder, pinned by
+            // a_virtual_selection_never_reaches_the_physical_open_path, so this
+            // stays defense in depth, exactly as 46b labelled it.
             (
                 "virtual/open/lcore",
                 BackendKind::Virtual,
                 true,
                 true,
                 None,
-                CIRCUIT_OPEN_ROW,
+                VIRTUAL_NOT_PHYSICAL_ROW,
             ),
             (
                 "virtual/open/no-lcore",
@@ -3183,7 +3278,7 @@ mod tests {
                 true,
                 false,
                 None,
-                CIRCUIT_OPEN_ROW,
+                VIRTUAL_NOT_PHYSICAL_ROW,
             ),
             (
                 "virtual/closed/lcore",
@@ -3421,5 +3516,251 @@ mod tests {
             1,
             "the physical arm is the only route to the recovery branch"
         );
+    }
+
+    // WO-U46G-RECOVERY-RECLAIM regression set (audit findings #6 and #18). The
+    // 46b matrix stays the model of the arm; the arm ITSELF is pinned on the
+    // production region by the `include_str!` census below (46b's accepted
+    // methodology), because `open_physical` is the ladder's real open path and
+    // the circuit flag has no production setter a test may fake.
+
+    #[test]
+    fn the_circuit_open_arm_is_mode_scoped_so_hid_reaches_the_normal_arbitration() {
+        // Pre-fix RED (`u46g-prefix-reds.log`): the needle is ABSENT -
+        // `open_physical` entered the circuit branch on the flag alone
+        // (`src/backends/mod.rs:718`), so EVERY mode fell into the refusal at
+        // `src/backends/mod.rs:736` and the normal arbitration at
+        // `src/backends/mod.rs:741` was unreachable while the circuit stayed
+        // open. With the audit #1 wedge that meant an explicit `hid` selection
+        // was refused by an SDK-scoped flag: panel blank to process restart.
+        let source = include_str!("./mod.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("the test module marker");
+        let arm = production
+            .split("fn open_physical")
+            .nth(1)
+            .and_then(|rest| rest.split("fn select_physical_kind").next())
+            .expect("the open_physical production body");
+        let arm_flat: String = arm
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace(" .", ".");
+        // `split`-count, not `matches`: the needle carries `(` and `)`, which
+        // `str::matches` would read as regex groups (the 46b needles it shares
+        // this census with are plain text, so they are unaffected).
+        assert_eq!(
+            arm_flat
+                .split("sdk::circuit_open() && sdk_permits_ownership(kind)")
+                .count()
+                - 1,
+            1,
+            "the circuit branch is entered only by a mode that may own an SDK device"
+        );
+        assert_eq!(
+            arm_flat.matches(CIRCUIT_OPEN_DETAIL).count(),
+            1,
+            "the SDK/auto refusal row is byte-identical and stays the arm's only published row"
+        );
+        // The arbitration a `hid` selection reaches, on the production rule: the
+        // LCore-ownership guard answers OwnerConflict while LCore owns the
+        // device (the 46b core property, preserved), and a normal HID open when
+        // no LCore is present.
+        assert_eq!(
+            select_physical_kind(BackendKind::Hid, true)
+                .err()
+                .unwrap()
+                .cause,
+            LossCause::OwnerConflict,
+            "HID stays off a device LCore owns"
+        );
+        assert_eq!(
+            select_physical_kind(BackendKind::Hid, false).ok(),
+            Some(BackendKind::Hid),
+            "an explicit hid selection with no LCore reaches its own open"
+        );
+        // The cells the supersession changes, and the SDK/auto cells it must
+        // not touch.
+        let table: [(&str, BackendKind, bool, Option<&'static str>, &str); 5] = [
+            (
+                "hid/open/lcore",
+                BackendKind::Hid,
+                true,
+                None,
+                HID_CONFLICT_ROW,
+            ),
+            (
+                "hid/open/no-lcore",
+                BackendKind::Hid,
+                false,
+                Some("hid"),
+                "",
+            ),
+            ("auto/open/lcore", BackendKind::Auto, true, Some("sdk"), ""),
+            (
+                "auto/open/no-lcore",
+                BackendKind::Auto,
+                false,
+                None,
+                CIRCUIT_OPEN_ROW,
+            ),
+            (
+                "sdk/open/no-lcore",
+                BackendKind::Sdk,
+                false,
+                None,
+                CIRCUIT_OPEN_ROW,
+            ),
+        ];
+        for (label, mode, lcore_present, want_device, want_row) in table {
+            let (device, row) = recovery_arm_cell(mode, true, lcore_present);
+            assert_eq!(device, want_device, "cell {label}: device class");
+            assert_eq!(row, want_row, "cell {label}: published row");
+        }
+    }
+
+    /// The arm under `RECOVERY_BLOCKED` (the trust class, where 45a forbids
+    /// every fresh open): the resolver returns None at
+    /// `src/backends/sdk.rs:365`, so a permitting mode publishes the refusal
+    /// row and a non-permitting mode never sees the block state at all.
+    fn blocked_arm_cell(kind: BackendKind, lcore_present: bool) -> (Option<&'static str>, String) {
+        if sdk_permits_ownership(kind) {
+            return (
+                None,
+                published(&LossError::new(
+                    LossCause::CircuitOpen,
+                    CIRCUIT_OPEN_DETAIL.into(),
+                ))
+                .1,
+            );
+        }
+        match select_physical_kind(kind, lcore_present) {
+            Ok(BackendKind::Sdk) => (Some("sdk"), String::new()),
+            Ok(BackendKind::Hid) => (Some("hid"), String::new()),
+            Ok(other) => (None, format!("unexpected arbitration to {}", other.name())),
+            Err(error) => (None, published(&error).1),
+        }
+    }
+
+    #[test]
+    fn the_recovery_block_is_scoped_to_the_modes_the_circuit_guards() {
+        // Coverage row: `hid/blocked` is unaffected by RECOVERY_BLOCKED, and
+        // `auto`/`sdk` under a block keep the refusal row byte-identical.
+        let table: [(&str, BackendKind, bool, Option<&'static str>, &str); 6] = [
+            (
+                "auto/blocked/lcore",
+                BackendKind::Auto,
+                true,
+                None,
+                CIRCUIT_OPEN_ROW,
+            ),
+            (
+                "auto/blocked/no-lcore",
+                BackendKind::Auto,
+                false,
+                None,
+                CIRCUIT_OPEN_ROW,
+            ),
+            (
+                "sdk/blocked/lcore",
+                BackendKind::Sdk,
+                true,
+                None,
+                CIRCUIT_OPEN_ROW,
+            ),
+            (
+                "sdk/blocked/no-lcore",
+                BackendKind::Sdk,
+                false,
+                None,
+                CIRCUIT_OPEN_ROW,
+            ),
+            (
+                "hid/blocked/lcore",
+                BackendKind::Hid,
+                true,
+                None,
+                HID_CONFLICT_ROW,
+            ),
+            (
+                "hid/blocked/no-lcore",
+                BackendKind::Hid,
+                false,
+                Some("hid"),
+                "",
+            ),
+        ];
+        for (label, mode, lcore_present, want_device, want_row) in table {
+            let (device, row) = blocked_arm_cell(mode, lcore_present);
+            assert_eq!(device, want_device, "cell {label}: device class");
+            assert_eq!(row, want_row, "cell {label}: published row");
+        }
+    }
+
+    #[test]
+    fn a_backend_thread_spawn_failure_is_a_named_loss_never_a_panic() {
+        // WO-U46G item 5 (audit #18). Pre-fix form, disclosed: the production
+        // site was `.expect("spawn backend thread")`
+        // (`src/backends/mod.rs:414`), so an OS thread-creation failure aborted
+        // the process. Reproducing that behaviorally needs real OS thread
+        // exhaustion, which this WO bans, so the PRE-FIX RED is this census row
+        // (`u46g-prefix-reds.log`); the behavior is pinned post-fix by
+        // a_backend_spawn_failure_yields_the_named_loss_and_the_disconnected_row.
+        let source = include_str!("./mod.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("the test module marker");
+        let spawn = production
+            .split("pub fn spawn(")
+            .nth(1)
+            .and_then(|rest| rest.split("pub fn submit(").next())
+            .expect("the Backend::spawn production body");
+        assert_eq!(
+            spawn.matches(".expect(\"spawn backend thread\")").count(),
+            0,
+            "the backend worker spawn has no panic site"
+        );
+        assert_eq!(
+            spawn.matches("spawn_failure_loss").count(),
+            2,
+            "the real io::Error and the injected failure route through the one named-loss site"
+        );
+    }
+
+    #[test]
+    fn a_backend_spawn_failure_yields_the_named_loss_and_the_disconnected_row() {
+        // WO-U46G item 5 behavior, on the thread-local `cfg(test)` injection (no
+        // real OS exhaustion): `Backend::spawn` fails as a named loss, the state
+        // app.rs publishes for it is the established `Disconnected` row built by
+        // the worker's own construction point, and the injection is one token,
+        // so the next real spawn succeeds and joins cleanly.
+        let cfg = Config {
+            logitech_button_poll: Duration::from_millis(1),
+            ..Default::default()
+        };
+        inject_backend_spawn_failures(1);
+        let error = match Backend::spawn(BackendKind::Virtual, &cfg) {
+            Ok(_) => panic!("the injected spawn failure must yield the named loss"),
+            Err(error) => error,
+        };
+        assert_eq!(error.cause, LossCause::ProbeFail, "{error}");
+        assert!(
+            error.detail.contains("spawn backend worker thread"),
+            "{error}"
+        );
+        assert_eq!(
+            disconnect_state(&error),
+            BackendState::Disconnected {
+                cause: LossCause::ProbeFail,
+                reason: error.to_string(),
+            },
+            "the state app.rs publishes is the established loss-cause row, built by the worker's own construction point"
+        );
+        let backend = Backend::spawn(BackendKind::Virtual, &cfg)
+            .expect("the injection is one token, so the next spawn succeeds");
+        backend.shutdown();
     }
 }

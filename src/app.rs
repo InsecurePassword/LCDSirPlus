@@ -138,7 +138,18 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
 
     // Backend.
     let backend_kind = crate::backends::resolve_kind(&cfg.logitech_backend);
-    let mut backend = Backend::spawn(backend_kind, &cfg);
+    let mut backend = match Backend::spawn(backend_kind, &cfg) {
+        Ok(backend) => backend,
+        Err(error) => {
+            // WO-U46G item 5: the worker thread is the transport's only driver,
+            // so its absence is named on the established startup-failure outcome
+            // (the RC-1 cause+detail row) and the process exits with the
+            // startup-failure code the logging site uses - never a panic. No
+            // ownership was claimed: `Backend::spawn` claims on its own thread.
+            crate::log_error!("backend worker could not start: {error}");
+            return Err((1, format!("backend worker could not start: {error}")));
+        }
+    };
     crate::log_info!("backend: {}", backend_kind.name());
 
     // UI (tray + preview per mode).
@@ -247,11 +258,23 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                         watcher.replace(&files);
                         if backend_changed {
                             recovery.suspend();
-                            backend.reconfigure(
+                            match backend.reconfigure(
                                 crate::backends::resolve_kind(&cfg.logitech_backend),
                                 &cfg,
-                            );
-                            backend_state = BackendState::Discovering;
+                            ) {
+                                Ok(()) => backend_state = BackendState::Discovering,
+                                Err(error) => {
+                                    // WO-U46G item 5: the reload publishes the
+                                    // established Disconnected state/row (the
+                                    // worker's own construction point for a
+                                    // transport loss) and names the cause on the
+                                    // log. No device was claimed and no worker
+                                    // exists, so nothing restarts here: the
+                                    // reconnect ladder owns re-attempts.
+                                    crate::log_error!("backend reload failed: {error}");
+                                    backend_state = crate::backends::disconnect_state(&error);
+                                }
+                            }
                         }
                         sync_startup_if_needed(
                             &cfg,
@@ -2054,6 +2077,34 @@ mod tests {
             DeviceStatus::RecoveryFailed {
                 code: "call-timeout".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn a_backend_spawn_failure_publishes_the_named_loss_row_on_the_established_surface() {
+        // WO-U46G item 5: the startup/reload sites publish the SAME
+        // `Disconnected` shape the worker publishes for a transport loss (one
+        // construction point), so the panel and the log name the cause and no
+        // device status is claimed.
+        let error = crate::backends::LossError::new(
+            LossCause::ProbeFail,
+            "spawn backend worker thread: os error 8".into(),
+        );
+        let state = crate::backends::disconnect_state(&error);
+        assert_eq!(
+            state,
+            BackendState::Disconnected {
+                cause: LossCause::ProbeFail,
+                reason: "probe-fail: spawn backend worker thread: os error 8".to_string(),
+            },
+            "the reload site's state is the established loss-cause row"
+        );
+        assert_eq!(
+            published_device_status(&state, &DeviceStatus::Healthy),
+            DeviceStatus::LinkFailed {
+                code: "probe-fail".to_string()
+            },
+            "the failure surfaces as the named loss, never as a connected device"
         );
     }
 

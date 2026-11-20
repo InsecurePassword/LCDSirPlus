@@ -137,6 +137,15 @@ const RECOVERY_ATTEMPT_GAP_CAP_TICKS: usize = 48;
 /// saturating counter (`src/backends/sdk.rs:120`/`src/backends/sdk.rs:146` on
 /// 42132a7) allowed.
 ///
+/// SCOPE (WO-U46G item 2, audit finding #18): the census is PROCESS-WIDE, not
+/// per-episode. `recovered` resets the episode shape and keeps the ledger, so
+/// the tradeoff is explicit: an episode that strands owners permanently
+/// consumes headroom for every later episode, and at the bound the
+/// authorization stops process-wide until a retained owner actually returns.
+/// That is the intended cost - a stranded owner is retained memory until the
+/// process exits - and it is bounded, self-healing (every retirement restores
+/// one slot) and never a lifetime lockout.
+///
 /// Below the bound recovery stays fully re-armable (the census releases as
 /// owners return). At the bound the resolver FAILS CLOSED: no fresh open is
 /// authorized, and exactly one `log_warn` records it (recorded, silent-to-
@@ -258,27 +267,56 @@ impl CircuitRecovery {
         std::mem::replace(&mut self.bound_reported, false)
     }
 
-    /// The episode is over: the shape resets to the shipped baseline, window
-    /// identity, census identities and the report latch included.
+    /// The episode is over: the EPISODE shape resets to the shipped baseline -
+    /// window identity, streak, attempts and the report latch. WO-U46G item 2
+    /// (audit finding #18): the detached-owner census is the process's resource
+    /// ledger, not episode state, so it is KEPT. A displaced owner whose native
+    /// call never returns is retained memory for the life of the process
+    /// (thread, channel half, pinned handles, module reference, native frame),
+    /// so it keeps consuming headroom in every later episode and leaves only
+    /// through `retire(g)` on its own actual retirement
+    /// (`src/backends/sdk.rs:233`). The frozen `*self = Self::default()` erased
+    /// it on every close, so the bound counted a single episode only and the
+    /// 54984-class accumulation it exists to stop was re-armed for free.
     fn recovered(&mut self) {
-        *self = Self::default();
+        let detached = self.detached;
+        let detached_generations = std::mem::take(&mut self.detached_generations);
+        *self = Self {
+            detached,
+            detached_generations,
+            ..Default::default()
+        };
     }
 
     /// One ladder tick. Returns true only on the tick that authorizes the
     /// one fresh-open attempt: the streak must be unbroken (`device-present`
-    /// and responsive every tick; any miss restarts it), at most one
-    /// quarantined owner may be in flight (cap = 1), the detached-owner census
-    /// must be under the bound (F-REC-2: at the cap the resolver fails closed),
-    /// and the gap between attempts grows exponentially, bounded, in ladder
-    /// ticks - the `telemetry::backoff_interval` shape on the ladder's own
-    /// clock.
+    /// and responsive every tick; any miss restarts it), the recovery window
+    /// may hold at most ONE quarantined owner (cap = 1), the detached-owner
+    /// census must be under the bound (F-REC-2: at the cap the resolver fails
+    /// closed), and the gap between attempts grows exponentially, bounded, in
+    /// ladder ticks - the `telemetry::backoff_interval` shape on the ladder's
+    /// own clock.
+    ///
+    /// WO-U46G item 1 (audit finding #1): the authorization is EPISODE-scoped,
+    /// not window-scoped. The caller has already proven the episode
+    /// (`CIRCUIT_OPEN` + `OWNER_QUARANTINED` + not `RECOVERY_BLOCKED`,
+    /// `src/backends/sdk.rs:363`), so a window that is OCCUPIED (the owner's
+    /// call has not returned) and a window that is EMPTY (the owner's late
+    /// NON-health reply ran its self-retire tail, `:235`, while the circuit
+    /// stayed open) are the same sick device: the shipped gate
+    /// (`in_flight != 1`) made that second shape permanent - the tick never
+    /// fired again, the resolver returned `None`, and the circuit-open refusal
+    /// ran for every mode until the process restarted. The close rule is
+    /// untouched: only a health round-trip from the current generation ends an
+    /// episode (`circuit_closed_on_health`, `src/backends/sdk.rs:344`), so
+    /// authorizing an empty window can never declare recovery on its own.
     fn tick(&mut self, present: bool, responsive: bool) -> bool {
         if !present || !responsive {
             self.responsive_ticks = 0;
             return false;
         }
         self.responsive_ticks += 1;
-        if self.in_flight != 1 || self.bound_hit() {
+        if self.in_flight > 1 || self.bound_hit() {
             return false;
         }
         let gap =
@@ -1416,8 +1454,21 @@ fn validate_pe(path: &Path) -> Result<(), String> {
             let raw_size = u32_at(at + 16)?;
             let raw = u32_at(at + 20)?;
             let span = virtual_size.max(raw_size);
-            (rva >= virtual_address && rva < virtual_address.checked_add(span)?)
-                .then_some((raw + rva - virtual_address) as usize)
+            // WO-U46G item 4 (audit finding #7): the whole mapping expression is
+            // checked. The span add already used `checked_add`; the file-offset
+            // expression (`raw + rva - virtual_address`) did not, so a hostile
+            // `raw` near `u32::MAX` overflowed it (a panic under the debug
+            // profile, a wrapped offset under release) and the wrapped value
+            // then indexed `bytes[start..]` out of bounds. The offset is
+            // computed in u64 and bounded by the file length, so an unmappable
+            // RVA is a `None` and the caller's existing descriptive-Err `ok_or`
+            // names it; no panic, no wrapped offset.
+            let end = virtual_address.checked_add(span)?;
+            if rva < virtual_address || rva >= end {
+                return None;
+            }
+            let offset = (raw as u64) + u64::from(rva - virtual_address);
+            (offset < bytes.len() as u64).then_some(offset as usize)
         })
     };
     let export = rva_offset(export_rva).ok_or("SDK export directory is invalid")?;
@@ -1431,7 +1482,11 @@ fn validate_pe(path: &Path) -> Result<(), String> {
     for index in 0..count {
         let name_rva = u32_at(names + index * 4).ok_or("truncated SDK export name table")?;
         let start = rva_offset(name_rva).ok_or("invalid SDK export name")?;
-        let end = bytes[start..]
+        // WO-U46G item 4: the slice is bounded by `bytes.get`, so a start the
+        // mapping placed at or past the file end is a rejection, never a panic.
+        let end = bytes
+            .get(start..)
+            .ok_or("SDK export name is outside the file")?
             .iter()
             .position(|b| *b == 0)
             .map(|n| start + n)
@@ -2909,7 +2964,14 @@ mod tests {
         OWNER_QUARANTINED.store(false, Ordering::Release);
         RECOVERY_BLOCKED.store(false, Ordering::Release);
         SDK_OWNER_ACTIVE.store(NO_OWNER, Ordering::Release);
-        CIRCUIT_RECOVERY.lock().unwrap().recovered();
+        let mut machine = CIRCUIT_RECOVERY.lock().unwrap();
+        machine.recovered();
+        // WO-U46G item 2 (declared adaptation): `recovered()` now RETAINS the
+        // process-wide detached census by design, so the scenario-normalizing
+        // reset clears the census explicitly to keep every 45a/46a scenario
+        // isolated at a full-headroom start.
+        machine.detached = 0;
+        machine.detached_generations.clear();
     }
 
     #[test]
@@ -3019,6 +3081,7 @@ mod tests {
         let mut machine = CircuitRecovery::default();
         machine.quarantined();
         machine.quarantined();
+        machine.displaced();
         machine.tick(true, true);
         machine.recovered();
         assert_eq!(
@@ -3029,6 +3092,20 @@ mod tests {
             ),
             (0, 0, 0),
             "a closed circuit starts the next episode from N=3, attempt 0"
+        );
+        // WO-U46G item 2 (the single permitted 45a semantic change): the EPISODE
+        // shape resets - window identity, streak, attempts, latch - and the
+        // detached census does NOT, because it is the process's resource
+        // ledger: a retained owner leaves only through `retire(g)` on its own
+        // retirement (`src/backends/sdk.rs:233`).
+        assert_eq!(
+            machine.detached, 1,
+            "the census is not part of the episode shape: the retained owner stays counted"
+        );
+        machine.retired();
+        assert_eq!(
+            machine.detached, 0,
+            "the retained owner's retirement is what restores the headroom"
         );
         machine.quarantined();
         assert!(!machine.tick(true, true));
@@ -3478,8 +3555,13 @@ mod tests {
                     machine.in_flight,
                     machine.detached
                 ),
-                (0, 0, 0, 0),
-                "the closed episode resets the window AND the detached census"
+                // WO-U46G item 2 (declared adaptation): the 45a expectation was
+                // `(0, 0, 0, 0)` - the frozen `recovered()` erased the census.
+                // The closed episode resets the window and the episode shape;
+                // the ONE displaced owner this scenario registered stays in the
+                // process-wide census until it retires.
+                (0, 0, 0, 1),
+                "the closed episode resets the window; the process-wide census keeps the retained owner"
             );
         }
         let needle = ["log_info!(\"", "{CIRCUIT_RECOVERY_AUDIT}", "\")"].concat();
@@ -4162,12 +4244,17 @@ mod tests {
                     machine.detached,
                     machine.detached_generations.len()
                 ),
-                (0, 0, 0, 0, 0),
-                "the closed episode resets the window AND the detached census"
+                // WO-U46G item 2 (declared adaptation): the 46a expectation was
+                // `(0, 0, 0, 0, 0)` - the frozen `recovered()` erased the
+                // census. The displaced owner this scenario registered is still
+                // retained (its native call never returned), so it stays
+                // identified in the process-wide ledger after the close.
+                (0, 0, 0, 1, 1),
+                "the closed episode resets the window; the census keeps the owner that is still retained"
             );
             assert!(
                 !machine.bound_hit(),
-                "a closed episode is under the bound: the next episode is armable"
+                "one retained owner is under the bound: the next episode is armable"
             );
         }
         let needle = ["log_info!(\"", "{CIRCUIT_RECOVERY_AUDIT}", "\")"].concat();
@@ -4334,6 +4421,544 @@ mod tests {
             ),
             (0, 0, 0),
             "the closed episode leaves no census ghost, so the next episode starts at full headroom"
+        );
+    }
+
+    // WO-U46G-RECOVERY-RECLAIM regression set (ponytail audit findings #1, #6,
+    // #7, #18; user handoff 2026-11-20 sections 4 and 5).
+    //
+    // Step 0 applicability on the pre-fix tree 12ff06d, re-found on disk and
+    // quoted row-for-row in `WO-U46G-RECEIPT.md` section 0:
+    //   * `tick` `src/backends/sdk.rs:281` - `if self.in_flight != 1 ||
+    //     self.bound_hit()` authorizes ONLY an OCCUPIED window;
+    //   * `retire` `src/backends/sdk.rs:233-246` - `:235` zeroes the window when
+    //     the registered owner itself returns;
+    //   * `circuit_closed_on_health` `src/backends/sdk.rs:344-350` - the close
+    //     needs a health round-trip from the CURRENT generation;
+    //   * the resolver arms `src/backends/sdk.rs:363-367` + the `!authorized`
+    //     return at `src/backends/sdk.rs:385`;
+    //   * the refusal `src/backends/mod.rs:736`, entered by EVERY mode once
+    //     `src/backends/mod.rs:718` is true, so the normal arbitration at
+    //     `src/backends/mod.rs:741` is unreachable while the circuit is open.
+    // The fixed point: CIRCUIT_OPEN + OWNER_QUARANTINED + an EMPTY window
+    // (in_flight 0) => `tick` false => the resolver returns None => the
+    // circuit-open refusal for every mode, forever, panel blank until the
+    // process restarts. The shipped test
+    // `a_full_dispatch_window_quarantines_once_and_the_returning_owner_self_retires`
+    // (`src/backends/sdk.rs:3133`) lands in exactly that state and escapes only
+    // through a hand-built session literal (`src/backends/sdk.rs:3223`); no
+    // shipped test ever drove the ladder OUT of it. Every test below drives
+    // production functions only, and the scenario set takes
+    // `circuit_scenario_guard()` per the R-1 standing contract (the wedge
+    // scenario uses 2 real threads, disclosed).
+
+    #[test]
+    fn an_open_episode_with_an_empty_window_authorizes_the_next_ladder_tick() {
+        // Audit #1, the wedge authorization rule: an OPEN, UNBLOCKED episode
+        // whose window is EMPTY (the quarantined owner retired; the device is
+        // still sick) authorizes on the next ladder tick at the grown gap,
+        // exactly like an occupied window. Pre-fix RED: the `in_flight != 1`
+        // gate at `src/backends/sdk.rs:281` made the tick never fire again, so
+        // the episode was a permanent refusal.
+        let mut machine = CircuitRecovery::default();
+        let owner = next_owner_generation();
+        machine.quarantine(owner);
+        assert!(!machine.tick(true, true), "episode tick 1 of the gap 3");
+        assert!(!machine.tick(true, true), "episode tick 2 of the gap 3");
+        // The owner's call returns with a NON-health reply, so the episode
+        // survives, and its self-retire tail empties the window (:235).
+        machine.retire(owner);
+        assert_eq!(
+            (machine.in_flight, machine.window_generation),
+            (0, NO_OWNER),
+            "the wedged shape: the circuit is open, the episode marker is set, the window is EMPTY"
+        );
+        assert!(
+            machine.tick(true, true),
+            "the third consecutive ladder tick authorizes the fresh open with an empty window (pre-fix: the wedge - the tick never fires again)"
+        );
+    }
+
+    #[test]
+    fn the_wedge_is_rescued_by_the_next_ladder_tick_on_a_real_owner_sequence() {
+        // Audit #1 end to end, on the production sequence only: a real owner
+        // thread poisons inside a native call (the dispatch-window quarantine
+        // site), its late NON-health reply keeps the episode live, its
+        // self-retire tail empties the window, and the NEXT ladder tick
+        // authorizes the fresh open through the production `tick`. The fresh
+        // owner's health round-trip then closes the circuit on the one audit
+        // line, and a stale second retirement registers nothing.
+        // Pre-fix RED: the authorization assert (the shipped test's own
+        // `src/backends/sdk.rs:3223` escape, driven from the ladder instead).
+        let _guard = circuit_scenario_guard();
+        circuit_episode_reset();
+        let (requests, receiver) = mpsc::sync_channel(1);
+        let (stall_reply, _stall_keep) = mpsc::sync_channel(1);
+        let (running_tx, running_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        requests
+            .try_send(Envelope {
+                request: Request::Submit(vec![0; PIXELS]),
+                reply: stall_reply,
+            })
+            .expect("the channel starts empty");
+        let a_generation = claim_sdk_owner().expect("A opens as the authorized owner");
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let thread = std::thread::spawn(move || {
+            owner_loop(
+                Box::new(Unreturning {
+                    inner: Slow,
+                    running: running_tx,
+                    release: release_rx,
+                }),
+                receiver,
+            )
+        });
+        running_rx
+            .recv_timeout(DRIVEN_HANDSHAKE_BUDGET)
+            .expect("the gated owner dequeued the Submit and announced itself");
+        let mut device = SdkDevice {
+            requests: Some(requests),
+            payload: Mutex::new(None),
+            abandoned: Arc::clone(&abandoned),
+            generation: a_generation,
+        };
+        // The production timeout site: the gated owner never replies inside the
+        // bound, so the call is a timeout, A is quarantined under A's own
+        // generation, and the circuit opens.
+        let error = device
+            .call_timeout(Request::Poll, Duration::from_millis(1))
+            .err()
+            .unwrap();
+        assert_eq!(error.cause, LossCause::CallTimeout, "{error}");
+        assert!(
+            error
+                .detail
+                .contains("owner quarantined and circuit opened"),
+            "{error}"
+        );
+        assert!(
+            circuit_open() && OWNER_QUARANTINED.load(Ordering::Acquire),
+            "the full dispatch window quarantines A and opens the circuit"
+        );
+        {
+            let machine = CIRCUIT_RECOVERY.lock().unwrap();
+            assert_eq!(
+                (machine.in_flight, machine.window_generation),
+                (1, a_generation),
+                "the window registers A by identity"
+            );
+        }
+        // A's call returns; the queued slot drains and answers the close with a
+        // NON-health completion, so the episode survives (46a P3).
+        release_tx
+            .try_send(())
+            .expect("the gated owner accepted the release");
+        device
+            .close(true)
+            .expect("the drained owner answers the close");
+        assert!(
+            circuit_open(),
+            "a close-only completion is not health: the episode stays live"
+        );
+        thread.join().unwrap();
+        // A's self-retire tail (the production tail of `open_session:1726`):
+        // the window empties while the circuit and the episode marker stay.
+        owner_self_retire(&abandoned, a_generation);
+        {
+            let machine = CIRCUIT_RECOVERY.lock().unwrap();
+            assert_eq!(
+                (machine.in_flight, machine.window_generation),
+                (0, NO_OWNER),
+                "the wedged shape on the production sequence: circuit open, episode live, window EMPTY"
+            );
+        }
+        assert!(
+            circuit_open() && OWNER_QUARANTINED.load(Ordering::Acquire),
+            "the device is still sick: only a health round-trip closes the episode"
+        );
+        // The ladder keeps ticking (one tick per pass): the authorization rule
+        // is episode-scoped, so the empty window authorizes at the gap.
+        let mut machine = CIRCUIT_RECOVERY.lock().unwrap();
+        assert!(!machine.tick(true, true), "ladder tick 1 of the gap 3");
+        assert!(!machine.tick(true, true), "ladder tick 2 of the gap 3");
+        assert!(
+            machine.tick(true, true),
+            "THE WEDGE: the next ladder tick authorizes the fresh open with an EMPTY window (pre-fix: the refusal row forever, panel blank to restart)"
+        );
+        drop(machine);
+        // The authorized fresh open, in the resolver's own arm shape
+        // (`claim_sdk_owner_for_recovery` + `open_session`'s claim swap): the
+        // slot is empty (A released it), so nobody is displaced.
+        let b_generation = next_owner_generation();
+        claim_sdk_owner_for_recovery(b_generation);
+        {
+            let machine = CIRCUIT_RECOVERY.lock().unwrap();
+            assert_eq!(
+                (machine.in_flight, machine.detached),
+                (0, 0),
+                "an empty slot displaces nobody: no census entry is invented (:423-426)"
+            );
+        }
+        let (fresh_requests, fresh_receiver) = mpsc::sync_channel(1);
+        let fresh_calls = Arc::new(Mutex::new(Vec::new()));
+        let fresh_thread =
+            std::thread::spawn(move || owner_loop(Box::new(Fake(fresh_calls)), fresh_receiver));
+        let fresh_device = SdkDevice {
+            requests: Some(fresh_requests),
+            payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
+            generation: b_generation,
+        };
+        fresh_device
+            .poll()
+            .expect("the fresh owner's health round-trip lands");
+        assert!(
+            !circuit_open(),
+            "the rescued episode closes on the fresh owner's health"
+        );
+        assert!(
+            !OWNER_QUARANTINED.load(Ordering::Acquire),
+            "the episode marker cleared with the circuit"
+        );
+        // A stale second retirement of the old owner registers nothing, and a
+        // closed circuit authorizes no resolver pass.
+        owner_self_retire(&abandoned, a_generation);
+        {
+            let machine = CIRCUIT_RECOVERY.lock().unwrap();
+            assert_eq!(
+                (
+                    machine.in_flight,
+                    machine.window_generation,
+                    machine.detached
+                ),
+                (0, NO_OWNER, 0),
+                "a stale return retires no window and invents no census entry"
+            );
+        }
+        assert_eq!(
+            SDK_OWNER_ACTIVE.load(Ordering::Acquire),
+            b_generation,
+            "the fresh owner keeps the claim"
+        );
+        assert!(
+            try_circuit_recovery("fixture").is_none(),
+            "a closed circuit authorizes no resolver pass (it returns before any discovery)"
+        );
+        drop(fresh_device);
+        fresh_thread.join().unwrap();
+        release_sdk_owner(b_generation);
+        circuit_episode_reset();
+    }
+
+    #[test]
+    fn a_retired_owner_is_rescued_at_the_grown_gap_and_never_before() {
+        // Coverage row (a): timeout -> late NON-health reply -> retirement ->
+        // the rescue is authorized at the GROWN gap (`3 << attempts`, capped at
+        // 48), never before. Pre-fix RED: the grown-gap assert (the empty
+        // window never authorized at any gap).
+        let mut machine = CircuitRecovery::default();
+        let owner = next_owner_generation();
+        machine.quarantine(owner);
+        assert!(!machine.tick(true, true), "gap 3: tick 1");
+        assert!(!machine.tick(true, true), "gap 3: tick 2");
+        assert!(
+            machine.tick(true, true),
+            "the occupied window authorizes attempt 1 (attempts = 1)"
+        );
+        // The fresh owner's call never returns (the window re-homes), and then
+        // it returns late with a non-health reply and retires.
+        machine.quarantine(owner);
+        machine.retire(owner);
+        assert_eq!(
+            (
+                machine.in_flight,
+                machine.window_generation,
+                machine.attempts
+            ),
+            (0, NO_OWNER, 1),
+            "the wedge after an attempt: empty window, one attempt spent"
+        );
+        let gap = RECOVERY_PROBE_TICKS << 1;
+        for tick in 0..(gap - 1) {
+            assert!(
+                !machine.tick(true, true),
+                "the rescue is never early: pre-gap tick {tick} of the grown gap {gap} refuses"
+            );
+        }
+        assert!(
+            machine.tick(true, true),
+            "the rescue fires on the grown gap with an EMPTY window (pre-fix: the wedge)"
+        );
+        assert_eq!(machine.attempts, 2, "exactly one attempt per gap");
+    }
+
+    #[test]
+    fn a_stale_retirement_keeps_the_window_one_owner_and_the_census_tracking_both() {
+        // Coverage rows (b) and (c): an OLD owner's retirement while a newer
+        // owner exists (and after the newer owner was quarantined too) leaves
+        // the window at ONE owner, keeps the newer owner's registration, and
+        // leaves the census tracking exactly the retained owners.
+        let mut machine = CircuitRecovery::default();
+        let a_generation = next_owner_generation();
+        let b_generation = next_owner_generation();
+        machine.quarantine(a_generation); // A poisons
+        machine.detach(a_generation); // A is displaced by B's fresh open
+        machine.quarantine(b_generation); // B poisons too: the window re-homes
+        machine.detach(b_generation); // B is displaced by C's fresh open
+        machine.retire(a_generation); // A's late return
+        assert_eq!(
+            (machine.in_flight, machine.window_generation),
+            (1, b_generation),
+            "the window stays the ONE owner in flight: a stale retirement clears nothing of B"
+        );
+        assert_eq!(
+            machine.detached_generations,
+            vec![b_generation],
+            "the census tracks exactly the owner that is still retained"
+        );
+        assert_eq!(
+            machine.detached, 1,
+            "A's retirement restored A's own headroom"
+        );
+        assert!(!machine.tick(true, true), "B's episode: tick 1 of 3");
+    }
+
+    #[test]
+    fn the_process_wide_census_carries_stranded_owners_across_episodes() {
+        // Audit #18, item 2: the detached-owner census is PROCESS-WIDE.
+        // Episode 1 strands owner A and recovers through owner B's health;
+        // episode 2 starts with census = 1 retained A; repeating the episode
+        // consumes headroom to the bound (8), where authorization stops
+        // fail-closed with ONE recorded warn; retiring a stranded owner
+        // restores headroom, so there is NO lifetime lockout.
+        // Pre-fix RED: `recovered()` (`:263-264`, `*self = Self::default()`)
+        // erased the census, so every episode started at a full 8 - the
+        // 54984-class accumulation the bound exists to stop.
+        let mut machine = CircuitRecovery::default();
+        let mut stranded: Vec<u64> = Vec::new();
+        for episode in 1..DETACHED_OWNER_BOUND {
+            let a_generation = next_owner_generation();
+            machine.quarantine(a_generation); // A poisons
+            machine.detach(a_generation); // the resolver displaced A: A is retained
+            stranded.push(a_generation);
+            assert_eq!(
+                machine.detached, episode,
+                "episode {episode}: the stranded owners accumulate process-wide"
+            );
+            // B's health round-trip closes this episode: the episode shape
+            // resets; the census does not.
+            machine.recovered();
+            assert_eq!(
+                (
+                    machine.responsive_ticks,
+                    machine.attempts,
+                    machine.in_flight,
+                    machine.window_generation
+                ),
+                (0, 0, 0, NO_OWNER),
+                "the episode shape resets on the close"
+            );
+            assert_eq!(
+                machine.detached, episode,
+                "the census SURVIVES the close (pre-fix: erased to 0)"
+            );
+        }
+        let a_generation = next_owner_generation();
+        machine.quarantine(a_generation);
+        machine.detach(a_generation);
+        stranded.push(a_generation);
+        assert_eq!(
+            machine.detached, DETACHED_OWNER_BOUND,
+            "the process-wide census reached the bound"
+        );
+        assert!(
+            machine.bound_hit(),
+            "the bound is process-wide, not per-episode"
+        );
+        assert!(
+            machine.take_bound_report(),
+            "the reaching of the bound is recorded exactly once"
+        );
+        for tick in 0..=RECOVERY_ATTEMPT_GAP_CAP_TICKS {
+            assert!(
+                !machine.tick(true, true),
+                "at the bound no fresh open is authorized, at any gap (tick {tick})"
+            );
+        }
+        assert!(
+            !machine.take_bound_report(),
+            "ONE warn: the latch stays consumed while the bound stands"
+        );
+        assert_eq!(machine.attempts, 0, "the bound consumed no attempts");
+        // No lifetime lockout: a stranded owner retires (its call returns), and
+        // the next episode authorizes again at the shipped cadence.
+        machine.retire(stranded[0]);
+        assert!(
+            !machine.bound_hit(),
+            "one retirement restores headroom process-wide"
+        );
+        assert!(
+            machine.tick(true, true),
+            "authorization resumes on the first tick with headroom: the unbroken healthy streak ran the whole bound, and the bound gate consumes no attempt, so there is NO lifetime lockout"
+        );
+    }
+
+    // WO-U46G item 4 fixture geometry (offsets `validate_pe` reads).
+    const PE_AT: usize = 0x40;
+    const OPTIONAL_AT: usize = PE_AT + 24;
+    const SECTION0_AT: usize = OPTIONAL_AT + 240;
+    const SECTION1_AT: usize = SECTION0_AT + 40;
+    const EXPORT_RVA: u32 = 0x2000;
+    const EXPORT_AT: usize = 0x1A0;
+    const NAMES_AT: usize = 0x1E0;
+    const STRINGS_AT: usize = 0x220;
+    const PE_LEN: usize = 0x2A0;
+
+    /// WO-U46G item 4: a synthetic AMD64 PE32+ image, built from bytes in the
+    /// test (no vendor DLL is read), shaped exactly on the fields `validate_pe`
+    /// maps: DOS header -> `e_lfanew` -> PE header (2 sections) -> a 240-byte
+    /// optional header whose DataDirectory[0] names the export RVA -> a section
+    /// table -> the export directory, its name-RVA table and the name strings.
+    /// The two sections exist so a hostile mapping can be applied to the NAME
+    /// table while the export-directory mapping stays valid.
+    fn pe_fixture() -> Vec<u8> {
+        let mut bytes = vec![0u8; PE_LEN];
+        bytes[0..2].copy_from_slice(b"MZ");
+        let put16 = |bytes: &mut [u8], at: usize, value: u16| {
+            bytes[at..at + 2].copy_from_slice(&value.to_le_bytes())
+        };
+        let put32 = |bytes: &mut [u8], at: usize, value: u32| {
+            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes())
+        };
+        put32(&mut bytes, 0x3c, PE_AT as u32);
+        bytes[PE_AT..PE_AT + 4].copy_from_slice(b"PE\0\0");
+        put16(&mut bytes, PE_AT + 4, 0x8664);
+        put16(&mut bytes, PE_AT + 6, 2);
+        put16(&mut bytes, PE_AT + 20, 240);
+        put16(&mut bytes, OPTIONAL_AT, 0x20b);
+        put32(&mut bytes, OPTIONAL_AT + 112, EXPORT_RVA);
+        bytes[SECTION0_AT..SECTION0_AT + 8].copy_from_slice(b".text\0\0\0");
+        put32(&mut bytes, SECTION0_AT + 8, 0x100);
+        put32(&mut bytes, SECTION0_AT + 12, EXPORT_RVA);
+        put32(&mut bytes, SECTION0_AT + 16, 0x100);
+        put32(&mut bytes, SECTION0_AT + 20, EXPORT_AT as u32);
+        bytes[SECTION1_AT..SECTION1_AT + 8].copy_from_slice(b".rdata\0\0");
+        put32(&mut bytes, SECTION1_AT + 8, 0x10);
+        put32(&mut bytes, SECTION1_AT + 12, 0x3000);
+        put32(&mut bytes, SECTION1_AT + 16, 0x10);
+        put32(&mut bytes, SECTION1_AT + 20, STRINGS_AT as u32);
+        put32(&mut bytes, EXPORT_AT + 24, EXPORTS.len() as u32);
+        put32(
+            &mut bytes,
+            EXPORT_AT + 32,
+            EXPORT_RVA + (NAMES_AT - EXPORT_AT) as u32,
+        );
+        let mut at = STRINGS_AT;
+        for (index, name) in EXPORTS.iter().enumerate() {
+            put32(
+                &mut bytes,
+                NAMES_AT + index * 4,
+                EXPORT_RVA + (at - EXPORT_AT) as u32,
+            );
+            bytes[at..at + name.len()].copy_from_slice(name.as_bytes());
+            at += name.len() + 1;
+        }
+        bytes
+    }
+
+    /// Write one fixture and return `validate_pe`'s rejection text (empty when
+    /// the image validates), removing the file. The temp-file shape is the
+    /// shipped `native_pin_rejects_hard_linked_file` pattern.
+    fn validate_pe_outcome(bytes: &[u8]) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "lcdsirplus-sdk-pe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, bytes).expect("the fixture is writable");
+        let outcome = validate_pe(&path).err().unwrap_or_default();
+        fs::remove_file(&path).expect("the fixture is removable");
+        outcome
+    }
+
+    #[test]
+    fn validate_pe_rejects_the_hostile_section_mapping_with_descriptive_errors() {
+        // Audit #7, item 4: the section mapping and the export-name slice must
+        // return the descriptive validation Err for every hostile edge, never a
+        // panic and never a wrapped offset. The valid control image proves the
+        // fixtures are non-vacuous.
+        // Pre-fix RED: the name-offset fixtures index `bytes[start..]`
+        // (`src/backends/sdk.rs:1434`) with `start` past the file end, and the
+        // offset expression (`src/backends/sdk.rs:1420`) adds/subtracts u32
+        // unchecked: under the release gate it panics out of bounds (the whole
+        // test is red), under debug it additionally panics on the arithmetic
+        // overflow. Disclosed in the receipt: the pre-fix form is a panic, not
+        // a wrong answer.
+        let good = pe_fixture();
+        assert_eq!(
+            validate_pe_outcome(&good),
+            "",
+            "the control image validates: every rejection below is a mutation of it"
+        );
+        let put32 = |bytes: &mut Vec<u8>, at: usize, value: u32| {
+            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes())
+        };
+        // Name offset past the file end: the section window is widened so the
+        // name RVA maps one byte beyond the file.
+        let mut past = good.clone();
+        put32(&mut past, SECTION0_AT + 8, 0x1000);
+        put32(&mut past, NAMES_AT, 0x2101);
+        assert_eq!(
+            validate_pe_outcome(&past),
+            "invalid SDK export name",
+            "a name offset the section maps past the file end is a rejection, not an index panic"
+        );
+        // The u32 add/sub edge: a raw pointer near u32::MAX, so
+        // `raw + rva - virtual_address` overflows and wraps.
+        let mut overflow = good.clone();
+        put32(&mut overflow, SECTION1_AT + 8, 0x1000);
+        put32(&mut overflow, SECTION1_AT + 20, u32::MAX - 0x10);
+        put32(&mut overflow, NAMES_AT + 4, 0x3010);
+        assert_eq!(
+            validate_pe_outcome(&overflow),
+            "invalid SDK export name",
+            "an overflowing section mapping is clamped to a rejection, never a wrapped offset"
+        );
+        // The exact-EOF boundary: the mapped offset lands on the file length.
+        let mut exact = good.clone();
+        put32(&mut exact, SECTION0_AT + 8, 0x101);
+        put32(&mut exact, NAMES_AT, 0x2100);
+        assert!(
+            validate_pe_outcome(&exact).contains("SDK export name"),
+            "an offset at the file end is rejected by the export-name rule"
+        );
+        // `VirtualAddress + span` overflow: the checked add maps nothing.
+        let mut span = good.clone();
+        put32(&mut span, OPTIONAL_AT + 112, u32::MAX - 4);
+        put32(&mut span, SECTION0_AT + 12, u32::MAX - 4);
+        assert_eq!(
+            validate_pe_outcome(&span),
+            "SDK export directory is invalid",
+            "a section whose span overflows u32 maps nothing"
+        );
+        // Truncated tables: the export directory header and the name table.
+        let mut truncated = good.clone();
+        truncated.truncate(EXPORT_AT + 24);
+        assert_eq!(
+            validate_pe_outcome(&truncated),
+            "truncated SDK export directory",
+            "a file that ends inside the export directory is a rejection"
+        );
+        let mut names = good.clone();
+        put32(&mut names, EXPORT_AT + 32, 0x20FE);
+        assert_eq!(
+            validate_pe_outcome(&names),
+            "truncated SDK export name table",
+            "a name table that runs past the file end is a rejection"
         );
     }
 }
