@@ -2484,6 +2484,29 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// WO-U46K (the registered contention-flake family): the ONE test-region acquisition seam
+    /// for the shared `CIRCUIT_RECOVERY` machine. Two properties, both load-bearing:
+    ///
+    /// * TOLERANCE: a poisoned shared mutex must never cascade across independent scenarios.
+    ///   Every scenario that acquires it is guarded by `circuit_scenario_guard()` and
+    ///   re-initializes the FULL machine shape through `circuit_episode_reset` first (all
+    ///   seven fields: `recovered()` plus the declared `detached` / `detached_generations`
+    ///   clears), so a tolerant lock cannot mask state corruption - the machine is
+    ///   overwritten before it is read. No scenario uses poison itself as the tested signal.
+    /// * NO SELF-POISONING: a `MutexGuard` dropped while a panic unwinds re-poisons the mutex,
+    ///   and the PRODUCTION acquisition sites (the 8 rows of the 46a audit: `quarantine`,
+    ///   `circuit_closed_on_health`, the three resolver ticks, `detach`, `retire`, the
+    ///   `open_session` dispatch site) all `unwrap()`. So a test that asserts while holding
+    ///   the guard aborts every later scenario - in production code as well, which is the
+    ///   registered ~13-row cascade. Callers therefore take a SNAPSHOT, let the guard drop at
+    ///   the end of the block, and assert on the snapshot: the same fields, read at the same
+    ///   program point, under the same scenario guard.
+    fn recovery_lock() -> std::sync::MutexGuard<'static, CircuitRecovery> {
+        CIRCUIT_RECOVERY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn unreturning_owner_opens_the_circuit_without_borrowed_data() {
         let _guard = circuit_scenario_guard();
@@ -2801,6 +2824,13 @@ mod tests {
         // pixel buffers and the owner observes one stable payload pointer
         // (measured reuse). The disclosed residual is the fixed per-send
         // metadata (the reply sync_channel node), counted, not assumed.
+        // WO-U46K (R-1 standing contract, extended to the complete writer census): this
+        // scenario drives production `SdkDevice` calls, and production `call_timeout` writes
+        // the guarded circuit family from them - `owner_quarantined` on a timeout and
+        // `circuit_closed_on_health` on a health reply (the 46a-audited production sites).
+        // Unguarded, its health reply ran `recovered()` on a shared machine a concurrent
+        // circuit scenario had registered an owner in - the registered primary red.
+        let _guard = circuit_scenario_guard();
         let recorder = Recording::measured(0);
         let observed = Arc::clone(&recorder.observed);
         let submits = Arc::clone(&recorder.submits);
@@ -2888,6 +2918,10 @@ mod tests {
         // is opened by the owner's first execute and closed when the second fill
         // provably lands inside it (see `drive_payload_exclusivity`), so the
         // scenario keeps its meaning with no wall-clock term to lose.
+        // WO-U46K (R-1, as in `sdk_payload_buffer_is_reused_per_send_after_warm_up`): the
+        // driven sends are production `SdkDevice` calls, so the circuit family is written
+        // through the production sites and the scenario serializes with the circuit set.
+        let _guard = circuit_scenario_guard();
         let (observed, submits) = drive_payload_exclusivity();
         assert_eq!(observed.len(), 2);
         assert_eq!(
@@ -2916,6 +2950,11 @@ mod tests {
         // timeline is a pure event chain — zero sleeps — so it completes far inside
         // 2 s of real time under any CPU oversubscription, and it measures the
         // driven read order, so it cannot go green on an empty run.
+        // WO-U46K (R-1, as in the two sibling EC-2 scenarios): the driven sends are
+        // production `SdkDevice` calls, so this scenario serializes with the circuit set.
+        // The guard is taken HERE, above the timer, so the 2 s bound below measures the
+        // driven chain alone and never the queue behind a circuit scenario.
+        let _guard = circuit_scenario_guard();
         let started = Instant::now();
         let (observed, submits) = drive_payload_exclusivity();
         let elapsed = started.elapsed();
@@ -2964,7 +3003,7 @@ mod tests {
         OWNER_QUARANTINED.store(false, Ordering::Release);
         RECOVERY_BLOCKED.store(false, Ordering::Release);
         SDK_OWNER_ACTIVE.store(NO_OWNER, Ordering::Release);
-        let mut machine = CIRCUIT_RECOVERY.lock().unwrap();
+        let mut machine = recovery_lock();
         machine.recovered();
         // WO-U46G item 2 (declared adaptation): `recovered()` now RETAINS the
         // process-wide detached census by design, so the scenario-normalizing
@@ -3122,7 +3161,7 @@ mod tests {
         circuit_episode_reset();
         CIRCUIT_OPEN.store(true, Ordering::Release);
         OWNER_QUARANTINED.store(true, Ordering::Release);
-        CIRCUIT_RECOVERY.lock().unwrap().quarantined();
+        recovery_lock().quarantined();
         let (requests, receiver) = mpsc::sync_channel(1);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let thread = std::thread::spawn(move || owner_loop(Box::new(Fake(calls)), receiver));
@@ -3141,18 +3180,15 @@ mod tests {
             !OWNER_QUARANTINED.load(Ordering::Acquire),
             "the episode marker cleared with the circuit"
         );
-        {
-            let machine = CIRCUIT_RECOVERY.lock().unwrap();
-            assert_eq!(
-                (
-                    machine.responsive_ticks,
-                    machine.attempts,
-                    machine.in_flight
-                ),
-                (0, 0, 0),
-                "the recovery reset the machine to the shipped shape"
-            );
-        }
+        let machine = {
+            let state = recovery_lock();
+            (state.responsive_ticks, state.attempts, state.in_flight)
+        };
+        assert_eq!(
+            machine,
+            (0, 0, 0),
+            "the recovery reset the machine to the shipped shape"
+        );
         assert!(device.poll().is_ok());
         assert!(
             !circuit_open(),
@@ -3270,9 +3306,12 @@ mod tests {
         );
         // A second timed-out call on the same session must not count twice.
         let _ = device.call_timeout(Request::Poll, Duration::from_millis(1));
+        let machine = {
+            let state = recovery_lock();
+            state.in_flight
+        };
         assert_eq!(
-            CIRCUIT_RECOVERY.lock().unwrap().in_flight,
-            1,
+            machine, 1,
             "cap: exactly one in-flight quarantined owner per abandoned session"
         );
         // The owner returns: release the gate, drain the queued slot, close.
@@ -3312,11 +3351,11 @@ mod tests {
         );
         drop(fresh_device);
         fresh_thread.join().unwrap();
-        assert_eq!(
-            CIRCUIT_RECOVERY.lock().unwrap().in_flight,
-            0,
-            "the quarantined owner self-retired cleanly"
-        );
+        let machine = {
+            let state = recovery_lock();
+            state.in_flight
+        };
+        assert_eq!(machine, 0, "the quarantined owner self-retired cleanly");
         circuit_episode_reset();
     }
 
@@ -3354,17 +3393,15 @@ mod tests {
             SdkDevice::open(&owner, "fixture").err().unwrap().cause,
             LossCause::CircuitOpen
         );
-        let machine = CIRCUIT_RECOVERY.lock().unwrap();
+        let machine = {
+            let state = recovery_lock();
+            (state.responsive_ticks, state.attempts, state.in_flight)
+        };
         assert_eq!(
-            (
-                machine.responsive_ticks,
-                machine.attempts,
-                machine.in_flight
-            ),
+            machine,
             (0, 0, 0),
             "the refused arms recorded no ticks and consumed no attempts"
         );
-        drop(machine);
         circuit_episode_reset();
     }
 
@@ -3527,7 +3564,7 @@ mod tests {
         CIRCUIT_OPEN.store(true, Ordering::Release);
         OWNER_QUARANTINED.store(true, Ordering::Release);
         {
-            let mut machine = CIRCUIT_RECOVERY.lock().unwrap();
+            let mut machine = recovery_lock();
             machine.quarantined();
             machine.displaced();
         }
@@ -3546,24 +3583,25 @@ mod tests {
             !OWNER_QUARANTINED.load(Ordering::Acquire),
             "the episode marker cleared with the circuit"
         );
-        {
-            let machine = CIRCUIT_RECOVERY.lock().unwrap();
-            assert_eq!(
-                (
-                    machine.responsive_ticks,
-                    machine.attempts,
-                    machine.in_flight,
-                    machine.detached
-                ),
-                // WO-U46G item 2 (declared adaptation): the 45a expectation was
-                // `(0, 0, 0, 0)` - the frozen `recovered()` erased the census.
-                // The closed episode resets the window and the episode shape;
-                // the ONE displaced owner this scenario registered stays in the
-                // process-wide census until it retires.
-                (0, 0, 0, 1),
-                "the closed episode resets the window; the process-wide census keeps the retained owner"
-            );
-        }
+        let machine = {
+            let state = recovery_lock();
+            (
+                state.responsive_ticks,
+                state.attempts,
+                state.in_flight,
+                state.detached,
+            )
+        };
+        // WO-U46G item 2 (declared adaptation): the 45a expectation was
+        // `(0, 0, 0, 0)` - the frozen `recovered()` erased the census.
+        // The closed episode resets the window and the episode shape;
+        // the ONE displaced owner this scenario registered stays in the
+        // process-wide census until it retires.
+        assert_eq!(
+            machine,
+            (0, 0, 0, 1),
+            "the closed episode resets the window; the process-wide census keeps the retained owner"
+        );
         let needle = ["log_info!(\"", "{CIRCUIT_RECOVERY_AUDIT}", "\")"].concat();
         assert_eq!(
             include_str!("./sdk.rs").matches(needle.as_str()).count(),
@@ -3625,7 +3663,7 @@ mod tests {
         circuit_episode_reset();
         let a_generation = claim_sdk_owner().expect("A opens as the authorized owner");
         // A poisons: the window registers A's own identity.
-        CIRCUIT_RECOVERY.lock().unwrap().quarantine(a_generation);
+        recovery_lock().quarantine(a_generation);
         // The resolver displaces A: the swap registers A's generation in the
         // detached census and installs B as the claim holder.
         let b_generation = next_owner_generation();
@@ -3651,22 +3689,21 @@ mod tests {
             .recv_timeout(DRIVEN_HANDSHAKE_BUDGET)
             .expect("the returning owner ran its tail");
         thread.join().unwrap();
-        {
-            let machine = CIRCUIT_RECOVERY.lock().unwrap();
-            assert_eq!(
-                (
-                    machine.in_flight,
-                    machine.window_generation,
-                    machine.detached
-                ),
-                (0, NO_OWNER, 0),
-                "A's return releases BOTH of A's registrations and nothing of B's"
-            );
-            assert!(
-                machine.detached_generations.is_empty(),
-                "the census holds no ghost of a retired owner"
-            );
-        }
+        let machine = {
+            let state = recovery_lock();
+            (
+                state.in_flight,
+                state.window_generation,
+                state.detached,
+                state.detached_generations.is_empty(),
+            )
+        };
+        assert_eq!(
+            (machine.0, machine.1, machine.2),
+            (0, NO_OWNER, 0),
+            "A's return releases BOTH of A's registrations and nothing of B's"
+        );
+        assert!(machine.3, "the census holds no ghost of a retired owner");
         assert_eq!(
             SDK_OWNER_ACTIVE.load(Ordering::Acquire),
             b_generation,
@@ -3766,7 +3803,7 @@ mod tests {
         let b_generation = claim_sdk_owner().expect("the replacement owner B claims the slot");
         let a_generation = next_owner_generation(); // A: a displaced identity
         {
-            let mut machine = CIRCUIT_RECOVERY.lock().unwrap();
+            let mut machine = recovery_lock();
             machine.quarantine(b_generation);
             machine.detach(a_generation); // A is the retained detached owner
         }
@@ -3778,18 +3815,19 @@ mod tests {
             b_generation,
             "the claim of the current generation owner survives a stale owner's return"
         );
-        {
-            let machine = CIRCUIT_RECOVERY.lock().unwrap();
-            assert_eq!(
-                (machine.in_flight, machine.window_generation),
-                (1, b_generation),
-                "a stale retirement is a no-op on the live window registration"
-            );
-            assert_eq!(
-                machine.detached, 0,
-                "the stale retirement released only A's own census entry"
-            );
-        }
+        let machine = {
+            let state = recovery_lock();
+            (state.in_flight, state.window_generation, state.detached)
+        };
+        assert_eq!(
+            (machine.0, machine.1),
+            (1, b_generation),
+            "a stale retirement is a no-op on the live window registration"
+        );
+        assert_eq!(
+            machine.2, 0,
+            "the stale retirement released only A's own census entry"
+        );
         assert!(
             !release_sdk_owner(a_generation),
             "the identity-gated release refuses a generation that does not own the claim"
@@ -3950,7 +3988,7 @@ mod tests {
         CIRCUIT_OPEN.store(true, Ordering::Release);
         OWNER_QUARANTINED.store(true, Ordering::Release);
         let generation = claim_sdk_owner().expect("the owner holds the claim");
-        CIRCUIT_RECOVERY.lock().unwrap().quarantine(generation);
+        recovery_lock().quarantine(generation);
         let (requests, receiver) = mpsc::sync_channel(1);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let thread = std::thread::spawn(move || owner_loop(Box::new(Fake(calls)), receiver));
@@ -3986,7 +4024,7 @@ mod tests {
         CIRCUIT_OPEN.store(true, Ordering::Release);
         OWNER_QUARANTINED.store(true, Ordering::Release);
         let generation = claim_sdk_owner().expect("the owner holds the claim");
-        CIRCUIT_RECOVERY.lock().unwrap().quarantine(generation);
+        recovery_lock().quarantine(generation);
         let (requests, receiver) = mpsc::sync_channel(1);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let thread = std::thread::spawn(move || owner_loop(Box::new(Fake(calls)), receiver));
@@ -4022,7 +4060,7 @@ mod tests {
         CIRCUIT_OPEN.store(true, Ordering::Release);
         OWNER_QUARANTINED.store(true, Ordering::Release);
         let generation = claim_sdk_owner().expect("the owner holds the claim");
-        CIRCUIT_RECOVERY.lock().unwrap().quarantine(generation);
+        recovery_lock().quarantine(generation);
         let (requests, receiver) = mpsc::sync_channel(1);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let thread = std::thread::spawn(move || owner_loop(Box::new(Fake(calls)), receiver));
@@ -4044,14 +4082,15 @@ mod tests {
             OWNER_QUARANTINED.load(Ordering::Acquire),
             "the episode marker survives a close-only completion"
         );
-        {
-            let machine = CIRCUIT_RECOVERY.lock().unwrap();
-            assert_eq!(
-                (machine.in_flight, machine.window_generation),
-                (1, generation),
-                "the window census survives a close-only completion"
-            );
-        }
+        let machine = {
+            let state = recovery_lock();
+            (state.in_flight, state.window_generation)
+        };
+        assert_eq!(
+            machine,
+            (1, generation),
+            "the window census survives a close-only completion"
+        );
         device.requests.take();
         // And real recovery still lands: a health round-trip closes the circuit.
         let (poll_requests, poll_receiver) = mpsc::sync_channel(1);
@@ -4087,7 +4126,7 @@ mod tests {
         CIRCUIT_OPEN.store(true, Ordering::Release);
         OWNER_QUARANTINED.store(true, Ordering::Release);
         let generation = claim_sdk_owner().expect("the owner holds the claim");
-        CIRCUIT_RECOVERY.lock().unwrap().quarantine(generation);
+        recovery_lock().quarantine(generation);
         let (requests, receiver) = mpsc::sync_channel(1);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let thread = std::thread::spawn(move || owner_loop(Box::new(Fake(calls)), receiver));
@@ -4105,14 +4144,15 @@ mod tests {
             circuit_open(),
             "a semantic error completion keeps the circuit open"
         );
-        {
-            let machine = CIRCUIT_RECOVERY.lock().unwrap();
-            assert_eq!(
-                (machine.in_flight, machine.window_generation),
-                (1, generation),
-                "the episode census survives a semantic error"
-            );
-        }
+        let machine = {
+            let state = recovery_lock();
+            (state.in_flight, state.window_generation)
+        };
+        assert_eq!(
+            machine,
+            (1, generation),
+            "the episode census survives a semantic error"
+        );
         drop(device);
         thread.join().unwrap();
         release_sdk_owner(generation);
@@ -4135,7 +4175,7 @@ mod tests {
         let stale_generation = next_owner_generation(); // A: displaced
         let fresh_generation = claim_sdk_owner().expect("the replacement owner B holds the claim");
         {
-            let mut machine = CIRCUIT_RECOVERY.lock().unwrap();
+            let mut machine = recovery_lock();
             machine.quarantine(stale_generation);
             machine.detach(stale_generation);
         }
@@ -4159,18 +4199,15 @@ mod tests {
             OWNER_QUARANTINED.load(Ordering::Acquire),
             "the episode marker survives a stale owner's success"
         );
-        {
-            let machine = CIRCUIT_RECOVERY.lock().unwrap();
-            assert_eq!(
-                (
-                    machine.in_flight,
-                    machine.window_generation,
-                    machine.detached
-                ),
-                (1, stale_generation, 1),
-                "the window registration and the census entry survive a stale success"
-            );
-        }
+        let machine = {
+            let state = recovery_lock();
+            (state.in_flight, state.window_generation, state.detached)
+        };
+        assert_eq!(
+            machine,
+            (1, stale_generation, 1),
+            "the window registration and the census entry survive a stale success"
+        );
         drop(device);
         thread.join().unwrap();
         // Actual recovery: the CURRENT generation owner's health round-trip.
@@ -4210,7 +4247,7 @@ mod tests {
         let stale_generation = next_owner_generation();
         let fresh_generation = claim_sdk_owner().expect("the fresh owner B holds the claim");
         {
-            let mut machine = CIRCUIT_RECOVERY.lock().unwrap();
+            let mut machine = recovery_lock();
             machine.quarantine(stale_generation);
             machine.detach(stale_generation);
         }
@@ -4234,29 +4271,31 @@ mod tests {
             !OWNER_QUARANTINED.load(Ordering::Acquire),
             "the episode marker cleared"
         );
-        {
-            let machine = CIRCUIT_RECOVERY.lock().unwrap();
-            assert_eq!(
-                (
-                    machine.responsive_ticks,
-                    machine.attempts,
-                    machine.in_flight,
-                    machine.detached,
-                    machine.detached_generations.len()
-                ),
-                // WO-U46G item 2 (declared adaptation): the 46a expectation was
-                // `(0, 0, 0, 0, 0)` - the frozen `recovered()` erased the
-                // census. The displaced owner this scenario registered is still
-                // retained (its native call never returned), so it stays
-                // identified in the process-wide ledger after the close.
-                (0, 0, 0, 1, 1),
-                "the closed episode resets the window; the census keeps the owner that is still retained"
-            );
-            assert!(
-                !machine.bound_hit(),
-                "one retained owner is under the bound: the next episode is armable"
-            );
-        }
+        let machine = {
+            let state = recovery_lock();
+            (
+                state.responsive_ticks,
+                state.attempts,
+                state.in_flight,
+                state.detached,
+                state.detached_generations.len(),
+                state.bound_hit(),
+            )
+        };
+        // WO-U46G item 2 (declared adaptation): the 46a expectation was
+        // `(0, 0, 0, 0, 0)` - the frozen `recovered()` erased the
+        // census. The displaced owner this scenario registered is still
+        // retained (its native call never returned), so it stays
+        // identified in the process-wide ledger after the close.
+        assert_eq!(
+            (machine.0, machine.1, machine.2, machine.3, machine.4),
+            (0, 0, 0, 1, 1),
+            "the closed episode resets the window; the census keeps the owner that is still retained"
+        );
+        assert!(
+            !machine.5,
+            "one retained owner is under the bound: the next episode is armable"
+        );
         let needle = ["log_info!(\"", "{CIRCUIT_RECOVERY_AUDIT}", "\")"].concat();
         assert_eq!(
             include_str!("./sdk.rs").matches(needle.as_str()).count(),
@@ -4541,14 +4580,15 @@ mod tests {
             circuit_open() && OWNER_QUARANTINED.load(Ordering::Acquire),
             "the full dispatch window quarantines A and opens the circuit"
         );
-        {
-            let machine = CIRCUIT_RECOVERY.lock().unwrap();
-            assert_eq!(
-                (machine.in_flight, machine.window_generation),
-                (1, a_generation),
-                "the window registers A by identity"
-            );
-        }
+        let machine = {
+            let state = recovery_lock();
+            (state.in_flight, state.window_generation)
+        };
+        assert_eq!(
+            machine,
+            (1, a_generation),
+            "the window registers A by identity"
+        );
         // A's call returns; the queued slot drains and answers the close with a
         // NON-health completion, so the episode survives (46a P3).
         release_tx
@@ -4565,41 +4605,49 @@ mod tests {
         // A's self-retire tail (the production tail of `open_session:1726`):
         // the window empties while the circuit and the episode marker stay.
         owner_self_retire(&abandoned, a_generation);
-        {
-            let machine = CIRCUIT_RECOVERY.lock().unwrap();
-            assert_eq!(
-                (machine.in_flight, machine.window_generation),
-                (0, NO_OWNER),
-                "the wedged shape on the production sequence: circuit open, episode live, window EMPTY"
-            );
-        }
+        let machine = {
+            let state = recovery_lock();
+            (state.in_flight, state.window_generation)
+        };
+        assert_eq!(
+            machine,
+            (0, NO_OWNER),
+            "the wedged shape on the production sequence: circuit open, episode live, window EMPTY"
+        );
         assert!(
             circuit_open() && OWNER_QUARANTINED.load(Ordering::Acquire),
             "the device is still sick: only a health round-trip closes the episode"
         );
         // The ladder keeps ticking (one tick per pass): the authorization rule
         // is episode-scoped, so the empty window authorizes at the gap.
-        let mut machine = CIRCUIT_RECOVERY.lock().unwrap();
-        assert!(!machine.tick(true, true), "ladder tick 1 of the gap 3");
-        assert!(!machine.tick(true, true), "ladder tick 2 of the gap 3");
+        let machine = {
+            let mut state = recovery_lock();
+            (
+                state.tick(true, true),
+                state.tick(true, true),
+                state.tick(true, true),
+            )
+        };
+        assert!(!machine.0, "ladder tick 1 of the gap 3");
+        assert!(!machine.1, "ladder tick 2 of the gap 3");
         assert!(
-            machine.tick(true, true),
+            machine.2,
             "THE WEDGE: the next ladder tick authorizes the fresh open with an EMPTY window (pre-fix: the refusal row forever, panel blank to restart)"
         );
-        drop(machine);
         // The authorized fresh open, in the resolver's own arm shape
         // (`claim_sdk_owner_for_recovery` + `open_session`'s claim swap): the
         // slot is empty (A released it), so nobody is displaced.
         let b_generation = next_owner_generation();
         claim_sdk_owner_for_recovery(b_generation);
-        {
-            let machine = CIRCUIT_RECOVERY.lock().unwrap();
-            assert_eq!(
-                (machine.in_flight, machine.detached),
-                (0, 0),
-                "an empty slot displaces nobody: no census entry is invented (:423-426)"
-            );
-        }
+        let machine = {
+            let state = recovery_lock();
+            (state.in_flight, state.detached)
+        };
+        assert_eq!(
+            machine,
+            (0, 0),
+            "an empty slot displaces nobody: no census entry is invented (:423-426)"
+        );
         let (fresh_requests, fresh_receiver) = mpsc::sync_channel(1);
         let fresh_calls = Arc::new(Mutex::new(Vec::new()));
         let fresh_thread =
@@ -4624,18 +4672,15 @@ mod tests {
         // A stale second retirement of the old owner registers nothing, and a
         // closed circuit authorizes no resolver pass.
         owner_self_retire(&abandoned, a_generation);
-        {
-            let machine = CIRCUIT_RECOVERY.lock().unwrap();
-            assert_eq!(
-                (
-                    machine.in_flight,
-                    machine.window_generation,
-                    machine.detached
-                ),
-                (0, NO_OWNER, 0),
-                "a stale return retires no window and invents no census entry"
-            );
-        }
+        let machine = {
+            let state = recovery_lock();
+            (state.in_flight, state.window_generation, state.detached)
+        };
+        assert_eq!(
+            machine,
+            (0, NO_OWNER, 0),
+            "a stale return retires no window and invents no census entry"
+        );
         assert_eq!(
             SDK_OWNER_ACTIVE.load(Ordering::Acquire),
             b_generation,
