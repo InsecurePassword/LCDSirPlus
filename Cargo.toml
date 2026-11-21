@@ -1,3 +1,9 @@
+[workspace]
+members = ["components/lcdsirplus_discord"]
+default-members = [".", "components/lcdsirplus_discord"]
+# `target` and the vendored `third_party/winres` path dep stay out, as in the standalone baseline.
+exclude = ["target", "third_party/winres"]
+
 [package]
 name = "lcdsirplus"
 version = "0.3.0"
@@ -27,12 +33,14 @@ windows = { version = "0.58", features = [
     "Win32_System_RemoteDesktop",
     "Win32_System_Registry",
     "Win32_System_WindowsProgramming",
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_SystemInformation",
     "Win32_System_Performance",
     "Win32_System_Power",
     "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
     "Win32_System_Console",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",

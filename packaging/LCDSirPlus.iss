@@ -89,6 +89,7 @@ Name: "startup"; Description: "Start LCDSirPlus when I sign in"; GroupDescriptio
 
 [Files]
 Source: "{#PayloadRoot}\LCDSirPlus.exe"; DestDir: "{app}"; Flags: ignoreversion notimestamp
+Source: "{#PayloadRoot}\lcdsirplus_discord.dll"; DestDir: "{app}"; Flags: ignoreversion notimestamp
 Source: "{#PayloadRoot}\PresentMon.exe"; DestDir: "{app}"; Flags: ignoreversion notimestamp
 Source: "{#PayloadRoot}\lcdsirplus.default.txt"; DestDir: "{app}"; Flags: ignoreversion notimestamp
 Source: "{#PayloadRoot}\lcdsirplus.layout"; DestDir: "{app}"; Flags: ignoreversion notimestamp

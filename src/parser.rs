@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::config::{
     parse_processor_list, validate, validate_config_string, Config, MAX_CONFIG_AGGREGATE_BYTES,
     MAX_CONFIG_FILES, MAX_CONFIG_INCLUDE_DIRECTIVES, MAX_CONFIG_LINES, MAX_CONFIG_LIST_ITEMS,
-    MAX_CONFIG_TOKEN_BYTES, MAX_INCLUDES,
+    MAX_CONFIG_STRING_BYTES, MAX_CONFIG_TOKEN_BYTES, MAX_INCLUDES,
 };
 
 #[cfg(test)]
@@ -90,8 +90,7 @@ pub fn load(path: &Path) -> Result<LoadedConfig, ParseError> {
 
 /// Parse one immutable byte slice with identical semantics; includes are
 /// rejected so the effective configuration binds to exactly these bytes.
-/// (Isolated-mode surface: tests now, hardware-test evidence in Phase 4.)
-#[allow(dead_code)]
+/// Production caller: the installed-template preflight at `src/runtime.rs:118`.
 pub fn parse_standalone(contents: &[u8]) -> Result<Config, ParseError> {
     const SOURCE: &str = "standalone-configuration";
     let mut ctx = ParseContext {
@@ -338,6 +337,20 @@ impl ParseContext {
             if v.is_empty() {
                 return Err(format!("{} requires a value", key));
             }
+            // WO-U46H #17: `validate_config_string` runs per token, so the JOINED
+            // value was never measured: the widest legal directive (256 tokens of
+            // MAX_CONFIG_STRING_BYTES, plus the separators the join inserts) built
+            // a 1,048,831-byte value for a single setting. Cap the COMPLETE value
+            // at the documented per-byte limit - the same limit the processor-list
+            // joined value already carries (`config.rs:748`) - and reject on the
+            // summed token lengths, before the join allocates the value.
+            let total = v.iter().map(|token| token.len()).sum::<usize>() + v.len() - 1;
+            if total > MAX_CONFIG_STRING_BYTES {
+                return Err(format!(
+                    "{} exceeds limit of {} bytes",
+                    key, MAX_CONFIG_STRING_BYTES
+                ));
+            }
             Ok(v.join(" "))
         };
         let cfg = &mut self.cfg;
@@ -436,11 +449,6 @@ impl ParseContext {
                 cfg.headset_query_timeout = ms_auto(v, Duration::from_millis(1200))?;
             }
             "headset_stale_ms" => cfg.headset_stale_after = ms_auto(v, Duration::from_secs(45))?,
-            "headset_warn_percent" => cfg.headset_warn_percent = checked_i32(key, intv(v)?)?,
-            "headset_critical_percent" => {
-                cfg.headset_critical_percent = checked_i32(key, intv(v)?)?
-            }
-            "headset_estimate_hours" => cfg.headset_estimate_hours = boolv(v)?,
             "controller_enabled" => cfg.controller_enabled = boolv(v)?,
             "controller_index" => cfg.controller_index = checked_i32(key, intv(v)?)?,
             "controller_poll_ms" => cfg.controller_poll = ms_auto(v, Duration::from_secs(10))?,
@@ -467,15 +475,8 @@ impl ParseContext {
             }
             "disk_graph_ceiling_mbps" => cfg.disk_graph_ceiling_mbps = floatv(v)?,
             "fps_graph_ceiling" => cfg.fps_graph_ceiling = floatv(v)?,
-            "warning" => cfg.warning = boolv(v)?,
-            "temperature_warning_enabled" => cfg.temperature_warning_enabled = boolv(v)?,
             "cpu_temp_max_c" => cfg.cpu_temp_max_c = floatv(v)?,
             "gpu_temp_max_c" => cfg.gpu_temp_max_c = floatv(v)?,
-            "bottleneck_cpu_percent" => cfg.bottleneck_cpu_percent = floatv(v)?,
-            "bottleneck_gpu_percent" => cfg.bottleneck_gpu_percent = floatv(v)?,
-            "bottleneck_memory_percent" => cfg.bottleneck_memory_percent = floatv(v)?,
-            "bottleneck_disk_mbps" => cfg.bottleneck_disk_mbps = floatv(v)?,
-            "bottleneck_sustain_ms" => cfg.bottleneck_sustain = msv(v)?,
             "audio_enabled" => cfg.audio_enabled = boolv(v)?,
             "audio_poll_ms" => cfg.audio_poll = ms_auto(v, Duration::from_secs(1))?,
             "discord_enabled" => cfg.discord_enabled = boolv(v)?,
@@ -493,14 +494,6 @@ impl ParseContext {
             "hang_failures_required" => cfg.hang_failures = checked_i32(key, intv(v)?)?,
             "hang_minimum_ms" => cfg.hang_minimum = msv(v)?,
             "hang_ignore" => cfg.hang_ignore = v.to_vec(),
-            "cpu_temp_warning" => cfg.cpu_temp_warning = floatv(v)?,
-            "cpu_temp_critical" => cfg.cpu_temp_critical = floatv(v)?,
-            "gpu_temp_warning" => cfg.gpu_temp_warning = floatv(v)?,
-            "gpu_temp_critical" => cfg.gpu_temp_critical = floatv(v)?,
-            "memory_warning_enabled" => cfg.memory_warning_enabled = boolv(v)?,
-            "memory_warning" => cfg.memory_warning = floatv(v)?,
-            "vmem_warning" => cfg.vmem_warning = floatv(v)?,
-            "critical_alert_linger_ms" => cfg.critical_alert_linger = msv(v)?,
             "log_level" => cfg.log_level = lower_one(v)?,
             "log_max_bytes" => {
                 let n = intv(v)?;
@@ -705,6 +698,132 @@ mod tests {
         assert_eq!(cfg.discord_redirect_uri, "https://legacy.invalid/callback");
     }
 
+    /// WO-U46H #17: the joined value is capped, not only every token inside it.
+    /// The real bounds, recomputed from the parser's own consts: the widest legal
+    /// directive is `MAX_CONFIG_LIST_ITEMS` (256) tokens of
+    /// `MAX_CONFIG_STRING_BYTES` (4,096) bytes plus the `MAX_CONFIG_LIST_ITEMS - 1`
+    /// separators the join inserts = 1,048,831 bytes, which the shipped per-token
+    /// check accepted for `date_format`, `time_format`, `logitech_friendly_name`
+    /// and `presentmon_path`. The cap is `MAX_CONFIG_STRING_BYTES`, the unit the
+    /// processor-list joined value already carries (`config.rs:748`), and the
+    /// rejection happens on the summed token lengths, before the join allocates.
+    #[test]
+    fn joined_values_are_capped_at_the_documented_byte_limit() {
+        let limit = MAX_CONFIG_STRING_BYTES;
+        let read = |cfg: &Config, key: &str| -> String {
+            match key {
+                "date_format" => cfg.date_format.clone(),
+                "time_format" => cfg.time_format.clone(),
+                "logitech_friendly_name" => cfg.logitech_friendly_name.clone(),
+                "presentmon_path" => cfg.presentmon_path.clone(),
+                other => unreachable!("unmapped key {other}"),
+            }
+        };
+        for key in [
+            "date_format",
+            "time_format",
+            "logitech_friendly_name",
+            "presentmon_path",
+        ] {
+            // Exact limit as one token: accepted, and stored whole.
+            let exact = parse_standalone(format!("{key} {}\n", "a".repeat(limit)).as_bytes())
+                .unwrap_or_else(|error| panic!("{key} exact limit rejected: {error}"));
+            assert_eq!(read(&exact, key).len(), limit, "{key} exact limit");
+            // Exact limit spread over tokens: 2,047 + 1 + 2,048 = 4,096.
+            let joined = format!(
+                "{key} {} {}\n",
+                "b".repeat(limit / 2 - 1),
+                "c".repeat(limit / 2)
+            );
+            let exact = parse_standalone(joined.as_bytes())
+                .unwrap_or_else(|error| panic!("{key} exact joined limit rejected: {error}"));
+            assert_eq!(read(&exact, key).len(), limit, "{key} exact joined limit");
+            // Over the limit by one byte through the join: every token is legal
+            // per-token, so only the complete-value check can catch it.
+            let over = format!(
+                "{key} {} {}\n",
+                "b".repeat(limit / 2),
+                "c".repeat(limit / 2)
+            );
+            let error = reject(key, over);
+            assert_eq!(error.line, 1, "{key}");
+            assert_eq!(
+                error.message,
+                format!("{key} exceeds limit of {limit} bytes"),
+                "{key}: over-join must name the key and the limit"
+            );
+            // The widest shipped-legal token shape: 256 x 4,096 bytes.
+            let widest = format!(
+                "{key} {}\n",
+                vec!["a".repeat(limit); MAX_CONFIG_LIST_ITEMS].join(" ")
+            );
+            let error = reject(key, widest);
+            assert_eq!(
+                error.message,
+                format!("{key} exceeds limit of {limit} bytes"),
+                "{key}: the 1,048,831-byte value is refused, not built"
+            );
+        }
+        // Unicode length: the unit is bytes, so 2,048 two-byte runes land exactly
+        // on the limit and one more rune is over it.
+        let exact_unicode =
+            parse_standalone(format!("date_format {}\n", "\u{e9}".repeat(limit / 2)).as_bytes())
+                .unwrap();
+        assert_eq!(exact_unicode.date_format.chars().count(), limit / 2);
+        assert_eq!(exact_unicode.date_format.len(), limit);
+        let over_unicode = parse_standalone(
+            format!("date_format {}\n", "\u{e9}".repeat(limit / 2 + 1)).as_bytes(),
+        )
+        .unwrap_err();
+        assert!(
+            over_unicode.message.contains("exceeds limit of 4096 bytes"),
+            "{over_unicode}"
+        );
+        // Two multibyte tokens that each pass the per-token check, joined over it.
+        let joined_unicode = parse_standalone(
+            format!(
+                "date_format {} {}\n",
+                "\u{e9}".repeat(limit / 4),
+                "\u{e9}".repeat(limit / 4)
+            )
+            .as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            joined_unicode.message,
+            "date_format exceeds limit of 4096 bytes".to_string(),
+            "the joined multibyte value is 4,097 bytes"
+        );
+        // The processor-list keys keep the same cap and now report the key, since
+        // the complete value is checked before the list is parsed.
+        let ccd = parse_standalone(
+            format!(
+                "ccd_cache_processors {} {}\n",
+                "0".repeat(limit / 2),
+                "1".repeat(limit / 2)
+            )
+            .as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            ccd.message,
+            "ccd_cache_processors exceeds limit of 4096 bytes"
+        );
+        // A legal short multi-token value still joins, so the cap is not a ban.
+        let ok = parse_standalone(b"date_format dd MMM yyyy\ntime_format HH:mm:ss\n").unwrap();
+        assert_eq!(ok.date_format, "dd MMM yyyy");
+        assert_eq!(ok.time_format, "HH:mm:ss");
+    }
+
+    /// The parse error of a directive whose value is over the joined cap; a value
+    /// that parses is the defect this test is written for.
+    fn reject(key: &str, line: String) -> ParseError {
+        match parse_standalone(line.as_bytes()) {
+            Ok(_) => panic!("{key} accepted a value over the joined cap"),
+            Err(error) => error,
+        }
+    }
+
     #[test]
     fn duplicate_keys_rejected_with_line_diagnostics() {
         let err = parse_standalone(b"preview_scale 3\npreview_scale 4\n").unwrap_err();
@@ -715,8 +834,7 @@ mod tests {
     #[test]
     fn auto_intervals_map_to_defaults() {
         let cfg =
-            parse_standalone(b"warning 0\ntelemetry_interval_ms auto\nrender_interval_ms 250\n")
-                .unwrap();
+            parse_standalone(b"telemetry_interval_ms auto\nrender_interval_ms 250\n").unwrap();
         assert_eq!(cfg.telemetry_interval, Duration::from_millis(300));
         assert_eq!(cfg.render_interval, Duration::from_millis(250));
     }
@@ -733,35 +851,80 @@ mod tests {
         }
     }
 
+    /// WO-REMOVE-ALERTS: `render_interval_ms` keeps its own grammar and `25..5000` bound; the
+    /// retired rule that coupled a slow cadence to the temperature-warning switches is gone.
     #[test]
-    fn warning_render_interval_accepts_auto_and_rejects_slow_cadence() {
-        let cfg = parse_standalone(b"warning 1\nrender_interval_ms auto\n").unwrap();
+    fn render_interval_accepts_auto_and_its_own_bounds_without_any_warning_rule() {
+        let cfg = parse_standalone(b"render_interval_ms auto\n").unwrap();
         assert_eq!(cfg.render_interval, Duration::from_millis(100));
-        assert!(parse_standalone(b"warning 1\nrender_interval_ms 101\n").is_err());
-        assert!(parse_standalone(b"warning 0\nrender_interval_ms 5000\n").is_ok());
-        assert!(parse_standalone(
-            b"warning 1\ntemperature_warning_enabled 0\nrender_interval_ms 5000\n"
-        )
-        .is_ok());
+        for value in ["101", "5000"] {
+            assert!(
+                parse_standalone(format!("render_interval_ms {value}\n").as_bytes()).is_ok(),
+                "rejected {value} with no warning setting present"
+            );
+        }
+        for value in ["24", "5001"] {
+            assert!(
+                parse_standalone(format!("render_interval_ms {value}\n").as_bytes()).is_err(),
+                "accepted the out-of-bound {value}"
+            );
+        }
     }
 
+    /// WO-REMOVE-ALERTS (S3): the 17 retired settings are ordinary unknown keys — no
+    /// ignored-key list, no compatibility shim, no obsolete-key warning path.
     #[test]
-    fn parses_independent_warning_categories_and_legacy_thresholds() {
-        let cfg = parse_standalone(
-            b"warning 0\ntemperature_warning_enabled off\nmemory_warning_enabled yes\nmemory_warning 0\nvmem_warning 75\n",
-        )
-        .unwrap();
-        assert!(!cfg.warning);
-        assert!(!cfg.temperature_warning_enabled);
-        assert!(cfg.memory_warning_enabled);
-        assert_eq!(cfg.memory_warning, 0.0);
-        assert_eq!(cfg.vmem_warning, 75.0);
-
-        for key in ["temperature_warning_enabled", "memory_warning_enabled"] {
-            let error = parse_standalone(format!("{key} maybe\n").as_bytes()).unwrap_err();
-            assert_eq!(error.line, 1);
-            assert!(error.message.contains(key));
+    fn retired_alert_and_bottleneck_keys_are_rejected_as_unknown() {
+        for key in [
+            "bottleneck_cpu_percent",
+            "bottleneck_gpu_percent",
+            "bottleneck_memory_percent",
+            "bottleneck_disk_mbps",
+            "bottleneck_sustain_ms",
+            "warning",
+            "temperature_warning_enabled",
+            "memory_warning_enabled",
+            "cpu_temp_warning",
+            "cpu_temp_critical",
+            "gpu_temp_warning",
+            "gpu_temp_critical",
+            "memory_warning",
+            "vmem_warning",
+            "critical_alert_linger_ms",
+            "headset_warn_percent",
+            "headset_critical_percent",
+            "headset_estimate_hours",
+        ] {
+            let error = parse_standalone(format!("{key} 1\n").as_bytes()).unwrap_err();
+            assert!(error.message.contains("unknown key"), "{key}: {error}");
+            assert_eq!(error.line, 1, "{key}");
         }
+    }
+
+    /// WO-REMOVE-ALERTS (S3): `ALERTS`/`BOTTLENECK` are not selectable modules any more, in any
+    /// spelling, while the replacement and surviving options parse.
+    #[test]
+    fn retired_module_tokens_are_rejected_in_slot_lists() {
+        for token in [
+            "ALERTS",
+            "alerts",
+            "BOTTLENECK",
+            "bottleneck",
+            "CPU_CACHE_TEMP",
+            "cpu_cache_temp",
+            "CPU_FREQ_TEMP",
+            "cpu_freq_temp",
+        ] {
+            let error =
+                parse_standalone(format!("slot_3 {token} THERMALS\n").as_bytes()).unwrap_err();
+            assert!(
+                error.message.contains("unknown button option")
+                    && error.message.to_uppercase().contains(&token.to_uppercase()),
+                "{token}: {error}"
+            );
+        }
+        assert!(parse_standalone(b"slot_3 THERMALS POWER_LIMIT\n").is_ok());
+        assert!(parse_standalone(b"slot_2 PROC_HANG FPS_1LOW\n").is_ok());
     }
 
     #[test]
@@ -844,18 +1007,18 @@ mod tests {
     #[test]
     fn parses_module_expansion_contract_and_keeps_old_configs_valid() {
         let cfg = parse_standalone(
-            b"warning 0\ncpu_temp_max_c 88\ngpu_temp_max_c 89\ndisk_graph_ceiling_mbps 2000\nfps_graph_ceiling 360\ncpu_fan_max_rpm 1800\nhwinfo_cpu_temp_sensor \"CPU Exact Case\"\nhwinfo_cpu_temp_reading \"CPU Package\"\nhwinfo_total_power_sensor System\nhwinfo_total_power_reading Total\nbottleneck_sustain_ms 0\nslot_0 cpu_load_graph system_battery bottleneck\n",
+            b"cpu_temp_max_c 88\ngpu_temp_max_c 89\ndisk_graph_ceiling_mbps 2000\nfps_graph_ceiling 360\ncpu_fan_max_rpm 1800\nhwinfo_cpu_temp_sensor \"CPU Exact Case\"\nhwinfo_cpu_temp_reading \"CPU Package\"\nhwinfo_total_power_sensor System\nhwinfo_total_power_reading Total\nslot_0 cpu_load_graph system_battery power_limit\n",
         )
         .unwrap();
-        assert!(!cfg.warning);
         assert_eq!(
             cfg.slots[0],
-            vec!["CPU_LOAD_GRAPH", "SYSTEM_BATTERY", "BOTTLENECK"]
+            vec!["CPU_LOAD_GRAPH", "SYSTEM_BATTERY", "POWER_LIMIT"]
         );
+        assert_eq!(cfg.cpu_temp_max_c, 88.0);
+        assert_eq!(cfg.gpu_temp_max_c, 89.0);
         assert_eq!(cfg.cpu_fan_max_rpm, 1800);
         assert_eq!(cfg.hwinfo_cpu_temp_sensor, "CPU Exact Case");
         assert_eq!(cfg.hwinfo_cpu_temp_reading, "CPU Package");
-        assert_eq!(cfg.bottleneck_sustain, Duration::ZERO);
         assert!(parse_standalone(b"preview_scale 2\nhang_button 3\n").is_ok());
         assert!(parse_standalone(b"hwinfo_cpu_temp_sensor CPU\n").is_err());
         assert!(parse_standalone(b"hwinfo_cpu_power_sensor CPU\n").is_err());
@@ -878,8 +1041,6 @@ mod tests {
         for key in [
             "preview_scale",
             "main_display",
-            "headset_warn_percent",
-            "headset_critical_percent",
             "controller_index",
             "network_probe_window",
             "discord_max_speakers",

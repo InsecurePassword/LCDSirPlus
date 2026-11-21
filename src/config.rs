@@ -41,7 +41,7 @@ pub const DEFAULT_SLOTS: [&[&str]; 4] = [
         "JITTER",
         "AUDIO",
     ],
-    &["BOTTLENECK", "THERMALS", "POWER_LIMIT"],
+    &["THERMALS", "POWER_LIMIT"],
 ];
 
 pub const MODULES: &[&str] = &[
@@ -68,14 +68,12 @@ pub const MODULES: &[&str] = &[
     "SESSION_SUMMARY",
     "CLOCK",
     "GAME_NAME",
-    "ALERTS",
     "PROVIDER_STATUS",
+    "DISCORD",
     "CPU_LOAD",
     "RAM_USAGE",
     "GPU_LOAD",
     "VRAM_USAGE",
-    "CPU_CACHE_TEMP",
-    "CPU_FREQ_TEMP",
     "CPU_LOAD_GRAPH",
     "GPU_LOAD_GRAPH",
     "CPU_TEMP_GRAPH",
@@ -96,7 +94,6 @@ pub const MODULES: &[&str] = &[
     "NET_HEALTH",
     "SYSTEM_BATTERY",
     "HARD_FAULTS",
-    "BOTTLENECK",
     "PROC_HANG",
 ];
 
@@ -176,9 +173,6 @@ pub struct Config {
     pub headset_poll: Duration,
     pub headset_query_timeout: Duration,
     pub headset_stale_after: Duration,
-    pub headset_warn_percent: i32,
-    pub headset_critical_percent: i32,
-    pub headset_estimate_hours: bool,
 
     pub controller_enabled: bool,
     pub controller_index: i32,
@@ -195,17 +189,8 @@ pub struct Config {
     pub disk_graph_ceiling_mbps: f64,
     pub fps_graph_ceiling: f64,
 
-    pub warning: bool,
-    pub memory_warning_enabled: bool,
-    pub temperature_warning_enabled: bool,
     pub cpu_temp_max_c: f64,
     pub gpu_temp_max_c: f64,
-
-    pub bottleneck_cpu_percent: f64,
-    pub bottleneck_gpu_percent: f64,
-    pub bottleneck_memory_percent: f64,
-    pub bottleneck_disk_mbps: f64,
-    pub bottleneck_sustain: Duration,
 
     pub audio_enabled: bool,
     pub audio_poll: Duration,
@@ -228,14 +213,6 @@ pub struct Config {
     pub hang_failures: i32,
     pub hang_minimum: Duration,
     pub hang_ignore: Vec<String>,
-
-    pub cpu_temp_warning: f64,
-    pub cpu_temp_critical: f64,
-    pub gpu_temp_warning: f64,
-    pub gpu_temp_critical: f64,
-    pub memory_warning: f64,
-    pub vmem_warning: f64,
-    pub critical_alert_linger: Duration,
 
     pub log_level: String,
     pub log_max_bytes: u64,
@@ -316,9 +293,6 @@ impl Default for Config {
             headset_poll: Duration::from_secs(15),
             headset_query_timeout: Duration::from_millis(1200),
             headset_stale_after: Duration::from_secs(45),
-            headset_warn_percent: 25,
-            headset_critical_percent: 0,
-            headset_estimate_hours: true,
             controller_enabled: true,
             controller_index: -1,
             controller_poll: Duration::from_secs(10),
@@ -332,16 +306,8 @@ impl Default for Config {
             network_graph_ceiling_upload_mbps: 1000.0,
             disk_graph_ceiling_mbps: 1000.0,
             fps_graph_ceiling: 240.0,
-            warning: true,
-            memory_warning_enabled: true,
-            temperature_warning_enabled: true,
             cpu_temp_max_c: 90.0,
             gpu_temp_max_c: 90.0,
-            bottleneck_cpu_percent: 90.0,
-            bottleneck_gpu_percent: 95.0,
-            bottleneck_memory_percent: 90.0,
-            bottleneck_disk_mbps: 500.0,
-            bottleneck_sustain: Duration::from_secs(2),
             audio_enabled: true,
             audio_poll: Duration::from_secs(1),
             discord_enabled: true,
@@ -374,13 +340,6 @@ impl Default for Config {
             .iter()
             .map(|s| s.to_string())
             .collect(),
-            cpu_temp_warning: 85.0,
-            cpu_temp_critical: 95.0,
-            gpu_temp_warning: 83.0,
-            gpu_temp_critical: 90.0,
-            memory_warning: 100.0,
-            vmem_warning: 100.0,
-            critical_alert_linger: Duration::from_secs(3),
             log_level: "info".into(),
             log_max_bytes: 2 * 1024 * 1024,
             log_backups: 3,
@@ -436,13 +395,6 @@ pub fn validate(c: &Config) -> Result<(), String> {
         25,
         5000,
     )?;
-    if c.warning && c.temperature_warning_enabled && c.render_interval > Duration::from_millis(100)
-    {
-        return Err(
-            "render_interval_ms must be <=100 when warning=1 and temperature_warning_enabled=1"
-                .into(),
-        );
-    }
     check_range_i32("main_display", c.main_display, 1, 3)?;
     if !matches!(c.preview_mode.as_str(), "auto" | "always" | "never") {
         return Err("preview_mode must be auto, always, or never".into());
@@ -598,16 +550,6 @@ pub fn validate(c: &Config) -> Result<(), String> {
         600000,
     )?;
     check_range_f64("stutter_threshold_ms", c.stutter_threshold_ms, 1.0, 1000.0)?;
-    check_range_i32("headset_warn_percent", c.headset_warn_percent, 0, 100)?;
-    check_range_i32(
-        "headset_critical_percent",
-        c.headset_critical_percent,
-        0,
-        100,
-    )?;
-    if c.headset_critical_percent > c.headset_warn_percent {
-        return Err("headset_critical_percent must be <= headset_warn_percent".into());
-    }
     check_range_u64(
         "headset_poll_ms",
         c.headset_poll.as_millis() as u64,
@@ -679,56 +621,6 @@ pub fn validate(c: &Config) -> Result<(), String> {
     check_range_f64("fps_graph_ceiling", c.fps_graph_ceiling, 1.0, 1000.0)?;
     check_range_f64("cpu_temp_max_c", c.cpu_temp_max_c, 1.0, 150.0)?;
     check_range_f64("gpu_temp_max_c", c.gpu_temp_max_c, 1.0, 150.0)?;
-    check_range_f64(
-        "bottleneck_cpu_percent",
-        c.bottleneck_cpu_percent,
-        1.0,
-        100.0,
-    )?;
-    check_range_f64(
-        "bottleneck_gpu_percent",
-        c.bottleneck_gpu_percent,
-        1.0,
-        100.0,
-    )?;
-    check_range_f64(
-        "bottleneck_memory_percent",
-        c.bottleneck_memory_percent,
-        1.0,
-        100.0,
-    )?;
-    check_range_f64(
-        "bottleneck_disk_mbps",
-        c.bottleneck_disk_mbps,
-        1.0,
-        100000.0,
-    )?;
-    check_range_u64(
-        "bottleneck_sustain_ms",
-        c.bottleneck_sustain.as_millis() as u64,
-        0,
-        60000,
-    )?;
-    for (name, v) in [
-        ("cpu_temp_warning", c.cpu_temp_warning),
-        ("cpu_temp_critical", c.cpu_temp_critical),
-        ("gpu_temp_warning", c.gpu_temp_warning),
-        ("gpu_temp_critical", c.gpu_temp_critical),
-    ] {
-        check_range_f64(name, v, 0.0, 150.0)?;
-    }
-    for (name, v) in [
-        ("memory_warning", c.memory_warning),
-        ("vmem_warning", c.vmem_warning),
-    ] {
-        check_range_f64(name, v, 0.0, 100.0)?;
-    }
-    if c.cpu_temp_critical < c.cpu_temp_warning || c.gpu_temp_critical < c.gpu_temp_warning {
-        return Err("critical temperature must be >= warning temperature".into());
-    }
-    if c.critical_alert_linger > Duration::from_secs(60) {
-        return Err("critical_alert_linger_ms must be 0..60000".into());
-    }
     if c.discord_max_speakers < 1 || c.discord_max_speakers > 4 {
         return Err("discord_max_speakers must be 1..4".into());
     }
@@ -914,14 +806,14 @@ mod tests {
     fn default_is_valid() {
         let cfg = Config::default();
         assert_eq!(cfg.main_display, 1);
-        assert!(cfg.memory_warning_enabled);
-        assert!(cfg.temperature_warning_enabled);
+        assert_eq!(cfg.slots[3], ["THERMALS", "POWER_LIMIT"]);
         assert!(!cfg.hang_enabled);
         assert_eq!(cfg.presentmon_target_mode, "presenting");
         assert!(cfg.presentmon_deferred);
         assert!(!cfg.presentmon_persist);
-        assert_eq!(cfg.memory_warning, 100.0);
-        assert_eq!(cfg.vmem_warning, 100.0);
+        assert_eq!(cfg.render_interval, Duration::from_millis(100));
+        assert_eq!(cfg.cpu_temp_max_c, 90.0);
+        assert_eq!(cfg.gpu_temp_max_c, 90.0);
         assert!(validate(&cfg).is_ok());
     }
 
@@ -1042,31 +934,29 @@ mod tests {
             )
         );
         assert_eq!(
-            (
-                defaults.memory_warning_enabled,
-                defaults.temperature_warning_enabled,
-                defaults.hang_enabled,
-                defaults.memory_warning,
-                defaults.vmem_warning,
-            ),
-            (
-                shipped.memory_warning_enabled,
-                shipped.temperature_warning_enabled,
-                shipped.hang_enabled,
-                shipped.memory_warning,
-                shipped.vmem_warning,
-            )
+            (defaults.hang_enabled, defaults.render_interval),
+            (shipped.hang_enabled, shipped.render_interval)
         );
     }
 
     #[test]
     fn module_registry_is_exact_unique_and_case_insensitive() {
-        assert_eq!(MODULES.len(), 53);
+        assert_eq!(MODULES.len(), 50);
         let unique: std::collections::HashSet<_> = MODULES.iter().collect();
         assert_eq!(unique.len(), MODULES.len());
         assert!(MODULES
             .iter()
             .all(|module| valid_module(&module.to_lowercase())));
+        assert!(
+            !MODULES.contains(&"ALERTS"),
+            "alerts retired with the feature"
+        );
+        assert!(
+            !MODULES.contains(&"BOTTLENECK"),
+            "bottleneck retired with the feature"
+        );
+        assert!(MODULES.contains(&"PROC_HANG"), "RIP stays selectable");
+        assert!(MODULES.contains(&"THERMALS"), "readings stay selectable");
     }
 
     #[test]
@@ -1104,39 +994,62 @@ mod tests {
         assert!(validate(&cfg).is_err());
     }
 
+    /// WO-REMOVE-ALERTS: the retired `warning`/`temperature_warning_enabled` pair no longer
+    /// couples to the render cadence, so the independently valid `25..5000` ms bound is the
+    /// only rule, and the user's actual interval is honored at any value in it.
     #[test]
-    fn warning_requires_rendering_each_hundred_millisecond_transition() {
-        assert!(validate(&Config {
-            warning: true,
-            render_interval: Duration::from_millis(100),
-            ..Config::default()
-        })
-        .is_ok());
-        assert!(validate(&Config {
-            warning: true,
-            render_interval: Duration::from_millis(101),
-            ..Config::default()
-        })
-        .is_err());
-        assert!(validate(&Config {
-            warning: false,
-            render_interval: Duration::from_secs(5),
-            ..Config::default()
-        })
-        .is_ok());
-        assert!(validate(&Config {
-            warning: true,
-            temperature_warning_enabled: false,
-            render_interval: Duration::from_secs(5),
-            ..Config::default()
-        })
-        .is_ok());
-        assert!(validate(&Config {
-            memory_warning: 0.0,
-            vmem_warning: 0.0,
-            ..Config::default()
-        })
-        .is_ok());
+    fn render_interval_bounds_stand_alone_after_the_warning_coupling_was_retired() {
+        for value in [25, 100, 101, 1000, 5000] {
+            assert!(
+                validate(&Config {
+                    render_interval: Duration::from_millis(value),
+                    ..Config::default()
+                })
+                .is_ok(),
+                "rejected the independently valid {value} ms"
+            );
+        }
+        for value in [24, 5001] {
+            assert!(
+                validate(&Config {
+                    render_interval: Duration::from_millis(value),
+                    ..Config::default()
+                })
+                .is_err(),
+                "accepted out-of-bound {value} ms"
+            );
+        }
+    }
+
+    /// WO-REMOVE-ALERTS (S3): the migrated shipped template is the shipped default surface,
+    /// carries no retired assignment or module token, and keeps `PROC_HANG` ownership.
+    #[test]
+    fn migrated_template_is_the_default_surface_and_keeps_proc_hang_ownership() {
+        let shipped = crate::parser::parse_standalone(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/lcdsirplus.txt"
+        )))
+        .expect("migrated shipped configuration must parse");
+        assert_eq!(shipped.slots, Config::default().slots);
+        for slot in shipped.slots.iter().filter(|slot| !slot.is_empty()) {
+            for module in slot.iter() {
+                assert!(
+                    module != "ALERTS" && module != "BOTTLENECK",
+                    "retired module token survived in {slot:?}"
+                );
+            }
+        }
+        let hang_owners = shipped
+            .slots
+            .iter()
+            .filter(|slot| {
+                slot.iter()
+                    .any(|module| module.eq_ignore_ascii_case("PROC_HANG"))
+            })
+            .count();
+        assert_eq!(hang_owners, 1, "PROC_HANG owns exactly one slot");
+        assert_eq!(shipped.slots[3], ["THERMALS", "POWER_LIMIT"]);
+        assert!(validate(&shipped).is_ok());
     }
 
     #[test]

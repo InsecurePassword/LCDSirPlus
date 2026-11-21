@@ -43,6 +43,14 @@ $expected = @{
     Size = [uint64]956768
     Hash = '9bec3083069f58f911e6a512f4806db51a27bd096103087bc1d05ef54c80a191'
     Signer = 'Intel Corporation'
+    # Authenticode identity of the pinned artifact, derived on 2026-11-20 from the local
+    # third_party/PresentMon/PresentMon.exe (956,768 B, SHA-256 9bec3083...a191, matching the
+    # tracked manifest) with Get-AuthenticodeSignature. CERT ROLLOVER: on any artifact-version
+    # bump, re-derive Subject and Thumbprint from the newly pinned binary together with Size and
+    # Hash; never relax this to a name-only check. The signing leaf's own NotAfter is in the past,
+    # so the chain stays Valid only through its embedded counter timestamp.
+    Subject = 'CN=Intel Corporation, O=Intel Corporation, S=California, C=US'
+    Thumbprint = '4B923D748E9EBE27252FDBA244342C1888A2D23E'
     Flags = @(
         '--process_id',
         '--output_stdout',
@@ -65,15 +73,16 @@ function Assert-FileIdentity {
 }
 
 function Assert-PresentMonSignature {
-    param([string]$Path, [string]$Signer)
+    param([string]$Path)
     $signature = Get-AuthenticodeSignature -FilePath $Path
-    if ($signature.Status -ne [Management.Automation.SignatureStatus]::Valid) {
-        throw "PresentMon Authenticode signature is not valid: $($signature.Status) ($($signature.StatusMessage))"
-    }
     $certificate = $signature.SignerCertificate
     $simpleName = if ($null -eq $certificate) { $null } else { $certificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) }
-    if ($simpleName -cne $Signer) {
-        throw "PresentMon Authenticode signer mismatch: expected $Signer, got $simpleName"
+    $subject = if ($null -eq $certificate) { $null } else { $certificate.Subject }
+    $thumbprint = if ($null -eq $certificate) { $null } else { $certificate.Thumbprint }
+    if ($signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or $null -eq $certificate -or
+        $simpleName -cne $expected.Signer -or $subject -cne $expected.Subject -or
+        $thumbprint -cne $expected.Thumbprint) {
+        throw "PresentMon Authenticode identity mismatch: $($signature.Status), $simpleName, $subject, $thumbprint"
     }
 }
 
@@ -109,6 +118,24 @@ function Publish-AtomicFile {
         $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         throw "Atomic PresentMon cache replacement failed ($errorCode): $Destination"
     }
+}
+
+function Set-TlsFloor {
+    # Minimal host-appropriate TLS policy for the two Invoke-WebRequest calls below, and the
+    # only one that works on every supported host: both scripts declare `#Requires -Version 5.1`,
+    # and Invoke-WebRequest -SslProtocol / -HttpVersion exist only on PowerShell 6.0+ / 7.0+
+    # (measured on this host: absent on 5.1.26100.9818, present on 7.6.10). Tls13 is exposed by
+    # [Net.SecurityProtocolType] on both hosts, so the floor is Tls12 | Tls13 - the strongest
+    # protocols available, never excluding a stronger one; only the deprecated Ssl3/Tls/Tls11 are
+    # left out. The host default is SystemDefault, so this scopes the process for the download
+    # only; the caller restores the previous value in `finally`. Returns it.
+    $previous = [Net.ServicePointManager]::SecurityProtocol
+    $floor = [Net.SecurityProtocolType]::Tls12
+    if ([Enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') {
+        $floor = $floor -bor [Net.SecurityProtocolType]::Tls13
+    }
+    [Net.ServicePointManager]::SecurityProtocol = $floor
+    return $previous
 }
 
 if (-not [IO.File]::Exists($manifestPath)) { throw "PresentMon manifest is missing: $manifestPath" }
@@ -162,7 +189,7 @@ foreach ($license in $licenses) {
 $binary = Join-Path $root 'PresentMon.exe'
 if ($VerifyOnly) {
     Assert-FileIdentity $binary $expected.Size $expected.Hash 'PresentMon binary'
-    Assert-PresentMonSignature $binary $expected.Signer
+    Assert-PresentMonSignature $binary
     Assert-PresentMonHelp $binary $expected.Flags
     foreach ($license in $licenses) {
         Assert-FileIdentity (Join-Path $root $license.file) ([uint64]$license.size) $license.sha256 "PresentMon $($license.file)"
@@ -173,12 +200,14 @@ if ($VerifyOnly) {
 
 [IO.Directory]::CreateDirectory($root) | Out-Null
 $temporary = New-Object 'Collections.Generic.List[string]'
+$previousTls = $null
 try {
+    $previousTls = Set-TlsFloor
     $binaryTemp = Join-Path $root ('.PresentMon.' + [Guid]::NewGuid().ToString('N') + '.download.exe')
     [void]$temporary.Add($binaryTemp)
     Invoke-WebRequest -Uri $manifest.artifact.url -OutFile $binaryTemp -UseBasicParsing -TimeoutSec $downloadTimeoutSeconds
     Assert-FileIdentity $binaryTemp $expected.Size $expected.Hash 'Downloaded PresentMon binary'
-    Assert-PresentMonSignature $binaryTemp $expected.Signer
+    Assert-PresentMonSignature $binaryTemp
     Assert-PresentMonHelp $binaryTemp $expected.Flags
 
     $licenseTemps = @()
@@ -194,6 +223,7 @@ try {
     & $PSCommandPath -VerifyOnly
 }
 finally {
+    if ($null -ne $previousTls) { [Net.ServicePointManager]::SecurityProtocol = $previousTls }
     foreach ($path in $temporary) {
         if ([IO.File]::Exists($path)) { Remove-Item -LiteralPath $path -Force }
     }

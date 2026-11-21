@@ -12,7 +12,7 @@ use std::os::windows::fs::FileExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf, Prefix};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -1233,12 +1233,13 @@ impl Stats {
 pub fn spawn(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
+    consumers: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
 ) -> (mpsc::Receiver<Update>, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("telemetry-presentmon".into())
-        .spawn(move || run(config, generation, shutdown, tx))
+        .spawn(move || run(config, generation, consumers, shutdown, tx))
         .expect("PresentMon telemetry thread");
     (rx, thread)
 }
@@ -1251,6 +1252,25 @@ fn current_request(config: &RwLock<Config>, generation: &AtomicU64) -> (u64, Con
             return (before, config);
         }
     }
+}
+
+/// WO-TEL-D2 (S5, U-8): the 50 ms loop head reuses the cached `Arc<Config>`
+/// under an unchanged generation (no 20 Hz `Config` clone); a changed
+/// generation takes the module's shipped `current_request` rule copy, so the
+/// cached value belongs to the generation reported with it. Generation
+/// semantics are untouched.
+fn cached_request(
+    config: &RwLock<Config>,
+    generation: &AtomicU64,
+    cache: &mut (u64, Arc<Config>),
+) -> (u64, Arc<Config>) {
+    let before = generation.load(Ordering::SeqCst);
+    if before == cache.0 && before != 0 && generation.load(Ordering::SeqCst) == before {
+        return (before, Arc::clone(&cache.1));
+    }
+    let (generation, config) = current_request(config, generation);
+    *cache = (generation, Arc::new(config));
+    (generation, Arc::clone(&cache.1))
 }
 
 fn confirm_start_request(
@@ -1281,42 +1301,103 @@ fn confirm_start_request(
     Ok(())
 }
 
+/// EC-6: named child-exit causes observed at the presentmon child boundary.
+/// Stable short tokens (RC-1 vocabulary discipline, `CatalogUnavailableReason::code` style);
+/// the reason text carries class + numeric exit code only, never child argv or paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildExit {
+    Normal,
+    Failed(u32),
+    DidNotExitInTime,
+}
+
+/// `ExitStatus::code()` is always `Some` on Windows; the sentinel keeps a code-less (signal) death
+/// named as a failure instead of masking it as a normal exit. Not reachable on the pinned target.
+const NO_EXIT_CODE: u32 = u32::MAX;
+
+impl ChildExit {
+    fn classify(status: &ExitStatus) -> Self {
+        match status.code() {
+            Some(0) => Self::Normal,
+            Some(code) => Self::Failed(code as u32),
+            None => Self::Failed(NO_EXIT_CODE),
+        }
+    }
+
+    fn token(self) -> String {
+        match self {
+            Self::Normal => "exited_normal".into(),
+            Self::Failed(code) => format!("exited_failed_{code}"),
+            Self::DidNotExitInTime => "did_not_exit_in_time".into(),
+        }
+    }
+
+    fn reason(self) -> String {
+        format!("presentmon child {}", self.token())
+    }
+
+    /// Full provider-unavailable reason for a child that stopped while capturing (site 1).
+    fn capture_end_reason(self, target: &str) -> String {
+        format!(
+            "{} while capturing {target}; the target may have exited",
+            self.reason()
+        )
+    }
+}
+
 fn wait_bounded(
     timeout: Duration,
     mut exited: impl FnMut() -> Result<bool, String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let deadline = Instant::now() + timeout;
     loop {
         if exited()? {
-            return Ok(());
+            return Ok(true);
         }
         if Instant::now() >= deadline {
-            return Err(format!(
-                "exit was not confirmed within {} ms",
-                timeout.as_millis()
-            ));
+            return Ok(false);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn wait_child_bounded(child: &mut Child, timeout: Duration) -> Result<(), String> {
-    wait_bounded(timeout, || {
+fn wait_child_bounded(child: &mut Child, timeout: Duration) -> Result<ChildExit, String> {
+    let mut observed: Option<ExitStatus> = None;
+    let confirmed = wait_bounded(timeout, || {
         child
             .try_wait()
-            .map(|status| status.is_some())
+            .map(|status| {
+                let done = status.is_some();
+                if done {
+                    observed = status;
+                }
+                done
+            })
             .map_err(|error| format!("query child status: {error}"))
-    })
+    })?;
+    match (confirmed, observed) {
+        (true, Some(status)) => Ok(ChildExit::classify(&status)),
+        // confirmed only happens once a status was observed, so this arm is unreachable.
+        (true, None) => Ok(ChildExit::DidNotExitInTime),
+        (false, _) => Err(format!(
+            "exit was not confirmed within {} ms: {}",
+            timeout.as_millis(),
+            ChildExit::DidNotExitInTime.token()
+        )),
+    }
 }
 
-fn stop_child_bounded(child: &mut Child, timeout: Duration) -> Result<(), String> {
-    if child.try_wait().is_ok_and(|status| status.is_some()) {
-        return Ok(());
+fn stop_child_bounded(child: &mut Child, timeout: Duration) -> Result<ChildExit, String> {
+    if let Ok(Some(status)) = child.try_wait() {
+        return Ok(ChildExit::classify(&status));
     }
     if let Err(kill) = child.kill() {
         return match child.try_wait() {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => Err(format!("kill child: {kill}; child is still running")),
+            Ok(Some(status)) => Ok(ChildExit::classify(&status)),
+            Ok(None) => Err(format!(
+                "kill child: {kill}; child is still running: {}",
+                ChildExit::DidNotExitInTime.token()
+            )),
             Err(wait) => Err(format!("kill child: {kill}; confirm exit: {wait}")),
         };
     }
@@ -1339,13 +1420,18 @@ fn join_thread_bounded<T>(
 fn run(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
+    consumers: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     tx: mpsc::Sender<Update>,
 ) {
     let mut capture = Capture::default();
     let mut current_generation = 0;
+    let mut request = (
+        0u64,
+        Arc::new(config.read().unwrap_or_else(|e| e.into_inner()).clone()),
+    );
     while !shutdown.load(Ordering::Relaxed) {
-        let (request_generation, cfg) = current_request(&config, &generation);
+        let (request_generation, cfg) = cached_request(&config, &generation, &mut request);
         if request_generation != current_generation {
             if capture.stop_and_report_cleanup(&tx, request_generation, Instant::now()) {
                 std::thread::sleep(Duration::from_millis(50));
@@ -1353,6 +1439,27 @@ fn run(
             }
             capture = Capture::default();
             current_generation = request_generation;
+        }
+        // WO-TEL-D2 (S2, U-3): no displayed presentmon-backed module
+        // (`app.rs module_extended_consumers`, fall-through included) => ZERO
+        // target polls AND ZERO child-spawn retries: the reconcile gate (target
+        // selection, executable resolution, the child spawn retry ladder) is
+        // never reached. The park reuses the shipped disabled-arm shape:
+        // `stop_and_report_cleanup` once, one deduped `unavailable` publication
+        // (health: `providers["presentmon"]` false => the availability
+        // predicate `app.rs:745-763` keeps falling through, fed by publication,
+        // not by fresh polls), then the existing 50 ms sleep. Demand return
+        // re-enters reconcile: the 1 s target-poll gate is due
+        // (`last_target_poll` stale), so selection runs on the next worker tick
+        // after publication (<=100 ms render + 50 ms loop).
+        if !crate::telemetry::demanded(consumers.load(Ordering::Relaxed), "presentmon") {
+            if capture.stop_and_report_cleanup(&tx, request_generation, Instant::now()) {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            capture.unavailable(&tx, request_generation, "no display consumer".into());
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
         }
         capture.reconcile(&cfg, request_generation, &tx, &|target, key| {
             confirm_start_request(
@@ -1504,6 +1611,7 @@ impl Capture {
         if let Some(child) = &mut self.child {
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    let exit = ChildExit::classify(&status);
                     let target = if presenting {
                         "local frame presenters".into()
                     } else {
@@ -1514,13 +1622,7 @@ impl Capture {
                     self.failure(
                         tx,
                         generation,
-                        with_diagnostic(
-                            format!(
-                                "PresentMon exited ({status}) while capturing {}; the target may have exited",
-                                target
-                            ),
-                            stderr,
-                        ),
+                        with_diagnostic(exit.capture_end_reason(&target), stderr),
                     );
                     return;
                 }
@@ -1987,8 +2089,8 @@ impl Capture {
 
     fn stop_with(
         &mut self,
-        stop_child: impl FnOnce(&mut Child) -> Result<(), String>,
-        cleanup: impl FnOnce(&str) -> Result<(), String>,
+        stop_child: impl FnOnce(&mut Child) -> Result<ChildExit, String>,
+        mut cleanup: impl FnMut(&str) -> Result<(), String>,
     ) -> String {
         let mut shutdown = Vec::new();
         self.stop_diagnostic.clear();
@@ -1996,6 +2098,13 @@ impl Capture {
             if let Err(error) = stop_child(&mut child) {
                 self.stop_diagnostic = format!("teardown: {error}");
                 self.child = Some(child);
+                // WO-U46I (#13): an unconfirmed child stop keeps the child handle (the retry
+                // ladder owns that resource), but the ETW session is THIS instance's own named
+                // registration, and the presenting-mode child carries no `--terminate_on_proc_exit`
+                // (`presentmon_args`), so the session must not stay registered behind the retry.
+                // The cleanup is attempted here and its outcome is reported as a SEPARATE segment
+                // next to the child-stop outcome.
+                self.cleanup_owned_session(&mut cleanup);
                 return String::new();
             }
         }
@@ -2016,6 +2125,24 @@ impl Capture {
         if !shutdown.is_empty() {
             self.stop_diagnostic = format!("shutdown: {}", shutdown.join("; "));
         }
+        self.cleanup_owned_session(&mut cleanup);
+        self.target = ProcessInfo::default();
+        self.key.clear();
+        self.stats = None;
+        self.activity = ActivityTracker::default();
+        self.catalog = CatalogCache::default();
+        self.challenger = None;
+        self.last_frame = None;
+        self.last_publish = None;
+        self.started_at = None;
+        stderr
+    }
+
+    /// WO-U46I (#13): clean up exactly THIS instance's owned named session. Idempotent (a cleared
+    /// `owned_session` is never cleaned again) and never an unrelated session. The child-handle
+    /// ownership is a separate resource and is not part of this outcome; a refused cleanup keeps
+    /// the claim so `teardown_pending` schedules the retry, as shipped.
+    fn cleanup_owned_session(&mut self, cleanup: &mut impl FnMut(&str) -> Result<(), String>) {
         let cleanup_error = self
             .owned_session
             .as_deref()
@@ -2029,16 +2156,6 @@ impl Capture {
         } else {
             self.owned_session = None;
         }
-        self.target = ProcessInfo::default();
-        self.key.clear();
-        self.stats = None;
-        self.activity = ActivityTracker::default();
-        self.catalog = CatalogCache::default();
-        self.challenger = None;
-        self.last_frame = None;
-        self.last_publish = None;
-        self.started_at = None;
-        stderr
     }
 
     fn teardown_pending(&self) -> bool {
@@ -2434,7 +2551,15 @@ fn validate_executable(path: &Path) -> Result<PinnedExecutable, String> {
         return Err("path is not a PresentMon console executable".into());
     }
     let pinned = pin_canonical_executable(canonical)?;
-    verify_authenticode(&pinned.file, &pinned.path)?;
+    // WO-U46I (#3a): the signature check goes through the bounded wrapper, so the 50 ms worker
+    // never blocks on `WinVerifyTrustEx`. The wrapper receives an OWNED duplicate of the pinned
+    // handle, so the pinned-identity and SHA-256 checks below keep the shipped order and content.
+    verify_authenticode_bounded(
+        &pinned.path,
+        pinned.file.try_clone().map_err(|error| {
+            format!("open the pinned PresentMon for signature verification: {error}")
+        })?,
+    )?;
     if pinned.identity.size != PRESENTMON_SIZE
         || held_sha256(&pinned.file, pinned.identity.size)? != PRESENTMON_SHA256
     {
@@ -2709,6 +2834,85 @@ fn held_sha256(file: &File, size: u64) -> Result<String, String> {
     Ok(crate::sha256::hex(&hash.finish()))
 }
 
+/// WO-U46I (#3a): the 50 ms capture worker must not block on `WinVerifyTrustEx` — the trust call
+/// performs verification work with no OS bound, and it is reached from the capture start inside
+/// the worker loop. The check runs on a dedicated verifier thread and the worker waits a BOUNDED
+/// time. The gate slot bounds OUTSTANDING WORK per provider instance: at most one verifier thread
+/// is ever in flight, and a timeout fails closed while KEEPING the in-flight thread counted, so a
+/// later attempt declines instead of stranding a new thread per timeout. The gate is consumed by
+/// the verifier's COMPLETION, never by a timeout-ack, so nothing accumulates across polling,
+/// retries or reconfiguration. The bounded precedent is `providers/discord.rs:2205-2226`, whose
+/// single-outstanding flag is cleared ONLY by the verifier thread, so after one timeout the flag
+/// stays set forever (a permanent lockout); that latch defect is not replicated here.
+const VERIFIER_BOUND: Duration = Duration::from_secs(5);
+const VERIFIER_BUSY: &str =
+    "PresentMon Authenticode verifier is already running; capture not started";
+const VERIFIER_TIMEOUT: &str = "PresentMon Authenticode verification timed out; the verifier is \
+                                still running; capture not started";
+
+thread_local! {
+    /// One gate slot per provider instance: `run` (the capture worker thread) is the only caller,
+    /// and a reconfiguration reuses that thread, so the slot spans reconfigures by construction.
+    static AUTHENTICODE_GATE: std::cell::RefCell<Option<mpsc::Receiver<Result<(), String>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The gate state machine: Idle (`None`) / Running (a receiver slot). See the const block above.
+fn run_bounded_verifier<R, F>(
+    gate: &mut Option<mpsc::Receiver<R>>,
+    bound: Duration,
+    work: F,
+) -> Result<R, String>
+where
+    R: Send + 'static,
+    F: FnOnce() -> R + Send + 'static,
+{
+    if let Some(pending) = gate.as_ref() {
+        match pending.try_recv() {
+            // The previous verifier returned (or died): THIS completion consumes the gate, so the
+            // current attempt is entitled to spawn its own verification.
+            Ok(_) | Err(mpsc::TryRecvError::Disconnected) => *gate = None,
+            // Still in flight: decline without spawning, so the outstanding count stays one.
+            Err(mpsc::TryRecvError::Empty) => return Err(VERIFIER_BUSY.into()),
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    let Ok(_verifier) = std::thread::Builder::new()
+        .name("presentmon-authenticode".into())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+    else {
+        return Err(
+            "PresentMon Authenticode verifier thread could not start; capture not started".into(),
+        );
+    };
+    let receiver = gate.insert(rx);
+    match receiver.recv_timeout(bound) {
+        Ok(result) => {
+            *gate = None;
+            Ok(result)
+        }
+        // FAIL CLOSED with the thread counted: the slot keeps the receiver, so the next attempt
+        // declines until this verifier actually returns, and the diagnostic names the outcome.
+        Err(_) => Err(VERIFIER_TIMEOUT.into()),
+    }
+}
+
+/// The bounded wrapper the capture start calls. The inputs are OWNED by the verifier thread (a
+/// duplicated file handle + an owned path), so no borrow crosses and the worker never blocks on
+/// the OS call itself.
+fn verify_authenticode_bounded(path: &Path, file: File) -> Result<(), String> {
+    let path = path.to_path_buf();
+    AUTHENTICODE_GATE
+        .with(|gate| {
+            run_bounded_verifier(&mut gate.borrow_mut(), VERIFIER_BOUND, move || {
+                verify_authenticode(&file, &path)
+            })
+        })
+        .and_then(|result| result)
+}
+
 fn verify_authenticode(file: &File, path: &Path) -> Result<(), String> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Security::Cryptography::{
@@ -2973,6 +3177,99 @@ fn find_named_process(name: &str) -> Result<ProcessInfo, String> {
 mod tests {
     use super::*;
 
+    /// EC-8 (P1 §2 EC-8, acceptance 2): a generation bump while the worker is idle clears the
+    /// capture, and with it the publication-dedupe state, so the new generation republishes its
+    /// own provider state instead of staying suppressed behind the previous generation's detail.
+    /// PresentMon stays disabled: no child process is started and no ETW session is touched.
+    #[test]
+    fn presentmon_config_change_midflight_clears_capture_and_republishes_the_disabled_reason() {
+        let config = Arc::new(RwLock::new(Config {
+            presentmon_enabled: false,
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        // WO-TEL-D2 (U-3): demand the presentmon readings so the worker reaches
+        // `reconcile` (the shipped disabled-config path this test pins); demand
+        // 0 would park the worker before the config gate.
+        let consumers = Arc::new(AtomicU64::new(crate::telemetry::ALL_EXTENDED_CONSUMERS));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let thread = {
+            let config = Arc::clone(&config);
+            let generation = Arc::clone(&generation);
+            let consumers = Arc::clone(&consumers);
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || run(config, generation, consumers, shutdown, tx))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut published = None;
+        while published.is_none() && Instant::now() < deadline {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(100)) {
+                if update.generation == 1 {
+                    published = Some(update);
+                }
+            }
+        }
+        let published = published.expect("the worker publishes generation-1 provider state");
+        assert_eq!(published.detail, "disabled");
+        generation.fetch_add(1, Ordering::SeqCst);
+        let mut republished = None;
+        while republished.is_none() && Instant::now() < deadline {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(100)) {
+                if update.generation == 2 {
+                    republished = Some(update);
+                }
+            }
+        }
+        let update = republished.expect(
+            "a mid-flight generation bump clears the capture so the new generation republishes state",
+        );
+        assert_eq!(update.detail, "disabled");
+        assert!(!update.available && !update.error);
+        shutdown.store(true, Ordering::Relaxed);
+        thread.join().unwrap();
+    }
+
+    /// EC-8 (P1 §2 EC-8, acceptance 2): the generation gate that runs immediately before a
+    /// capture start refuses a request whose generation moved mid-flight, and a request whose
+    /// config content moved while the generation counter did not. Presenting mode only, so no
+    /// target enumeration, child process, or ETW session is involved.
+    #[test]
+    fn presentmon_config_change_midflight_refuses_the_capture_start_gate() {
+        let config = Config {
+            presentmon_enabled: true,
+            presentmon_target_mode: "presenting".into(),
+            ..Config::default()
+        };
+        let shared = RwLock::new(config.clone());
+        let generation = AtomicU64::new(2);
+        let shutdown = AtomicBool::new(false);
+        let target = ProcessInfo::default();
+        let key = capture_key(&config, &target);
+        assert!(
+            confirm_start_request(&shared, &generation, &shutdown, &config, 2, &target, &key)
+                .is_ok(),
+            "an unchanged generation and config must be accepted"
+        );
+        let error =
+            confirm_start_request(&shared, &generation, &shutdown, &config, 1, &target, &key)
+                .unwrap_err();
+        assert!(
+            error.contains("changed"),
+            "a generation that moved mid-flight must refuse the start: {error}"
+        );
+        let mut moved = config.clone();
+        moved.presentmon_interval += Duration::from_millis(1);
+        *shared.write().unwrap() = moved.clone();
+        let error =
+            confirm_start_request(&shared, &generation, &shutdown, &moved, 2, &target, &key)
+                .unwrap_err();
+        assert!(
+            error.contains("changed"),
+            "a config change with a stable generation counter must refuse the start: {error}"
+        );
+    }
+
     #[test]
     #[ignore = "reads the optional current-user NVIDIA App catalog"]
     fn r6_real_catalog_probe() {
@@ -3128,12 +3425,23 @@ mod tests {
         let reader = std::thread::spawn(move || read_diagnostic(stderr, reader_output));
         let status = child.wait().unwrap();
         reader.join().unwrap();
-        let detail = with_diagnostic(
-            format!("PresentMon exited ({status})"),
-            diagnostic_text(&output.lock().unwrap()),
-        );
         assert_eq!(status.code(), Some(5));
+        // EC-6: the bounded observation site classifies the real exit and names the code.
+        assert_eq!(
+            wait_child_bounded(&mut child, Duration::ZERO),
+            Ok(ChildExit::Failed(5))
+        );
+        let reason = ChildExit::Failed(5).capture_end_reason("game.exe");
+        assert!(reason.contains("exited_failed_5"), "{reason}");
+        let detail = with_diagnostic(reason, diagnostic_text(&output.lock().unwrap()));
         assert!(detail.contains("access denied"));
+        // privacy: the classification adds class + code only, never the child's argv or path.
+        for leak in ["cmd.exe", "exit /B", "echo", "\\", "/C"] {
+            assert!(
+                !detail.contains(leak),
+                "child detail leaked {leak:?}: {detail}"
+            );
+        }
 
         let output = Arc::new(std::sync::Mutex::new(BoundedDiagnostic::default()));
         read_diagnostic(
@@ -3972,7 +4280,7 @@ mod tests {
             modified: 4,
         });
         capture.catalog.checked_at = Some(Instant::now());
-        capture.stop_with(|_| Ok(()), |_| Ok(()));
+        capture.stop_with(|_| Ok(ChildExit::Normal), |_| Ok(()));
         assert!(matches!(capture.catalog.state, CatalogState::Unavailable));
         assert!(capture.catalog.metadata.is_none() && capture.catalog.checked_at.is_none());
     }
@@ -4620,7 +4928,7 @@ mod tests {
             window: 2,
             wins: 1,
         });
-        capture.stop_with(|_| Ok(()), |_| Ok(()));
+        capture.stop_with(|_| Ok(ChildExit::Normal), |_| Ok(()));
         assert!(
             capture.target.pid == 0
                 && capture.stats.is_none()
@@ -5002,13 +5310,16 @@ mod tests {
     fn failed_cleanup_is_retained_and_gates_retry() {
         let mut capture = Capture::default();
         capture.owned_session = Some("LCDSirPlus-42-owned".into());
-        capture.stop_with(|_| Ok(()), |_| Err("injected failure".into()));
+        capture.stop_with(
+            |_| Ok(ChildExit::Normal),
+            |_| Err("injected failure".into()),
+        );
         #[rustfmt::skip]
         assert_eq!(capture.owned_session.as_deref(), Some("LCDSirPlus-42-owned"));
         capture.schedule_retry(Instant::now());
         assert!(retry_pending(capture.retry_after, Instant::now()));
         #[rustfmt::skip]
-        capture.stop_with(|_| Ok(()), |name| { assert_eq!(name, "LCDSirPlus-42-owned"); Ok(()) });
+        capture.stop_with(|_| Ok(ChildExit::Normal), |name| { assert_eq!(name, "LCDSirPlus-42-owned"); Ok(()) });
     }
 
     #[test]
@@ -5026,17 +5337,43 @@ mod tests {
             name: "game.exe".into(),
             image_path: String::new(),
         };
+        let cleanup_names: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         capture.stop_with(
-            |_| Err("forced kill/wait timeout".into()),
-            |_| panic!("ETW cleanup must wait for confirmed child exit"),
+            |_| {
+                Err(format!(
+                    "kill child: forced kill; child is still running: {}",
+                    ChildExit::DidNotExitInTime.token()
+                ))
+            },
+            |name| {
+                cleanup_names.lock().unwrap().push(name.to_string());
+                Ok(())
+            },
         );
         assert!(capture.child.is_some() && capture.reader.is_some());
+        // WO-U46I (#13) supersedes the shipped coupling "ETW cleanup must wait for a confirmed
+        // child exit": the named ETW session is THIS instance's own registration (and the
+        // presenting-mode child carries no `--terminate_on_proc_exit`), so a child that survives
+        // the bounded confirm must not leave it registered. The cleanup now runs in the same arm
+        // that retains the child, on the owned name only, as a SEPARATE reported outcome. The
+        // child/reader/target retention and the EC-6 token claims below are unchanged.
         assert_eq!(
-            capture.owned_session.as_deref(),
-            Some("LCDSirPlus-42-owned")
+            cleanup_names.lock().unwrap().as_slice(),
+            ["LCDSirPlus-42-owned".to_string()],
+            "(#13) the owned session is cleaned up on the retained-child path, exactly once"
+        );
+        assert_eq!(
+            capture.owned_session, None,
+            "(#13) a completed cleanup clears the claim"
         );
         assert_eq!(capture.target.pid, 42);
-        assert!(capture.stop_diagnostic.contains("forced kill/wait timeout"));
+        // EC-6 acceptance (2): a child that survives the bounded confirm keeps its existing class,
+        // and that class is the stable did_not_exit_in_time token.
+        assert!(capture.stop_diagnostic.contains("forced kill"));
+        assert!(capture.stop_diagnostic.contains("child is still running"));
+        assert!(capture
+            .stop_diagnostic
+            .contains(&ChildExit::DidNotExitInTime.token()));
         let error = capture
             .start(
                 &executable,
@@ -5092,10 +5429,119 @@ mod tests {
         let started = Instant::now();
         assert!(take_diagnostic(Some(Arc::clone(&diagnostic)), false).is_empty());
         assert!(started.elapsed() < Duration::from_millis(20));
-        assert!(wait_bounded(Duration::ZERO, || Ok(false))
-            .unwrap_err()
-            .contains("exit was not confirmed"));
+        assert_eq!(
+            wait_bounded(Duration::ZERO, || Ok(false)),
+            Ok(false),
+            "a bounded confirm that never observes an exit reports an unconfirmed loop"
+        );
+        assert_eq!(wait_bounded(Duration::ZERO, || Ok(true)), Ok(true));
         drop(guard);
+    }
+
+    fn synthetic_cmd_child(command: &str) -> Child {
+        Command::new("cmd.exe")
+            .args(["/D", "/C", command])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap()
+    }
+
+    fn synthetic_exit_status(code: u8) -> ExitStatus {
+        let mut child = synthetic_cmd_child(&format!("exit /B {code}"));
+        child.wait().unwrap()
+    }
+
+    fn synthetic_long_running_child() -> Child {
+        synthetic_cmd_child("ping -n 20 127.0.0.1 >nul")
+    }
+
+    #[test]
+    fn child_exit_classification_names_the_synthetic_exit_code() {
+        // EC-6 acceptance (1): a child that exits with code X yields a reason that names X.
+        let failing = synthetic_exit_status(101);
+        assert_eq!(failing.code(), Some(101));
+        let exit = ChildExit::classify(&failing);
+        assert_eq!(exit, ChildExit::Failed(101));
+        assert_eq!(exit.token(), "exited_failed_101");
+        assert_eq!(exit.reason(), "presentmon child exited_failed_101");
+        assert!(exit.capture_end_reason("game.exe").contains("101"));
+
+        // EC-6 acceptance (4): the exit-code-0 path keeps its semantics, named as a normal exit.
+        let clean = synthetic_exit_status(0);
+        assert_eq!(clean.code(), Some(0));
+        assert_eq!(ChildExit::classify(&clean), ChildExit::Normal);
+        assert_eq!(ChildExit::Normal.token(), "exited_normal");
+    }
+
+    #[test]
+    fn child_exit_tokens_are_stable_and_privacy_bounded() {
+        let cases = [
+            (ChildExit::Normal, "exited_normal"),
+            (ChildExit::Failed(5), "exited_failed_5"),
+            (ChildExit::Failed(NO_EXIT_CODE), "exited_failed_4294967295"),
+            (ChildExit::DidNotExitInTime, "did_not_exit_in_time"),
+        ];
+        for (exit, token) in cases {
+            assert_eq!(exit.token(), token);
+            assert_eq!(exit.reason(), format!("presentmon child {token}"));
+            // The classification text carries class + numeric code only: no child argv, path,
+            // session name or target identity.
+            for leak in [
+                "\\",
+                "/",
+                ":",
+                "cmd",
+                "exe",
+                "LCDSirPlus-",
+                "--process_id",
+                "game",
+            ] {
+                assert!(
+                    !exit.reason().contains(leak),
+                    "{} leaks {leak:?}",
+                    exit.reason()
+                );
+            }
+        }
+        // A code-less death is named as a failure, never masked as a normal exit.
+        assert_eq!(ChildExit::Failed(NO_EXIT_CODE), ChildExit::Failed(u32::MAX));
+    }
+
+    #[test]
+    fn wait_child_bounded_names_did_not_exit_in_time_when_the_confirm_expires() {
+        let mut child = synthetic_long_running_child();
+        let error = wait_child_bounded(&mut child, Duration::from_millis(1))
+            .expect_err("a running child cannot confirm its exit within 1 ms");
+        assert!(
+            error.contains("exit was not confirmed within 1 ms"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&ChildExit::DidNotExitInTime.token()),
+            "{error}"
+        );
+        for leak in ["cmd.exe", "ping", "\\", "/C"] {
+            assert!(
+                !error.contains(leak),
+                "timeout reason leaked {leak:?}: {error}"
+            );
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn stop_child_bounded_classifies_the_confirmed_exit_after_kill() {
+        let mut child = synthetic_long_running_child();
+        let exit = stop_child_bounded(&mut child, Duration::from_millis(STOP_TIMEOUT_MS.into()))
+            .expect("the bounded confirm must confirm the kill");
+        let status = child.wait().unwrap();
+        assert_eq!(exit, ChildExit::classify(&status));
+        assert!(!matches!(exit, ChildExit::DidNotExitInTime));
+        assert!(!exit.token().contains('\\') && !exit.token().contains('/'));
     }
 
     #[test]
@@ -5171,8 +5617,404 @@ mod tests {
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicU64::new(1));
-        let (_updates, thread) = spawn(config, generation, Arc::clone(&shutdown));
+        let (_updates, thread) = spawn(
+            config,
+            generation,
+            // WO-TEL-D2 (U-3): demand 0 parks the worker in the new gate arm;
+            // shutdown then joins it through the same lifecycle (zero child work).
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&shutdown),
+        );
         shutdown.store(true, Ordering::Relaxed);
         assert!(thread.join().is_ok());
+    }
+
+    /// WO-TEL-D2 (S2, U-3) STRUCTURAL pin (TEL-B `include_str!` occurrence
+    /// form; name/doc are honest: this inspects shipped source, the worker's
+    /// real-thread child behavior needs hardware and stays in the ignored
+    /// native tests). Claims: the worker loop reads the demand word exactly
+    /// once; the demand gate precedes `capture.reconcile(`; the park arm stops
+    /// a running child (`stop_and_report_cleanup`) and publishes the deduped
+    /// unavailable reason on the shipped 50 ms sleep; the child-spawn machinery
+    /// (`resolve_executable`, `.spawn()`, the `TARGET_POLL` selection) occurs
+    /// ZERO times inside the `run` slice — it lives behind the gate, inside
+    /// reconcile, which the demand-0 path never reaches.
+    #[test]
+    fn presentmon_run_gate_stops_target_poll_and_child_spawn_at_zero_demand() {
+        let source = include_str!("presentmon.rs").replace("\r\n", "\n");
+        let start = source.find("fn run(\n").expect("the shipped worker exists");
+        // Slice the WORKER LOOP BODY: from the shipped `fn run(` head to the
+        // loop-end marker (the shutdown drain), so the slice is the loop, not
+        // the following `impl Capture` block (where the gated machinery lives).
+        let rest = &source[start..];
+        let end = rest
+            .find("\n    let mut stderr = String::new();")
+            .expect("the shipped loop-end marker closes the worker loop");
+        let run = &rest[..end];
+        assert_eq!(
+            run.matches("crate::telemetry::demanded(").count(),
+            1,
+            "the demand read exists exactly once in the worker loop"
+        );
+        assert_eq!(
+            run.matches("consumers.load(Ordering::Relaxed)").count(),
+            1,
+            "the worker reads the published consumer word once per loop iteration"
+        );
+        let gate = run
+            .find("if !crate::telemetry::demanded(")
+            .expect("the demand gate");
+        let reconcile = run.find("capture.reconcile(").expect("the reconcile call");
+        assert!(
+            gate < reconcile,
+            "the gate precedes the reconcile path: demand 0 performs no target poll and no child-spawn retry"
+        );
+        assert!(
+            run.contains("stop_and_report_cleanup(&tx, request_generation, Instant::now())"),
+            "the park stops a running child once (shipped cleanup arm)"
+        );
+        assert!(
+            run.contains("\"no display consumer\""),
+            "the park publishes the deduped unavailable reason (health-fed availability predicate stays consistent)"
+        );
+        assert_eq!(
+            run.matches("resolve_executable").count(),
+            0,
+            "the run loop never resolves the executable itself"
+        );
+        assert_eq!(
+            run.matches(".spawn()").count(),
+            0,
+            "the run loop never spawns a child (the CreateProcess retry ladder lives behind the gate)"
+        );
+        assert_eq!(
+            run.matches("capture.unavailable(").count(),
+            1,
+            "the park arm publishes the unavailable state through the dedupe exactly once per iteration"
+        );
+        assert_eq!(
+            run.matches("std::thread::sleep(Duration::from_millis(50))").count(),
+            4,
+            "generation cleanup, demand park (cleanup-pending), demand park (settled) and the main loop all reuse the shipped 50 ms sleep"
+        );
+    }
+
+    /// WO-U46I (#13) PRE-RED: the `stop_with` early-return arm (an unconfirmed child stop) restored
+    /// the child handle and returned, skipping the ETW cleanup of the session THIS instance created.
+    /// The child handle is a per-capture resource whose retry is owned by the retention ladder; the
+    /// named ETW session is a system-wide registration, so leaving it registered on every unconfirmed
+    /// stop is the defect. The fix attempts the cleanup in the same arm and reports the child-stop and
+    /// session-cleanup outcomes as SEPARATE segments; ownership, retention and the retry ladder stay.
+    /// Pre-fix: the cleanup seam is never called => RED at step (i).
+    #[test]
+    fn presentmon_child_stop_failure_still_cleans_the_owned_session() {
+        use std::sync::atomic::AtomicUsize;
+        let child = Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut capture = Capture::default();
+        capture.child = Some(child);
+        capture.owned_session = Some("LCDSirPlus-99-owned".into());
+        let calls = AtomicUsize::new(0);
+        let names: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        capture.stop_with(
+            |_| Err("injected child stop failure: child is still running".to_string()),
+            |name| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                names.lock().unwrap().push(name.to_string());
+                Ok(())
+            },
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "(i) the owned ETW session is cleaned up exactly once even when the child stop is unconfirmed"
+        );
+        assert_eq!(
+            names.lock().unwrap().as_slice(),
+            ["LCDSirPlus-99-owned".to_string()],
+            "(ii) cleanup runs on THIS instance's owned session name, never an unrelated session"
+        );
+        assert!(
+            capture.child.is_some(),
+            "(iii) the child-handle retention on a stop failure is unchanged (the retry ladder owns it)"
+        );
+        assert_eq!(
+            capture.owned_session, None,
+            "(iv) a completed cleanup clears the ownership claim"
+        );
+        assert!(
+            capture
+                .stop_diagnostic
+                .contains("teardown: injected child stop failure"),
+            "(v) the child-stop outcome is named on its own: {}",
+            capture.stop_diagnostic
+        );
+        assert!(
+            !capture.stop_diagnostic.contains("ETW cleanup:"),
+            "(v) a successful session cleanup adds no cleanup outcome: {}",
+            capture.stop_diagnostic
+        );
+        // (vi) idempotence: the cleared session is never cleaned a second time.
+        capture.stop_with(
+            |_| Err("injected child stop failure again".to_string()),
+            |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "(vi) a second stop does not repeat the completed cleanup"
+        );
+        assert!(
+            capture.child.is_some(),
+            "(vi) the child handle stays retained across repeats"
+        );
+        // (vii) a cleanup failure is reported as a SEPARATE outcome next to the child-stop outcome,
+        // and the session claim is kept for the retry (the shipped `teardown_pending` rule).
+        capture.owned_session = Some("LCDSirPlus-99-owned".into());
+        capture.stop_with(
+            |_| Err("child stop failed".to_string()),
+            |_| Err("session stop refused".to_string()),
+        );
+        assert!(
+            capture
+                .stop_diagnostic
+                .contains("teardown: child stop failed"),
+            "(vii) the child-stop outcome: {}",
+            capture.stop_diagnostic
+        );
+        assert!(
+            capture
+                .stop_diagnostic
+                .contains("ETW cleanup: session stop refused"),
+            "(vii) the session-cleanup outcome is reported separately: {}",
+            capture.stop_diagnostic
+        );
+        assert_eq!(
+            capture.owned_session.as_deref(),
+            Some("LCDSirPlus-99-owned"),
+            "(vii) a refused cleanup keeps the session claim so the retry re-attempts it"
+        );
+    }
+
+    /// WO-U46I (#3a) PRE-RED, STRUCTURAL FORM (the runtime form needs the gate runner, which has
+    /// no home pre-fix, and the WO bans real certificate hangs / real OS thread exhaustion): the
+    /// capture start in the 50 ms worker loop must not run `WinVerifyTrustEx` synchronously. The
+    /// shipped shape calls the unbounded verifier straight from `validate_executable`, so one
+    /// revocation/OCSP stall blocks the worker (and the provider) with no bound. The fix routes the
+    /// check through a bounded wrapper with a one-outstanding-thread gate. Pre-fix: the synchronous
+    /// call site is present and the wrapper is absent => RED (the anchor panics on the missing
+    /// runner, the same loud form the WO discloses).
+    #[test]
+    fn presentmon_verifier_call_site_is_bounded() {
+        let source = include_str!("presentmon.rs").replace("\r\n", "\n");
+        let body = |head: &str| -> String {
+            let start = source
+                .find(head)
+                .unwrap_or_else(|| panic!("(#3a) the source carries `{head}`"));
+            let end = source[start..]
+                .find("\n}")
+                .unwrap_or_else(|| panic!("`{head}` closes at column zero"))
+                + start
+                + 2;
+            source[start..end].to_string()
+        };
+        let validate = body("fn validate_executable(path: &Path)");
+        assert!(
+            !validate.contains("verify_authenticode(&pinned.file, &pinned.path)"),
+            "(#3a) the 50 ms worker path must not call the unbounded verifier synchronously"
+        );
+        assert!(
+            validate.contains("verify_authenticode_bounded("),
+            "(#3a) the Authenticode check runs through the bounded wrapper"
+        );
+        assert!(
+            validate.contains("held_sha256(&pinned.file, pinned.identity.size)"),
+            "(#3a) the SHA-256 and pinned-identity checks keep their shipped place"
+        );
+        let bounded = validate
+            .find("verify_authenticode_bounded(")
+            .unwrap_or(usize::MAX);
+        let hashed = validate
+            .find("held_sha256(&pinned.file")
+            .unwrap_or(usize::MAX);
+        assert!(
+            bounded < hashed,
+            "(#3a) the existing check ORDER is unchanged: signature, then pinned size + SHA-256"
+        );
+        let wrapper = body("fn verify_authenticode_bounded(");
+        assert!(
+            wrapper.contains("run_bounded_verifier("),
+            "(#3a) the wrapper delegates to the gate runner that owns the bound"
+        );
+        let runner = body("fn run_bounded_verifier<");
+        assert!(
+            runner.contains("recv_timeout"),
+            "(#3a) the worker waits a BOUNDED time for the verifier thread"
+        );
+        assert!(
+            runner.contains("TryRecvError::Empty"),
+            "(#3a) an in-flight verifier DECLINES a new attempt: at most one thread is outstanding"
+        );
+        assert!(
+            runner.contains("*gate = None"),
+            "(#3a) the gate is cleared by the verifier's COMPLETION, never by a timeout-ack"
+        );
+        assert!(
+            !runner.contains(".expect("),
+            "(#3a) the runner never panics on a spawn failure: it fails closed"
+        );
+    }
+
+    /// WO-U46I (#3a) BEHAVIORAL + THREAD CENSUS: the gate runner facing a WEDGED verifier (the
+    /// deterministic seam; the WO bans real certificate hangs). The first attempt times out and
+    /// FAILS CLOSED with a recorded diagnostic; every later attempt while that verifier is wedged
+    /// declines, and the census shows the outstanding verifier-thread count stays exactly ONE — no
+    /// thread is stranded per timeout and nothing accumulates. When the wedged verifier returns,
+    /// the gate is consumed by that COMPLETION (never by a timeout-ack) and the next attempt spawns.
+    #[test]
+    fn presentmon_bounded_verifier_keeps_one_outstanding_thread() {
+        use std::sync::atomic::AtomicUsize;
+        let entered = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let mut gate: Option<mpsc::Receiver<Result<(), String>>> = None;
+        let bound = Duration::from_millis(20);
+        let counted = Arc::clone(&entered);
+        let first = run_bounded_verifier(&mut gate, bound, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let _ = release_rx.recv();
+            Ok(())
+        });
+        let detail = first.expect_err("(#3a) a wedged verifier makes the attempt fail closed");
+        assert!(
+            detail.contains("timed out"),
+            "(#3a) the timeout is the recorded diagnostic: {detail}"
+        );
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "(#3a) exactly one verifier thread entered"
+        );
+        assert!(
+            gate.is_some(),
+            "(#3a) the timeout keeps the in-flight thread COUNTED"
+        );
+        for attempt in 2..=6 {
+            let declined = run_bounded_verifier(&mut gate, bound, || Ok(()));
+            assert!(
+                declined.is_err(),
+                "(#3a) attempt {attempt} declines while a verifier is in flight"
+            );
+            assert_eq!(
+                entered.load(Ordering::SeqCst),
+                1,
+                "(#3a) census: NO new verifier thread per timeout (attempt {attempt})"
+            );
+        }
+        let released = release_tx.send(());
+        assert!(
+            released.is_ok(),
+            "(#3a) the release reaches the wedged verifier's own receiver: {released:?}"
+        );
+        // The completion is observed THROUGH the gate, which is exactly the contract: an attempt
+        // declines while the verifier is still in flight (the release above is asynchronous, so the
+        // number of declines is scheduling, never a bound on outstanding threads), and the first
+        // attempt that sees the completion clears the slot and spawns. Each decline is an instant
+        // `try_recv`, so this loop adds no sleep; it is capped loudly.
+        let mut declines = 0usize;
+        let outcome = loop {
+            // The census counts EVERY verifier thread that starts, so the post-completion
+            // attempt's work is counted too: exactly one new entry proves one new thread.
+            let counted = Arc::clone(&entered);
+            match run_bounded_verifier(&mut gate, Duration::from_secs(2), move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }) {
+                Ok(result) => break result,
+                Err(declined) => {
+                    assert!(
+                        declined.contains("already running"),
+                        "(#3a) the release must only ever decline as in-flight: {declined}"
+                    );
+                    declines += 1;
+                    // A cooperative yield so the released verifier gets scheduled; never a sleep,
+                    // and the cap below is loud, not a bound on the production behavior.
+                    std::thread::yield_now();
+                    assert!(
+                        declines <= 100,
+                        "(#3a) the released verifier never released the gate: declines={declines} \
+                         entered={} gate_owned={}",
+                        entered.load(Ordering::SeqCst),
+                        gate.is_some()
+                    );
+                }
+            }
+        };
+        assert!(
+            outcome.is_ok(),
+            "(#3a) the new verification is answered: {outcome:?}"
+        );
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            2,
+            "(#3a) exactly one new thread, for the new attempt"
+        );
+        assert!(
+            gate.is_none(),
+            "(#3a) a completed verification clears the gate"
+        );
+    }
+
+    /// WO-U46I (#3a): a verifier that COMPLETES reports its own result and clears the gate, so a
+    /// later attempt re-verifies (the discord precedent's latch, whose gate stays set forever
+    /// after a timeout, is not replicated). A verifier thread that DIES is counted, fails closed,
+    /// and its completion (the disconnected channel) releases the gate for the next attempt.
+    #[test]
+    fn presentmon_bounded_verifier_reports_results_and_clears_the_gate() {
+        let mut gate: Option<mpsc::Receiver<Result<(), String>>> = None;
+        let accepted = run_bounded_verifier(&mut gate, VERIFIER_BOUND, || Ok(()))
+            .expect("(#3a) a verifier that completes is answered inside the bound");
+        assert!(
+            accepted.is_ok(),
+            "(#3a) the verification result is the caller's outcome"
+        );
+        assert!(gate.is_none(), "(#3a) the gate is cleared by completion");
+        let rejected = run_bounded_verifier(&mut gate, VERIFIER_BOUND, || {
+            Err("PresentMon Authenticode signature is not valid: 0x800b0109".into())
+        })
+        .expect("(#3a) a rejecting verifier is answered inside the bound");
+        assert_eq!(
+            rejected.expect_err("(#3a) the signature failure reaches the capture start"),
+            "PresentMon Authenticode signature is not valid: 0x800b0109",
+            "(#3a) the shipped diagnostic text is preserved, not synthesized"
+        );
+        assert!(
+            gate.is_none(),
+            "(#3a) a completed rejection also clears the gate (re-verification stays possible)"
+        );
+        let dead = run_bounded_verifier(&mut gate, VERIFIER_BOUND, || {
+            panic!("( #3a) injected verifier thread death: the runner must fail closed")
+        });
+        assert!(
+            dead.is_err(),
+            "(#3a) a verifier thread that dies fails the attempt closed"
+        );
+        assert!(
+            gate.is_some(),
+            "(#3a) the dead thread stays counted until its completion is observed"
+        );
+        let revived = run_bounded_verifier(&mut gate, VERIFIER_BOUND, || Ok(()))
+            .expect("(#3a) the dead verifier's completion releases the gate for the next attempt");
+        assert!(revived.is_ok(), "(#3a) the next attempt re-verifies");
+        assert!(
+            gate.is_none(),
+            "(#3a) the gate ends cleared: no permanent latch"
+        );
     }
 }

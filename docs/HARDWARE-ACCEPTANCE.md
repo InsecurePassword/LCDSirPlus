@@ -110,7 +110,7 @@ Use a standard Windows 11 x64 account.
    `LCore.exe` is present, plus one clean HID-to-SDK and SDK-to-HID change.
 7. If step 1 stopped **Logitech LampArray Service**, restore its recorded prior
    state and confirm its startup type is unchanged.
-8. Check all four slot buttons, button 4 alert acknowledgement, tray and preview,
+8. Check all four slot buttons, button 4 normal slot cycling, tray and preview,
    orientation, inversion, unplug/replug recovery, and no duplicate display
    output.
 9. Run for two hours, including sleep/wake when supported. Record CPU, memory,
@@ -173,8 +173,11 @@ credential bytes.
    secret fails before Discord use and the environment value is removed.
 2. Authorize two test accounts separately. Switch accounts and confirm only the
    active account's voice state appears.
-3. Check channel title, self/other speakers, speaking order, mute/deafen,
-   linger, leave/rejoin, Discord restart, LCDSirPlus restart, and refresh.
+ 3. Confirm the `Discord` row in `PROVIDER_STATUS` follows the connection across
+   mute/deafen, leave/rejoin, Discord restart, LCDSirPlus restart, and refresh.
+   The panel shows no speaker list and never switches to a speaker view: the
+   automatic full-screen takeover was removed, so speaking never replaces the
+   selected display. No replacement speaker pane exists.
 4. Revoke access and follow the manual's
    [disconnect instructions](INSTRUCTION-MANUAL.md#disconnect-discord). Confirm
    local credentials are removed and no private remote error text appears.

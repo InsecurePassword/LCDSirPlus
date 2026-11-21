@@ -37,6 +37,7 @@ use super::g13::{
     G13_INPUT_REPORT_ID, G13_INPUT_REPORT_LENGTH, G13_OUTPUT_REPORT_LENGTH, G13_PRODUCT_ID,
     G13_USAGE, G13_USAGE_PAGE, G13_VENDOR_ID,
 };
+use super::{LossCause, LossError};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_INTERFACES_VISITED: usize = 256;
@@ -51,23 +52,27 @@ const COMPETING_OWNERS: [(&str, &str); 2] = [
     ),
 ];
 
-fn owner_gate(processes: Result<Vec<String>, String>) -> Result<(), String> {
-    let processes = processes
-        .map_err(|e| format!("cannot enumerate running processes ({e}); refusing direct HID"))?;
+fn owner_gate(processes: Result<Vec<String>, String>) -> Result<(), LossError> {
+    let processes = processes.map_err(|e| {
+        LossError::new(
+            LossCause::ProbeFail,
+            format!("cannot enumerate running processes ({e}); refusing direct HID"),
+        )
+    })?;
     if let Some((_, message)) = COMPETING_OWNERS.iter().find(|(owner, _)| {
         processes
             .iter()
             .any(|name| name.eq_ignore_ascii_case(owner))
     }) {
-        return Err((*message).into());
+        return Err(LossError::new(LossCause::OwnerConflict, (*message).into()));
     }
     Ok(())
 }
 
 fn owner_guarded<T>(
     processes: Result<Vec<String>, String>,
-    operation: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
+    operation: impl FnOnce() -> Result<T, LossError>,
+) -> Result<T, LossError> {
     owner_gate(processes)?;
     operation()
 }
@@ -244,13 +249,14 @@ unsafe fn open_attributes(device_path: &str) -> Result<CandidateInfo, String> {
     let handle = open_path(
         device_path,
         FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0),
-    )?;
+    )
+    .map_err(|error| error.detail)?;
     let info = describe(handle, device_path);
     let _ = CloseHandle(handle);
     info
 }
 
-unsafe fn open_path(device_path: &str, share: FILE_SHARE_MODE) -> Result<HANDLE, String> {
+unsafe fn open_path(device_path: &str, share: FILE_SHARE_MODE) -> Result<HANDLE, LossError> {
     let wide: Vec<u16> = device_path
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -264,7 +270,14 @@ unsafe fn open_path(device_path: &str, share: FILE_SHARE_MODE) -> Result<HANDLE,
         FILE_FLAG_OVERLAPPED,
         None,
     )
-    .map_err(|e| format!("open failed: {}", e))
+    .map_err(|e| {
+        LossError::new(
+            LossCause::OpenFailed {
+                code: e.code().0 as u32,
+            },
+            format!("open failed: {e}"),
+        )
+    })
 }
 
 unsafe fn describe(handle: HANDLE, device_path: &str) -> Result<CandidateInfo, String> {
@@ -293,11 +306,14 @@ unsafe fn describe(handle: HANDLE, device_path: &str) -> Result<CandidateInfo, S
     })
 }
 
-fn validate_input_id(id: u8) -> Result<(), String> {
+fn validate_input_id(id: u8) -> Result<(), LossError> {
     if id != G13_INPUT_REPORT_ID {
-        return Err(format!(
-            "HID input report ID 0x{:02x}, want 0x{:02x}",
-            id, G13_INPUT_REPORT_ID
+        return Err(LossError::new(
+            LossCause::ProbeFail,
+            format!(
+                "HID input report ID 0x{:02x}, want 0x{:02x}",
+                id, G13_INPUT_REPORT_ID
+            ),
         ));
     }
     Ok(())
@@ -316,7 +332,7 @@ unsafe impl Send for HidDevice {}
 impl HidDevice {
     /// Open the first matching G13 collection. Returns discovery evidence
     /// alongside the device so callers can log exact selection reasons.
-    pub fn open() -> Result<(HidDevice, Discovery), String> {
+    pub fn open() -> Result<(HidDevice, Discovery), LossError> {
         owner_gate(running_process_names())?;
         let discovery = discover();
         let Some(candidate) = discovery.candidates.first() else {
@@ -326,23 +342,30 @@ impl HidDevice {
                 .map(|r| r.reason.clone())
                 .collect::<Vec<_>>()
                 .join("; ");
-            return Err(if detail.is_empty() {
-                "HID discovery: no G13 collection matched VID/PID, usage, and 8/992-byte reports"
-                    .into()
-            } else {
-                format!(
-                    "HID discovery: no G13 collection matched VID/PID, usage, and 8/992-byte reports (scanned {} interfaces: {})",
-                    discovery.scanned, detail
-                )
-            });
+            return Err(LossError::new(
+                LossCause::DeviceAbsent,
+                if detail.is_empty() {
+                    "HID discovery: no G13 collection matched VID/PID, usage, and 8/992-byte reports"
+                        .into()
+                } else {
+                    format!(
+                        "HID discovery: no G13 collection matched VID/PID, usage, and 8/992-byte reports (scanned {} interfaces: {})",
+                        discovery.scanned, detail
+                    )
+                },
+            ));
         };
         let handle = unsafe { open_path(&candidate.device_path, FILE_SHARE_MODE(0))? };
         if let Err(error) = owner_gate(running_process_names()) {
             unsafe {
                 let _ = CloseHandle(handle);
             }
-            return Err(format!(
-                "running-process check failed after exclusive HID open: {error}"
+            return Err(LossError::new(
+                LossCause::OwnerConflict,
+                format!(
+                    "running-process check failed after exclusive HID open: {}",
+                    error.detail
+                ),
             ));
         }
         let (read_event, write_event) = create_io_events(
@@ -351,7 +374,8 @@ impl HidDevice {
             |owned| unsafe {
                 let _ = CloseHandle(owned);
             },
-        )?;
+        )
+        .map_err(|reason| LossError::new(LossCause::ProbeFail, reason))?;
         Ok((
             HidDevice {
                 handle,
@@ -363,7 +387,7 @@ impl HidDevice {
     }
 
     /// Write one 992-byte output report with a bounded timeout.
-    pub fn write_report(&self, report: &[u8; G13_OUTPUT_REPORT_LENGTH]) -> Result<(), String> {
+    pub fn write_report(&self, report: &[u8; G13_OUTPUT_REPORT_LENGTH]) -> Result<(), LossError> {
         owner_guarded(running_process_names(), || {
             self.write_report_unchecked(report)
         })
@@ -372,9 +396,10 @@ impl HidDevice {
     fn write_report_unchecked(
         &self,
         report: &[u8; G13_OUTPUT_REPORT_LENGTH],
-    ) -> Result<(), String> {
-        unsafe { ResetEvent(self.write_event) }
-            .map_err(|e| format!("HID reset write event: {e}"))?;
+    ) -> Result<(), LossError> {
+        unsafe { ResetEvent(self.write_event) }.map_err(|e| {
+            LossError::new(LossCause::ProbeFail, format!("HID reset write event: {e}"))
+        })?;
         let mut overlapped = self.new_overlapped(self.write_event);
         let result = unsafe {
             windows::Win32::Storage::FileSystem::WriteFile(
@@ -395,7 +420,10 @@ impl HidDevice {
                     self.wait_pending(self.write_event, &overlapped, IO_TIMEOUT, "HID write")?;
                 validate_transfer("HID write", transferred, G13_OUTPUT_REPORT_LENGTH)
             }
-            Err(e) => Err(format!("HID write: {}", e)),
+            Err(e) => Err(LossError::new(
+                LossCause::ProbeFail,
+                format!("HID write: {e} (code {:#010x})", e.code().0 as u32),
+            )),
         }
     }
 
@@ -404,8 +432,10 @@ impl HidDevice {
         &self,
         buffer: &mut [u8; G13_INPUT_REPORT_LENGTH],
         timeout: Duration,
-    ) -> Result<bool, String> {
-        unsafe { ResetEvent(self.read_event) }.map_err(|e| format!("HID reset read event: {e}"))?;
+    ) -> Result<bool, LossError> {
+        unsafe { ResetEvent(self.read_event) }.map_err(|e| {
+            LossError::new(LossCause::ProbeFail, format!("HID reset read event: {e}"))
+        })?;
         let mut overlapped = self.new_overlapped(self.read_event);
         let result = unsafe {
             windows::Win32::Storage::FileSystem::ReadFile(
@@ -436,11 +466,17 @@ impl HidDevice {
                     }
                     result => {
                         self.cancel_and_drain(&overlapped, "HID read")?;
-                        Err(format!("HID read wait failed: {result:?}"))
+                        Err(LossError::new(
+                            LossCause::ProbeFail,
+                            format!("HID read wait failed: {result:?}"),
+                        ))
                     }
                 }
             }
-            Err(e) => Err(format!("HID read: {}", e)),
+            Err(e) => Err(LossError::new(
+                LossCause::ProbeFail,
+                format!("HID read: {e} (code {:#010x})", e.code().0 as u32),
+            )),
         }
     }
 
@@ -451,10 +487,16 @@ impl HidDevice {
         overlapped
     }
 
-    fn overlapped_result(&self, overlapped: &OVERLAPPED, label: &str) -> Result<u32, String> {
+    fn overlapped_result(&self, overlapped: &OVERLAPPED, label: &str) -> Result<u32, LossError> {
         let mut transferred = 0u32;
-        unsafe { GetOverlappedResult(self.handle, overlapped, &mut transferred, false) }
-            .map_err(|e| format!("{label} completion: {e}"))?;
+        unsafe { GetOverlappedResult(self.handle, overlapped, &mut transferred, false) }.map_err(
+            |e| {
+                LossError::new(
+                    LossCause::ProbeFail,
+                    format!("{label} completion: {e} (code {:#010x})", e.code().0 as u32),
+                )
+            },
+        )?;
         Ok(transferred)
     }
 
@@ -464,37 +506,47 @@ impl HidDevice {
         overlapped: &OVERLAPPED,
         timeout: Duration,
         label: &str,
-    ) -> Result<u32, String> {
+    ) -> Result<u32, LossError> {
         match unsafe { WaitForSingleObject(event, timeout.as_millis() as u32) } {
             WAIT_OBJECT_0 => self.overlapped_result(overlapped, label),
             WAIT_TIMEOUT => {
                 self.cancel_and_drain(overlapped, label)?;
-                Err(format!("{label} timed out"))
+                Err(LossError::new(
+                    LossCause::CallTimeout,
+                    format!("{label} timed out"),
+                ))
             }
             result => {
                 self.cancel_and_drain(overlapped, label)?;
-                Err(format!("{label} wait failed: {result:?}"))
+                Err(LossError::new(
+                    LossCause::ProbeFail,
+                    format!("{label} wait failed: {result:?}"),
+                ))
             }
         }
     }
 
-    fn cancel_and_drain(&self, overlapped: &OVERLAPPED, label: &str) -> Result<(), String> {
+    fn cancel_and_drain(&self, overlapped: &OVERLAPPED, label: &str) -> Result<(), LossError> {
         unsafe {
             let _ = CancelIoEx(self.handle, Some(overlapped));
             let mut transferred = 0u32;
             match GetOverlappedResult(self.handle, overlapped, &mut transferred, true) {
                 Ok(()) => Ok(()),
                 Err(error) if error.code() == ERROR_OPERATION_ABORTED.to_hresult() => Ok(()),
-                Err(error) => Err(format!("{label} cancellation completion: {error}")),
+                Err(error) => Err(LossError::new(
+                    LossCause::ProbeFail,
+                    format!("{label} cancellation completion: {error}"),
+                )),
             }
         }
     }
 
     /// Blank the panel, cancel any pending I/O, and close handles.
-    pub fn close(&mut self) -> Result<(), String> {
+    pub fn close(&mut self) -> Result<(), LossError> {
         let blank_result = self.write_report(&super::g13::blank_report());
         self.close_handles();
-        blank_result.map_err(|e| format!("HID blank on close: {e}"))
+        blank_result
+            .map_err(|e| LossError::new(e.cause, format!("HID blank on close: {}", e.detail)))
     }
 
     /// Close immediately without a final write when LCore.exe is found running.
@@ -535,10 +587,11 @@ fn create_io_events(
     Ok((read, write))
 }
 
-fn validate_transfer(label: &str, transferred: u32, expected: usize) -> Result<(), String> {
+fn validate_transfer(label: &str, transferred: u32, expected: usize) -> Result<(), LossError> {
     if transferred as usize != expected {
-        return Err(format!(
-            "{label} completed {transferred} of {expected} bytes"
+        return Err(LossError::new(
+            LossCause::TransferIncomplete { code: transferred },
+            format!("{label} completed {transferred} of {expected} bytes"),
         ));
     }
     Ok(())
@@ -556,24 +609,56 @@ mod tests {
     }
 
     #[test]
+    fn owner_gate_names_competing_owner_conflict() {
+        let refused = owner_gate(Ok(vec!["LCore.exe".into()])).unwrap_err();
+        assert_eq!(refused.cause, LossCause::OwnerConflict);
+    }
+
+    #[test]
+    fn enumeration_failure_names_probe_fail() {
+        let error = owner_gate(Err("snapshot unavailable".into())).unwrap_err();
+        assert_eq!(error.cause, LossCause::ProbeFail);
+    }
+
+    #[test]
+    fn open_path_failure_names_open_failed_with_the_os_code() {
+        // CreateFileW on an absent device path fails without touching hardware.
+        let error = unsafe { open_path("\\\\.\\lcdsirplus-absent-unit-test", FILE_SHARE_MODE(0)) }
+            .unwrap_err();
+        assert!(
+            matches!(error.cause, LossCause::OpenFailed { code } if code != 0),
+            "the CreateFileW HRESULT rides with the cause: {error:?}"
+        );
+        let LossCause::OpenFailed { code } = error.cause else {
+            panic!("expected open-failed cause");
+        };
+        assert_eq!(
+            code & 0xFFFF,
+            windows::Win32::Foundation::ERROR_FILE_NOT_FOUND.0,
+            "win32 error 2 inside the HRESULT 0x8007_00xx form"
+        );
+    }
+
+    #[test]
     fn owner_detection_errors_fail_closed_without_private_data() {
         let error = owner_gate(Err("snapshot unavailable".into())).unwrap_err();
-        assert!(error.contains("refusing direct HID"));
-        assert!(!error.contains('\\'));
+        assert!(error.detail.contains("refusing direct HID"));
+        assert!(!error.detail.contains('\\'));
     }
 
     #[test]
     fn owner_refusal_is_actionable_and_retry_can_recover() {
         let refused = owner_gate(Ok(vec!["LCore.exe".into()])).unwrap_err();
-        assert!(refused.contains("exit Logitech Gaming Software"));
+        assert!(refused.detail.contains("exit Logitech Gaming Software"));
         let refused = owner_gate(Ok(vec!["logi_lamparray_service.AMD64.exe".into()])).unwrap_err();
-        assert!(refused.contains("stop Logitech LampArray service"));
+        assert!(refused.detail.contains("stop Logitech LampArray service"));
         assert!(owner_gate(Ok(Vec::new())).is_ok());
     }
 
     #[test]
     fn partial_transfers_are_rejected() {
-        assert!(validate_transfer("HID write", 991, 992).is_err());
+        let error = validate_transfer("HID write", 991, 992).unwrap_err();
+        assert_eq!(error.cause, LossCause::TransferIncomplete { code: 991 });
         assert!(validate_transfer("HID write", 992, 992).is_ok());
     }
 

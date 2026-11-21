@@ -182,7 +182,7 @@ pub fn spawn(
     let (tx, rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("telemetry-network-quality".into())
-        .spawn(move || worker(config, generation, shutdown, tx))
+        .spawn(move || worker(config, generation, shutdown, tx, probe))
         .expect("network quality thread");
     (rx, thread)
 }
@@ -202,6 +202,7 @@ fn worker(
     generation: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     tx: mpsc::Sender<Update>,
+    probe: fn(&Policy, &RwLock<Config>, &AtomicBool) -> Outcome,
 ) {
     let mut state = State::default();
     let mut policy = None;
@@ -427,6 +428,8 @@ fn icmp_probe(address: Ipv4Addr, timeout: Duration) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::{Mutex, OnceLock};
 
     #[test]
     fn history_is_bounded_and_separates_loss_from_provider_errors() {
@@ -547,5 +550,358 @@ mod tests {
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
+    }
+
+    /// EC-8 (P1 §2 EC-8, acceptance 2): a config generation bump that lands while the worker
+    /// is mid-cadence must clear the probe baseline and republish for the new generation —
+    /// the same rule as the template `netif::failure_clears_baseline_and_recovery_requires_a_new_interval`.
+    /// Loopback only: the target is a socket this test binds and never accepts on, so the probe
+    /// is a local `connect` with no external traffic and no privileged path.
+    #[test]
+    fn network_config_change_midflight_clears_baseline_and_republishes_the_new_generation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = Arc::new(RwLock::new(Config {
+            network_probe_enabled: true,
+            network_probe_method: "tcp".into(),
+            network_probe_target: format!("127.0.0.1:{port}"),
+            network_probe_interval: Duration::from_secs(600),
+            network_probe_timeout: Duration::from_millis(500),
+            network_probe_window: 5,
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let thread = {
+            let config = Arc::clone(&config);
+            let generation = Arc::clone(&generation);
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || worker(config, generation, shutdown, tx, probe))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut baseline = None;
+        while baseline.is_none() && Instant::now() < deadline {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(100)) {
+                if update.generation == 1 && update.ping.valid {
+                    baseline = Some(update);
+                }
+            }
+        }
+        assert!(
+            baseline.is_some(),
+            "the loopback probe must publish a generation-1 baseline first"
+        );
+        generation.fetch_add(1, Ordering::SeqCst);
+        let mut cleared = None;
+        while cleared.is_none() && Instant::now() < deadline {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(100)) {
+                if update.generation == 2 {
+                    cleared = Some(update);
+                }
+            }
+        }
+        let cleared = cleared.expect(
+            "a mid-flight generation bump republishes a cleared update for the new generation",
+        );
+        assert!(
+            !cleared.ping.valid && !cleared.jitter.valid && !cleared.loss.valid,
+            "the prior baseline must be cleared, never carried onto the new generation"
+        );
+        assert!(!cleared.available && cleared.error.is_none());
+        shutdown.store(true, Ordering::Relaxed);
+        thread.join().unwrap();
+    }
+
+    // EC-8 F-3 gap-fill (WO-A1-08-AUDIT probe F: deleting the post-probe re-check left the
+    // full suite green). These three tests drive the real worker loop with a SYNTHETIC slow
+    // probe — a channel handshake in which the probe signals its entry, then blocks until the
+    // test releases it — so a config change lands strictly INSIDE the probe call and the
+    // post-probe re-check (current L264-277) sees it with zero wall-clock racing. One test per
+    // arm of the L266 condition: generation bump, policy-content change, policy disabled.
+    // No sleeps, no sockets, no DNS, no ICMP: the synthetic probe never touches the network,
+    // and the production `probe()` is not used by these tests.
+
+    struct SlowProbe {
+        enter: Sender<()>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    static SLOW_GENERATION: OnceLock<SlowProbe> = OnceLock::new();
+    static SLOW_CONTENT: OnceLock<SlowProbe> = OnceLock::new();
+    static SLOW_DISABLED: OnceLock<SlowProbe> = OnceLock::new();
+
+    const MIDPROBE_WAIT: Duration = Duration::from_secs(2);
+
+    fn install_slow_probe(slot: &'static OnceLock<SlowProbe>) -> (Receiver<()>, Sender<()>) {
+        let (enter_tx, enter_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        assert!(
+            slot.set(SlowProbe {
+                enter: enter_tx,
+                release: Mutex::new(release_rx),
+            })
+            .is_ok(),
+            "each slow-probe slot is installed exactly once"
+        );
+        (enter_rx, release_tx)
+    }
+
+    fn block_in_probe(slot: &OnceLock<SlowProbe>) -> Outcome {
+        let probe = slot
+            .get()
+            .expect("the test installs the slow-probe control before spawning the worker");
+        probe
+            .enter
+            .send(())
+            .expect("the slow probe signals its entry to the test");
+        probe
+            .release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the test releases the slow probe (loud 5 s timeout, never a hang)");
+        Outcome::Success(12.0)
+    }
+
+    fn slow_probe_generation(
+        _policy: &Policy,
+        _config: &RwLock<Config>,
+        _shutdown: &AtomicBool,
+    ) -> Outcome {
+        block_in_probe(&SLOW_GENERATION)
+    }
+
+    fn slow_probe_content(
+        _policy: &Policy,
+        _config: &RwLock<Config>,
+        _shutdown: &AtomicBool,
+    ) -> Outcome {
+        block_in_probe(&SLOW_CONTENT)
+    }
+
+    fn slow_probe_disabled(
+        _policy: &Policy,
+        _config: &RwLock<Config>,
+        _shutdown: &AtomicBool,
+    ) -> Outcome {
+        block_in_probe(&SLOW_DISABLED)
+    }
+
+    fn midprobe_config(target: &str) -> Config {
+        Config {
+            network_probe_enabled: true,
+            network_probe_method: "tcp".into(),
+            network_probe_target: target.into(),
+            network_probe_interval: Duration::from_secs(600),
+            network_probe_timeout: Duration::from_millis(500),
+            network_probe_window: 5,
+            ..Config::default()
+        }
+    }
+
+    struct MidProbe {
+        rx: Receiver<Update>,
+        shutdown: Arc<AtomicBool>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    fn spawn_midprobe_worker(
+        config: Arc<RwLock<Config>>,
+        generation: Arc<AtomicU64>,
+        probe: fn(&Policy, &RwLock<Config>, &AtomicBool) -> Outcome,
+    ) -> MidProbe {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let thread = {
+            let config = Arc::clone(&config);
+            let generation = Arc::clone(&generation);
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || worker(config, generation, shutdown, tx, probe))
+        };
+        MidProbe {
+            rx,
+            shutdown,
+            thread,
+        }
+    }
+
+    fn cleared_update(update: &Update) -> bool {
+        !update.ping.valid
+            && !update.jitter.valid
+            && !update.loss.valid
+            && !update.available
+            && update.error.is_none()
+    }
+
+    /// L266 arm 1 (generation moved mid-probe): the worker drops the probe outcome, never
+    /// publishes it on the superseded request_generation 1, republishes a cleared update for
+    /// generation 2, and resets cadence state (immediate re-probe under a 600 s interval).
+    #[test]
+    fn generation_bump_midprobe_discards_the_stale_outcome_and_republishes_the_new_generation() {
+        let (enter_rx, release_tx) = install_slow_probe(&SLOW_GENERATION);
+        let generation = Arc::new(AtomicU64::new(1));
+        let run = spawn_midprobe_worker(
+            Arc::new(RwLock::new(midprobe_config("synthetic-fixed"))),
+            Arc::clone(&generation),
+            slow_probe_generation,
+        );
+        let startup = run
+            .rx
+            .recv_timeout(MIDPROBE_WAIT)
+            .expect("the loop head publishes the cleared generation-1 update");
+        assert_eq!(startup.generation, 1);
+        enter_rx
+            .recv_timeout(MIDPROBE_WAIT)
+            .expect("the worker entered the probe");
+        generation.store(2, Ordering::SeqCst);
+        release_tx.send(()).expect("release #1");
+        let mut superseded = vec![startup];
+        let republished = loop {
+            let update = run
+                .rx
+                .recv_timeout(MIDPROBE_WAIT)
+                .expect("the post-probe re-check republishes for generation 2");
+            if update.generation == 2 {
+                break update;
+            }
+            superseded.push(update);
+        };
+        assert!(
+            superseded
+                .iter()
+                .all(|update| !(update.generation == 1 && update.ping.valid)),
+            "the superseded probe outcome must never be published on request_generation 1: {superseded:?}"
+        );
+        assert!(
+            cleared_update(&republished),
+            "the generation-2 republish is a cleared baseline: {republished:?}"
+        );
+        enter_rx
+            .recv_timeout(MIDPROBE_WAIT)
+            .expect("last_attempt reset: the worker re-probes immediately for generation 2 under a 600 s cadence");
+        run.shutdown.store(true, Ordering::Release);
+        release_tx.send(()).expect("release #2");
+        drop(release_tx);
+        run.thread
+            .join()
+            .expect("the worker joins after release #2");
+    }
+
+    /// L266 arm 2 (policy content moved mid-probe, same generation): the outcome is dropped,
+    /// the first post-change update is the cleared republish on the current generation, and
+    /// the re-probe under the new policy starts from a fresh baseline (loss of exactly 0 %,
+    /// jitter not yet computable) with cadence reset.
+    #[test]
+    fn policy_content_change_midprobe_discards_the_stale_outcome_and_republishes_a_cleared_baseline(
+    ) {
+        let (enter_rx, release_tx) = install_slow_probe(&SLOW_CONTENT);
+        let config = Arc::new(RwLock::new(midprobe_config("synthetic-one")));
+        let generation = Arc::new(AtomicU64::new(1));
+        let run = spawn_midprobe_worker(
+            Arc::clone(&config),
+            Arc::clone(&generation),
+            slow_probe_content,
+        );
+        let startup = run
+            .rx
+            .recv_timeout(MIDPROBE_WAIT)
+            .expect("the loop head publishes the cleared generation-1 update");
+        assert_eq!(startup.generation, 1);
+        enter_rx
+            .recv_timeout(MIDPROBE_WAIT)
+            .expect("the worker entered the probe");
+        config.write().unwrap().network_probe_target = "synthetic-two".into();
+        release_tx.send(()).expect("release #1");
+        let republished = run
+            .rx
+            .recv_timeout(MIDPROBE_WAIT)
+            .expect("a mid-probe policy-content change republishes a cleared update");
+        assert_eq!(
+            republished.generation, 1,
+            "the republish carries the current generation"
+        );
+        assert!(
+            cleared_update(&republished),
+            "the first post-change update is the cleared baseline, never the stale probe outcome: {republished:?}"
+        );
+        enter_rx.recv_timeout(MIDPROBE_WAIT).expect(
+            "last_attempt reset: immediate re-probe under the new policy despite a 600 s cadence",
+        );
+        release_tx.send(()).expect("release #2");
+        let fresh = run
+            .rx
+            .recv_timeout(MIDPROBE_WAIT)
+            .expect("the re-probe publishes the new baseline");
+        assert_eq!(fresh.generation, 1);
+        assert!(
+            fresh.available && fresh.ping.valid && (fresh.ping.value - 12.0).abs() < f64::EPSILON
+        );
+        assert!(
+            fresh.loss.valid && fresh.loss.value == 0.0,
+            "state.clear() left a fresh trial window: {fresh:?}"
+        );
+        assert!(
+            !fresh.jitter.valid,
+            "the cleared baseline has a single success, so jitter is not yet computable: {fresh:?}"
+        );
+        run.shutdown.store(true, Ordering::Release);
+        run.thread
+            .join()
+            .expect("the worker exits within one TICK of shutdown");
+    }
+
+    /// L266 arm 3 (policy disabled mid-probe): the outcome is dropped, the block republishes
+    /// a cleared update for the current generation, and the loop then publishes the disabled
+    /// unavailable state; NO update ever carries the superseded outcome.
+    /// Disclosed (see receipt §1.6 P-b3): a disabling flip always changes Policy content
+    /// (enabled is a field), so this scenario fires through the content AND the !active()
+    /// disjuncts together.
+    #[test]
+    fn policy_disabled_midprobe_discards_the_stale_outcome_and_republishes_the_disabled_state() {
+        let (enter_rx, release_tx) = install_slow_probe(&SLOW_DISABLED);
+        let config = Arc::new(RwLock::new(midprobe_config("synthetic-fixed")));
+        let generation = Arc::new(AtomicU64::new(1));
+        let run = spawn_midprobe_worker(
+            Arc::clone(&config),
+            Arc::clone(&generation),
+            slow_probe_disabled,
+        );
+        let startup = run
+            .rx
+            .recv_timeout(MIDPROBE_WAIT)
+            .expect("the loop head publishes the cleared generation-1 update");
+        assert_eq!(startup.generation, 1);
+        enter_rx
+            .recv_timeout(MIDPROBE_WAIT)
+            .expect("the worker entered the probe");
+        config.write().unwrap().network_probe_enabled = false;
+        release_tx.send(()).expect("release #1");
+        let republished = run.rx.recv_timeout(MIDPROBE_WAIT).expect(
+            "the mid-probe disable republishes a cleared update for the current generation",
+        );
+        assert_eq!(republished.generation, 1);
+        assert!(
+            cleared_update(&republished),
+            "the first post-disable update is the cleared republish, never the stale outcome: {republished:?}"
+        );
+        let disabled = run
+            .rx
+            .recv_timeout(MIDPROBE_WAIT)
+            .expect("the disabled policy publishes its unavailable state");
+        assert_eq!(disabled.generation, 1);
+        assert!(cleared_update(&disabled));
+        let mut all = vec![startup, republished, disabled];
+        while let Ok(update) = run.rx.recv_timeout(Duration::from_millis(250)) {
+            all.push(update);
+        }
+        assert!(
+            all.iter().all(|update| !update.ping.valid),
+            "the superseded probe outcome is dropped on the disabled path: {all:?}"
+        );
+        run.shutdown.store(true, Ordering::Release);
+        run.thread
+            .join()
+            .expect("the disabled worker exits within one TICK of shutdown");
     }
 }

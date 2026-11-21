@@ -1,6 +1,21 @@
 //! Button input events and edge-debounce tracking.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// EC-7: per-transition monotonic sequence stamp; never reset, and it saturates
+/// at `u64::MAX` (the wrap policy: at saturation the last stamp repeats).
+static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
+
+/// Stamp taken at the emission site, so a stamp identifies one physical
+/// transition; `0` is the unstamped value events built without this helper carry.
+fn next_stamp() -> u64 {
+    NEXT_STAMP
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |stamp| {
+            stamp.checked_add(1)
+        })
+        .unwrap_or(u64::MAX)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Event {
@@ -13,6 +28,9 @@ pub struct Event {
     pub canceled: bool,
     pub at: Instant,
     pub source: &'static str,
+    /// EC-7: per-transition monotonic stamp (0 = unstamped), so a consumer can
+    /// tell a re-emitted transition of the same physical press from a new press.
+    pub stamp: u64,
 }
 
 /// Edge detector with per-button debounce, ported from the Go
@@ -62,6 +80,7 @@ impl ButtonTracker {
                         canceled: false,
                         at: now,
                         source,
+                        stamp: next_stamp(),
                     });
                 } else if self.emitted[i] {
                     self.emitted[i] = false;
@@ -72,6 +91,7 @@ impl ButtonTracker {
                         canceled: false,
                         at: now,
                         source,
+                        stamp: next_stamp(),
                     });
                 }
             }
@@ -90,6 +110,7 @@ impl ButtonTracker {
                     canceled: true,
                     at: now,
                     source,
+                    stamp: next_stamp(),
                 });
             }
         }
@@ -176,5 +197,47 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|e| !e.down && e.canceled));
         assert!(events.iter().all(|e| e.source == "test"));
+    }
+
+    #[test]
+    fn ec7_every_emitted_transition_carries_a_unique_non_decreasing_stamp() {
+        let debounce = Duration::from_millis(40);
+        let mut b = ButtonTracker::default();
+        let mut stamps: Vec<u64> = Vec::new();
+        for (second, states) in [
+            (0u64, [false, false, false, false]),
+            (1, [true, false, false, false]),
+            (2, [true, false, false, false]),
+            (3, [true, true, false, false]),
+            (4, [true, true, false, false]),
+            (5, [false, true, false, false]),
+            (6, [false, true, false, false]),
+        ]
+        .into_iter()
+        {
+            stamps.extend(
+                b.observe(t(second, 0), states, debounce, "test")
+                    .into_iter()
+                    .map(|event| event.stamp),
+            );
+        }
+        stamps.extend(
+            b.disconnect(t(7, 0), "test")
+                .into_iter()
+                .map(|event| event.stamp),
+        );
+        assert_eq!(
+            stamps.len(),
+            4,
+            "down(0), down(1), release(0), canceled release(1)"
+        );
+        assert!(
+            stamps.iter().all(|&stamp| stamp != 0),
+            "an emitted transition is never the unstamped value"
+        );
+        assert!(
+            stamps.windows(2).all(|pair| pair[1] > pair[0]),
+            "stamps are unique and non-decreasing: {stamps:?}"
+        );
     }
 }

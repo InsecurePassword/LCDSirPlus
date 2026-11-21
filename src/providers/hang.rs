@@ -14,11 +14,12 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::UpdateWindow;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::SystemInformation::GetWindowsDirectoryW;
 use windows::Win32::System::Threading::{
-    GetCurrentProcessId, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
-    TerminateProcess, WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    GetCurrentProcessId, GetExitCodeProcess, GetProcessTimes, OpenProcess,
+    QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, EnumWindows, GetAncestor,
@@ -37,12 +38,121 @@ const POLL_BUDGET: Duration = Duration::from_secs(5);
 const MAX_WINDOWS: usize = 4096;
 const MAX_TITLE_CHARS: usize = 256;
 
+/// TC-1 (P2 §2 TC-1): the bound a press-bind places on the publication that
+/// carries a bound target is `bound_policy.interval + PUBLISH_AGE_TOLERANCE`,
+/// measured on the monotonic clock. The interval is the probe interval in force
+/// at bind time; this is the ONE stated tolerance.
+///
+/// Derivation — the tolerance is one publish cycle:
+/// * `Cadence::poll_due` starts a publish no earlier than `hang_probe_interval_ms`
+///   after the previous publish *start*, so a cadence step costs one interval.
+/// * Producing the publication costs up to the bounded enumeration/probe budget
+///   `POLL_BUDGET` (5 s: deadline in `enumerate_and_probe`, per-window clamp and
+///   budget-exhaustion abort in `enumerate_callback`), and the publish stamp is
+///   taken when the publish completes, so a legitimate publication lags the
+///   schedule by exactly that budget in the worst case.
+/// * One publish cycle = interval (cadence) + `POLL_BUDGET` (worst-case
+///   production of one cycle), hence `PUBLISH_AGE_TOLERANCE = POLL_BUDGET`.
+///
+/// Consequence (P2 tradeoffs): a publication older than one whole cycle means the
+/// detector skipped a cycle (stall, or a publish that exhausted its budget), so
+/// the kill identity is no longer bounded; the press is refused with the audited
+/// `canceled-continuity` outcome, never silently. `hang_probe_interval_ms` spans
+/// 250..60000, so the bound is nearly free at short intervals and loose in
+/// absolute time at 60000 (65 s), which is what the opt-in config range implies.
+const PUBLISH_AGE_TOLERANCE: Duration = POLL_BUDGET;
+
+/// TC-3 (WO-B-03-FIX): the capacity of [`HoldState::terminal`], the set of timed-out
+/// published identities.
+///
+/// Derivation from the existing enumerate/publication caps (no new budget invented):
+/// * A mark is pushed only for the target a press bound, and the press binds
+///   `targets[hung_index % targets.len()]` (`event`), i.e. an entry of the
+///   publication that is current at bind time.
+/// * The gates then require presence in that same publication
+///   (`target_in_current_generation`), so a live mark can only name an identity the
+///   detector published.
+/// * One publish cycle enumerates at most `MAX_WINDOWS` windows and ABORTS the whole
+///   publication past that limit (`enumerate_callback` sets `limit_exceeded`, and
+///   `enumerate_and_probe` turns it into `Err`, which publishes ZERO targets), and
+///   one window contributes at most one observation, whose identity is one `Tracker`
+///   record. So a publication carries at most `MAX_WINDOWS` distinct identities.
+///
+/// Hence `MAX_TERMINAL_MARKS = MAX_WINDOWS`: one mark per identity a publication can
+/// carry. The production path cannot reach it (each mark costs one press-hold of
+/// 1..10 s plus the 5 s bounded completion wait), and the generation prune in
+/// [`HoldState::prune_terminal`] keeps the set far below it in practice. Eviction
+/// when full is OLDEST-first, stated on `report_action` and pinned by
+/// `the_terminal_set_evicts_the_oldest_mark_at_capacity`.
+const MAX_TERMINAL_MARKS: usize = MAX_WINDOWS;
+
+/// TC-4 (P2 §2 TC-4): the named publication token for a probe result the detector
+/// cannot evaluate — `ProbeResult::Indeterminate`, the class `classify_probe_result`
+/// gives every failed `WM_NULL` probe that is NOT a documented `ERROR_TIMEOUT`.
+///
+/// The token is the single formatting site [`probe_indeterminate_reason`] in the
+/// RC-1/EC-6 named-cause discipline (the RC-1 precedent is
+/// `LossCause::TransferIncomplete` -> `format!("transfer-incomplete({code})")`,
+/// `src/backends/mod.rs` L95), with the count as payload: `probe-indeterminate-<N>`.
+///
+/// Driver (ACCEPTED b54-16 loss-vs-failure separation + B53-10/B53-11): the shipped
+/// app's single detector (`IsHungAppWindow`) gives ONE undifferentiated signal, and the
+/// counterpart absorbed this class silently (`Timeout | Indeterminate => {}`). The token
+/// separates "probes lost their ability to evaluate" from "no timeout observed".
+///
+/// Distinctness (anti-masking): no token = the cycle saw no not-evaluable probe;
+/// hard enumeration/budget/limit failures keep their own `Update::error` classes;
+/// a token NEVER turns into a target (see [`record_probe_result`]).
+const PROBE_INDETERMINATE: &str = "probe-indeterminate";
+
+/// TC-4: the ONE site that renders the token, so the vocabulary cannot drift.
+/// `None` = the publication has nothing of this class to report.
+fn probe_indeterminate_reason(count: usize) -> Option<String> {
+    (count != 0).then(|| format!("{PROBE_INDETERMINATE}-{count}"))
+}
+
+/// TC-4: one publish cycle's probe bookkeeping, built fresh inside
+/// [`enumerate_and_probe`]. Because the record is created per cycle, a cycle's
+/// not-evaluable count cannot leak into the next publication; the worker-side reset
+/// rule is stated again in [`publish_indeterminate`].
+///
+/// Bounded by the existing caps, no new budget: one window is probed at most once per
+/// cycle (`enumerate_callback` runs once per top-level window) and one cycle visits at
+/// most `MAX_WINDOWS` windows before `limit_exceeded` aborts the whole publication
+/// (`enumerate_callback` L1007-1011 + `enumerate_and_probe` L994-995 => ZERO targets),
+/// so `indeterminate <= MAX_WINDOWS` (4096) always — the same derivation family as
+/// `MAX_TERMINAL_MARKS`.
+#[derive(Clone, Debug, Default)]
+struct ProbeCycle {
+    /// Eligibility input for the `Tracker`: only documented timeouts with a confirmed
+    /// identity, exactly as before TC-4.
+    observations: Vec<Observation>,
+    /// The per-window-per-cycle count of `Indeterminate` probes (information only).
+    indeterminate: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Update {
     pub generation: u64,
     pub targets: Vec<HungTarget>,
     pub available: bool,
     pub error: Option<&'static str>,
+    /// TC-4 (P2 §2 TC-4): how many probes of the cycle that produced this publication
+    /// returned `Indeterminate`. Purely additive: these probes never enter the
+    /// eligibility math, so this number is never a target and never a failure, and a
+    /// non-zero count publishes [`Update::availability_reason`] beside ZERO targets.
+    /// The field is the machine-readable half of the signal; `0` is the default.
+    pub probe_indeterminate: usize,
+}
+
+impl Update {
+    /// TC-4: the named availability reason this publication carries, i.e.
+    /// `probe-indeterminate-<N>` when the cycle lost probes it could not evaluate, and
+    /// `None` when it did not — which is how "no timeout observed" stays distinguishable
+    /// from "N not-evaluable probes".
+    pub fn availability_reason(&self) -> Option<String> {
+        probe_indeterminate_reason(self.probe_indeterminate)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -86,16 +196,93 @@ impl From<&Config> for Policy {
 struct Press {
     source: &'static str,
     started: Instant,
+    /// EC-7: the stamp of the transition that bound this press, so a re-emitted
+    /// transition of the same physical press is not bound as a second press
+    /// (0 = unstamped, the pre-EC-7 shape, whose behavior is unchanged).
+    stamp: u64,
     backward: bool,
     bound: Option<(usize, HungTarget, Policy)>,
     canceled: bool,
     resolved: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Audit {
     pub target: HungTarget,
     pub outcome: &'static str,
+    /// TC-3 (P2 §2 TC-3): the exit-code classification the bounded completion wait
+    /// produced for this action; `ExitInfo::None` on every non-action audit line.
+    pub exit: ExitInfo,
+}
+
+impl Audit {
+    /// An audit line with no completion classification (the pre-TC-3 shape).
+    pub(crate) fn raised(target: HungTarget, outcome: &'static str) -> Self {
+        Self {
+            target,
+            outcome,
+            exit: ExitInfo::None,
+        }
+    }
+
+    /// The audit line text `app.rs` logs verbatim, so the TC-3 classification is
+    /// asserted where it is produced (P2 §2 TC-3 acceptance (1)).
+    pub fn line(&self) -> String {
+        format!(
+            "hung action pid={} process={} outcome={}{}",
+            self.target.pid,
+            self.target.process_name,
+            self.outcome,
+            self.exit.suffix()
+        )
+    }
+}
+
+/// TC-3 (P2 §2 TC-3): what the bounded wait learned about the target exit AFTER a
+/// terminate. Deliberately NOT an `ActionOutcome` class: the shipped outcome classes
+/// (§3 items 5-8) stay exactly as they are, and this is extra named information on
+/// the same audit line (anti-masking, per the TC-3 ban scan).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExitInfo {
+    /// No completion classification applies (refusal, failed open, pre-terminate exit).
+    #[default]
+    None,
+    /// Signaled completion and the exit code was read off the handle this action
+    /// already opened (`PROCESS_QUERY_LIMITED_INFORMATION`; rights set unchanged).
+    Captured(u32),
+    /// Signaled completion, exit-code read failed: named in the audit line, never silent.
+    Unavailable,
+}
+
+impl ExitInfo {
+    /// Label suffix in the existing audit label style (`exit=0x1234`,
+    /// `exit-code-unavailable`); empty when there is nothing to name.
+    fn suffix(self) -> String {
+        match self {
+            Self::None => String::new(),
+            Self::Captured(code) => format!(" exit={code:#x}"),
+            Self::Unavailable => " exit-code-unavailable".to_owned(),
+        }
+    }
+}
+
+/// TC-3 (P2 §2 TC-3): what one guarded action produced — the shipped outcome class
+/// plus the completion classification that rides the same audit line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActionReport {
+    pub outcome: ActionOutcome,
+    pub exit: ExitInfo,
+}
+
+impl ActionReport {
+    /// A report with no completion classification (the injected test terminators).
+    #[cfg(test)]
+    pub fn bare(outcome: ActionOutcome) -> Self {
+        Self {
+            outcome,
+            exit: ExitInfo::None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +300,15 @@ pub struct HoldState {
     owner_resolved: bool,
     pub hung_index: usize,
     pub hung_detail: bool,
+    /// TC-3 (P2 §2 TC-3, WO-B-03-FIX): the published identities (quadruples) whose last
+    /// action reached `wait-timeout`, each with the publish generation that publication
+    /// carried. A SET, not a slot: every timed-out identity of a generation stays
+    /// terminal, so a second `wait-timeout` cannot evict an earlier identity's mark and
+    /// re-open its terminate (the WO-B-03-AUDIT §3 gap). Bounded by
+    /// [`MAX_TERMINAL_MARKS`] and pruned of generations the detector has republished
+    /// ([`HoldState::prune_terminal`]); empty = no terminal action recorded, so every
+    /// identity is bindable as before.
+    terminal: Vec<(Identity, u64)>,
 }
 
 impl HoldState {
@@ -126,10 +322,7 @@ impl HoldState {
             };
             if !press.canceled && !press.resolved && Some(index) != owner {
                 press.canceled = true;
-                return Some(Audit {
-                    target: target.clone(),
-                    outcome: "canceled-slot-owner",
-                });
+                return Some(Audit::raised(target.clone(), "canceled-slot-owner"));
             }
         }
         None
@@ -141,6 +334,15 @@ impl HoldState {
         targets: &[HungTarget],
         provider_available: bool,
     ) -> Option<Audit> {
+        self.prune_terminal(targets);
+        if !self
+            .presses
+            .iter()
+            .flatten()
+            .any(|press| press.bound.is_some() && !press.canceled && !press.resolved)
+        {
+            return None;
+        }
         let policy = Policy::from(cfg);
         for (button, press) in self
             .presses
@@ -157,13 +359,18 @@ impl HoldState {
                     || !policy.active()
                     || &policy != bound_policy
                     || (self.owner_resolved && self.owner != Some(button))
-                    || targets.get(*index) != Some(target))
+                    || targets.get(*index) != Some(target)
+                    || !target_in_current_generation(target, targets)
+                    || !publication_within_bind_bound(
+                        target,
+                        bound_policy,
+                        targets,
+                        Instant::now(),
+                    )
+                    || target_is_terminal(&self.terminal, target))
             {
                 press.canceled = true;
-                return Some(Audit {
-                    target: target.clone(),
-                    outcome: "canceled-continuity",
-                });
+                return Some(Audit::raised(target.clone(), "canceled-continuity"));
             }
         }
         None
@@ -174,10 +381,7 @@ impl HoldState {
             if let Some((_, target, _)) = &press.bound {
                 if !press.canceled && !press.resolved {
                     press.canceled = true;
-                    return Some(Audit {
-                        target: target.clone(),
-                        outcome: "canceled-config-reload",
-                    });
+                    return Some(Audit::raised(target.clone(), "canceled-config-reload"));
                 }
             }
         }
@@ -224,7 +428,15 @@ impl HoldState {
         }
         if event.down {
             if let Some(existing) = &self.presses[event.index] {
-                if existing.source != event.source || existing.canceled || existing.resolved {
+                // EC-7: a re-emitted transition of the press that is already bound
+                // carries that press's own stamp, so it is one physical press and is
+                // not re-bound (which would re-arm the hold budget). Unstamped
+                // events (0) keep the shipped duplicate-down behavior.
+                if existing.source != event.source
+                    || existing.canceled
+                    || existing.resolved
+                    || (event.stamp != 0 && existing.stamp == event.stamp)
+                {
                     return HoldCommand::None;
                 }
             }
@@ -243,6 +455,7 @@ impl HoldState {
             self.presses[event.index] = Some(Press {
                 source: event.source,
                 started: event.at,
+                stamp: event.stamp,
                 backward: event.backward,
                 bound,
                 canceled: false,
@@ -274,24 +487,21 @@ impl HoldState {
             };
         };
         if event.canceled || press.canceled {
-            return HoldCommand::Audit(Audit {
+            return HoldCommand::Audit(Audit::raised(
                 target,
-                outcome: if event.canceled {
+                if event.canceled {
                     "canceled-device-loss"
                 } else {
                     "canceled-continuity"
                 },
-            });
+            ));
         }
         if !provider_available
             || !policy.active()
             || Policy::from(cfg) != policy
             || targets.get(index) != Some(&target)
         {
-            return HoldCommand::Audit(Audit {
-                target,
-                outcome: "refused-release-policy-or-target",
-            });
+            return HoldCommand::Audit(Audit::raised(target, "refused-release-policy-or-target"));
         }
         let duration = event.at.saturating_duration_since(press.started);
         if duration >= cfg.hang_hold {
@@ -303,10 +513,7 @@ impl HoldState {
         } else {
             self.hung_detail = !self.hung_detail;
         }
-        HoldCommand::Audit(Audit {
-            target,
-            outcome: "canceled-early-release",
-        })
+        HoldCommand::Audit(Audit::raised(target, "canceled-early-release"))
     }
 
     pub fn tick(
@@ -316,7 +523,7 @@ impl HoldState {
         targets: &[HungTarget],
         provider_available: bool,
     ) -> HoldCommand {
-        let policy = Policy::from(cfg);
+        self.prune_terminal(targets);
         let owner = if self.owner_resolved {
             self.owner
         } else {
@@ -329,6 +536,7 @@ impl HoldState {
         }) else {
             return HoldCommand::None;
         };
+        let policy = Policy::from(cfg);
         let press = press.as_mut().unwrap();
         let (index, target, bound_policy) = press.bound.as_ref().unwrap();
         if !provider_available
@@ -336,12 +544,12 @@ impl HoldState {
             || &policy != bound_policy
             || owner != Some(button)
             || targets.get(*index) != Some(target)
+            || !target_in_current_generation(target, targets)
+            || !publication_within_bind_bound(target, bound_policy, targets, now)
+            || target_is_terminal(&self.terminal, target)
         {
             press.canceled = true;
-            return HoldCommand::Audit(Audit {
-                target: target.clone(),
-                outcome: "canceled-continuity",
-            });
+            return HoldCommand::Audit(Audit::raised(target.clone(), "canceled-continuity"));
         }
         let duration = now.saturating_duration_since(press.started);
         if duration < cfg.hang_hold {
@@ -349,13 +557,78 @@ impl HoldState {
         }
         press.resolved = true;
         if duration > maximum_press_duration(cfg.hang_hold) {
-            return HoldCommand::Audit(Audit {
-                target: target.clone(),
-                outcome: "refused-stale-hold",
-            });
+            return HoldCommand::Audit(Audit::raised(target.clone(), "refused-stale-hold"));
         }
         HoldCommand::Terminate(target.clone())
     }
+
+    /// TC-3 (P2 §2 TC-3): `wait-timeout` is a TERMINAL outcome for the published
+    /// identity the action acted on. The identity is marked action-attempted together
+    /// with the publish generation that publication carried, so a later press can only
+    /// bind an identity a probe cycle RE-PUBLISHED at a strictly newer generation —
+    /// no repeat terminate on a stale identity, and no permanent lockout of the
+    /// feature (the re-publish re-arm is the only re-arm, §3 item 10; the mark rides
+    /// the existing `canceled-continuity` refusal, so the press is audited, never silent).
+    ///
+    /// WO-B-03-FIX: the marks are a SET, so marking a second identity of the same
+    /// publication keeps every earlier identity's mark (the one-slot field let a second
+    /// `wait-timeout` evict the first mark, which re-opened a stale-identity terminate
+    /// in a legal long-interval config — WO-B-03-AUDIT §3). Single-identity semantics are
+    /// unchanged: one identity, one mark, refused until a re-publish.
+    pub fn report_action(&mut self, target: &HungTarget, outcome: ActionOutcome) {
+        if outcome != ActionOutcome::WaitTimeout {
+            return;
+        }
+        let mark = (Identity::from(target), target.publish_generation);
+        if self.terminal.contains(&mark) {
+            return;
+        }
+        // Stated eviction policy: at capacity the OLDEST mark is dropped (it carries the
+        // lowest publish generation, so it is the first entry `prune_terminal` discards
+        // anyway), and the mark this action just earned is always kept — the set never
+        // trades the identity that just timed out for a stale one.
+        if self.terminal.len() >= MAX_TERMINAL_MARKS {
+            self.terminal.remove(0);
+        }
+        self.terminal.push(mark);
+    }
+
+    /// TC-3 (WO-B-03-FIX): the mark-set half of the re-arm rule. A publication at a
+    /// newer generation IS the re-publish the spec requires to re-arm (`event` binds an
+    /// entry of the current publication, and `target_in_current_generation` refuses a
+    /// bind older than it), so marks of generations the detector has already replaced
+    /// are inert: dropping them at every gate pass is what keeps the set bounded within
+    /// one publication. The app feeds each publication to `HoldState` at the two gate
+    /// sites (`reconcile`/`tick`, once per run-loop iteration), which is where this runs.
+    /// An unstamped or empty publication carries no stated generation, so nothing is
+    /// pruned — the refusal-safe direction, matching `target_in_current_generation`.
+    fn prune_terminal(&mut self, targets: &[HungTarget]) {
+        let current = targets
+            .iter()
+            .map(|target| target.publish_generation)
+            .max()
+            .unwrap_or(0);
+        if current != 0 {
+            self.terminal
+                .retain(|(_, generation)| *generation >= current);
+        }
+    }
+}
+
+/// TC-3: the terminal-marking half of the bind-side refusal (see
+/// [`HoldState::report_action`]). A free function so the press-side gates in
+/// `reconcile`/`tick` read the `terminal` field alongside the pressed target.
+/// WO-B-03-FIX: the bound target is terminal when ANY stored mark names its
+/// quadruple with a generation at least as new as the one the press bound — the same
+/// five clauses the one-slot field had, applied to every identity of the set.
+fn target_is_terminal(terminal: &[(Identity, u64)], bound: &HungTarget) -> bool {
+    terminal.iter().any(|(identity, generation)| {
+        bound.publish_generation <= *generation
+            && bound.hwnd == identity.hwnd
+            && bound.pid == identity.pid
+            && bound.creation_time == identity.creation_time
+            && bound.image_path == identity.image_path
+    })
 }
 
 fn maximum_press_duration(hold: Duration) -> Duration {
@@ -366,6 +639,54 @@ impl Policy {
     fn active(&self) -> bool {
         self.enabled && !self.safe_mode
     }
+}
+
+/// TC-1 stamping: every target of a publication carries the detector's monotonic
+/// publish generation and the monotonic time of that publish. Driver
+/// B53-06/B53-17: the shipped app zeroes its target global every pass, so its
+/// kill identity is at most one render tick old; the counterpart bounds the
+/// identity to the newest publication instead, and the two gates below measure it.
+fn stamp_publish(targets: Vec<HungTarget>, generation: u64) -> Vec<HungTarget> {
+    let published_at = Instant::now();
+    targets
+        .into_iter()
+        .map(|mut target| {
+            target.publish_generation = generation;
+            target.publish_time = Some(published_at);
+            target
+        })
+        .collect()
+}
+
+/// TC-1 action bound: the bound identity must be present in the CURRENT publish
+/// generation, and that generation must be *stated* (non-zero, stamped by the
+/// detector) and never older than the generation the press bound. Presence keeps
+/// the pre-TC-1 identity meaning, so this clause can only add a refusal.
+fn target_in_current_generation(bound: &HungTarget, targets: &[HungTarget]) -> bool {
+    bound.publish_generation != 0
+        && targets.iter().any(|live| {
+            live == bound
+                && live.publish_generation != 0
+                && live.publish_generation >= bound.publish_generation
+        })
+}
+
+/// TC-1 press-bind bound: the publication that carries the bound identity is at
+/// most `interval + PUBLISH_AGE_TOLERANCE` old, where `interval` is the probe
+/// interval in force at bind time (`bound_policy`).
+fn publication_within_bind_bound(
+    bound: &HungTarget,
+    bound_policy: &Policy,
+    targets: &[HungTarget],
+    now: Instant,
+) -> bool {
+    targets.iter().any(|live| {
+        live == bound
+            && live.publish_time.is_some_and(|published_at| {
+                now.saturating_duration_since(published_at)
+                    <= bound_policy.interval + PUBLISH_AGE_TOLERANCE
+            })
+    })
 }
 
 impl From<&HungTarget> for Identity {
@@ -518,6 +839,31 @@ fn current_request(config: &RwLock<Config>, generation: &AtomicU64) -> (u64, Con
     }
 }
 
+/// WO-TEL-D3-B1 (L5): the shipped request-read helpers of `telemetry.rs:198-240`, module-local
+/// copy exactly as `providers/presentmon.rs:1262-1274` carries it. The 50 ms worker loop head
+/// reuses the cached `Arc<Config>` under an unchanged generation (the parked/disabled detector,
+/// `hang_enabled 0` in the dev config, cloned a full `Config` ~20 times/s), and the fresh path
+/// IS the shipped `SeqCst` pairing, so the cached value belongs to the generation reported with
+/// it. The EC-8 rule (a bump clears tracker/cadence/policy and republishes for the new
+/// generation) and the accepted mid-cycle freshness re-read are byte-identical.
+fn current_config(config: &RwLock<Config>) -> Config {
+    config.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn cached_request(
+    config: &RwLock<Config>,
+    generation: &AtomicU64,
+    cache: &mut (u64, Arc<Config>),
+) -> (u64, Arc<Config>) {
+    let before = generation.load(Ordering::SeqCst);
+    if before == cache.0 && before != 0 && generation.load(Ordering::SeqCst) == before {
+        return (before, Arc::clone(&cache.1));
+    }
+    let (generation, config) = current_request(config, generation);
+    *cache = (generation, Arc::new(config));
+    (generation, Arc::clone(&cache.1))
+}
+
 fn worker(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
@@ -531,9 +877,16 @@ fn worker(
     let mut disabled_published = false;
     let mut published_available = None;
     let mut published_targets = None;
+    // TC-4: the not-evaluable count of the CURRENTLY published cycle. Written only
+    // through `publish_indeterminate`, which replaces it per cycle (never accumulates).
+    let mut published_indeterminate = 0usize;
     let mut current_generation = 0;
+    let mut publish_generation = 0u64;
+    // WO-TEL-D3-B1 (L5): the cache the loop head reads through (seeded from the shipped
+    // `current_config` shape, exactly as the four telemetry sampling loops seed theirs).
+    let mut request = (0u64, Arc::new(current_config(&config)));
     while !shutdown.load(Ordering::Relaxed) {
-        let (request_generation, cfg) = current_request(&config, &generation);
+        let (request_generation, cfg) = cached_request(&config, &generation, &mut request);
         if request_generation != current_generation {
             current_generation = request_generation;
             tracker.clear();
@@ -552,7 +905,7 @@ fn worker(
                 return;
             }
         }
-        let policy = Policy::from(&cfg);
+        let policy = Policy::from(cfg.as_ref());
         if reset_on_policy_change(&mut current_policy, &policy, &mut tracker, &mut cadence) {
             log_worker_transition(
                 &mut published_available,
@@ -566,6 +919,7 @@ fn worker(
                     targets: Vec::new(),
                     available: policy.active(),
                     error: None,
+                    ..Default::default()
                 })
                 .is_err()
             {
@@ -584,6 +938,7 @@ fn worker(
                     targets: Vec::new(),
                     available: false,
                     error: None,
+                    ..Default::default()
                 })
                 .is_err()
             } {
@@ -620,6 +975,7 @@ fn worker(
                     targets: Vec::new(),
                     available: latest_policy.active(),
                     error: None,
+                    ..Default::default()
                 })
                 .is_err()
             {
@@ -628,24 +984,39 @@ fn worker(
             continue;
         }
         let update = match result {
-            Ok(observations) => Update {
-                generation: request_generation,
-                targets: tracker.update(
-                    started.elapsed(),
-                    observations,
-                    policy.failures,
-                    policy.minimum,
-                ),
-                available: true,
-                error: None,
-            },
+            Ok(cycle) => {
+                publish_generation += 1;
+                let probe_indeterminate =
+                    publish_indeterminate(&cycle, &mut published_indeterminate);
+                Update {
+                    generation: request_generation,
+                    targets: stamp_publish(
+                        tracker.update(
+                            started.elapsed(),
+                            cycle.observations,
+                            policy.failures,
+                            policy.minimum,
+                        ),
+                        publish_generation,
+                    ),
+                    available: true,
+                    error: None,
+                    probe_indeterminate,
+                }
+            }
             Err(error) => {
                 tracker.clear();
+                // An aborted cycle (budget, enumeration, limit) has no publication, so
+                // the same reset rule publishes NO count — a stale number cannot ride on
+                // the zero-target failure update either.
+                let probe_indeterminate =
+                    publish_indeterminate(&ProbeCycle::default(), &mut published_indeterminate);
                 Update {
                     generation: request_generation,
                     targets: Vec::new(),
                     available: false,
                     error: Some(error),
+                    probe_indeterminate,
                 }
             }
         };
@@ -655,6 +1026,12 @@ fn worker(
             update.available,
             update.targets.len(),
         );
+        if let Some(reason) = update.availability_reason() {
+            // TC-4 (P2 §2 TC-4): the named loss cause is audited once per publish
+            // cycle — bounded and never silent, the same discipline as the TC-2
+            // acceptance-refusal log in `enumerate_and_probe`.
+            crate::log_warn!("hung-window detector {reason}");
+        }
         if tx.send(update).is_err() {
             return;
         }
@@ -681,34 +1058,43 @@ struct EnumerationContext {
     ignored: HashSet<String>,
     windows_dir: String,
     self_pid: u32,
+    /// TC-2: the session of this process, computed once per publish cycle; `Err` =
+    /// the session query failed, which refuses every candidate fail-closed.
+    self_session: Result<u32, ()>,
     only_pid: Option<u32>,
     timeout: Duration,
     deadline: Instant,
-    observations: Vec<Observation>,
+    /// TC-4: this cycle's probe bookkeeping — the eligible observations AND the
+    /// per-window-per-cycle count of not-evaluable probes. Fresh per cycle.
+    cycle: ProbeCycle,
     visited: usize,
     stopped: bool,
     limit_exceeded: bool,
+    refusals: AcceptanceCounters,
 }
 
 fn enumerate_and_probe(
     timeout: Duration,
     ignore: &[String],
     only_pid: Option<u32>,
-) -> Result<Vec<Observation>, &'static str> {
+) -> Result<ProbeCycle, &'static str> {
     let windows_dir = windows_directory()?;
     let mut ignored = ignored_names(ignore);
     ignored.insert("lcdsirplus.exe".into());
+    let self_pid = unsafe { GetCurrentProcessId() };
     let mut context = EnumerationContext {
         ignored,
         windows_dir,
-        self_pid: unsafe { GetCurrentProcessId() },
+        self_pid,
+        self_session: session_of(self_pid),
         only_pid,
         timeout,
         deadline: Instant::now() + POLL_BUDGET,
-        observations: Vec::new(),
+        cycle: ProbeCycle::default(),
         visited: 0,
         stopped: false,
         limit_exceeded: false,
+        refusals: AcceptanceCounters::default(),
     };
     let result = unsafe {
         EnumWindows(
@@ -716,6 +1102,22 @@ fn enumerate_and_probe(
             LPARAM((&mut context as *mut EnumerationContext) as isize),
         )
     };
+    if context.refusals.cross_session != 0 {
+        // TC-2: acceptance-side refusals are audited once per cycle (bounded, never
+        // silent), using the same named vocabulary as the action outcomes.
+        crate::log_warn!(
+            "hung-window detector {}={}",
+            ActionOutcome::CrossSession.label(),
+            context.refusals.cross_session
+        );
+    }
+    if context.refusals.session_unknown != 0 {
+        crate::log_warn!(
+            "hung-window detector {}={}",
+            ActionOutcome::SessionUnknown.label(),
+            context.refusals.session_unknown
+        );
+    }
     if result.is_err() && !context.stopped {
         return Err("window enumeration failed");
     }
@@ -725,7 +1127,7 @@ fn enumerate_and_probe(
     if context.limit_exceeded {
         return Err("hung-window enumeration limit exceeded");
     }
-    Ok(context.observations)
+    Ok(context.cycle)
 }
 
 unsafe extern "system" fn enumerate_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -743,36 +1145,34 @@ unsafe extern "system" fn enumerate_callback(hwnd: HWND, lparam: LPARAM) -> BOOL
     let Some(target) = describe_candidate(
         hwnd,
         context.self_pid,
+        context.self_session,
         context.only_pid,
         &context.ignored,
         &context.windows_dir,
+        &mut context.refusals,
     ) else {
         return BOOL(1);
     };
     let remaining = context.deadline.saturating_duration_since(Instant::now());
     let probe_timeout = context.timeout.min(remaining).max(Duration::from_millis(1));
-    match probe(hwnd, probe_timeout) {
-        ProbeResult::Responsive => context.observations.push(Observation {
-            target,
-            responsive: true,
-        }),
-        ProbeResult::Timeout if identity_still_matches(hwnd, &target) => {
-            context.observations.push(Observation {
-                target,
-                responsive: false,
-            });
-        }
-        ProbeResult::Timeout | ProbeResult::Indeterminate => {}
-    }
+    let result = probe(hwnd, probe_timeout);
+    // The post-probe identity cross-check runs ONLY for a documented timeout, exactly
+    // as the old guard arm did (short-circuit), so no extra Win32 call is added on the
+    // responsive path and the eligibility semantics cannot change.
+    let identity_confirmed =
+        result == ProbeResult::Timeout && identity_still_matches(hwnd, &target);
+    record_probe_result(result, identity_confirmed, target, &mut context.cycle);
     BOOL(1)
 }
 
 unsafe fn describe_candidate(
     hwnd: HWND,
     self_pid: u32,
+    self_session: Result<u32, ()>,
     only_pid: Option<u32>,
     ignored: &HashSet<String>,
     windows_dir: &str,
+    refusals: &mut AcceptanceCounters,
 ) -> Option<HungTarget> {
     if !IsWindowVisible(hwnd).as_bool() {
         return None;
@@ -795,6 +1195,20 @@ unsafe fn describe_candidate(
     if pid == 0 || pid == self_pid || only_pid.is_some_and(|expected| expected != pid) {
         return None;
     }
+    // TC-2 (P2 §2 TC-2): session identity is checked immediately after the pid floor
+    // (which stays the first gate, §3 item 1), so a cross-session candidate never enters
+    // the publication and a failed session query is refused fail-closed.
+    match session_gate(session_of(pid), self_session) {
+        SessionGate::Same => {}
+        SessionGate::Cross => {
+            refusals.cross_session += 1;
+            return None;
+        }
+        SessionGate::Unknown => {
+            refusals.session_unknown += 1;
+            return None;
+        }
+    }
     let (creation_time, image_path, process_name) = query_identity(pid).ok()?;
     if excluded(&process_name, &image_path, ignored, windows_dir) {
         return None;
@@ -806,7 +1220,49 @@ unsafe fn describe_candidate(
         image_path,
         process_name,
         title,
+        ..Default::default()
     })
+}
+
+/// TC-2 (P2 §2 TC-2): session of a process id, mirroring the `src/backends/sdk.rs`
+/// restart-path pair check. No handle is opened and no rights are requested.
+fn session_of(pid: u32) -> Result<u32, ()> {
+    let mut session = 0u32;
+    unsafe { ProcessIdToSessionId(pid, &mut session) }
+        .map(|_| session)
+        .map_err(|_| ())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionGate {
+    /// Target shares this process's session: candidate stays eligible.
+    Same,
+    /// Foreign session: non-actionable (P2 TC-2 tradeoff), audited by name.
+    Cross,
+    /// A `ProcessIdToSessionId` query failed: refused fail-closed, never proceed.
+    Unknown,
+}
+
+fn session_gate(target: Result<u32, ()>, current: Result<u32, ()>) -> SessionGate {
+    // One precondition per edge: target query ok? current query ok? sessions equal?
+    let Ok(target) = target else {
+        return SessionGate::Unknown;
+    };
+    let Ok(current) = current else {
+        return SessionGate::Unknown;
+    };
+    if target == current {
+        SessionGate::Same
+    } else {
+        SessionGate::Cross
+    }
+}
+
+/// Per-cycle acceptance refusals, reported once by `enumerate_and_probe`.
+#[derive(Clone, Copy, Debug, Default)]
+struct AcceptanceCounters {
+    cross_session: usize,
+    session_unknown: usize,
 }
 
 unsafe fn probe(hwnd: HWND, timeout: Duration) -> ProbeResult {
@@ -832,6 +1288,55 @@ fn classify_probe_result(succeeded: bool, error: WIN32_ERROR) -> ProbeResult {
     } else {
         ProbeResult::Indeterminate
     }
+}
+
+/// TC-4 (P2 §2 TC-4): the disposition of ONE probe result inside the current publish
+/// cycle. The eligibility arms keep their exact pre-TC-4 semantics — the class pinned by
+/// `probe_classification_counts_only_documented_timeout`:
+/// * `Responsive` -> a responsive observation (as before);
+/// * `Timeout` ONLY with a confirmed identity (`identity_confirmed`, the same
+///   `identity_still_matches` cross-check the guard arm ran) -> the ONLY path that can
+///   make a target;
+/// * `Timeout` without it -> nothing (as before);
+/// * `Indeterminate` -> NOTHING for eligibility: it never becomes an `Observation`, so it
+///   never reaches the `Tracker`, the failure counters, or a published target. It is
+///   counted here, per window per cycle, which is the whole TC-4 change: the old
+///   absorption site `Timeout | Indeterminate => {}` becomes a named loss cause
+///   (b54-16 loss-vs-failure, B53-10/B53-11 single undifferentiated detector).
+///
+/// Bounded: at most one result per visited window, and one cycle visits at most
+/// `MAX_WINDOWS` windows before the publication is aborted, so
+/// `cycle.indeterminate <= MAX_WINDOWS` (derivation on [`ProbeCycle`]).
+fn record_probe_result(
+    result: ProbeResult,
+    identity_confirmed: bool,
+    target: HungTarget,
+    cycle: &mut ProbeCycle,
+) {
+    match result {
+        ProbeResult::Responsive => cycle.observations.push(Observation {
+            target,
+            responsive: true,
+        }),
+        ProbeResult::Timeout if identity_confirmed => cycle.observations.push(Observation {
+            target,
+            responsive: false,
+        }),
+        ProbeResult::Timeout => {}
+        ProbeResult::Indeterminate => cycle.indeterminate += 1,
+    }
+}
+
+/// TC-4: publish one cycle's not-evaluable count. The count of the published cycle
+/// REPLACES the previous one (assignment, never accumulation), so a stale count can
+/// never leak into a new publication — including the zero-target publications of an
+/// aborted cycle, which pass a default [`ProbeCycle`].
+///
+/// Derivation stays the [`ProbeCycle`] bound: the value assigned here is at most
+/// `MAX_WINDOWS` per publication, and the worker holds exactly one such number.
+fn publish_indeterminate(cycle: &ProbeCycle, published: &mut usize) -> usize {
+    *published = cycle.indeterminate;
+    *published
 }
 
 unsafe fn identity_still_matches(hwnd: HWND, expected: &HungTarget) -> bool {
@@ -987,6 +1492,11 @@ pub enum ActionOutcome {
     Recovered,
     IdentityMismatch,
     AccessDenied,
+    /// TC-2 (P2 §2 TC-2): the target lives in another session; named refusal raised
+    /// before the target is opened, so the `AccessDenied` class stays reachable.
+    CrossSession,
+    /// TC-2 (P2 §2 TC-2): a session query failed; refused fail-closed, never proceed.
+    SessionUnknown,
     TerminateFailure,
     WaitTimeout,
 }
@@ -999,6 +1509,8 @@ impl ActionOutcome {
             Self::Recovered => "recovered",
             Self::IdentityMismatch => "identity-mismatch",
             Self::AccessDenied => "access-denied",
+            Self::CrossSession => "refused-cross-session",
+            Self::SessionUnknown => "refused-session-unknown",
             Self::TerminateFailure => "terminate-failure",
             Self::WaitTimeout => "wait-timeout",
         }
@@ -1017,10 +1529,15 @@ trait ActionApi {
     fn window(&mut self, hwnd: usize) -> Result<HungTarget, ActionOutcome>;
     fn probe(&mut self, hwnd: usize, timeout: Duration) -> ProbeResult;
     fn open(&mut self, pid: u32) -> Result<Self::Process, ActionOutcome>;
+    fn session(&mut self, pid: u32) -> Result<u32, ActionOutcome>;
     fn process_identity(&mut self, process: &Self::Process)
         -> Result<(u64, String), ActionOutcome>;
     fn terminate(&mut self, process: &Self::Process) -> Result<(), ActionOutcome>;
     fn wait(&mut self, process: &Self::Process, timeout: Duration) -> ActionWait;
+    /// TC-3 (P2 §2 TC-3): read the target's exit code from the handle the action
+    /// ALREADY opened (rights set unchanged), after a signaled completion. Its failure
+    /// is a named classification, never an outcome class, so `Err(())` carries no class.
+    fn exit_code(&mut self, process: &Self::Process) -> Result<u32, ()>;
 }
 
 struct OwnedProcess(HANDLE);
@@ -1059,6 +1576,10 @@ impl ActionApi for NativeActionApi {
             })
     }
 
+    fn session(&mut self, pid: u32) -> Result<u32, ActionOutcome> {
+        session_of(pid).map_err(|_| ActionOutcome::SessionUnknown)
+    }
+
     fn process_identity(
         &mut self,
         process: &Self::Process,
@@ -1080,6 +1601,16 @@ impl ActionApi for NativeActionApi {
             WAIT_TIMEOUT => ActionWait::Timeout,
             _ => ActionWait::Failed,
         }
+    }
+
+    fn exit_code(&mut self, process: &Self::Process) -> Result<u32, ()> {
+        // TC-3 (P2 §2 TC-3), read-only on the existing handle — the
+        // `src/recovery.rs` GetExitCodeProcess precedent (`Win32_System_Threading`,
+        // already a declared feature, so the Cargo manifest is untouched).
+        let mut code = 0;
+        unsafe { GetExitCodeProcess(process.0, &mut code) }
+            .map(|()| code)
+            .map_err(|_| ())
     }
 }
 
@@ -1114,17 +1645,41 @@ unsafe fn action_window(hwnd: HWND) -> Result<HungTarget, ActionOutcome> {
         image_path,
         process_name,
         title,
+        ..Default::default()
     })
 }
 
-pub fn terminate_bound_target(target: &HungTarget, cfg: &Config) -> ActionOutcome {
-    terminate_bound_target_with(&mut NativeActionApi, target, cfg)
+pub fn terminate_bound_target(target: &HungTarget, cfg: &Config) -> ActionReport {
+    terminate_action_with(&mut NativeActionApi, target, cfg)
 }
 
+/// TC-3 (P2 §2 TC-3): the full completion report for one guarded action.
+fn terminate_action_with<A: ActionApi>(
+    api: &mut A,
+    target: &HungTarget,
+    cfg: &Config,
+) -> ActionReport {
+    let mut exit = ExitInfo::None;
+    let outcome = terminate_outcome_with(api, target, cfg, &mut exit);
+    ActionReport { outcome, exit }
+}
+
+/// The pre-TC-3 entry point kept verbatim for the shipped outcome-only tests: the
+/// outcome class is untouched by the completion classification.
+#[cfg(test)]
 fn terminate_bound_target_with<A: ActionApi>(
     api: &mut A,
     target: &HungTarget,
     cfg: &Config,
+) -> ActionOutcome {
+    terminate_outcome_with(api, target, cfg, &mut ExitInfo::None)
+}
+
+fn terminate_outcome_with<A: ActionApi>(
+    api: &mut A,
+    target: &HungTarget,
+    cfg: &Config,
+    exit: &mut ExitInfo,
 ) -> ActionOutcome {
     if cfg.safe_mode
         || !cfg.hang_enabled
@@ -1176,6 +1731,22 @@ fn terminate_bound_target_with<A: ActionApi>(
         Err(outcome) => return outcome,
     }
 
+    // TC-2 (P2 §2 TC-2): the session pair (the `src/backends/sdk.rs` restart precedent) is
+    // resolved BEFORE the target is opened, so a foreign-session refusal can never be
+    // absorbed by the open site's AccessDenied class (§3 item 6); each refusal edge below
+    // carries exactly one precondition.
+    let current_session = match api.session(self_pid) {
+        Ok(session) => session,
+        Err(outcome) => return outcome,
+    };
+    let target_session = match api.session(target.pid) {
+        Ok(session) => session,
+        Err(outcome) => return outcome,
+    };
+    if target_session != current_session {
+        return ActionOutcome::CrossSession;
+    }
+
     let process = match api.open(target.pid) {
         Ok(process) => process,
         Err(outcome) => return outcome,
@@ -1207,7 +1778,18 @@ fn terminate_bound_target_with<A: ActionApi>(
         return outcome;
     }
     match api.wait(&process, Duration::from_secs(5)) {
-        ActionWait::Signaled => ActionOutcome::Success,
+        ActionWait::Signaled => {
+            // TC-3 (P2 §2 TC-3): classification continues past `Signaled` — the exit
+            // code is read off the handle this action already opened, and a read
+            // failure is NAMED (`exit-code-unavailable`) while the `Success` class
+            // stays exactly as shipped. The bounded wait above remains the only
+            // completion mechanism (§3 item 8).
+            *exit = match api.exit_code(&process) {
+                Ok(code) => ExitInfo::Captured(code),
+                Err(()) => ExitInfo::Unavailable,
+            };
+            ActionOutcome::Success
+        }
         ActionWait::Timeout => ActionOutcome::WaitTimeout,
         ActionWait::Failed => ActionOutcome::TerminateFailure,
     }
@@ -1417,10 +1999,10 @@ fn detect_harness(pid: u32) -> Result<HungTarget, String> {
     let mut last_error = None;
     while started.elapsed() < Duration::from_secs(5) {
         match enumerate_and_probe(Duration::from_millis(100), &[], Some(pid)) {
-            Ok(observations) => {
+            Ok(cycle) => {
                 let targets = tracker.update(
                     started.elapsed(),
-                    observations,
+                    cycle.observations,
                     2,
                     Duration::from_millis(300),
                 );
@@ -1450,12 +2032,12 @@ fn detect_harness_with_policy(pid: u32, policy: &Policy) -> Result<HungTarget, S
             std::thread::sleep(TICK);
             continue;
         }
-        let observations =
+        let cycle =
             enumerate_and_probe(policy.timeout, &policy.ignore, None).map_err(str::to_string)?;
         if let Some(target) = tracker
             .update(
                 started.elapsed(),
-                observations,
+                cycle.observations,
                 policy.failures,
                 policy.minimum,
             )
@@ -1579,6 +2161,7 @@ fn action_smoke(negative: bool) -> Result<u32, String> {
             canceled: false,
             at: started,
             source: "action-smoke",
+            stamp: 0,
         },
         &cfg,
         std::slice::from_ref(&target),
@@ -1594,6 +2177,7 @@ fn action_smoke(negative: bool) -> Result<u32, String> {
                 canceled: false,
                 at: started + Duration::from_millis(100),
                 source: "action-smoke",
+                stamp: 0,
             },
             &cfg,
             std::slice::from_ref(&target),
@@ -1613,6 +2197,7 @@ fn action_smoke(negative: bool) -> Result<u32, String> {
                 canceled: false,
                 at: restarted,
                 source: "action-smoke",
+                stamp: 0,
             },
             &cfg,
             std::slice::from_ref(&target),
@@ -1631,6 +2216,7 @@ fn action_smoke(negative: bool) -> Result<u32, String> {
                 canceled: false,
                 at: restarted + cfg.hang_hold,
                 source: "action-smoke",
+                stamp: 0,
             },
             &cfg,
             std::slice::from_ref(&target),
@@ -1659,11 +2245,11 @@ fn action_smoke(negative: bool) -> Result<u32, String> {
     let HoldCommand::Terminate(bound) = command else {
         return Err("qualified hold did not request termination".into());
     };
-    let outcome = terminate_bound_target(&bound, &cfg);
-    if outcome != ActionOutcome::Success {
+    let report = terminate_bound_target(&bound, &cfg);
+    if report.outcome != ActionOutcome::Success {
         return Err(format!(
             "owned child termination outcome={}",
-            outcome.label()
+            report.outcome.label()
         ));
     }
     if !matches!(
@@ -1675,6 +2261,7 @@ fn action_smoke(negative: bool) -> Result<u32, String> {
                 canceled: false,
                 at: started + cfg.hang_hold,
                 source: "action-smoke",
+                stamp: 0,
             },
             &cfg,
             std::slice::from_ref(&target),
@@ -1723,6 +2310,58 @@ fn is_cargo_test_binary(current: &Path) -> bool {
 mod tests {
     use super::*;
 
+    /// EC-8 (P1 §2 EC-8, acceptance 2): a generation bump that lands while the worker is
+    /// mid-cadence republishes a cleared state for the new generation and resets the
+    /// disabled-publish gate, so the worker cannot keep riding on the old generation.
+    /// The detector stays disabled: no window is enumerated and no target is probed.
+    #[test]
+    fn hang_config_change_midflight_clears_tracker_and_republishes_the_new_generation() {
+        let config = Arc::new(RwLock::new(Config {
+            hang_enabled: false,
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let thread = {
+            let config = Arc::clone(&config);
+            let generation = Arc::clone(&generation);
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || worker(config, generation, shutdown, tx))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut published = None;
+        while published.is_none() && Instant::now() < deadline {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(100)) {
+                if update.generation == 1 {
+                    published = Some(update);
+                }
+            }
+        }
+        assert!(
+            published.is_some(),
+            "the worker publishes generation-1 state before the bump"
+        );
+        generation.fetch_add(1, Ordering::SeqCst);
+        let mut republished = None;
+        while republished.is_none() && Instant::now() < deadline {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(100)) {
+                if update.generation == 2 {
+                    republished = Some(update);
+                }
+            }
+        }
+        let update = republished.expect(
+            "a mid-flight generation bump republishes cleared tracker state for the new generation",
+        );
+        assert!(
+            update.targets.is_empty() && !update.available && update.error.is_none(),
+            "generation 2 must start from an empty tracker, not the previous generation's state"
+        );
+        shutdown.store(true, Ordering::Relaxed);
+        thread.join().unwrap();
+    }
+
     fn target(hwnd: usize, pid: u32, creation: u64, path: &str) -> HungTarget {
         HungTarget {
             hwnd,
@@ -1735,7 +2374,31 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             title: format!("target {pid}"),
+            ..Default::default()
         }
+    }
+
+    /// TC-1: a target as the detector publishes it — stated publish generation and
+    /// a monotonic publish time (fresh by the bind bound).
+    fn published(mut target: HungTarget, generation: u64) -> HungTarget {
+        target.publish_generation = generation;
+        target.publish_time = Some(Instant::now());
+        target
+    }
+
+    /// WO-QA-01 (known issue F-2): the same publication with a DRIVEN publish time.
+    /// `publish_time` is the seam the shipped TC-1 stale test already injects (it sets
+    /// `stale.publish_time = Some(Instant::now() - (interval + PUBLISH_AGE_TOLERANCE
+    /// plus one second))`), and `tick` evaluates `publication_within_bind_bound`
+    /// against the virtual `now` the caller passes, so a test that stamps its
+    /// publications on the same virtual timeline measures virtual age and has NO
+    /// real-time headroom to lose. `stamp_publish` (the production stamper, real
+    /// `Instant::now()`) is untouched; `reconcile`'s real-`Instant::now()` bound is
+    /// deliberately not on the driven path.
+    fn published_at(mut target: HungTarget, generation: u64, published_at: Instant) -> HungTarget {
+        target.publish_generation = generation;
+        target.publish_time = Some(published_at);
+        target
     }
 
     fn failed(target: HungTarget) -> Observation {
@@ -1902,6 +2565,207 @@ mod tests {
         );
     }
 
+    /// TC-4 helper: run one synthetic publish cycle through the real counting seam.
+    /// A `Timeout` is given a confirmed identity (the arm the eligibility math
+    /// requires); every other class runs with the identity cross-check unconfirmed.
+    /// No Win32 handle, window, probe, process query or termination is involved.
+    fn probe_cycle(results: &[ProbeResult], target: &HungTarget) -> ProbeCycle {
+        let mut cycle = ProbeCycle::default();
+        for &result in results {
+            record_probe_result(
+                result,
+                result == ProbeResult::Timeout,
+                target.clone(),
+                &mut cycle,
+            );
+        }
+        cycle
+    }
+
+    /// TC-4 helper: the publication the worker builds from one cycle.
+    fn publication(cycle: &ProbeCycle, published: &mut usize, generation: u64) -> Update {
+        let mut tracker = Tracker::default();
+        Update {
+            generation,
+            targets: stamp_publish(
+                tracker.update(
+                    Duration::ZERO,
+                    cycle.observations.clone(),
+                    1,
+                    Duration::ZERO,
+                ),
+                generation,
+            ),
+            available: true,
+            error: None,
+            probe_indeterminate: publish_indeterminate(cycle, published),
+        }
+    }
+
+    #[test]
+    fn not_evaluable_probes_publish_a_named_loss_cause_and_no_target() {
+        // TC-4 acceptance (1): injecting `Indeterminate` probe results publishes the
+        // named `probe-indeterminate` reason with ZERO targets.
+        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let cycle = probe_cycle(&[ProbeResult::Indeterminate; 3], &item);
+        assert_eq!(cycle.indeterminate, 3, "one count per window per cycle");
+        assert!(
+            cycle.observations.is_empty(),
+            "a not-evaluable probe never enters eligibility"
+        );
+
+        let mut published = 0usize;
+        let update = publication(&cycle, &mut published, 1);
+        assert_eq!(update.targets.len(), 0);
+        assert_eq!(update.probe_indeterminate, 3);
+        assert_eq!(
+            update.availability_reason().as_deref(),
+            Some("probe-indeterminate-3")
+        );
+        assert!(update.error.is_none(), "a loss cause is not a hard failure");
+    }
+
+    #[test]
+    fn indeterminate_never_counts_toward_a_target() {
+        // TC-4 ban: the eligibility math is only documented `Timeout` + confirmed
+        // identity (the class pinned by
+        // `probe_classification_counts_only_documented_timeout`, which stays byte-identical
+        // and green). A window that only ever answers `Indeterminate` gets no record, no
+        // failure credit and no target, in a cycle that also contains a real timeout.
+        let hung = target(1, 10, 20, r"C:\Games\game.exe");
+        let lost = target(2, 20, 30, r"C:\Games\lost.exe");
+        let fine = target(3, 30, 40, r"C:\Games\fine.exe");
+        let mut cycle = ProbeCycle::default();
+        record_probe_result(ProbeResult::Timeout, true, hung.clone(), &mut cycle);
+        for _ in 0..3 {
+            record_probe_result(ProbeResult::Indeterminate, false, lost.clone(), &mut cycle);
+        }
+        record_probe_result(ProbeResult::Responsive, false, fine.clone(), &mut cycle);
+        assert_eq!(cycle.indeterminate, 3);
+
+        let mut published = 0usize;
+        let update = publication(&cycle, &mut published, 1);
+        assert_eq!(
+            update.targets,
+            vec![hung],
+            "only the documented timeout became a target"
+        );
+        assert_eq!(update.probe_indeterminate, 3);
+        assert_eq!(
+            update.availability_reason().as_deref(),
+            Some("probe-indeterminate-3")
+        );
+
+        // The indeterminate identity never reaches the `Tracker` records at all.
+        let mut tracker = Tracker::default();
+        tracker.update(Duration::ZERO, cycle.observations, 1, Duration::ZERO);
+        assert!(!tracker.records.contains_key(&Identity::from(&lost)));
+        assert!(tracker
+            .records
+            .contains_key(&Identity::from(&update.targets[0])));
+        assert!(!tracker.records.contains_key(&Identity::from(&fine)));
+    }
+
+    #[test]
+    fn the_not_evaluable_count_resets_every_publish_cycle() {
+        // TC-4 acceptance (5): counters reset each cycle, so a stale count can never
+        // leak into a new publication (including an aborted cycle's zero-target one).
+        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let mut published = 0usize;
+
+        let lost = probe_cycle(&[ProbeResult::Indeterminate; 3], &item);
+        assert_eq!(publish_indeterminate(&lost, &mut published), 3);
+        assert_eq!(published, 3);
+
+        // The next cycle saw no not-evaluable probe: it publishes 0 / no token.
+        let quiet = probe_cycle(&[ProbeResult::Responsive], &item);
+        assert_eq!(publish_indeterminate(&quiet, &mut published), 0);
+        assert_eq!(published, 0);
+        let update = publication(&quiet, &mut published, 2);
+        assert_eq!(update.probe_indeterminate, 0);
+        assert_eq!(
+            update.availability_reason(),
+            None,
+            "the previous cycle's count did not leak"
+        );
+
+        // An aborted cycle (budget/limit/enumeration failure) publishes no count either.
+        assert_eq!(
+            publish_indeterminate(&ProbeCycle::default(), &mut published),
+            0
+        );
+    }
+
+    #[test]
+    fn the_loss_cause_token_is_distinct_from_every_other_publication_signal() {
+        // TC-4 anti-masking: "no timeout observed" (no token) and "N not-evaluable
+        // probes" (token) are distinguishable, and the token is not a hard-failure class.
+        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let mut published = 0usize;
+
+        let quiet = publication(&probe_cycle(&[], &item), &mut published, 1);
+        assert_eq!(
+            quiet.availability_reason(),
+            None,
+            "a cycle that observed nothing not-evaluable carries no token"
+        );
+
+        let lost = publication(
+            &probe_cycle(&[ProbeResult::Indeterminate; 2], &item),
+            &mut published,
+            2,
+        );
+        assert_eq!(
+            lost.availability_reason().as_deref(),
+            Some("probe-indeterminate-2")
+        );
+        assert!(
+            lost.targets.is_empty(),
+            "the named loss cause never publishes a target"
+        );
+
+        let failed = Update {
+            generation: 3,
+            error: Some("hung-window poll budget exceeded"),
+            ..Default::default()
+        };
+        assert_eq!(
+            failed.availability_reason(),
+            None,
+            "a hard failure keeps its own named class"
+        );
+        for message in [
+            "window enumeration failed",
+            "hung-window poll budget exceeded",
+            "hung-window enumeration limit exceeded",
+        ] {
+            assert!(
+                !message.contains(PROBE_INDETERMINATE),
+                "{message} must not absorb the loss-cause token"
+            );
+        }
+    }
+
+    #[test]
+    fn the_not_evaluable_count_is_bounded_by_the_enumeration_cap() {
+        // TC-4 boundedness: one count per visited window, and the existing enumeration
+        // cap bounds the cycle. `enumerate_callback` aborts the WHOLE publication when a
+        // cycle visits more than `MAX_WINDOWS` windows (`limit_exceeded` -> `Err` -> ZERO
+        // targets), so the counter of a PUBLISHED cycle is at most `MAX_WINDOWS` — the
+        // same derivation as `MAX_TERMINAL_MARKS` (no new budget invented).
+        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let cycle = probe_cycle(&[ProbeResult::Indeterminate; MAX_WINDOWS], &item);
+        assert_eq!(cycle.indeterminate, MAX_WINDOWS);
+        assert_eq!(cycle.observations.len(), 0);
+        assert_eq!(
+            probe_indeterminate_reason(cycle.indeterminate)
+                .unwrap()
+                .strip_prefix(PROBE_INDETERMINATE)
+                .unwrap(),
+            format!("-{MAX_WINDOWS}")
+        );
+    }
+
     #[test]
     fn post_probe_identity_requires_every_captured_field() {
         let expected = target(1, 10, 20, r"C:\Games\game.exe");
@@ -2051,6 +2915,26 @@ mod tests {
             canceled: false,
             at,
             source,
+            stamp: 0,
+        }
+    }
+
+    /// EC-7: the same event shape with an explicit transition stamp.
+    fn button_stamped(
+        index: usize,
+        down: bool,
+        at: Instant,
+        source: &'static str,
+        stamp: u64,
+    ) -> Event {
+        Event {
+            index,
+            down,
+            backward: false,
+            canceled: false,
+            at,
+            source,
+            stamp,
         }
     }
 
@@ -2060,7 +2944,7 @@ mod tests {
             hang_enabled: true,
             ..Config::default()
         };
-        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let item = published(target(1, 10, 20, r"C:\Games\game.exe"), 1);
         let started = Instant::now();
         let mut hold = HoldState::default();
         assert!(matches!(
@@ -2246,7 +3130,7 @@ mod tests {
             hang_enabled: true,
             ..Config::default()
         };
-        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let item = published(target(1, 10, 20, r"C:\Games\game.exe"), 1);
         let items = vec![item.clone()];
         let started = Instant::now();
         let mut hold = HoldState::default();
@@ -2301,8 +3185,8 @@ mod tests {
             hang_enabled: true,
             ..Config::default()
         };
-        let a = target(1, 10, 20, r"C:\Games\a.exe");
-        let b = target(2, 11, 21, r"C:\Games\b.exe");
+        let a = published(target(1, 10, 20, r"C:\Games\a.exe"), 1);
+        let b = published(target(2, 11, 21, r"C:\Games\b.exe"), 1);
         let started = Instant::now();
         for mutation in 0..7 {
             let mut hold = HoldState::default();
@@ -2366,7 +3250,7 @@ mod tests {
             hang_enabled: true,
             ..Config::default()
         };
-        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let item = published(target(1, 10, 20, r"C:\Games\game.exe"), 1);
         for owner in 0..4 {
             let started = Instant::now();
             let mut hold = HoldState::default();
@@ -2417,15 +3301,236 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn stale_publication_refuses_the_bind_as_canceled_continuity() {
+        // TC-1 acceptance (1): a publication older than the probe interval in force
+        // at bind time plus PUBLISH_AGE_TOLERANCE cancels the press with the audited
+        // canceled-continuity outcome — at the continuity pass and at the action
+        // tick — and no Terminate command is emitted.
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        let mut stale = target(1, 10, 20, r"C:\Games\game.exe");
+        stale.publish_generation = 1;
+        stale.publish_time = Some(
+            Instant::now()
+                - (cfg.hang_probe_interval + PUBLISH_AGE_TOLERANCE + Duration::from_secs(1)),
+        );
+        let items = vec![stale.clone()];
+        let started = Instant::now();
+
+        let mut hold = HoldState::default();
+        hold.set_owner(Some(2));
+        hold.event(button(2, true, started, "hid"), &cfg, &items, true);
+        assert!(hold.presses[2]
+            .as_ref()
+            .is_some_and(|press| press.bound.is_some()));
+        let audit = hold
+            .reconcile(&cfg, &items, true)
+            .expect("the stale publication cancels the bind");
+        assert_eq!(audit.outcome, "canceled-continuity");
+        assert_eq!(audit.target, stale);
+        assert_eq!(audit.target.publish_generation, 1);
+
+        let mut ticked = HoldState::default();
+        ticked.set_owner(Some(2));
+        ticked.event(button(2, true, started, "hid"), &cfg, &items, true);
+        assert!(matches!(
+            ticked.tick(started + cfg.hang_hold, &cfg, &items, true),
+            HoldCommand::Audit(Audit {
+                outcome: "canceled-continuity",
+                ..
+            })
+        ));
+        assert!(!matches!(
+            ticked.tick(started + cfg.hang_hold, &cfg, &items, true),
+            HoldCommand::Terminate(_)
+        ));
+        assert_eq!(
+            ticked.progress(started + cfg.hang_hold, &cfg),
+            0.0,
+            "the refused press is cancelled, never armed for a second action"
+        );
+    }
+
+    #[test]
+    fn unstated_generation_publication_refuses_the_action_as_canceled_continuity() {
+        // TC-1 action bound: a publication with a fresh publish time and no stated
+        // (non-zero) publish generation is not a current generation, so the press
+        // is refused. This isolates the generation clause from the age clause.
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        let mut unstated = target(1, 10, 20, r"C:\Games\game.exe");
+        unstated.publish_generation = 0;
+        unstated.publish_time = Some(Instant::now());
+        let items = vec![unstated.clone()];
+        let started = Instant::now();
+        let mut hold = HoldState::default();
+        hold.set_owner(Some(2));
+        hold.event(button(2, true, started, "hid"), &cfg, &items, true);
+        assert!(matches!(
+            hold.tick(started + cfg.hang_hold, &cfg, &items, true),
+            HoldCommand::Audit(Audit {
+                outcome: "canceled-continuity",
+                ..
+            })
+        ));
+        assert!(hold.presses[2]
+            .as_ref()
+            .is_some_and(|press| press.canceled && !press.resolved));
+    }
+
+    #[test]
+    fn republished_identity_stays_bound_until_the_action() {
+        // TC-1 must not fight the publish cadence: the same identity republished at
+        // a newer generation (fresh stamp) is the current generation for a press
+        // bound at an older one, so the hold still reaches its action.
+        let cfg = Config {
+            hang_enabled: true,
+            hang_probe_interval: Duration::from_millis(250),
+            ..Config::default()
+        };
+        let item = target(1, 10, 20, r"C:\Games\game.exe");
+        let older = published(item.clone(), 1);
+        let latest = published(item, 9);
+        let started = Instant::now();
+        let mut hold = HoldState::default();
+        hold.set_owner(Some(2));
+        hold.event(
+            button(2, true, started, "hid"),
+            &cfg,
+            std::slice::from_ref(&older),
+            true,
+        );
+        assert!(matches!(
+            hold.tick(
+                started + Duration::from_millis(200),
+                &cfg,
+                std::slice::from_ref(&older),
+                true
+            ),
+            HoldCommand::None
+        ));
+        assert!(matches!(
+            hold.tick(
+                started + cfg.hang_hold,
+                &cfg,
+                std::slice::from_ref(&latest),
+                true
+            ),
+            HoldCommand::Terminate(bound) if bound == older
+        ));
+    }
+
+    #[test]
+    fn published_targets_carry_their_publish_generation_and_time() {
+        // TC-1 stamping at the publish boundary: every published target states its
+        // generation and monotonic publish time; a bare target is unstamped, so the
+        // new gates are fail-closed.
+        let stamped = stamp_publish(vec![target(1, 10, 20, r"C:\Games\game.exe")], 7);
+        assert_eq!(stamped[0].publish_generation, 7);
+        let published_at = stamped[0].publish_time.expect("publish time");
+        assert!(Instant::now() >= published_at);
+        let bare = target(1, 10, 20, r"C:\Games\game.exe");
+        assert_eq!(bare.publish_generation, 0);
+        assert!(bare.publish_time.is_none());
+    }
+
+    #[test]
+    fn ec7_same_stamp_reemission_binds_one_press_and_never_rearms_the_hold() {
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        let item = published(target(1, 10, 20, r"C:\Games\game.exe"), 1);
+        let items = vec![item.clone()];
+        let started = Instant::now();
+        // One physical press: the stamp of its down transition is recorded at bind.
+        let mut hold = HoldState::default();
+        assert!(matches!(
+            hold.event(
+                button_stamped(2, true, started, "hid", 7),
+                &cfg,
+                &items,
+                true
+            ),
+            HoldCommand::None
+        ));
+        assert!(hold.presses[2]
+            .as_ref()
+            .is_some_and(|press| press.bound.is_some() && press.stamp == 7));
+        // The same transition re-emitted late (same stamp) is not a second press and
+        // does not move the bound press's start, so the terminate budget stays intact.
+        assert!(matches!(
+            hold.event(
+                button_stamped(2, true, started + cfg.hang_hold, "hid", 7),
+                &cfg,
+                &items,
+                true
+            ),
+            HoldCommand::None
+        ));
+        assert_eq!(
+            hold.presses.iter().flatten().count(),
+            1,
+            "one bound press per physical press"
+        );
+        assert_eq!(
+            hold.presses[2].as_ref().unwrap().started,
+            started,
+            "a same-stamp re-emission must not re-arm the hold"
+        );
+        assert!(matches!(
+            hold.tick(
+                started + cfg.hang_hold,
+                &cfg,
+                std::slice::from_ref(&item),
+                true
+            ),
+            HoldCommand::Terminate(bound) if bound == item
+        ));
+        // The gate is stamp-specific: a distinct stamp is a new physical press, so the
+        // shipped duplicate-down restart behavior is unchanged.
+        let mut fresh = HoldState::default();
+        fresh.event(
+            button_stamped(2, true, started, "hid", 7),
+            &cfg,
+            &items,
+            true,
+        );
+        let second = started + Duration::from_millis(200);
+        fresh.event(
+            button_stamped(2, true, second, "hid", 8),
+            &cfg,
+            &items,
+            true,
+        );
+        assert_eq!(
+            fresh.presses[2].as_ref().unwrap().started,
+            second,
+            "a distinct stamp re-binds as a new press"
+        );
+    }
+
     struct FakeActionApi {
         target: HungTarget,
         windows: Vec<Result<HungTarget, ActionOutcome>>,
         probes: Vec<ProbeResult>,
+        self_session: Result<u32, ActionOutcome>,
+        target_session: Result<u32, ActionOutcome>,
         open: Result<(), ActionOutcome>,
         identity: Result<(u64, String), ActionOutcome>,
         terminate: Result<(), ActionOutcome>,
         wait: ActionWait,
+        /// TC-3 (P2 §2 TC-3): the synthetic exit code the signalled completion reads
+        /// back; `Err(())` = the read itself fails (named, never silent).
+        exit: Result<u32, ()>,
+        open_calls: usize,
         terminate_calls: usize,
+        exit_calls: usize,
     }
 
     impl FakeActionApi {
@@ -2435,10 +3540,15 @@ mod tests {
                 target,
                 windows: Vec::new(),
                 probes: vec![ProbeResult::Timeout, ProbeResult::Timeout],
+                self_session: Ok(1),
+                target_session: Ok(1),
                 open: Ok(()),
                 terminate: Ok(()),
                 wait: ActionWait::Signaled,
+                exit: Ok(0),
+                open_calls: 0,
                 terminate_calls: 0,
+                exit_calls: 0,
             }
         }
     }
@@ -2459,7 +3569,16 @@ mod tests {
         }
 
         fn open(&mut self, _pid: u32) -> Result<Self::Process, ActionOutcome> {
+            self.open_calls += 1;
             self.open
+        }
+
+        fn session(&mut self, pid: u32) -> Result<u32, ActionOutcome> {
+            if pid == self.target.pid {
+                self.target_session
+            } else {
+                self.self_session
+            }
         }
 
         fn process_identity(
@@ -2480,6 +3599,11 @@ mod tests {
                 ActionWait::Timeout => ActionWait::Timeout,
                 ActionWait::Failed => ActionWait::Failed,
             }
+        }
+
+        fn exit_code(&mut self, _process: &Self::Process) -> Result<u32, ()> {
+            self.exit_calls += 1;
+            self.exit
         }
     }
 
@@ -2514,6 +3638,12 @@ mod tests {
         let mut api = FakeActionApi::valid(expected.clone());
         api.open = Err(ActionOutcome::AccessDenied);
         cases.push((api, ActionOutcome::AccessDenied));
+        // TC-2 (P2 §2 TC-2 acceptance (2)): the cross-session refusal joins the adversarial
+        // set; every case above keeps its exact class, AccessDenied included, so the new
+        // gate cannot absorb the privilege class.
+        let mut api = FakeActionApi::valid(expected.clone());
+        api.target_session = Ok(2);
+        cases.push((api, ActionOutcome::CrossSession));
         let mut api = FakeActionApi::valid(expected.clone());
         api.identity = Ok((21, expected.image_path.clone()));
         cases.push((api, ActionOutcome::IdentityMismatch));
@@ -2582,6 +3712,85 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_gate_refuses_cross_session_and_query_failure() {
+        // TC-2 acceptance site (P2 §2 TC-2): same session stays eligible, a foreign session
+        // is refused by name, and ANY session-query failure is fail-closed (never proceed).
+        assert_eq!(session_gate(Ok(1), Ok(1)), SessionGate::Same);
+        assert_eq!(session_gate(Ok(2), Ok(1)), SessionGate::Cross);
+        assert_eq!(session_gate(Ok(1), Ok(2)), SessionGate::Cross);
+        assert_eq!(session_gate(Err(()), Ok(1)), SessionGate::Unknown);
+        assert_eq!(session_gate(Ok(1), Err(())), SessionGate::Unknown);
+        assert_eq!(session_gate(Err(()), Err(())), SessionGate::Unknown);
+        // The named vocabulary that rides the audit plumbing (log_hang_audit / detector line).
+        assert_eq!(ActionOutcome::CrossSession.label(), "refused-cross-session");
+        assert_eq!(
+            ActionOutcome::SessionUnknown.label(),
+            "refused-session-unknown"
+        );
+    }
+
+    #[test]
+    fn action_refuses_cross_session_before_open() {
+        // TC-2 acceptance (1): a target in another session yields the named outcome,
+        // OpenProcess is never reached (so AccessDenied cannot absorb it) and
+        // TerminateProcess is never called.
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        let expected = target(1, 10, 20, r"C:\Games\game.exe");
+        let mut api = FakeActionApi::valid(expected.clone());
+        api.target_session = Ok(2);
+        assert_eq!(
+            terminate_bound_target_with(&mut api, &expected, &cfg),
+            ActionOutcome::CrossSession
+        );
+        assert_eq!(
+            api.open_calls, 0,
+            "the session gate runs before OpenProcess"
+        );
+        assert_eq!(
+            api.terminate_calls, 0,
+            "a refused target is never terminated"
+        );
+    }
+
+    #[test]
+    fn action_refuses_when_the_session_query_fails() {
+        // TC-2 acceptance (5): a session query failure is a named audited outcome and is
+        // fail-closed — the action never proceeds to open or terminate.
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        let expected = target(1, 10, 20, r"C:\Games\game.exe");
+        let mut api = FakeActionApi::valid(expected.clone());
+        api.target_session = Err(ActionOutcome::SessionUnknown);
+        assert_eq!(
+            terminate_bound_target_with(&mut api, &expected, &cfg),
+            ActionOutcome::SessionUnknown,
+            "a failed target-session query is a named fail-closed outcome"
+        );
+        assert_eq!(
+            api.open_calls, 0,
+            "a failed query never proceeds to OpenProcess"
+        );
+        assert_eq!(api.terminate_calls, 0);
+
+        let mut api = FakeActionApi::valid(expected.clone());
+        api.self_session = Err(ActionOutcome::SessionUnknown);
+        assert_eq!(
+            terminate_bound_target_with(&mut api, &expected, &cfg),
+            ActionOutcome::SessionUnknown
+        );
+        assert_eq!(
+            api.open_calls, 0,
+            "a failed query never proceeds to OpenProcess"
+        );
+        assert_eq!(api.terminate_calls, 0);
+    }
+
+    #[test]
     fn action_calls_terminate_once_only_after_all_checks() {
         let cfg = Config {
             hang_enabled: true,
@@ -2610,6 +3819,613 @@ mod tests {
             ActionOutcome::WaitTimeout
         );
         assert_eq!(api.terminate_calls, 1);
+    }
+
+    /// One published target at the stated generation (the publication the press binds).
+    fn armed_items(generation: u64) -> Vec<HungTarget> {
+        vec![published(
+            target(1, 10, 20, r"C:\Games\game.exe"),
+            generation,
+        )]
+    }
+
+    #[test]
+    fn signaled_completion_records_the_target_exit_code_in_the_audit_line() {
+        // TC-3 acceptance (1): terminate + Signaled -> the audit line carries the exit
+        // code read off the handle this action already opened. Synthetic code via Fake;
+        // no real process is ever opened, queried or terminated by this test.
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        let expected = target(1, 10, 20, r"C:\Games\game.exe");
+        let mut api = FakeActionApi::valid(expected.clone());
+        api.exit = Ok(0x1234);
+        let report = terminate_action_with(&mut api, &expected, &cfg);
+        assert_eq!(report.outcome, ActionOutcome::Success);
+        assert_eq!(report.exit, ExitInfo::Captured(0x1234));
+        assert_eq!(api.terminate_calls, 1);
+        assert_eq!(api.exit_calls, 1);
+        let line = Audit {
+            target: expected.clone(),
+            outcome: report.outcome.label(),
+            exit: report.exit,
+        }
+        .line();
+        assert!(line.contains("outcome=success"), "{line}");
+        assert!(line.contains("exit=0x1234"), "{line}");
+        // An unclassified audit line keeps the shipped text exactly (no suffix).
+        let plain = Audit::raised(expected.clone(), "canceled-continuity").line();
+        assert_eq!(
+            plain,
+            format!(
+                "hung action pid={} process={} outcome=canceled-continuity",
+                expected.pid, expected.process_name
+            )
+        );
+    }
+
+    #[test]
+    fn a_failed_exit_code_read_is_named_without_changing_the_success_class() {
+        // TC-3 acceptance (5): a failed exit-code read is named `exit-code-unavailable`
+        // on the same audit line; the shipped `Success` class stays untouched, and the
+        // bounded 5 s wait remains the only completion mechanism.
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        let expected = target(1, 10, 20, r"C:\Games\game.exe");
+        let mut api = FakeActionApi::valid(expected.clone());
+        api.exit = Err(());
+        let report = terminate_action_with(&mut api, &expected, &cfg);
+        assert_eq!(
+            report.outcome,
+            ActionOutcome::Success,
+            "a failed exit-code read never changes the outcome class"
+        );
+        assert_eq!(report.exit, ExitInfo::Unavailable);
+        assert_eq!(api.terminate_calls, 1);
+        assert_eq!(api.exit_calls, 1);
+        let line = Audit {
+            target: expected.clone(),
+            outcome: report.outcome.label(),
+            exit: report.exit,
+        }
+        .line();
+        assert!(line.contains("outcome=success"), "{line}");
+        assert!(line.contains("exit-code-unavailable"), "{line}");
+
+        // A terminate that never reaches a signalled completion carries no
+        // classification at all (named failure class, empty suffix).
+        let mut api = FakeActionApi::valid(expected.clone());
+        api.terminate = Err(ActionOutcome::TerminateFailure);
+        let report = terminate_action_with(&mut api, &expected, &cfg);
+        assert_eq!(report.outcome, ActionOutcome::TerminateFailure);
+        assert_eq!(report.exit, ExitInfo::None);
+        assert_eq!(api.exit_calls, 0);
+    }
+
+    #[test]
+    fn a_wait_timeout_marks_the_published_identity_terminal() {
+        // TC-3 acceptance (2): after a `wait-timeout`, a later press on the SAME
+        // identity from the SAME publication is refused through the existing
+        // canceled-continuity path — at the action tick and at the continuity pass —
+        // so no second `HoldCommand::Terminate` is ever emitted, and the guarded
+        // action (the only path that can call TerminateProcess) never runs again for
+        // that stale publication.
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        let items = armed_items(3);
+        let started = Instant::now();
+        let mut hold = HoldState::default();
+        hold.set_owner(Some(2));
+        hold.event(button(2, true, started, "hid"), &cfg, &items, true);
+        assert!(matches!(
+            hold.tick(started + cfg.hang_hold, &cfg, &items, true),
+            HoldCommand::Terminate(ref bound) if bound == &items[0]
+        ));
+        hold.report_action(&items[0], ActionOutcome::WaitTimeout);
+        assert!(matches!(
+            hold.event(
+                button(2, false, started + cfg.hang_hold, "hid"),
+                &cfg,
+                &items,
+                true
+            ),
+            HoldCommand::None
+        ));
+
+        // Second press, same identity, no re-publish: canceled-continuity, no Terminate.
+        hold.event(button(2, true, started, "hid"), &cfg, &items, true);
+        assert!(matches!(
+            hold.tick(started + cfg.hang_hold, &cfg, &items, true),
+            HoldCommand::Audit(Audit {
+                outcome: "canceled-continuity",
+                ..
+            })
+        ));
+        assert!(
+            !matches!(
+                hold.tick(started + cfg.hang_hold, &cfg, &items, true),
+                HoldCommand::Terminate(_)
+            ),
+            "a terminal identity can never request a repeat terminate"
+        );
+        assert_eq!(
+            hold.progress(started + cfg.hang_hold, &cfg),
+            0.0,
+            "the refused press is cancelled, never armed for a second action"
+        );
+
+        // The continuity pass cancels an armed press on the stale identity too.
+        let mut armed = HoldState::default();
+        armed.set_owner(Some(2));
+        armed.event(button(2, true, started, "hid"), &cfg, &items, true);
+        armed.report_action(&items[0], ActionOutcome::WaitTimeout);
+        let audit = armed
+            .reconcile(&cfg, &items, true)
+            .expect("the terminal identity cancels the armed press");
+        assert_eq!(audit.outcome, "canceled-continuity");
+    }
+
+    #[test]
+    fn a_fresh_republish_rearms_the_terminal_identity() {
+        // TC-3 acceptance (3): the mark is bound to the publication it acted on, so a
+        // probe-cycle RE-PUBLISH at a newer generation of the same validated identity
+        // re-arms a press, and the guarded action terminates again — no permanent
+        // lockout. The re-arm stays bounded by `hang_probe_interval_ms` (P2 tradeoff).
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        let stale = armed_items(3);
+        let fresh = armed_items(4);
+        let started = Instant::now();
+        let mut hold = HoldState::default();
+        hold.set_owner(Some(2));
+        hold.event(button(2, true, started, "hid"), &cfg, &stale, true);
+        assert!(matches!(
+            hold.tick(started + cfg.hang_hold, &cfg, &stale, true),
+            HoldCommand::Terminate(_)
+        ));
+        hold.report_action(&stale[0], ActionOutcome::WaitTimeout);
+        hold.event(
+            button(2, false, started + cfg.hang_hold, "hid"),
+            &cfg,
+            &stale,
+            true,
+        );
+
+        hold.event(button(2, true, started, "hid"), &cfg, &fresh, true);
+        assert!(matches!(
+            hold.tick(started + cfg.hang_hold, &cfg, &fresh, true),
+            HoldCommand::Terminate(ref bound) if bound == &fresh[0]
+        ));
+
+        // The re-published identity really reaches the guarded action (Fake api only).
+        let expected = fresh[0].clone();
+        let mut api = FakeActionApi::valid(expected.clone());
+        api.exit = Ok(0x1234);
+        let report = terminate_action_with(&mut api, &expected, &cfg);
+        assert_eq!(report.outcome, ActionOutcome::Success);
+        assert_eq!(report.exit, ExitInfo::Captured(0x1234));
+        assert_eq!(
+            api.terminate_calls, 1,
+            "a re-published, re-validated identity is actionable again"
+        );
+    }
+
+    #[test]
+    fn a_signaled_success_marks_nothing_terminal() {
+        // Only `wait-timeout` is terminal (P2 §2 TC-3 wording): a signalled success
+        // records no mark, so this rule cannot widen into a permanent lockout.
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        let items = armed_items(3);
+        let started = Instant::now();
+        let mut hold = HoldState::default();
+        hold.set_owner(Some(2));
+        hold.event(button(2, true, started, "hid"), &cfg, &items, true);
+        assert!(matches!(
+            hold.tick(started + cfg.hang_hold, &cfg, &items, true),
+            HoldCommand::Terminate(_)
+        ));
+        hold.report_action(&items[0], ActionOutcome::Success);
+        hold.event(
+            button(2, false, started + cfg.hang_hold, "hid"),
+            &cfg,
+            &items,
+            true,
+        );
+        hold.event(button(2, true, started, "hid"), &cfg, &items, true);
+        assert!(matches!(
+            hold.tick(started + cfg.hang_hold, &cfg, &items, true),
+            HoldCommand::Terminate(_)
+        ));
+    }
+
+    /// TC-3 (WO-B-03-FIX): press-hold the target the panel currently indexes
+    /// (`hung_index`) through to the action tick, release the press, and report what
+    /// the tick produced: `Some(index)` when it asked to terminate that published
+    /// target — the only path that reaches the guarded action, so the strongest
+    /// assertion available for "no second terminate" — `None` when it refused.
+    fn press_to_action(
+        hold: &mut HoldState,
+        cfg: &Config,
+        items: &[HungTarget],
+        at: Instant,
+    ) -> Option<usize> {
+        hold.event(button(2, true, at, "hid"), cfg, items, true);
+        let command = hold.tick(at + cfg.hang_hold, cfg, items, true);
+        hold.event(
+            button(2, false, at + cfg.hang_hold, "hid"),
+            cfg,
+            items,
+            true,
+        );
+        if let HoldCommand::Terminate(target) = command {
+            items.iter().position(|item| item == &target)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn a_second_wait_timeout_does_not_evict_an_earlier_identity() {
+        // WO-B-03-FIX (T1, the WO-B-03-AUDIT §3 refuting sequence): ONE publication
+        // (generation 5) carries TWO hung identities A and B, both stuck, at the legal
+        // long probe interval 20 s, so the bind bound is `interval +
+        // PUBLISH_AGE_TOLERANCE` = 25 s (`hang_probe_interval_ms` legal 250..60000,
+        // config.rs L743-748). A times out, B times out, A is re-bound from the SAME,
+        // never-re-published generation. The one-slot field overwrote A's mark with
+        // B's, so that third press passed every gate and terminated A a second time;
+        // the mark SET keeps both marks, so the press is refused through
+        // `canceled-continuity` and Terminate is emitted exactly once for A.
+        // Fake-only discipline: no real process is opened, queried or terminated; the
+        // refusal is asserted at the command level, the only route to the action.
+        let cfg = Config {
+            hang_enabled: true,
+            hang_probe_interval: Duration::from_secs(20),
+            ..Config::default()
+        };
+        let items = vec![
+            published(target(1, 10, 20, r"C:\Games\game.exe"), 5),
+            published(target(2, 20, 30, r"C:\Games\other.exe"), 5),
+        ];
+        let started = Instant::now();
+        let mut hold = HoldState::default();
+        hold.set_owner(Some(2));
+
+        // A's press-hold acts, and its `wait-timeout` marks A at generation 5.
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &items, started),
+            Some(0),
+            "the first press on A is the one Terminate it ever gets"
+        );
+        hold.report_action(&items[0], ActionOutcome::WaitTimeout);
+
+        // The panel cycles to B (the short-press cycle moves `hung_index`), B times out.
+        hold.hung_index = 1;
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &items, started),
+            Some(1),
+            "B is a different identity, so its first press acts"
+        );
+        hold.report_action(&items[1], ActionOutcome::WaitTimeout);
+        assert_eq!(
+            hold.terminal.len(),
+            2,
+            "B's timeout must not evict A's mark"
+        );
+
+        // The panel cycles back to A: same quadruple, SAME generation 5 (no probe cycle
+        // in between at a 20 s interval), inside the 25 s bind bound: refused.
+        hold.hung_index = 0;
+        hold.event(button(2, true, started, "hid"), &cfg, &items, true);
+        assert!(matches!(
+            hold.tick(started + cfg.hang_hold, &cfg, &items, true),
+            HoldCommand::Audit(Audit {
+                outcome: "canceled-continuity",
+                ..
+            })
+        ));
+        assert!(
+            !matches!(
+                hold.tick(started + cfg.hang_hold, &cfg, &items, true),
+                HoldCommand::Terminate(_)
+            ),
+            "the timed-out identity A can never request a repeat terminate"
+        );
+        assert_eq!(
+            hold.progress(started + cfg.hang_hold, &cfg),
+            0.0,
+            "the refused press is cancelled, never armed for a second action"
+        );
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &items, started),
+            None,
+            "no later press into A's publication acts either"
+        );
+        assert_eq!(
+            hold.terminal.len(),
+            2,
+            "refusals add no marks: only a `wait-timeout` marks"
+        );
+
+        // The continuity pass cancels an armed press on A the same way (gate 1).
+        let mut armed = HoldState::default();
+        armed.set_owner(Some(2));
+        armed.report_action(&items[0], ActionOutcome::WaitTimeout);
+        armed.report_action(&items[1], ActionOutcome::WaitTimeout);
+        armed.event(button(2, true, started, "hid"), &cfg, &items, true);
+        let audit = armed
+            .reconcile(&cfg, &items, true)
+            .expect("the terminal identity cancels the armed press");
+        assert_eq!(audit.outcome, "canceled-continuity");
+    }
+
+    #[test]
+    fn a_republish_prunes_every_mark_and_rearms_each_identity_once() {
+        // WO-B-03-FIX (T2): TC-3 acceptance (3) for the mark SET — a probe cycle
+        // RE-PUBLISHED both identities at a newer generation, which is the specced
+        // re-arm, and the gate pass PRUNES every mark of the older generation (the
+        // bounded-growth half of the fix). Each identity is then actionable exactly
+        // ONCE in the new generation and refused again inside it.
+        // Probe P4b (prune call removed) fails the `is_empty` assert; probe P4c
+        // (`contains` dedup removed) fails the `len == 1` assert.
+        //
+        // WO-QA-01 (known issue F-2): the timeline is DRIVEN. Every gate on this path
+        // reads the virtual `now` the test passes (`tick`'s parameter, `press_to_action`'s
+        // `at`), so the publications carry injected publish times on the same virtual
+        // timeline (the `publish_time` seam, `published_at` above). The 20 s probe
+        // interval (T1's legal config, 250..60000 ms) bounds the bind at
+        // `interval + PUBLISH_AGE_TOLERANCE` = 25 s, and the re-publish sits 40 s of
+        // VIRTUAL time after the first publication — far outside the 5 s of real
+        // headroom the pre-fix body relied on, which is what made it load-sensitive
+        // (WO-B-03-FIX-AUDIT F-2; the seam-removal probe, stamping `Instant::now()`
+        // instead, fails the re-arm assert at once). Zero sleeps, zero real-time terms.
+        let cfg = Config {
+            hang_enabled: true,
+            hang_probe_interval: Duration::from_secs(20),
+            ..Config::default()
+        };
+        let base = Instant::now();
+        let republished = base + Duration::from_secs(40);
+        let stale = vec![
+            published_at(target(1, 10, 20, r"C:\Games\game.exe"), 5, base),
+            published_at(target(2, 20, 30, r"C:\Games\other.exe"), 5, base),
+        ];
+        let fresh = vec![
+            published_at(target(1, 10, 20, r"C:\Games\game.exe"), 6, republished),
+            published_at(target(2, 20, 30, r"C:\Games\other.exe"), 6, republished),
+        ];
+        let first_press = base + Duration::from_secs(20);
+        let mut hold = HoldState::default();
+        hold.set_owner(Some(2));
+
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &stale, first_press),
+            Some(0),
+            "A acts in generation 5"
+        );
+        hold.report_action(&stale[0], ActionOutcome::WaitTimeout);
+        hold.report_action(&stale[0], ActionOutcome::WaitTimeout);
+        assert_eq!(
+            hold.terminal.len(),
+            1,
+            "one identity is marked once per generation (dedup keeps the set small)"
+        );
+        hold.hung_index = 1;
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &stale, first_press),
+            Some(1),
+            "B acts in generation 5"
+        );
+        hold.report_action(&stale[1], ActionOutcome::WaitTimeout);
+        assert_eq!(hold.terminal.len(), 2, "both generation-5 marks live");
+
+        // Re-publish at generation 6 re-arms A and prunes the generation-5 marks.
+        hold.hung_index = 0;
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &fresh, republished),
+            Some(0),
+            "A is re-armed by the re-publish (no permanent lockout)"
+        );
+        assert!(
+            hold.terminal.is_empty(),
+            "marks older than the current publication are pruned, not kept"
+        );
+
+        // A times out again in generation 6: marked, and the repeat press is refused.
+        hold.report_action(&fresh[0], ActionOutcome::WaitTimeout);
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &fresh, republished),
+            None,
+            "the re-armed A terminates once, not twice, in generation 6"
+        );
+
+        // B re-arms by the same re-publish, and is likewise once-only in generation 6.
+        hold.hung_index = 1;
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &fresh, republished),
+            Some(1),
+            "B is re-armed by the same re-publish"
+        );
+        hold.report_action(&fresh[1], ActionOutcome::WaitTimeout);
+        assert_eq!(
+            hold.terminal.len(),
+            2,
+            "both generation-6 marks are live (neither evicts the other)"
+        );
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &fresh, republished),
+            None,
+            "the re-armed B terminates once, not twice, in generation 6"
+        );
+    }
+
+    #[test]
+    fn the_driven_time_rearm_needs_no_real_time_headroom() {
+        // WO-QA-01 (B), acceptance (2): the bounded-runtime proof. The driven sequence
+        // (press one probe cycle after the publish, re-publish two cycles later, re-arm
+        // inside the new generation) needs NO real clock at all: it runs in
+        // microseconds, so the pre-fix 5 s of real headroom is gone, not padded. The
+        // outcome asserts pin the sequence itself, so the bound cannot be met by
+        // measuring an empty run.
+        let cfg = Config {
+            hang_enabled: true,
+            hang_probe_interval: Duration::from_secs(20),
+            ..Config::default()
+        };
+        let started = Instant::now();
+        let republished = started + Duration::from_secs(40);
+        let stale = vec![published_at(
+            target(1, 10, 20, r"C:\Games\game.exe"),
+            5,
+            started,
+        )];
+        let fresh = vec![published_at(
+            target(1, 10, 20, r"C:\Games\game.exe"),
+            6,
+            republished,
+        )];
+        let mut hold = HoldState::default();
+        hold.set_owner(Some(2));
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &stale, started + Duration::from_secs(20)),
+            Some(0),
+            "the driven generation-5 press acts"
+        );
+        hold.report_action(&stale[0], ActionOutcome::WaitTimeout);
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &fresh, republished),
+            Some(0),
+            "the driven re-publish re-arms with no real time elapsed"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the driven sequence must need no real 5 s headroom, measured: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn the_terminal_set_evicts_the_oldest_mark_at_capacity() {
+        // WO-B-03-FIX (T3): the stated eviction policy, pinned. Filling the set to
+        // `MAX_TERMINAL_MARKS` (one mark per identity a publication can carry, derived
+        // from the `MAX_WINDOWS` enumerate cap) and pushing one more mark keeps the
+        // bound and drops the OLDEST mark; the evicted identity is bindable again in
+        // its own generation, and the mark this action just earned is always kept.
+        let cfg = Config {
+            hang_enabled: true,
+            ..Config::default()
+        };
+        let marks: Vec<HungTarget> = (0..MAX_TERMINAL_MARKS)
+            .map(|index| {
+                published(
+                    target(
+                        index,
+                        index as u32 + 1_000,
+                        index as u64,
+                        &format!(r"C:\Games\game{index}.exe"),
+                    ),
+                    1,
+                )
+            })
+            .collect();
+        let mut hold = HoldState::default();
+        for mark in &marks {
+            hold.report_action(mark, ActionOutcome::WaitTimeout);
+        }
+        assert_eq!(
+            hold.terminal.len(),
+            MAX_TERMINAL_MARKS,
+            "the set is bounded by the publication cap"
+        );
+        assert_eq!(
+            hold.terminal[0].0,
+            Identity::from(&marks[0]),
+            "marks are kept oldest-first, so eviction has a stated meaning"
+        );
+
+        let overflow = published(
+            target(
+                MAX_TERMINAL_MARKS,
+                u32::MAX,
+                u64::MAX,
+                r"C:\Games\overflow.exe",
+            ),
+            1,
+        );
+        hold.report_action(&overflow, ActionOutcome::WaitTimeout);
+        assert_eq!(
+            hold.terminal.len(),
+            MAX_TERMINAL_MARKS,
+            "the set never grows past the bound"
+        );
+        assert_eq!(
+            hold.terminal[0].0,
+            Identity::from(&marks[1]),
+            "the OLDEST mark is the one evicted"
+        );
+        assert!(
+            !target_is_terminal(&hold.terminal, &marks[0]),
+            "the evicted identity is no longer terminal"
+        );
+        assert!(
+            target_is_terminal(&hold.terminal, &marks[MAX_TERMINAL_MARKS - 1]),
+            "the newest marks survive"
+        );
+        assert!(
+            target_is_terminal(&hold.terminal, &overflow),
+            "the mark this action earned is always kept"
+        );
+
+        // Gate-level consequence of the same policy, in the evicted identity's own
+        // generation: it re-arms; a surviving mark keeps refusing.
+        let started = Instant::now();
+        let items = vec![marks[0].clone(), marks[1].clone()];
+        hold.set_owner(Some(2));
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &items, started),
+            Some(0),
+            "beyond the bound the evicted identity acts: re-arming is the documented effect"
+        );
+        assert_eq!(
+            hold.terminal.len(),
+            MAX_TERMINAL_MARKS,
+            "the action itself adds no mark; only a `wait-timeout` report does"
+        );
+        hold.hung_index = 1;
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &items, started),
+            None,
+            "the mark that survived the eviction still refuses its identity"
+        );
+
+        // The full set on a fresh timeout evicts the next-oldest mark, in order.
+        hold.report_action(&items[0], ActionOutcome::WaitTimeout);
+        assert_eq!(
+            hold.terminal[0].0,
+            Identity::from(&marks[2]),
+            "the second-oldest is evicted next: the policy is stable under pressure"
+        );
+        hold.hung_index = 0;
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &items, started),
+            None,
+            "A, re-marked by its own timeout, is refused again"
+        );
+        hold.hung_index = 1;
+        assert_eq!(
+            press_to_action(&mut hold, &cfg, &items, started),
+            Some(1),
+            "B, evicted by the fresh mark, is bindable again (documented beyond-bound behavior)"
+        );
     }
 
     #[test]
@@ -2687,5 +4503,70 @@ mod tests {
     #[ignore = "proves early/wrong-identity release leaves owned child alive until cleanup"]
     fn disposable_harness_action_negative_smoke() {
         assert!(action_smoke(true).is_ok());
+    }
+
+    /// WO-TEL-D3-B1 (L5) STRUCTURAL pin of the hung-detector worker's loop-head config read,
+    /// following the shipped needle pattern of
+    /// `telemetry.rs::telemetry_loops_read_a_cached_request_under_an_unchanged_generation` and
+    /// the production twin `providers/presentmon.rs:1262`. Proves: the 50 ms loop head reads a
+    /// cached `Arc<Config>` (the ~20 full-`Config` clones/s of the disabled/parked detector are
+    /// gone), the cache is seeded exactly as the shipped loops seed theirs, the ONLY remaining
+    /// `current_request` in the worker is the accepted mid-cycle freshness re-read, and the
+    /// EC-8 generation-bump rule (a bump republishes a cleared state, `Policy::from` rides the
+    /// same value) stays byte-identical. The harness-count is printed for the receipt.
+    ///
+    /// Declared disposition (contract L5 / audit §C6): `hang.rs` is UNBANNED for this order;
+    /// prior content = HEAD blob `5f965a08…` / file SHA256 head `89058032…`, POST = the new
+    /// blob recorded in the receipt's preservation table; the ledger region pin is restated in
+    /// lockstep, NOT weakened.
+    #[test]
+    fn hung_worker_loop_head_reads_a_cached_arc_config() {
+        let source = include_str!("hang.rs").replace("\r\n", "\n");
+        let head = source
+            .find("fn worker(\n")
+            .expect("the shipped worker function exists");
+        let tail = source
+            .find("fn log_worker_transition(")
+            .expect("the shipped transition logger closes the worker");
+        assert!(
+            tail > head,
+            "the worker is followed by its transition logger"
+        );
+        let loop_src = &source[head..tail];
+        let head_reads = loop_src
+            .matches("let (request_generation, cfg) = current_request(&config, &generation);")
+            .count();
+        let cached = loop_src
+            .matches("let (request_generation, cfg) = cached_request(&config, &generation, &mut request);")
+            .count();
+        let direct = loop_src
+            .matches("current_request(&config, &generation)")
+            .count();
+        println!("D3B1-L5 harness-count: loop-head full-Config reads = {head_reads}, cached loop-head reads = {cached}, direct request reads in the worker = {direct}");
+        assert_eq!(
+            head_reads, 0,
+            "L5: the 50 ms loop head performs no full-Config clone (~20/s removed)"
+        );
+        assert_eq!(
+            cached, 1,
+            "L5: exactly one cached loop-head request read (the shipped `cached_request` shape)"
+        );
+        assert!(
+            loop_src.contains("let mut request = (0u64, Arc::new(current_config(&config)));"),
+            "L5: the cache is seeded from the shipped `current_config` shape"
+        );
+        assert_eq!(
+            direct, 1,
+            "L5: the accepted mid-cycle freshness re-read stays a direct `current_request` (generation-keyed poll validity untouched)"
+        );
+        assert!(
+            loop_src.contains("let policy = Policy::from(cfg.as_ref());"),
+            "L5: the policy still derives from the request read with the generation stamped beside it (EC-8 semantics unchanged; `as_ref` is the `Arc<Config>` -> `&Config` deref the shipped `From<&Config>` impl needs)"
+        );
+        assert_eq!(
+            loop_src.matches("last_attempt = None;").count(),
+            loop_src.matches("cadence.last_attempt = None;").count(),
+            "L5: the cache change adds no cadence-clear site (every clear stays the shipped `cadence.` form)"
+        );
     }
 }

@@ -3,7 +3,7 @@
 Runs the repository build, test, documentation, and smoke-test gates.
 
 .DESCRIPTION
-Checks PowerShell, Rust, documentation, and product behavior with the pinned toolchain. Commands update Rust build outputs under target/; temporary fixtures are removed. The default run also creates the release executable and configuration in target/release and runs Windows CLI and GUI smoke tests, but not physical hardware acceptance.
+Checks PowerShell, Rust, documentation, and product behavior with the pinned toolchain. Commands update Rust build outputs under target/; temporary fixtures are removed. The default run also creates the release executable and configuration in target/release and runs Windows CLI and GUI smoke tests, but not physical hardware acceptance. Every process this script launches runs hidden: syntax-check children use -WindowStyle Hidden -NonInteractive, and the GUI smoke launches use a smoke configuration with preview_mode never and start_minimized 1 so no desktop window appears; the invalid-configuration smoke is exempt because its native startup-error dialog is the assertion.
 
 .PARAMETER ReleaseOnly
 Stops after formatting, lint, and release-mode test gates, skipping the final application build and Windows CLI and GUI smoke tests.
@@ -22,6 +22,13 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 $config = Join-Path $repo 'lcdsirplus.txt'
+$targetRoot = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+    Join-Path $repo 'target'
+} elseif ([IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
+    [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+} else {
+    [IO.Path]::GetFullPath((Join-Path $repo $env:CARGO_TARGET_DIR))
+}
 Set-Location -LiteralPath $repo
 
 function Invoke-LcdCli {
@@ -116,12 +123,12 @@ $parse = '$tokens=$null; $errors=$null; [Management.Automation.Language.Parser]:
 $allScripts = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1' -File | ForEach-Object { $_.Name } | Sort-Object)
 foreach ($script in $allScripts) {
     $env:LCDSIRPLUS_PARSE_FILE = Join-Path $PSScriptRoot $script
-    & (Get-Command pwsh).Source -NoProfile -Command $parse
+    & (Get-Command pwsh).Source -NoProfile -NonInteractive -WindowStyle Hidden -Command $parse
     if ($LASTEXITCODE -ne 0) { throw "pwsh syntax failed: $script" }
 }
 foreach ($script in @('Acquire-InnoSetup.ps1')) {
     $env:LCDSIRPLUS_PARSE_FILE = Join-Path $PSScriptRoot $script
-    & (Get-Command powershell.exe).Source -NoProfile -Command $parse
+    & (Get-Command powershell.exe).Source -NoProfile -NonInteractive -WindowStyle Hidden -Command $parse
     if ($LASTEXITCODE -ne 0) { throw "Windows PowerShell 5.1 syntax failed: $script" }
 }
 Remove-Item Env:\LCDSIRPLUS_PARSE_FILE -ErrorAction SilentlyContinue
@@ -168,7 +175,7 @@ if ([regex]::Matches($modules, $tableHeaderPattern).Count -ne 1 -or
 $moduleRows = @([regex]::Matches($modules, $tableRowPattern) | ForEach-Object { $_.Groups[1].Value })
 $manualRows = @([regex]::Matches($manual, $tableRowPattern) | ForEach-Object { $_.Groups[1].Value })
 $documentedModules = @([regex]::Matches($modules, $tableRowPattern) | ForEach-Object { $_.Groups[2].Value })
-if ($canonicalModules.Count -ne 53 -or $moduleRows.Count -ne 53 -or $manualRows.Count -ne 53) {
+if ($canonicalModules.Count -ne 50 -or $moduleRows.Count -ne 50 -or $manualRows.Count -ne 50) {
     throw "button option inventory mismatch: source=$($canonicalModules.Count), modules=$($moduleRows.Count), manual=$($manualRows.Count)"
 }
 for ($index = 0; $index -lt $canonicalModules.Count; $index++) {
@@ -181,9 +188,9 @@ $parserSource = [IO.File]::ReadAllText((Join-Path $repo 'src\parser.rs'))
 $applyBlock = [regex]::Match($parserSource, 'fn apply\(.*?match key \{(.*?)other =>', [Text.RegularExpressions.RegexOptions]::Singleline)
 if (-not $applyBlock.Success) { throw 'configuration parser key registry not found' }
 $acceptedConfigKeys = @('include') + @([regex]::Matches($applyBlock.Groups[1].Value, '"([a-z][a-z0-9_]*)"\s*(?:\||=>)') | ForEach-Object { $_.Groups[1].Value })
-$acceptedConfigKeyCount = 123
-$templateConfigKeyCount = 96
-$ignoredConfigKeyCount = 5
+$acceptedConfigKeyCount = 105
+$templateConfigKeyCount = 79
+$ignoredConfigKeyCount = 4
 if ($acceptedConfigKeys.Count -ne $acceptedConfigKeyCount -or
     @($acceptedConfigKeys | Group-Object | Where-Object Count -ne 1).Count -ne 0) {
     throw "configuration parser inventory mismatch: expected=$acceptedConfigKeyCount actual=$($acceptedConfigKeys.Count)"
@@ -198,7 +205,7 @@ if ($acceptedConfigKeys.Count -ne $documentedConfigKeys.Count -or $missingConfig
 foreach ($key in $acceptedConfigKeys) {
     if (@($documentedConfigKeys | Where-Object { $_ -ceq $key }).Count -ne 1) { throw "configuration reference entry mismatch: $key" }
 }
-$compatibilityConfigKeys = @('date_format', 'time_format', 'headset_estimate_hours', 'discord_redirect_uri', 'hang_button')
+$compatibilityConfigKeys = @('date_format', 'time_format', 'discord_redirect_uri', 'hang_button')
 $parserOnlyConfigKeys = @('network_graph_ceiling_mbps')
 if ($compatibilityConfigKeys.Count -ne $ignoredConfigKeyCount -or
     @($parserOnlyConfigKeys | Where-Object { $_ -cin $compatibilityConfigKeys }).Count -ne 0) {
@@ -292,23 +299,23 @@ foreach ($shortcut in @(
 }
 
 Write-Host '== cargo fmt check ==' -ForegroundColor Cyan
-cargo fmt --check
+cargo fmt --all -- --check
 if ($LASTEXITCODE -ne 0) { throw 'cargo fmt check failed' }
 
 Write-Host '== cargo clippy (zero-warning policy) ==' -ForegroundColor Cyan
-cargo clippy --all-targets 2>&1 | Tee-Object -Variable clippyOutput
+cargo clippy --workspace --all-targets --locked -j 1 2>&1 | Tee-Object -Variable clippyOutput
 if ($LASTEXITCODE -ne 0) { throw 'cargo clippy failed' }
 $warnings = @($clippyOutput | Where-Object { $_ -match 'warning:' })
 if ($warnings.Count -gt 0) { throw "clippy emitted $($warnings.Count) warnings; zero-warning policy violated" }
 
 Write-Host '== cargo test ==' -ForegroundColor Cyan
-cargo test --release --locked
+cargo test --workspace --release --locked -j 1
 if ($LASTEXITCODE -ne 0) { throw 'cargo test failed' }
 
 if ($ReleaseOnly) { return }
 
 Write-Host '== release build ==' -ForegroundColor Cyan
-cargo build --release
+cargo build --workspace --release --locked -j 1
 if ($LASTEXITCODE -ne 0) { throw 'release build failed' }
 
 Add-Type -TypeDefinition @'
@@ -363,8 +370,43 @@ namespace LCDSirPlus {
 }
 '@
 
+Write-Host '== smoke: Discord component ABI ==' -ForegroundColor Cyan
+$dll = Join-Path $targetRoot 'release\lcdsirplus_discord.dll'
+if (-not [IO.File]::Exists($dll)) { throw 'workspace build did not produce lcdsirplus_discord.dll' }
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace LCDSirPlus {
+    public static class DiscordAbiSmoke {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr LoadLibraryEx(string path, IntPtr file, uint flags);
+        [DllImport("kernel32.dll", CharSet = CharSet.Ansi, ExactSpelling = true)]
+        private static extern IntPtr GetProcAddress(IntPtr module, string name);
+        [DllImport("kernel32.dll")] private static extern bool FreeLibrary(IntPtr module);
+        [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+        private delegate IntPtr GetTable(uint magic, uint version, UIntPtr size);
+        public static void Verify(string path) {
+            IntPtr module = LoadLibraryEx(path, IntPtr.Zero, 0x00000900);
+            if (module == IntPtr.Zero) throw new InvalidOperationException("Discord DLL load failed: " + Marshal.GetLastWin32Error());
+            try {
+                IntPtr symbol = GetProcAddress(module, "lcsd_get_table");
+                if (symbol == IntPtr.Zero) throw new InvalidOperationException("Discord ABI export missing");
+                var get = (GetTable)Marshal.GetDelegateForFunctionPointer(symbol, typeof(GetTable));
+                int size = 8 + 10 * IntPtr.Size;
+                IntPtr table = get(0x6453434C, 1, (UIntPtr)size);
+                if (table == IntPtr.Zero || Marshal.ReadInt32(table) < size) throw new InvalidOperationException("Discord ABI table rejected");
+                for (int i = 0; i < 10; i++) {
+                    if (Marshal.ReadIntPtr(table, 8 + i * IntPtr.Size) == IntPtr.Zero) throw new InvalidOperationException("Discord ABI entry missing");
+                }
+            } finally { FreeLibrary(module); }
+        }
+    }
+}
+'@
+[LCDSirPlus.DiscordAbiSmoke]::Verify([IO.Path]::GetFullPath($dll))
+
 Write-Host '== smoke: --version ==' -ForegroundColor Cyan
-$exe = Join-Path $repo 'target\release\LCDSirPlus.exe'
+$exe = Join-Path $targetRoot 'release\LCDSirPlus.exe'
 $version = Invoke-LcdCli $exe @('--version')
 if ($version.ExitCode -ne 0 -or $version.Output.Trim() -cne 'LCDSirPlus 0.3.0') { throw '--version identity failed' }
 
@@ -376,10 +418,10 @@ Write-Host '== smoke: Windows GUI subsystem ==' -ForegroundColor Cyan
 if ((Get-PeSubsystem $exe) -ne 2) { throw 'release executable is not IMAGE_SUBSYSTEM_WINDOWS_GUI' }
 
 Write-Host '== smoke: --validate-config ==' -ForegroundColor Cyan
-$builtConfig = Join-Path $repo 'target\release\lcdsirplus.txt'
+$builtConfig = Join-Path $targetRoot 'release\lcdsirplus.txt'
 if (-not [IO.File]::Exists($builtConfig) -or
     [Convert]::ToBase64String([IO.File]::ReadAllBytes($builtConfig)) -cne [Convert]::ToBase64String([IO.File]::ReadAllBytes($config)) -or
-    [IO.File]::Exists((Join-Path $repo 'target\release\lcdsirplus.local.txt'))) {
+    [IO.File]::Exists((Join-Path $targetRoot 'release\lcdsirplus.local.txt'))) {
     throw 'release build configuration copy is invalid'
 }
 $validation = Invoke-LcdCli $exe @('--validate-config')
@@ -416,6 +458,7 @@ $lifecycleRoot = Join-Path ([IO.Path]::GetTempPath()) ('LCDSirPlus-lifecycle-' +
 $lifecycleExe = Join-Path $lifecycleRoot 'LCDSirPlus.exe'
 Copy-Item -LiteralPath $exe -Destination $lifecycleExe
 $testConfig = [IO.File]::ReadAllText($builtConfig)
+# Smoke config keeps the preview hidden so automation shows no desktop window.
 $testConfig = [Text.RegularExpressions.Regex]::Replace($testConfig, '(?m)^preview_mode\s+\S+', 'preview_mode            never')
 $testConfig = [Text.RegularExpressions.Regex]::Replace($testConfig, '(?m)^start_minimized\s+\S+', 'start_minimized         1')
 $testConfig = [Text.RegularExpressions.Regex]::Replace($testConfig, '(?m)^safe_mode\s+\S+', 'safe_mode               1')
@@ -423,7 +466,7 @@ $testConfig = [Text.RegularExpressions.Regex]::Replace($testConfig, '(?m)^safe_m
 $process = $null
 $window = [IntPtr]::Zero
 try {
-    $process = Start-Process -FilePath $lifecycleExe -WorkingDirectory $lifecycleRoot -PassThru
+    $process = Start-Process -FilePath $lifecycleExe -WorkingDirectory $lifecycleRoot -WindowStyle Hidden -PassThru
     $window = Wait-NativeWindow $process 'LCDSIRPLUS_PREVIEW'
     if ($window -eq [IntPtr]::Zero) { throw 'no-argument launch did not remain alive with its tray window' }
     if ([LCDSirPlus.NativeWindow]::ConsoleProcesses() -contains [uint32]$process.Id) { throw 'no-argument launch attached to the parent console' }
@@ -448,7 +491,7 @@ Copy-Item -LiteralPath $exe -Destination $errorExe
 $process = $null
 $dialog = [IntPtr]::Zero
 try {
-    $process = Start-Process -FilePath $errorExe -WorkingDirectory $errorRoot -PassThru
+    $process = Start-Process -FilePath $errorExe -WorkingDirectory $errorRoot -WindowStyle Hidden -PassThru
     $dialog = Wait-NativeWindow $process '#32770'
     if ($dialog -eq [IntPtr]::Zero -or [LCDSirPlus.NativeWindow]::Text($dialog) -cne 'LCDSirPlus startup error') { throw 'invalid no-argument launch did not show its native startup error' }
     if ([LCDSirPlus.NativeWindow]::ConsoleProcesses() -contains [uint32]$process.Id) { throw 'invalid no-argument launch attached to the parent console' }
@@ -465,3 +508,7 @@ Write-Host 'ALL GATES PASSED' -ForegroundColor Green
 Write-Host 'Physical acceptance (human) is intentionally NOT part of this script:'
 Write-Host '  .\target\release\LCDSirPlus.exe --hardware-test --backend hid --duration-secs 60'
 Write-Host '  .\target\release\LCDSirPlus.exe --hardware-test --backend sdk --duration-secs 60  # with LGS running'
+
+# Expected negative CLI cases leave a nonzero native exit status. All failures
+# have already thrown above; report the complete script result, not that stale code.
+exit 0

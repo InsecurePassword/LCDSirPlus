@@ -48,6 +48,13 @@ characters. One line can contain at most 256 values. Other limits are 8 include
 levels, 64 files, 64 include lines, 8 MiB total input, 16384 lines, and 16 KiB
 per token. Duplicate keys with the same spelling in one file are rejected.
 
+Six keys join their values into one string before use: `date_format`,
+`time_format`, `logitech_friendly_name`, `presentmon_path`, `ccd_cache_processors`
+and `ccd_frequency_processors`. The joined value is capped at 4096 bytes, counted
+over every value plus the single spaces the join inserts, so the cap applies to the
+total and not only to one token. An over-limit joined value is rejected with the
+key's own name, such as `ccd_cache_processors exceeds limit of 4096 bytes`.
+
 An `auto` interval uses the numeric default shown in its table. Other selectors
 that accept `auto` are described separately.
 
@@ -60,13 +67,13 @@ For display message meanings and setup tasks, see the
 |---|---:|---|---|
 | `config_refresh_ms` | `1000` (`auto`) | `100..60000` | Settings file check interval. |
 | `telemetry_interval_ms` | `300` (`auto`) | `100..10000` | Fast reading interval. |
-| `render_interval_ms` | `100` (`auto`) | `25..5000`; must be `<=100` when `warning 1` and `temperature_warning_enabled 1` | Screen update interval. |
+| `render_interval_ms` | `100` (`auto`) | `25..5000` | Screen update interval. |
 | `main_display` | `1` | integer `1`, `2`, or `3` | Main layout. |
 | `preview_mode` | `auto` | `auto`, `always`, `never` | Initial preview visibility. |
 | `preview_scale` | `4` | integer `1..10`; restart required | Preview size. |
 | `start_minimized` | `0` | boolean | Do not automatically show preview at startup. |
 | `start_at_login` | `0` | boolean | Portable current-user startup entry; ignored in safe mode and installed mode. |
-| `safe_mode` | `0` | boolean | Restrict the normal dashboard to local CPU, RAM, and clock data; harmless slot cycling and alert acknowledgement remain available. |
+| `safe_mode` | `0` | boolean | Restrict the normal dashboard to local CPU, RAM, and clock data; harmless slot cycling remains available. |
 
 `preview_mode auto` shows the preview when neither physical G13 connection is
 active. A tray toggle overrides later automatic visibility changes.
@@ -85,14 +92,14 @@ Layouts 2 and 3 scale inbound/IN bars with
 
 | Key | Default | Constraint |
 |---|---|---|
-| `slot_0` | `HEADSET_BATTERY CPU_TEMP CONTROLLER_BATTERY` | One or more of the 53 button values. |
+| `slot_0` | `HEADSET_BATTERY CPU_TEMP CONTROLLER_BATTERY` | One or more of the 50 button values. |
 | `slot_1` | `FPS_CURRENT NET_BOTH NET_GRAPH FRAME_TIME SESSION_TIME` | One or more button values. |
 | `slot_2` | `PROC_HANG FPS_1LOW DISK_IO DISK_IO_GRAPH GPU_TEMP PING JITTER AUDIO` | One or more button values. |
-| `slot_3` | `BOTTLENECK THERMALS POWER_LIMIT` | One or more button values. |
+| `slot_3` | `THERMALS POWER_LIMIT` | One or more button values. |
 
 The lists map to physical and preview buttons 1 through 4. A short press moves
 through one list. `PROC_HANG` may appear only once across all four lists. See
-the canonical [53-value button option reference](../modules.md) and the manual's
+the canonical [50-value button option reference](../modules.md) and the manual's
 [slot setup steps](INSTRUCTION-MANUAL.md#choose-layouts-and-button-options).
 
 ## Set CPU bars
@@ -107,6 +114,9 @@ The cache and frequency lists must both be `auto` or both be explicit. Explicit
 lists take effect only with `ccd_source manual`; otherwise automatic detection
 groups CPU cores by L3 cache or NUMA layout and uses CPUID L3 size to identify
 the larger V-Cache domain. One detected domain uses one full-height CPU bar.
+Each joined list is capped at 4096 bytes in total (see "Write valid lines"), and an
+over-limit list is reported under the key's own name, not as a generic
+processor-list message.
 
 ## Choose the G13 connection
 
@@ -241,8 +251,8 @@ unsupported shape, automatic workload fallback may still select another app.
 There is no user-maintained game list.
 
 With `presentmon_deferred 1`, unavailable PresentMon button options are skipped
-only for display. The saved selection does not change. `PROC_HANG` and
-`BOTTLENECK` are never selected as the temporary result. An all-unavailable list
+only for display. The saved selection does not change. `PROC_HANG` is never
+selected as the temporary result. An all-unavailable list
 shows `CLEAR`. Set it to `0` to keep the selected inactive panel.
 
 With `presentmon_persist 1`, automatic mode allows generic workload selection
@@ -290,8 +300,6 @@ PID is also unsupported. SteelSeries GG may coexist but is not read or required.
 | `headset_poll_ms` | `15000` (`auto`) | `1000..600000` | Read interval. |
 | `headset_query_timeout_ms` | `1200` (`auto`) | `100..10000` | Complete query time limit. |
 | `headset_stale_ms` | `45000` (`auto`) | at least poll interval; at most `3600000` | Reading age limit. |
-| `headset_warn_percent` | `25` | `0..100` | Battery warning threshold. |
-| `headset_critical_percent` | `0` | `0..100`; not above warning | Battery critical threshold. |
 
 ## Set controller, audio, and network options
 
@@ -313,7 +321,7 @@ The network probe is off by default and sends no traffic while off or in safe
 mode. Host names are rejected. TCP defaults to port 443 when no port is given.
 `auto` tries IPv4 ICMP and then TCP within one timeout; IPv6 uses TCP.
 
-## Set graph, pane warning, and bottleneck limits
+## Set graph ceilings
 
 | Key | Default | Accepted value or constraint | What it controls |
 |---|---:|---|---|
@@ -322,14 +330,14 @@ mode. Host names are rejected. TCP defaults to port 443 when no port is given.
 | `network_graph_ceiling_mbps` | none | finite `1..100000` | Active legacy alias that sets both directional network ceilings at that point in parse order. |
 | `disk_graph_ceiling_mbps` | `1000` | `1..100000` | Disk graph. |
 | `fps_graph_ceiling` | `240` | `1..1000` | FPS graph. |
-| `warning` | `1` | boolean | `1` flashes selected temperature panes; `0` uses full-screen temperature alerts. |
-| `cpu_temp_max_c` | `90` | `1..150` | CPU graph ceiling and pane flash threshold. |
-| `gpu_temp_max_c` | `90` | `1..150` | GPU graph ceiling and pane flash threshold. |
-| `bottleneck_cpu_percent` | `90` | `1..100` | CPU bottleneck threshold. |
-| `bottleneck_gpu_percent` | `95` | `1..100` | GPU bottleneck threshold. |
-| `bottleneck_memory_percent` | `90` | `1..100` | RAM/VRAM bottleneck threshold. |
-| `bottleneck_disk_mbps` | `500` | `1..100000` | Combined disk read/write threshold. |
-| `bottleneck_sustain_ms` | `2000` | `0..60000` | Time a bottleneck must continue. |
+| `cpu_temp_max_c` | `90` | `1..150` | CPU temperature graph and history scale only. |
+| `gpu_temp_max_c` | `90` | `1..150` | GPU temperature graph and history scale only. |
+
+`cpu_temp_max_c` and `gpu_temp_max_c` are graph-scale settings. They no longer
+flash a pane, invert a panel, or feed any alarm: the whole non-hang warning,
+alert, flashing, and bottleneck subsystem was removed, so no ordinary reading
+requests attention. A temperature above its ceiling simply draws a full-height
+graph; the numeric reading stays exact and unlabelled.
 
 All graphs cover the trailing 30 seconds. CPU/GPU load graphs use a fixed
 0..100% scale. `FRAME_TIME` scales to its observed 30-second range. Ceilings do
@@ -362,12 +370,19 @@ file, but repeating the same spelling in one file is an error.
 
 | Key | Default | Accepted value or constraint | What it controls |
 |---|---|---|---|
-| `discord_enabled` | `1` | boolean | Discord voice display; safe mode disables Discord access by the normal dashboard. |
+| `discord_enabled` | `1` | boolean | Discord voice-state integration; safe mode disables Discord access by the normal dashboard. |
 | `discord_client_id` | empty | digits only | Public application ID. Empty means not configured. |
-| `discord_linger_ms` | `700` | `0..10000` | Keep a speaker visible after speaking stops. |
-| `discord_max_speakers` | `2` | `1..4` | Visible speaker count before `+N`. |
-| `discord_show_self` | `0` | boolean | Include the current user. |
-| `discord_show_channel` | `0` | boolean | Show voice channel name as title. |
+| `discord_linger_ms` | `700` | `0..10000` | How long the provider keeps a speaker in the published voice state after speaking stops. |
+| `discord_max_speakers` | `2` | `1..4` | Speaker entries the provider tracks before reporting `+N`. |
+| `discord_show_self` | `0` | boolean | Include the current user in the published voice state. |
+| `discord_show_channel` | `0` | boolean | Voice channel name carried in the published voice state. |
+
+The panel no longer shows a speaker list. The automatic full-screen
+active-speaker takeover was removed, because only the hung-window feature may
+replace your selected display without your request; `PROVIDER_STATUS` keeps
+reporting the `Discord` connection row, and the settings above continue to shape
+the provider's published voice state. No replacement speaker pane exists, and
+retiring these four settings is a separate product decision.
 
 The client ID is not secret. Each user creates a Discord application and
 authorizes each Discord account. The authorization command requires the client
@@ -406,6 +421,13 @@ too late, the hold is refused rather than fired late.
 
 Termination can lose unsaved work. The default keeps detection and action off.
 
+This is the product's only attention path. No ordinary reading produces an alert,
+episode, flash, full-screen warning, sticky banner, bottleneck verdict, or
+acknowledgement step, so nothing can intercept this button, steal the frame, or
+queue ahead of a hung-window panel. A requested termination is reported as
+requested: `TerminateProcess` can return before the process exits, and pending
+I/O can delay it, so no outcome is presented as a confirmed recovery.
+
 ## Advanced compatibility-only settings
 
 These keys keep older configuration files valid. LCDSirPlus parses and validates
@@ -415,29 +437,62 @@ them but ignores their values. New files should omit them.
 |---|---:|---|---|
 | `date_format` | `yyyy-MM-dd dddd` | non-empty reserved string; not validated as a Windows format | Header date remains fixed. |
 | `time_format` | `HH:mm:ss` | non-empty reserved string; not validated as a Windows format | Ignored; Windows Short time controls output. |
-| `headset_estimate_hours` | `1` | boolean | No battery-hours estimate is shown. |
 | `discord_redirect_uri` | `http://127.0.0.1` | exactly one reserved string | No redirect is sent, registered, or opened. |
 | `hang_button` | `3` | integer `1..4` | The slot containing selected `PROC_HANG` owns the actual button. |
 
-## Set alerts
+## Retired: alerts, warnings, and bottleneck
 
-| Key | Default | Accepted value or constraint | What it controls |
-|---|---:|---|---|
-| `temperature_warning_enabled` | `1` | boolean | CPU/GPU temperature alerts and pane flashing. |
-| `memory_warning_enabled` | `1` | boolean | RAM/VRAM alerts. |
-| `cpu_temp_warning` | `85` | `0..150`; not above critical | CPU warning. |
-| `cpu_temp_critical` | `95` | `0..150`; not below warning | CPU critical alert. |
-| `gpu_temp_warning` | `83` | `0..150`; not above critical | GPU warning. |
-| `gpu_temp_critical` | `90` | `0..150`; not below warning | GPU critical alert. |
-| `memory_warning` | `100` | `0..100`; `0` is compatibility disable | Physical memory warning at or above value. |
-| `vmem_warning` | `100` | `0..100`; `0` is compatibility disable | Video memory warning at or above value. |
-| `critical_alert_linger_ms` | `3000` | `0..60000` | Keep a recovered critical alert for this long. |
+LCDSirPlus is a monitoring dashboard: you choose which readings to observe, and
+the program no longer classifies ordinary resource conditions into
+attention-demanding warnings. The complete non-hang warning/alert subsystem and
+the complete bottleneck classifier were deleted, not disabled: no evaluator,
+threshold, retained episode, severity ranking, linger timer, queue,
+acknowledgement state, full-screen warning, pane flash, `ALERTS` option,
+`BOTTLENECK` option, or alarm-only polling remains, and there is no hidden
+toggle, no compatibility shim, and no replacement alarm classifier.
 
-Use the category switches to turn alerts off. Existing installed threshold
-values are preserved during update. Only current readings create alerts. A
-warning clears on the first current recovered reading. A critical alert starts
-its linger time on that reading. Unknown or stale data does not prove recovery.
-Button 4 acknowledges the highest active alert before its normal slot action.
+The hung-process `PROC_HANG` feature is the only remaining attention path. Its
+detection, target presentation, short-press and long-press handling,
+cancellation, safe-mode refusal, guarded termination, audit lines, and outcomes
+are unchanged, and no ordinary alert can intercept its input or cover its panel.
+
+These settings are retired. They are ordinary unknown keys now: a file that
+still sets one is rejected with the normal `unknown key` diagnostic, and the
+last valid configuration stays active. Remove the lines; nothing is ignored,
+and no recurring obsolete-key warning is emitted.
+
+```text
+bottleneck_cpu_percent   bottleneck_gpu_percent   bottleneck_memory_percent
+bottleneck_disk_mbps     bottleneck_sustain_ms    warning
+temperature_warning_enabled   memory_warning_enabled
+cpu_temp_warning         cpu_temp_critical        gpu_temp_warning
+gpu_temp_critical        memory_warning           vmem_warning
+critical_alert_linger_ms headset_warn_percent     headset_critical_percent
+```
+
+`headset_enabled` and the battery polling controls stay, and keep reporting
+headset battery percentage, charging, online, and AC states: only the
+low/critical battery alarms are gone. `cpu_temp_max_c` and `gpu_temp_max_c`
+stay as graph scales (see "Set graph ceilings"). No warning setting may force a
+faster render cadence any more, so `render_interval_ms` keeps only its own
+`25..5000` bound and your chosen interval is honored.
+
+The shipped template and a migrated copy of an installed file are provided with
+the release notes; the migration removes only the retired assignments and the
+retired `ALERTS`/`BOTTLENECK` button values, preserves every other line, order,
+quote, and include, and replaces a button list that became empty with `CLOCK`.
+Default slot 4 is now `THERMALS POWER_LIMIT`.
+
+`headset_estimate_hours` retired the same way, and its compatibility-only entry
+was removed with it. It was parsed, validated and ignored, so it kept old files
+valid; that is no longer true. A file that still sets it is rejected as an
+unknown key, a running instance keeps its last valid configuration, and
+`--validate-config` exits 2. Remove the line.
+
+`CPU_CACHE_TEMP` and `CPU_FREQ_TEMP` are retired button values: no data source
+ever published them, so both showed `N/A`. A slot line naming either one is now
+rejected with `unknown button option`, and the last valid configuration stays
+active. Replace the name with `CPU_TEMP`.
 
 ## Set logging
 

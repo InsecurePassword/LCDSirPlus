@@ -323,12 +323,16 @@ fn run_step(
 
 fn submit(transport: &Transport<'_>, report: &[u8]) -> Result<(), String> {
     match transport {
-        Transport::DirectHid(device) => device.write_report(
-            report
-                .try_into()
-                .map_err(|_| "invalid 992-byte HID test report")?,
-        ),
-        Transport::DirectSdk(device) => device.submit(report.to_vec()),
+        Transport::DirectHid(device) => device
+            .write_report(
+                report
+                    .try_into()
+                    .map_err(|_| "invalid 992-byte HID test report")?,
+            )
+            .map_err(|error| error.to_string()),
+        Transport::DirectSdk(device) => device
+            .submit(report.to_vec())
+            .map_err(|error| error.to_string()),
         Transport::Virtual => Ok(()),
         #[cfg(test)]
         Transport::Fake(fake) | Transport::FakeSdk(fake) => fake.write(report),
@@ -352,9 +356,11 @@ fn poll_buttons(
 ) -> Result<(), String> {
     let mut raw = [0u8; 8];
     let read = match transport {
-        Transport::DirectHid(device) => device.read_input_timeout(&mut raw, timeout),
+        Transport::DirectHid(device) => device
+            .read_input_timeout(&mut raw, timeout)
+            .map_err(|error| error.to_string()),
         Transport::DirectSdk(device) => {
-            let (connected, states) = device.poll()?;
+            let (connected, states) = device.poll().map_err(|error| error.to_string())?;
             if !connected {
                 return Err("Logitech SDK reports the monochrome LCD disconnected".into());
             }

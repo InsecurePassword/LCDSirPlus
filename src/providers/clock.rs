@@ -18,11 +18,17 @@ pub struct ClockText {
     pub time: String,
 }
 
-pub fn read() -> ClockText {
-    let defaults = crate::config::Config::default();
+/// WO-TEL-D3-B1 (L6): the date format arrives as the app's configured slice, so this core-path
+/// call (3.33/s at the 300 ms `telemetry_interval`) no longer constructs a whole default
+/// `Config` (108 pub fields, 27 `String`, 2 `Vec`, `[Vec<String>; 4]`, a `BTreeMap` = the ~52
+/// heap blocks the census counted) to read one field. The app owns the `Config` it passes, so the
+/// value cannot drift from the live config (the D2 wholesale-replace rule). Wording note: this doc
+/// deliberately avoids the constructor token itself, because the L6 census below counts that
+/// token in the production region (the registered prose-token class).
+pub fn read(date_format: &str) -> ClockText {
     let st = unsafe { GetLocalTime() };
     ClockText {
-        date: format_date(&st, &defaults.date_format),
+        date: format_date(&st, date_format),
         date_short: format_date(&st, "yyyy-MM-dd ddd"),
         time: format_time(&st),
     }
@@ -127,6 +133,49 @@ mod tests {
         };
         assert_eq!(format_date(&st, "yyyy-MM-dd dddd"), "2026-08-08 Saturday");
         assert_eq!(format_date(&st, "yyyy-MM-dd ddd"), "2026-08-08 Sat");
+    }
+
+    /// WO-TEL-D3-B1 (L6): the core-path clock read takes the date format from its caller, so it
+    /// builds no `Config` at all. Census: the production region of this file (file start to the
+    /// `#[cfg(test)]` attribute) carries ZERO `Config::default` tokens, and `read` renders the
+    /// SUPPLIED pattern — proved against the host clock, so the pin is not vacuous: a `read` that
+    /// ignored its argument and rendered the shipped default format fails the year leg. The four
+    /// shipped format tests above stay byte-identical and exact.
+    #[test]
+    fn read_uses_the_supplied_date_format_and_builds_no_config() {
+        let source = include_str!("clock.rs").replace("\r\n", "\n");
+        let prod = &source[..source
+            .find("#[cfg(test)]")
+            .expect("the tests attribute opens the test module")];
+        println!(
+            "D3B1-L6 harness-count: Config::default tokens in the clock production region = {}",
+            prod.matches("Config::default").count()
+        );
+        assert_eq!(
+            prod.matches("Config::default").count(),
+            0,
+            "L6: the per-call whole-Config construction (~52 heap blocks x 3.33/s) is gone from the core path"
+        );
+        assert!(
+            prod.contains("pub fn read(date_format: &str) -> ClockText {"),
+            "L6: the format arrives as the caller's slice"
+        );
+        assert!(
+            prod.contains("date: format_date(&st, date_format),"),
+            "L6: the supplied format is the one rendered"
+        );
+        let st = unsafe { GetLocalTime() };
+        let year = st.wYear.to_string();
+        let text = read("yyyy");
+        assert_eq!(
+            text.date, year,
+            "L6: `read` renders the SUPPLIED pattern (a default-config format cannot equal a bare year)"
+        );
+        assert_eq!(
+            text.date_short,
+            format_date(&st, "yyyy-MM-dd ddd"),
+            "L6: the fixed short date keeps the shipped pattern, untouched by the parameter"
+        );
     }
 
     #[test]
