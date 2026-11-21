@@ -1,12 +1,14 @@
 # LCDSirPlus Button Options
 
-This is the canonical quick reference for all 52 button options, in source
+This is the canonical quick reference for all 50 button options, in source
 order. Its table is mirrored exactly in the instruction manual and PDF. For
 setup and editing steps, see the
 [instruction manual](docs/INSTRUCTION-MANUAL.md#choose-layouts-and-button-options).
 Put these values in `slot_0` through `slot_3`.
 `ALERTS` and `BOTTLENECK` were removed in 0.3.0: the product no longer classifies
 ordinary readings into warnings, and it no longer names a bottleneck.
+`CPU_CACHE_TEMP` and `CPU_FREQ_TEMP` are retired: no source published them, so a slot
+that names either one is rejected and the last valid configuration stays active.
 
 | Option | Description |
 |---|---|
@@ -39,8 +41,6 @@ ordinary readings into warnings, and it no longer names a bottleneck.
 | `RAM_USAGE` | Shows memory use and capacity. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `GPU_LOAD` | Shows GPU use. What you need: An NVIDIA or AMD graphics driver. |
 | `VRAM_USAGE` | Shows video memory use and capacity. What you need: An NVIDIA or AMD graphics driver. |
-| `CPU_CACHE_TEMP` | Shows N/A. What you need: Not available in version 0.3.0. |
-| `CPU_FREQ_TEMP` | Shows N/A. What you need: Not available in version 0.3.0. |
 | `CPU_LOAD_GRAPH` | Shows CPU use for 30 seconds. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `GPU_LOAD_GRAPH` | Shows GPU use for 30 seconds. What you need: An NVIDIA or AMD graphics driver. |
 | `CPU_TEMP_GRAPH` | Shows CPU temperature for 30 seconds. What you need: HWiNFO or LibreHardwareMonitor, installed and set up separately. |

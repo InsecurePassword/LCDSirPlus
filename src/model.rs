@@ -4,7 +4,6 @@
 //! same display semantics: explicit availability/freshness states, canonical
 //! byte values that never round-trip through float64, and legacy percentage
 //! projections for the fixed bars.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -53,7 +52,6 @@ pub enum MetricKey {
     VRAMUtilization,
     VRAMUsed,
     VRAMTotal,
-    CPUCCDTemp,
     CPUPeakUtilization,
     VRMTemp,
     ChipsetTemp,
@@ -117,6 +115,9 @@ impl Reading {
         }
     }
 
+    // Only test caller left (src/telemetry.rs:2261, a #[cfg(test)] module outside this scope);
+    // delete this wrapper together with that caller.
+    #[allow(dead_code)]
     pub fn current_celsius(key: MetricKey, value: f64, hardware_id: &str, at: SystemTime) -> Self {
         Self::current_number(key, ValueKind::Celsius, value, hardware_id, at)
     }
@@ -168,6 +169,10 @@ impl Reading {
     }
 }
 
+// Kept: the only reader was the retired CPU-cache/frequency temperature surface, and the field is
+// named by a struct literal outside this unit's file scope (`src/app.rs:3803` keeps
+// `..Default::default()`). Follow-up: delete this field, these three types and that row together.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum HardwareKind {
@@ -178,6 +183,7 @@ pub enum HardwareKind {
     GPU,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum HardwareRole {
     #[default]
@@ -186,6 +192,7 @@ pub enum HardwareRole {
     Frequency,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 pub struct HardwareDescriptor {
     pub hardware_id: String,
@@ -196,6 +203,7 @@ pub struct HardwareDescriptor {
 /// Immutable canonical snapshot published by the readings arbitrator.
 #[derive(Clone, Debug, Default)]
 pub struct ReadingsSnapshot {
+    #[allow(dead_code)]
     pub hardware: Vec<HardwareDescriptor>,
     pub metrics: Vec<Reading>,
 }
@@ -320,14 +328,23 @@ pub struct Speaker {
 pub struct DiscordState {
     pub connected: bool,
     pub authenticated: bool,
+    // Carried by the host projection `state_from_pod` (src/providers/discord.rs:907) from the
+    // byte-identical component ABI block; the renderer consumers were retired, so the compiler
+    // names these dead. Kept: removing them requires editing the ABI projection outside this scope.
+    #[allow(dead_code)]
     pub channel_id: String,
     pub channel_name: String,
     pub self_mute: bool,
+    #[allow(dead_code)]
     pub self_deaf: bool,
+    #[allow(dead_code)]
     pub voice_ping_ms: f64,
+    #[allow(dead_code)]
     pub connection_state: String,
     pub speakers: Vec<Speaker>,
+    #[allow(dead_code)]
     pub error: String,
+    #[allow(dead_code)]
     pub updated: Option<SystemTime>,
 }
 

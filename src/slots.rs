@@ -1,5 +1,4 @@
 //! Four button-aligned cycling slot windows.
-#![allow(dead_code)]
 
 use crate::config::Config;
 

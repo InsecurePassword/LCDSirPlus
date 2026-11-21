@@ -48,6 +48,13 @@ characters. One line can contain at most 256 values. Other limits are 8 include
 levels, 64 files, 64 include lines, 8 MiB total input, 16384 lines, and 16 KiB
 per token. Duplicate keys with the same spelling in one file are rejected.
 
+Six keys join their values into one string before use: `date_format`,
+`time_format`, `logitech_friendly_name`, `presentmon_path`, `ccd_cache_processors`
+and `ccd_frequency_processors`. The joined value is capped at 4096 bytes, counted
+over every value plus the single spaces the join inserts, so the cap applies to the
+total and not only to one token. An over-limit joined value is rejected with the
+key's own name, such as `ccd_cache_processors exceeds limit of 4096 bytes`.
+
 An `auto` interval uses the numeric default shown in its table. Other selectors
 that accept `auto` are described separately.
 
@@ -85,14 +92,14 @@ Layouts 2 and 3 scale inbound/IN bars with
 
 | Key | Default | Constraint |
 |---|---|---|
-| `slot_0` | `HEADSET_BATTERY CPU_TEMP CONTROLLER_BATTERY` | One or more of the 52 button values. |
+| `slot_0` | `HEADSET_BATTERY CPU_TEMP CONTROLLER_BATTERY` | One or more of the 50 button values. |
 | `slot_1` | `FPS_CURRENT NET_BOTH NET_GRAPH FRAME_TIME SESSION_TIME` | One or more button values. |
 | `slot_2` | `PROC_HANG FPS_1LOW DISK_IO DISK_IO_GRAPH GPU_TEMP PING JITTER AUDIO` | One or more button values. |
 | `slot_3` | `THERMALS POWER_LIMIT` | One or more button values. |
 
 The lists map to physical and preview buttons 1 through 4. A short press moves
 through one list. `PROC_HANG` may appear only once across all four lists. See
-the canonical [52-value button option reference](../modules.md) and the manual's
+the canonical [50-value button option reference](../modules.md) and the manual's
 [slot setup steps](INSTRUCTION-MANUAL.md#choose-layouts-and-button-options).
 
 ## Set CPU bars
@@ -107,6 +114,9 @@ The cache and frequency lists must both be `auto` or both be explicit. Explicit
 lists take effect only with `ccd_source manual`; otherwise automatic detection
 groups CPU cores by L3 cache or NUMA layout and uses CPUID L3 size to identify
 the larger V-Cache domain. One detected domain uses one full-height CPU bar.
+Each joined list is capped at 4096 bytes in total (see "Write valid lines"), and an
+over-limit list is reported under the key's own name, not as a generic
+processor-list message.
 
 ## Choose the G13 connection
 
@@ -427,7 +437,6 @@ them but ignores their values. New files should omit them.
 |---|---:|---|---|
 | `date_format` | `yyyy-MM-dd dddd` | non-empty reserved string; not validated as a Windows format | Header date remains fixed. |
 | `time_format` | `HH:mm:ss` | non-empty reserved string; not validated as a Windows format | Ignored; Windows Short time controls output. |
-| `headset_estimate_hours` | `1` | boolean | No battery-hours estimate is shown. |
 | `discord_redirect_uri` | `http://127.0.0.1` | exactly one reserved string | No redirect is sent, registered, or opened. |
 | `hang_button` | `3` | integer `1..4` | The slot containing selected `PROC_HANG` owns the actual button. |
 
@@ -473,6 +482,17 @@ the release notes; the migration removes only the retired assignments and the
 retired `ALERTS`/`BOTTLENECK` button values, preserves every other line, order,
 quote, and include, and replaces a button list that became empty with `CLOCK`.
 Default slot 4 is now `THERMALS POWER_LIMIT`.
+
+`headset_estimate_hours` retired the same way, and its compatibility-only entry
+was removed with it. It was parsed, validated and ignored, so it kept old files
+valid; that is no longer true. A file that still sets it is rejected as an
+unknown key, a running instance keeps its last valid configuration, and
+`--validate-config` exits 2. Remove the line.
+
+`CPU_CACHE_TEMP` and `CPU_FREQ_TEMP` are retired button values: no data source
+ever published them, so both showed `N/A`. A slot line naming either one is now
+rejected with `unknown button option`, and the last valid configuration stays
+active. Replace the name with `CPU_TEMP`.
 
 ## Set logging
 

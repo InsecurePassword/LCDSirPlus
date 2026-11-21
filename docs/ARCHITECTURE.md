@@ -79,6 +79,12 @@ closes the circuit, emits one recovery audit line, and the worker's existing
 Connected and completed-work health publications carry the recovery to the
 app, which clears the loss labels on real health only. LCore is never
 terminated on this path, and the ladder's row shape and cadence are unchanged.
+Authorization is refused while more than one open is in flight or once the
+detached-owner bound is reached (`src/backends/sdk.rs:315-319`). The detached-owner
+census is the process's resource ledger, not episode state: an episode reset keeps
+it, and an entry leaves only when that owner actually retires
+(`src/backends/sdk.rs:263-282`, `retire` at `src/backends/sdk.rs:233`), so the bound
+accumulates across episodes for the life of the process.
 
 Direct HID requires both exact `LCore.exe` and
 `logi_lamparray_service.AMD64.exe` to be absent and fails closed if process
@@ -158,9 +164,9 @@ disable or safe mode. Policy changes discard prior probe history.
 ## Provider config re-arm checklist (EC-8)
 
 One producer moves the config generation: the reload path in `src/app.rs`
-(`src/app.rs:232` `telemetry_runtime.update_config(&cfg)`), and the published telemetry stays
-generation-checked (`src/app.rs:201-203`) with explicit invalidation
-(`src/app.rs:1443-1452` `invalidate_telemetry_publication`). Every provider loop reads config
+(`src/app.rs:260` `telemetry_runtime.update_config(&cfg)`), and the published telemetry stays
+generation-checked (`src/app.rs:228`) with explicit invalidation
+(`src/app.rs:1515` `invalidate_telemetry_publication`). Every provider loop reads config
 and generation together through the one existing pattern, `current_request(&config, &generation)`
 (first provider copy: `src/providers/network.rs:190`), and clears the in-flight policy state it
 owns when the generation moves. `src/providers/mod.rs::tests::ec8_docs_checklist_names_every_provider`
@@ -176,16 +182,16 @@ checklist cannot drift from the tree.
 | `src/providers/headset.rs` | telemetry sampling loop `spawn_headset` `src/telemetry.rs:1373`, sampler seam param L1379 (production `spawn` passes the real `headset::query` at L1848), loop L1387, `cached_request` L1388, generation stamped on the result L1413 | coordinator success L683 and stale-generation event drop L716 | `delayed_old_generation_sensor_results_are_discarded`, `staleness_and_enablement_are_deterministic` (in `src/telemetry.rs`); cadence re-arm driven on the real loop with the sampler injected: `telemetry_headset_loop_behavioral_generation_bump_rearms_sampling`; zero-demand park + resume: `telemetry_headset_loop_zero_demand_parks_and_resume_samples_within_bound` |
 | `src/providers/lhm.rs` | `spawn_lhm` `src/telemetry.rs:1434`, sampler seam param L1440 with its `LhmSampler` fn-pointer alias L1427-1432 (production `spawn` passes the real `lhm::sample_extended` at L1856), loop L1458, `cached_request` L1459, sampler call L1488. No config reference in the module (0 `Config`/`cfg.` hits); URL, overrides, selectors and timeout arrive as arguments | success L684, readings L704, diagnostic L708, stale drop L719 | `lhm_values_transition_from_current_to_stale`, `config_update_replaces_shared_runtime_config`; cadence re-arm driven on the real loop with the sampler injected: `telemetry_lhm_loop_behavioral_generation_bump_rearms_sampling`; provider-outcome backoff replacing the shipped inversion: `telemetry_lhm_loop_provider_outcome_backoff_is_bounded_by_keep_alive` |
 | `src/providers/hwinfo.rs` | `spawn_hwinfo` `src/telemetry.rs:1511`, sampler seam param L1517 (production `spawn` passes the real `hwinfo::sample` at L1872), loop L1525, `cached_request` L1526, selector set and generation captured together L1544-1546. No config reference in the module (0 hits); selectors and max age arrive as arguments | readings L705, success L689, CPU temperature L698, stale drop L725-728 | `hwinfo_selector_generation_change_invalidates_temperature`, `hwinfo_diagnostic_survives_generation_and_changes_once_per_selector`, `safe_mode_clears_expansion_and_rebaselines`; cadence re-arm driven on the real loop with the sampler injected: `telemetry_hwinfo_loop_behavioral_generation_bump_rearms_sampling`; zero-demand park + resume: `telemetry_hwinfo_loop_zero_demand_parks_and_resume_samples_within_bound` |
-| `src/providers/gpu.rs` | `spawn_gpu` `src/telemetry.rs:1751`, sampler seam param L1757 with the one-line adapter `gpu_sample` L1747-1749 (its body is the shipped method call; production `spawn` passes the adapter at L1864), loop L1779, `cached_request` L1780. No config reference in the module (0 hits); `cfg.gpu_provider` is passed to `sample` L1796 | provider backend cache is dropped when the selector moves (`src/providers/gpu.rs:58-61`) and on disable L1807; coordinator success L685, backend name L702, GPU temperature/power L700-703; WO-TEL-D3-B1 core tier: the four CORE rows go explicit-unavailable via `publish_core_gpu_unavailable` L859, called from the `apply_gpu` failure arm L898 and the freshness disabled arm L1217, with the park loop sending exactly one core event (flag reset L1788, publish L1814-1823); the shipped DG-4 clear arm (success L685, backend L702, temperature/power L700-703) stays as accepted | `native_gpu_temperature_wins_until_stale`, `delayed_provider_updates_keep_their_generation_and_are_discarded`; cadence re-arm driven on the real loop with the sampler injected: `telemetry_gpu_loop_behavioral_generation_bump_rearms_sampling`; provider-outcome backoff bounding the vendor re-open chain: `telemetry_gpu_loop_provider_outcome_backoff_is_bounded_by_keep_alive`; zero-demand park + resume: `telemetry_gpu_loop_zero_demand_parks_and_resume_samples_within_bound`; WO-TEL-D3-B1 core tier: `gpu_disabled_park_publishes_explicit_core_unavailable_rows_once`, `gpu_loop_park_publishes_one_core_unavailable_event` |
+| `src/providers/gpu.rs` | `spawn_gpu` `src/telemetry.rs:1751`, sampler seam param L1757 with the one-line adapter `gpu_sample` L1747-1749 (its body is the shipped method call; production `spawn` passes the adapter at L1864), loop L1779, `cached_request` L1780. No config reference in the module (0 hits); `cfg.gpu_provider` is passed to `sample` L1796 | provider backend cache is dropped when the selector moves (`src/providers/gpu.rs:58-61`) and on disable L1807; coordinator success L685, backend name L702, GPU temperature/power L700-703; WO-TEL-D3-B1 core tier: the four CORE rows go explicit-unavailable via `publish_core_gpu_unavailable` L904, called from the `apply_gpu` failure arm L943 and the freshness disabled arm L1273, with the park loop sending exactly one core event (latch L1866, publish L1909-1910); WO-U46I (#16) resets that latch in the generation-bump branch (L1878, L1883), so a parked GPU loop re-publishes its explicit unavailable core rows after a configuration change instead of staying silent; the shipped DG-4 clear arm (success L685, backend L702, temperature/power L700-703) stays as accepted | `native_gpu_temperature_wins_until_stale`, `delayed_provider_updates_keep_their_generation_and_are_discarded`; cadence re-arm driven on the real loop with the sampler injected: `telemetry_gpu_loop_behavioral_generation_bump_rearms_sampling`; provider-outcome backoff bounding the vendor re-open chain: `telemetry_gpu_loop_provider_outcome_backoff_is_bounded_by_keep_alive`; zero-demand park + resume: `telemetry_gpu_loop_zero_demand_parks_and_resume_samples_within_bound`; WO-TEL-D3-B1 core tier: `gpu_disabled_park_publishes_explicit_core_unavailable_rows_once`, `gpu_loop_park_publishes_one_core_unavailable_event` |
 | `src/providers/netif.rs` | coordinator `Worker::tick` `src/telemetry.rs:595`, `cached_request` L599, poll L1014-1033. No config reference in the module (0 hits) | throughput baseline provider L681 and attempt stamp L693 | `failure_clears_baseline_and_recovery_requires_a_new_interval` (`src/providers/netif.rs:138-193`, the EC-8 template), `safe_mode_runtime_owns_and_joins_all_threads` |
 | `src/providers/performance.rs` | coordinator `Worker::tick` `src/telemetry.rs:595`, `cached_request` L599, poll L1046 with `performance.sample()` L1063. No config reference in the module (0 hits) | provider L682, attempt L694, readings L706, success L686 | `formatted_values_require_valid_status_and_finite_data` (module), `gated_provider_sampling_uses_keep_alive_bound_not_full_cadence`, `consumer_set_publication_is_visible_to_the_scheduler` |
 | `src/providers/connections.rs` | coordinator `Worker::tick` `src/telemetry.rs:595`, `cached_request` L599, poll L1104 with `connections::sample()` L1116. No config reference in the module (0 hits) | attempt L1114/L695, reading L707, success L1125/L687 | `decoder_is_bounded_and_counts_only_established` (module), `consumer_rejoin_restores_full_cadence_on_the_next_scheduled_tick`, `attempts_not_successes_control_cadence` |
 | `src/providers/system_power.rs` | coordinator `Worker::tick` `src/telemetry.rs:595`, `cached_request` L599, poll L1135 with `system_power::sample()` L1147. No config reference in the module (0 hits) | battery attempt L1145/L696, success L1161/L688 | `decoder_distinguishes_unknown_zero_and_no_battery` (module), `staleness_and_enablement_are_deterministic` |
 | `src/providers/audio.rs` | coordinator `Worker::tick` `src/telemetry.rs:595`, `cached_request` L599, poll L982 with `audio::read()` L999. No config reference in the module (0 hits) | audio attempt stamp L692 | none in the module (stateless `read()`, no in-flight policy state to reset); `staleness_and_enablement_are_deterministic` covers the coordinator state |
 | `src/providers/xinput.rs` | coordinator `Worker::tick` `src/telemetry.rs:595`, `cached_request` L599, poll L939-956. No config reference in the module (0 hits); `cfg.controller_index` arrives as an argument | controller attempt stamp L691 | `staleness_and_enablement_are_deterministic`, `query_does_not_panic_without_controller` |
-| `src/providers/cpu.rs` | app loop, synchronous: sampled in `build_snapshot` (`src/app.rs:1226`) at `src/app.rs:1237`. The app loop owns `cfg` by value and replaces it wholesale at `src/app.rs:223` before the bump at `src/app.rs:232`, so no stale config read exists. No config reference in the module (0 hits) | per-logical-processor counter baseline inside `cpu::CpuLoadProvider`, plus the WO-TEL-D3-B1 (L7) resident sample buffer: `RECORDS` L23, the `buffer` field L116 and the guarded single allocation at L126-130 (`src/providers/cpu.rs:109`); the provider is app-loop-owned (`src/app.rs:152`) and stateless across a reload | `ec5_synthetic_records_yield_hand_derived_percents`, `ec5_all_cpu_surfaces_share_this_one_derivation`, `cpu_provider_reuses_one_resident_sample_buffer` |
-| `src/providers/clock.rs` | app loop, synchronous: sampled at `src/app.rs:1236` as `clock::read(&cfg.date_format)`. The WO-TEL-D3-B1 (L6) seam takes the display format as a parameter (`src/providers/clock.rs:28-31`), so the sampling path builds no configuration value and performs no config read of its own; the app loop passes the live `cfg.date_format`, the same value the renderer slots use | none: `read()` is stateless, so there is no in-flight policy state to reset | `fixed_date_format_renders`, `explicit_short_time_patterns_render_12h_and_24h`, `read_uses_the_supplied_date_format_and_builds_no_config` |
-| `src/providers/memory.rs` | app loop, synchronous: sampled at `src/app.rs:1250` with `memory::sample()`. No config reference in the module (0 hits) | none: `sample()` is stateless, so there is no in-flight policy state to reset | none in the module; the app loop samples it synchronously from the `cfg` value it replaced wholesale at `src/app.rs:223` |
+| `src/providers/cpu.rs` | app loop, synchronous: sampled in `build_snapshot` (`src/app.rs:1330`) at `src/app.rs:1339`. The app loop owns `cfg` by value and replaces it wholesale at `src/app.rs:252` before the bump at `src/app.rs:260`, so no stale config read exists. No config reference in the module (0 hits) | per-logical-processor counter baseline inside `cpu::CpuLoadProvider`, plus the WO-TEL-D3-B1 (L7) resident sample buffer: `RECORDS` L23, the `buffer` field L116 and the guarded single allocation at L126-130 (`src/providers/cpu.rs:109`); the provider is app-loop-owned (`src/app.rs:152`) and stateless across a reload | `ec5_synthetic_records_yield_hand_derived_percents`, `ec5_all_cpu_surfaces_share_this_one_derivation`, `cpu_provider_reuses_one_resident_sample_buffer` |
+| `src/providers/clock.rs` | app loop, synchronous: sampled at `src/app.rs:1338` as `clock::read(&cfg.date_format)`. The WO-TEL-D3-B1 (L6) seam takes the display format as a parameter (`src/providers/clock.rs:28-31`), so the sampling path builds no configuration value and performs no config read of its own; the app loop passes the live `cfg.date_format`, the same value the renderer slots use | none: `read()` is stateless, so there is no in-flight policy state to reset | `fixed_date_format_renders`, `explicit_short_time_patterns_render_12h_and_24h`, `read_uses_the_supplied_date_format_and_builds_no_config` |
+| `src/providers/memory.rs` | app loop, synchronous: sampled at `src/app.rs:1352` with `memory::sample()`. No config reference in the module (0 hits) | none: `sample()` is stateless, so there is no in-flight policy state to reset | none in the module; the app loop samples it synchronously from the `cfg` value it replaced wholesale at `src/app.rs:252` |
 | `src/providers/ccd.rs` | app loop, reload-driven: `src/app.rs:229` re-resolves the topology through `resolve_ccd_topology` (`src/app.rs:808-810`) inside the same reload block that bumps the generation. No config reference in the module (0 hits); explicit lists arrive as arguments | the app-loop `topology` value is replaced by the reloaded one at `src/app.rs:229` | `from_lists_builds_masks`, `from_lists_single_when_one_side_missing` |
 
 Two bounded cadence details the checklist records without changing: the four `telemetry.rs`
@@ -240,6 +246,18 @@ switching rules, expiry, or cleanup.
 Frame readings become stale after five seconds and expire after ten. Shutdown
 stops and joins only the LCDSirPlus-owned child and trace session.
 
+The pre-spawn confirmation verifies the executable on a dedicated verifier thread
+and the worker waits a bounded time for it
+(`src/providers/presentmon.rs:1276`, `:2839`), so a hung signature check cannot
+block the panel loop. The coordinator's freshness pass covers the PresentMon game
+metrics on the worker's own success stamp: past one bound FPS, 1%-low, 0.1%-low and
+frame time read stale, and past twice that bound they read unavailable
+(`src/telemetry.rs:1315-1341`). Provider demand for PresentMon follows the selected
+consumers; on the shipped stock defaults the published demand word is unchanged, and
+the widening appears only in configurations whose single PresentMon link is served by
+fall-through. Automatic target selection is hardware-untested on this lane: no G13,
+game process or NVIDIA catalog was driven live during these units.
+
 ## Discord boundary
 
 Discord Desktop candidates are limited to local pipe names 0 through 9. The
@@ -253,6 +271,17 @@ browser or callback listener. The generic OAuth flow requires a client secret.
 Credentials are keyed by immutable Discord user ID and protected for the current
 Windows account. Safe mode starts no Discord discovery, IPC, credential, or
 HTTPS work.
+
+A component load raises the hard-error mode for the calling thread only: the guard
+calls `SetThreadErrorMode(SEM_FAILCRITICALERRORS, ...)` and restores the mode that
+same call reported, on every exit path (`src/providers/discord.rs:571-600`, used at
+`:612`). This supersedes the u44 §G(4) residue, which raised the process-wide
+`SetErrorMode` and so changed a dialog-suppression state that other threads observe
+through `GetThreadErrorMode`; the process-wide form is not used. Residual, stated
+plainly: a modal hard-error dialog is still possible on this path, and only in the
+case where the `SetThreadErrorMode` call itself fails - the guard records the refusal
+as a warning, restores nothing, and the load proceeds under the thread's existing
+mode, with classification, publication and the census all continuing.
 
 ## Hung-action boundary
 

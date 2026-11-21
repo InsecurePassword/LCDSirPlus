@@ -90,8 +90,7 @@ pub fn load(path: &Path) -> Result<LoadedConfig, ParseError> {
 
 /// Parse one immutable byte slice with identical semantics; includes are
 /// rejected so the effective configuration binds to exactly these bytes.
-/// (Isolated-mode surface: tests now, hardware-test evidence in Phase 4.)
-#[allow(dead_code)]
+/// Production caller: the installed-template preflight at `src/runtime.rs:118`.
 pub fn parse_standalone(contents: &[u8]) -> Result<Config, ParseError> {
     const SOURCE: &str = "standalone-configuration";
     let mut ctx = ParseContext {
@@ -450,7 +449,6 @@ impl ParseContext {
                 cfg.headset_query_timeout = ms_auto(v, Duration::from_millis(1200))?;
             }
             "headset_stale_ms" => cfg.headset_stale_after = ms_auto(v, Duration::from_secs(45))?,
-            "headset_estimate_hours" => cfg.headset_estimate_hours = boolv(v)?,
             "controller_enabled" => cfg.controller_enabled = boolv(v)?,
             "controller_index" => cfg.controller_index = checked_i32(key, intv(v)?)?,
             "controller_poll_ms" => cfg.controller_poll = ms_auto(v, Duration::from_secs(10))?,
@@ -895,6 +893,7 @@ mod tests {
             "critical_alert_linger_ms",
             "headset_warn_percent",
             "headset_critical_percent",
+            "headset_estimate_hours",
         ] {
             let error = parse_standalone(format!("{key} 1\n").as_bytes()).unwrap_err();
             assert!(error.message.contains("unknown key"), "{key}: {error}");
@@ -906,7 +905,16 @@ mod tests {
     /// spelling, while the replacement and surviving options parse.
     #[test]
     fn retired_module_tokens_are_rejected_in_slot_lists() {
-        for token in ["ALERTS", "alerts", "BOTTLENECK", "bottleneck"] {
+        for token in [
+            "ALERTS",
+            "alerts",
+            "BOTTLENECK",
+            "bottleneck",
+            "CPU_CACHE_TEMP",
+            "cpu_cache_temp",
+            "CPU_FREQ_TEMP",
+            "cpu_freq_temp",
+        ] {
             let error =
                 parse_standalone(format!("slot_3 {token} THERMALS\n").as_bytes()).unwrap_err();
             assert!(

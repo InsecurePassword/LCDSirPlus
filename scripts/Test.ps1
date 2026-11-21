@@ -175,7 +175,7 @@ if ([regex]::Matches($modules, $tableHeaderPattern).Count -ne 1 -or
 $moduleRows = @([regex]::Matches($modules, $tableRowPattern) | ForEach-Object { $_.Groups[1].Value })
 $manualRows = @([regex]::Matches($manual, $tableRowPattern) | ForEach-Object { $_.Groups[1].Value })
 $documentedModules = @([regex]::Matches($modules, $tableRowPattern) | ForEach-Object { $_.Groups[2].Value })
-if ($canonicalModules.Count -ne 52 -or $moduleRows.Count -ne 52 -or $manualRows.Count -ne 52) {
+if ($canonicalModules.Count -ne 50 -or $moduleRows.Count -ne 50 -or $manualRows.Count -ne 50) {
     throw "button option inventory mismatch: source=$($canonicalModules.Count), modules=$($moduleRows.Count), manual=$($manualRows.Count)"
 }
 for ($index = 0; $index -lt $canonicalModules.Count; $index++) {
@@ -188,9 +188,9 @@ $parserSource = [IO.File]::ReadAllText((Join-Path $repo 'src\parser.rs'))
 $applyBlock = [regex]::Match($parserSource, 'fn apply\(.*?match key \{(.*?)other =>', [Text.RegularExpressions.RegexOptions]::Singleline)
 if (-not $applyBlock.Success) { throw 'configuration parser key registry not found' }
 $acceptedConfigKeys = @('include') + @([regex]::Matches($applyBlock.Groups[1].Value, '"([a-z][a-z0-9_]*)"\s*(?:\||=>)') | ForEach-Object { $_.Groups[1].Value })
-$acceptedConfigKeyCount = 106
+$acceptedConfigKeyCount = 105
 $templateConfigKeyCount = 79
-$ignoredConfigKeyCount = 5
+$ignoredConfigKeyCount = 4
 if ($acceptedConfigKeys.Count -ne $acceptedConfigKeyCount -or
     @($acceptedConfigKeys | Group-Object | Where-Object Count -ne 1).Count -ne 0) {
     throw "configuration parser inventory mismatch: expected=$acceptedConfigKeyCount actual=$($acceptedConfigKeys.Count)"
@@ -205,7 +205,7 @@ if ($acceptedConfigKeys.Count -ne $documentedConfigKeys.Count -or $missingConfig
 foreach ($key in $acceptedConfigKeys) {
     if (@($documentedConfigKeys | Where-Object { $_ -ceq $key }).Count -ne 1) { throw "configuration reference entry mismatch: $key" }
 }
-$compatibilityConfigKeys = @('date_format', 'time_format', 'headset_estimate_hours', 'discord_redirect_uri', 'hang_button')
+$compatibilityConfigKeys = @('date_format', 'time_format', 'discord_redirect_uri', 'hang_button')
 $parserOnlyConfigKeys = @('network_graph_ceiling_mbps')
 if ($compatibilityConfigKeys.Count -ne $ignoredConfigKeyCount -or
     @($parserOnlyConfigKeys | Where-Object { $_ -cin $compatibilityConfigKeys }).Count -ne 0) {

@@ -49,7 +49,7 @@ network telemetry/history are unchanged. The active legacy
 position. Later assignments win sequentially through includes; same-spelling
 duplicates within one file remain invalid.
 
-The button registry contains exactly 52 values in `src/config.rs` order. Their
+The button registry contains exactly 50 values in `src/config.rs` order. Their
 descriptions appear in the canonical [modules.md](../modules.md) quick reference
 and are mirrored exactly in the instruction manual/PDF. Graphs cover the trailing
 30 seconds. There is no layout editor or plug-in system.

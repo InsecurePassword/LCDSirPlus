@@ -263,8 +263,6 @@ In an installed or portable package, open `modules.md` beside `LCDSirPlus.exe`.
 | `RAM_USAGE` | Shows memory use and capacity. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `GPU_LOAD` | Shows GPU use. What you need: An NVIDIA or AMD graphics driver. |
 | `VRAM_USAGE` | Shows video memory use and capacity. What you need: An NVIDIA or AMD graphics driver. |
-| `CPU_CACHE_TEMP` | Shows N/A. What you need: Not available in version 0.3.0. |
-| `CPU_FREQ_TEMP` | Shows N/A. What you need: Not available in version 0.3.0. |
 | `CPU_LOAD_GRAPH` | Shows CPU use for 30 seconds. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `GPU_LOAD_GRAPH` | Shows GPU use for 30 seconds. What you need: An NVIDIA or AMD graphics driver. |
 | `CPU_TEMP_GRAPH` | Shows CPU temperature for 30 seconds. What you need: HWiNFO or LibreHardwareMonitor, installed and set up separately. |
@@ -397,7 +395,9 @@ LCDSirPlus accepts only a local LibreHardwareMonitor address. It does not enable
 the web server or request a firewall exception. Do not expose this server to
 other computers.
 
-`CPU_CACHE_TEMP` and `CPU_FREQ_TEMP` are not available in this release.
+`CPU_CACHE_TEMP` and `CPU_FREQ_TEMP` are retired: no data source published them, so
+a button slot naming either one is rejected with the normal unknown-option
+diagnostic and the last valid configuration stays active.
 
 ## Connect devices and network data
 

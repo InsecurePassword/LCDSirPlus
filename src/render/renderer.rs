@@ -10,9 +10,8 @@ use super::font::{fit_text, text_width};
 use super::Frame;
 use crate::history::Series;
 use crate::model::{
-    session_duration, AcState, Availability, DeviceStatus, DiscordState, Freshness, HardwareKind,
-    HardwareRole, HeadsetBattery, HungTarget, Metric, MetricKey, ReadingsSnapshot, Snapshot,
-    ValueKind, WIDTH,
+    session_duration, AcState, Availability, DeviceStatus, DiscordState, Freshness, HeadsetBattery,
+    HungTarget, Metric, MetricKey, ReadingsSnapshot, Snapshot, ValueKind, WIDTH,
 };
 use crate::telemetry::PROBE_INDETERMINATE;
 
@@ -91,7 +90,7 @@ impl Renderer {
     }
 
     fn capture(&mut self, s: &Snapshot) {
-        let items: [(&'static str, Metric); 13] = [
+        let items: [(&'static str, Metric); 11] = [
             ("frame", s.game.frame_time_ms),
             ("fps", s.game.fps),
             ("netin", s.network_in),
@@ -122,14 +121,6 @@ impl Renderer {
                     MetricKey::DiskWriteBytesPerSec,
                     ValueKind::ByteRate,
                 ),
-            ),
-            (
-                "cachetemp",
-                canonical_cpu_domain_temperature(&s.readings, HardwareRole::Cache),
-            ),
-            (
-                "freqtemp",
-                canonical_cpu_domain_temperature(&s.readings, HardwareRole::Frequency),
             ),
         ];
         for (key, metric) in items {
@@ -500,24 +491,6 @@ impl Renderer {
                 MetricKey::VRAMUtilization,
                 MetricKey::VRAMUsed,
                 MetricKey::VRAMTotal,
-            ),
-            "CPU_CACHE_TEMP" => self.numeric_slot(
-                f,
-                left,
-                width,
-                "CACHE T",
-                canonical_cpu_domain_temperature(&s.readings, HardwareRole::Cache),
-                0,
-                "\u{00B0}",
-            ),
-            "CPU_FREQ_TEMP" => self.numeric_slot(
-                f,
-                left,
-                width,
-                "FREQ T",
-                canonical_cpu_domain_temperature(&s.readings, HardwareRole::Frequency),
-                0,
-                "\u{00B0}",
             ),
             "NET_IN" => self.network_numeric_slot(f, left, width, "NET IN", s.network_in),
             "NET_OUT" => self.network_numeric_slot(f, left, width, "NET OUT", s.network_out),
@@ -1684,54 +1657,6 @@ fn canonical_percent_metric(
     metric
 }
 
-fn canonical_cpu_domain_temperature(readings: &ReadingsSnapshot, role: HardwareRole) -> Metric {
-    if role != HardwareRole::Cache && role != HardwareRole::Frequency {
-        return Metric::invalid();
-    }
-    let mut hardware_id = String::new();
-    let mut matches = 0;
-    for descriptor in &readings.hardware {
-        if descriptor.kind != HardwareKind::CPUDomain || descriptor.role != role {
-            continue;
-        }
-        matches += 1;
-        if matches > 1 || descriptor.hardware_id.is_empty() {
-            return Metric::invalid();
-        }
-        hardware_id = descriptor.hardware_id.clone();
-    }
-    if matches != 1 {
-        return Metric::invalid();
-    }
-
-    let mut reading_matches = 0;
-    let mut reading = None;
-    for candidate in &readings.metrics {
-        if candidate.key != MetricKey::CPUCCDTemp || candidate.hardware_id != hardware_id {
-            continue;
-        }
-        reading_matches += 1;
-        if reading_matches > 1 {
-            return Metric::invalid();
-        }
-        reading = Some(candidate);
-    }
-    let Some(reading) = reading else {
-        return Metric::invalid();
-    };
-    let state = display_state_kind(reading, ValueKind::Celsius);
-    if state == DisplayState::Unavailable
-        || !reading.number.is_finite()
-        || !(-50.0..=200.0).contains(&reading.number)
-    {
-        return Metric::invalid();
-    }
-    let mut metric = reading.legacy_metric();
-    metric.valid = true;
-    metric.stale = state == DisplayState::Stale;
-    metric
-}
-
 /// Explicitly selected voice information. Never changes the dashboard or owns input.
 /// Names are fitted to a single slot; any omitted speakers retain an explicit +N suffix.
 fn discord_slot_text(
@@ -2171,21 +2096,7 @@ mod tests {
             freshness: Freshness::Current,
             ..Default::default()
         };
-        snapshot.readings.hardware = vec![
-            crate::model::HardwareDescriptor {
-                hardware_id: "domain-cache".into(),
-                kind: HardwareKind::CPUDomain,
-                role: HardwareRole::Cache,
-            },
-            crate::model::HardwareDescriptor {
-                hardware_id: "domain-frequency".into(),
-                kind: HardwareKind::CPUDomain,
-                role: HardwareRole::Frequency,
-            },
-        ];
         snapshot.readings.metrics.extend([
-            Reading::current_celsius(MetricKey::CPUCCDTemp, 69.0, "domain-cache", now),
-            Reading::current_celsius(MetricKey::CPUCCDTemp, 65.0, "domain-frequency", now),
             Reading::current_number(MetricKey::VRMTemp, ValueKind::Celsius, 58.0, "vrm", now),
             Reading::current_number(
                 MetricKey::ChipsetTemp,
@@ -3285,50 +3196,6 @@ mod tests {
     }
 
     #[test]
-    fn ccd_temperature_modules_resolve_roles_and_fail_closed() {
-        let at = at(1_800_100_000);
-        let readings = ReadingsSnapshot {
-            hardware: vec![
-                crate::model::HardwareDescriptor {
-                    hardware_id: "domain-frequency".into(),
-                    kind: HardwareKind::CPUDomain,
-                    role: HardwareRole::Frequency,
-                },
-                crate::model::HardwareDescriptor {
-                    hardware_id: "domain-cache".into(),
-                    kind: HardwareKind::CPUDomain,
-                    role: HardwareRole::Cache,
-                },
-            ],
-            metrics: vec![
-                Reading::current_celsius(MetricKey::CPUCCDTemp, 71.0, "domain-cache", at),
-                Reading::current_celsius(MetricKey::CPUCCDTemp, 63.0, "domain-frequency", at),
-            ],
-        };
-        let cache = canonical_cpu_domain_temperature(&readings, HardwareRole::Cache);
-        let frequency = canonical_cpu_domain_temperature(&readings, HardwareRole::Frequency);
-        assert!(cache.valid && !cache.stale && cache.value == 71.0);
-        assert!(frequency.valid && !frequency.stale && frequency.value == 63.0);
-
-        // Ambiguity, wrong kind, invalid values all fail closed.
-        let mut ambiguous = readings.clone();
-        ambiguous.hardware.push(crate::model::HardwareDescriptor {
-            hardware_id: "domain-cache-2".into(),
-            kind: HardwareKind::CPUDomain,
-            role: HardwareRole::Cache,
-        });
-        assert!(!canonical_cpu_domain_temperature(&ambiguous, HardwareRole::Cache).valid);
-
-        let mut wrong_kind = readings.clone();
-        wrong_kind.metrics[0].kind = ValueKind::Percent;
-        assert!(!canonical_cpu_domain_temperature(&wrong_kind, HardwareRole::Cache).valid);
-
-        let mut nan = readings.clone();
-        nan.metrics[0].number = f64::NAN;
-        assert!(!canonical_cpu_domain_temperature(&nan, HardwareRole::Cache).valid);
-    }
-
-    #[test]
     fn headset_states_render_distinctly() {
         let mut r = Renderer::new();
         let mut s = sample_snapshot();
@@ -3535,7 +3402,7 @@ mod tests {
     #[test]
     fn canonical_registry_dispatches_all_modules_with_bounded_frames() {
         // ALERTS and BOTTLENECK remain retired; DISCORD is an explicitly selected, noninterrupting pane.
-        assert_eq!(crate::config::MODULES.len(), 52);
+        assert_eq!(crate::config::MODULES.len(), 50);
         let normal = audit_snapshot();
         let edge = edge_snapshot();
         let status = status_snapshot();

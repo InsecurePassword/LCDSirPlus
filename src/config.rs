@@ -74,8 +74,6 @@ pub const MODULES: &[&str] = &[
     "RAM_USAGE",
     "GPU_LOAD",
     "VRAM_USAGE",
-    "CPU_CACHE_TEMP",
-    "CPU_FREQ_TEMP",
     "CPU_LOAD_GRAPH",
     "GPU_LOAD_GRAPH",
     "CPU_TEMP_GRAPH",
@@ -175,7 +173,6 @@ pub struct Config {
     pub headset_poll: Duration,
     pub headset_query_timeout: Duration,
     pub headset_stale_after: Duration,
-    pub headset_estimate_hours: bool,
 
     pub controller_enabled: bool,
     pub controller_index: i32,
@@ -296,7 +293,6 @@ impl Default for Config {
             headset_poll: Duration::from_secs(15),
             headset_query_timeout: Duration::from_millis(1200),
             headset_stale_after: Duration::from_secs(45),
-            headset_estimate_hours: true,
             controller_enabled: true,
             controller_index: -1,
             controller_poll: Duration::from_secs(10),
@@ -945,7 +941,7 @@ mod tests {
 
     #[test]
     fn module_registry_is_exact_unique_and_case_insensitive() {
-        assert_eq!(MODULES.len(), 52);
+        assert_eq!(MODULES.len(), 50);
         let unique: std::collections::HashSet<_> = MODULES.iter().collect();
         assert_eq!(unique.len(), MODULES.len());
         assert!(MODULES
