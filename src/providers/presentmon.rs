@@ -5872,29 +5872,48 @@ mod tests {
         );
     }
 
-    /// WO-U46I (#3a) BEHAVIORAL + THREAD CENSUS: the gate runner facing a WEDGED verifier (the
-    /// deterministic seam; the WO bans real certificate hangs). The first attempt times out and
-    /// FAILS CLOSED with a recorded diagnostic; every later attempt while that verifier is wedged
-    /// declines, and the census shows the outstanding verifier-thread count stays exactly ONE — no
-    /// thread is stranded per timeout and nothing accumulates. When the wedged verifier returns,
-    /// the gate is consumed by that COMPLETION (never by a timeout-ack) and the next attempt spawns.
+    /// WO-U46I (#3a) BEHAVIORAL + THREAD CENSUS, WO-47A DETERMINISTIC ORACLE: the gate runner facing
+    /// a WEDGED verifier (the deterministic seam; the WO bans real certificate hangs). The first
+    /// attempt times out and FAILS CLOSED with the shipped diagnostic; every later attempt while that
+    /// verifier is in flight declines with `VERIFIER_BUSY`, and the census shows the outstanding
+    /// verifier-thread count stays exactly ONE - no thread is stranded per timeout and nothing
+    /// accumulates. When the wedged verifier returns, the gate is consumed by that COMPLETION (never
+    /// by a timeout-ack) and the next attempt spawns exactly ONE new thread and ends cleared.
+    ///
+    /// WO-47A (FLAKE-2): the completion is reached by a HANDSHAKE observed under the gate, never by a
+    /// yield census. Every decline asserts the gate CONTRACT (`VERIFIER_BUSY`, `entered == 1`, slot
+    /// owned); the released verifier JOINS IN on a test-controlled completion channel and its result
+    /// is then observed as the PAYLOAD the runner puts on the gate channel. How many declines precede
+    /// a completion is scheduling and carries NO assertion - the registered red row (`declines=101`
+    /// on a tree that ran green 5x, with `entered=1 gate_owned=true`, i.e. the property HELD) was
+    /// exactly that count-as-oracle defect. Every wait here is the shipped `VERIFIER_BOUND` liveness
+    /// budget and fails closed naming the census; no sleep, no cap, no suppression.
     #[test]
     fn presentmon_bounded_verifier_keeps_one_outstanding_thread() {
         use std::sync::atomic::AtomicUsize;
         let entered = Arc::new(AtomicUsize::new(0));
         let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
         let mut gate: Option<mpsc::Receiver<Result<(), String>>> = None;
         let bound = Duration::from_millis(20);
         let counted = Arc::clone(&entered);
         let first = run_bounded_verifier(&mut gate, bound, move || {
             counted.fetch_add(1, Ordering::SeqCst);
             let _ = release_rx.recv();
+            // The body is done: report to the test, then return so the runner's own thread sends
+            // this result on the GATE channel - the completion the gate carries.
+            let _ = done_tx.send(());
             Ok(())
         });
         let detail = first.expect_err("(#3a) a wedged verifier makes the attempt fail closed");
         assert!(
             detail.contains("timed out"),
             "(#3a) the timeout is the recorded diagnostic: {detail}"
+        );
+        assert_eq!(
+            detail.as_str(),
+            VERIFIER_TIMEOUT,
+            "(#3a) the fail-closed diagnostic is the shipped timeout constant"
         );
         assert_eq!(
             entered.load(Ordering::SeqCst),
@@ -5905,11 +5924,16 @@ mod tests {
             gate.is_some(),
             "(#3a) the timeout keeps the in-flight thread COUNTED"
         );
+        // WO-47A: a FIXED number of attempts, each asserting the GATE OUTCOME under the in-flight
+        // verifier. The verifier is parked on the release, so this census is deterministic: every
+        // attempt declines as in-flight and NO new thread enters.
         for attempt in 2..=6 {
-            let declined = run_bounded_verifier(&mut gate, bound, || Ok(()));
-            assert!(
-                declined.is_err(),
-                "(#3a) attempt {attempt} declines while a verifier is in flight"
+            let declined = run_bounded_verifier(&mut gate, bound, || Ok(()))
+                .expect_err("(#3a) an attempt declines while a verifier is in flight");
+            assert_eq!(
+                declined.as_str(),
+                VERIFIER_BUSY,
+                "(#3a) attempt {attempt} declines as in-flight, never with another outcome"
             );
             assert_eq!(
                 entered.load(Ordering::SeqCst),
@@ -5922,40 +5946,45 @@ mod tests {
             released.is_ok(),
             "(#3a) the release reaches the wedged verifier's own receiver: {released:?}"
         );
-        // The completion is observed THROUGH the gate, which is exactly the contract: an attempt
-        // declines while the verifier is still in flight (the release above is asynchronous, so the
-        // number of declines is scheduling, never a bound on outstanding threads), and the first
-        // attempt that sees the completion clears the slot and spawns. Each decline is an instant
-        // `try_recv`, so this loop adds no sleep; it is capped loudly.
-        let mut declines = 0usize;
-        let outcome = loop {
-            // The census counts EVERY verifier thread that starts, so the post-completion
-            // attempt's work is counted too: exactly one new entry proves one new thread.
-            let counted = Arc::clone(&entered);
-            match run_bounded_verifier(&mut gate, Duration::from_secs(2), move || {
-                counted.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }) {
-                Ok(result) => break result,
-                Err(declined) => {
-                    assert!(
-                        declined.contains("already running"),
-                        "(#3a) the release must only ever decline as in-flight: {declined}"
-                    );
-                    declines += 1;
-                    // A cooperative yield so the released verifier gets scheduled; never a sleep,
-                    // and the cap below is loud, not a bound on the production behavior.
-                    std::thread::yield_now();
-                    assert!(
-                        declines <= 100,
-                        "(#3a) the released verifier never released the gate: declines={declines} \
-                         entered={} gate_owned={}",
-                        entered.load(Ordering::SeqCst),
-                        gate.is_some()
-                    );
-                }
-            }
-        };
+        // WO-47A THE HANDSHAKE, OBSERVED UNDER THE GATE (no yield count, no sleep, no cap):
+        // (1) the released verifier joins in on its own completion channel;
+        // (2) the runner's thread puts the verification result on the gate channel, and the test
+        //     observes THAT completion as the payload of the slot it owns;
+        // (3) the completion consumes the slot, exactly as the runner's contract does;
+        // (4) the first attempt after the completion spawns exactly ONE new thread, and the runner
+        //     clears the gate on that completion (the "reports results and clears the gate" leg).
+        let joined = done_rx.recv_timeout(VERIFIER_BOUND);
+        assert!(
+            joined.is_ok(),
+            "(#3a) the released verifier reports its body's completion to the test: {joined:?}"
+        );
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "(#3a) census: the in-flight verifier is still the ONLY thread after the join"
+        );
+        let slot = gate
+            .take()
+            .expect("(#3a) the in-flight verifier keeps the slot counted until its completion");
+        let completion = slot.recv_timeout(VERIFIER_BOUND);
+        assert_eq!(
+            completion.expect("(#3a) the released verifier's result arrives on the gate channel"),
+            Ok(()),
+            "(#3a) the completion the gate carries IS the verifier's own result"
+        );
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "(#3a) census: consuming the completion adds no verifier thread (the decline count that
+             preceded it is scheduling, never a bound on outstanding threads)"
+        );
+        let counted = Arc::clone(&entered);
+        let outcome = run_bounded_verifier(&mut gate, VERIFIER_BOUND, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let outcome =
+            outcome.expect("(#3a) the completion consumed the gate, so the next attempt spawns");
         assert!(
             outcome.is_ok(),
             "(#3a) the new verification is answered: {outcome:?}"
