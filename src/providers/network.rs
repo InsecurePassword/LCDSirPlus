@@ -15,6 +15,17 @@ use crate::config::Config;
 use crate::model::Metric;
 
 const TICK: Duration = Duration::from_millis(50);
+/// WO-OPT02B (finding O1, slice 2): the park bound of the DISABLED probe arm. The
+/// arm used to sleep the 50 ms tick (20 wakes/s in the production shape, where the
+/// probe is off). The enabling edges are the shipped `unpark`s
+/// (`Telemetry::update_config`, `set_consumers`, `Drop`/`wake_workers`), and a
+/// `park_timeout` IS interruptible by `unpark`, so a policy/generation change and
+/// the shutdown land at once.
+/// shortcut: the worker's loop head is also entered by tests that spawn it
+/// directly with no wake wiring (the EC-8 mid-probe trio), so the park stays
+/// bounded, at 1 s; upgrade it to an unbounded park if the worker signature gains
+/// the wake edge those direct spawns lack.
+const DISABLED_PARK: Duration = Duration::from_secs(1);
 const IP_SUCCESS: u32 = 0;
 const IP_REQ_TIMED_OUT: u32 = 11010;
 
@@ -247,7 +258,9 @@ fn worker(
                 }
             }
             disabled_published = true;
-            std::thread::sleep(TICK);
+            // WO-OPT02B: the disabled arm parks to the enabling edge (generation
+            // bump / policy change / shutdown) instead of pacing on the 50 ms tick.
+            std::thread::park_timeout(DISABLED_PARK);
             continue;
         }
         disabled_published = false;
@@ -903,5 +916,102 @@ mod tests {
         run.thread
             .join()
             .expect("the disabled worker exits within one TICK of shutdown");
+    }
+
+    /// WO-OPT02B (finding O1, slice 2), RED-FIRST on the unit-50 base tree. The
+    /// DISABLED probe arm (`network_probe_enabled` false, the production shape)
+    /// used to `sleep(TICK)` = 20 wakes/s while probing nothing. It is now an
+    /// interruptible `park_timeout(DISABLED_PARK)`, so it publishes zero rows while
+    /// nothing changes, and an enabling edge (generation bump / policy change /
+    /// shutdown) is observed within the documented bound. The RED row is the WAKE
+    /// PERIOD: the shipped arm re-reads the generation every ~50 ms (+ the host
+    /// timer's ~15.6 ms), the parked arm every `DISABLED_PARK`, so a phase-known
+    /// gap above `DORMANT_GAP_FLOOR` is RED on the base tree by construction.
+    /// Production interrupts the same park at once through the shipped
+    /// `wake_workers` unpark (`Telemetry::update_config` / `set_consumers` / `Drop`);
+    /// the bound is what the direct test spawns, which have no wake wiring, rely on.
+    /// The active probe arm (the `current.interval` gate) keeps its shipped 50 ms
+    /// sleep: the base tree's EC-8 mid-flight test shuts the worker down from that
+    /// arm and joins without any wake edge, so a cadence-length park there would
+    /// block the join the pinned test performs (disclosed, not weakened).
+    #[test]
+    fn network_disabled_worker_parks_across_the_idle_window_and_wakes_on_the_generation_edge() {
+        /// Loud, bounded "the worker reached the state I drove it to" budget.
+        const WORKER_EDGE_WAIT: Duration = Duration::from_secs(2);
+        /// Five shipped ticks: the parked arm's wake period is above this, the
+        /// shipped arm's (~50 ms + host timer) is below it.
+        const DORMANT_GAP_FLOOR: Duration = Duration::from_millis(250);
+        /// The documented bound of the bounded park.
+        const DORMANT_GAP_CEILING: Duration = Duration::from_millis(1_600);
+        let config = Arc::new(RwLock::new(Config {
+            network_probe_enabled: false,
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let thread = {
+            let config = Arc::clone(&config);
+            let generation = Arc::clone(&generation);
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || worker(config, generation, shutdown, tx, probe))
+        };
+        let startup = rx
+            .recv_timeout(WORKER_EDGE_WAIT)
+            .expect("(i) the disabled probe publishes its generation-1 state");
+        assert_eq!(startup.generation, 1);
+        assert!(
+            cleared_update(&startup),
+            "(i) the disabled state is stated unavailable, never a stale probe outcome"
+        );
+        // (flush) the generation state and the disabled-availability statement are
+        // both emitted per generation; drain until a full park cycle is quiet.
+        let mut published = vec![startup];
+        while let Ok(update) = rx.recv_timeout(DISABLED_PARK + Duration::from_millis(600)) {
+            published.push(update);
+        }
+        assert!(
+            published.iter().all(|update| update.generation == 1),
+            "(flush) the quiet worker publishes only generation 1: {published:?}"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(1_200)).is_err(),
+            "(dormancy) the parked disabled arm publishes zero rows across 1.2 s"
+        );
+        // (edge + wake census) two enabling edges; the SECOND gap is the phase-known
+        // one (the drain ends 1.6 s after the arm's last publication).
+        let mut gaps = Vec::new();
+        for generation_want in 2..=3u64 {
+            generation.fetch_add(1, Ordering::SeqCst);
+            let at = Instant::now();
+            let republished = rx
+                .recv_timeout(DISABLED_PARK + Duration::from_millis(600))
+                .expect("(edge) the bounded park re-reads the generation and republishes");
+            let gap = at.elapsed();
+            assert_eq!(
+                republished.generation, generation_want,
+                "(edge) the wake is the enabling edge's cleared state for the new generation"
+            );
+            assert!(
+                gap <= DORMANT_GAP_CEILING,
+                "(edge) the enabling edge woke the arm in {gap:?}, inside the documented bound"
+            );
+            gaps.push(gap);
+            while rx
+                .recv_timeout(DISABLED_PARK + Duration::from_millis(600))
+                .is_ok()
+            {}
+        }
+        println!("WO-OPT02B wake census (network disabled arm): gaps={gaps:?}");
+        assert!(
+            gaps[1] > DORMANT_GAP_FLOOR,
+            "(census) the parked arm's wake period is {:?}, far beyond the shipped 50 ms tick; \
+             RED on the base tree, where the arm sleeps the tick and wakes every ~65 ms",
+            gaps[1]
+        );
+        shutdown.store(true, Ordering::Release);
+        thread
+            .join()
+            .expect("the parked worker exits on the shutdown edge within the park bound");
     }
 }

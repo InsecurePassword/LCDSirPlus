@@ -17,12 +17,33 @@ use crate::providers::{
 };
 
 const DEFAULT_LHM_URL: &str = "http://127.0.0.1:8085/data.json";
+/// WO-OPT02B (finding O1, slice 2): the 50 ms tick is RETIRED from production -
+/// the five loops it paced now park to their own deadlines (`sampling_loop_park`,
+/// `Worker::park_bound`). The behavioral tests keep it as the cadence ruler
+/// (`BEHAVIORAL_SUPPRESS_WINDOW / TICK`, the `cadence - 3 * TICK` floors), so it
+/// is now a test-only constant, which keeps `clippy -D warnings` free of
+/// `dead_code` without adding a suppression.
+#[cfg(test)]
 const TICK: Duration = Duration::from_millis(50);
+/// WO-OPT02B: the floor of every telemetry-runtime deadline park. The host
+/// timer resolution is ~15.6 ms, so a park shorter than this is a spin. This is
+/// this file's own constant, mirroring `app.rs`'s `APP_LOOP_MIN_PARK`; the two
+/// loops are separate lanes and the value is deliberately not imported.
+const LOOP_MIN_PARK: Duration = Duration::from_millis(2);
 const NETWORK_POLL: Duration = Duration::from_secs(1);
 const EXTENDED_POLL: Duration = Duration::from_secs(1);
 const EXTENDED_STALE: Duration = Duration::from_secs(3);
 const BATTERY_POLL: Duration = Duration::from_secs(5);
 const BATTERY_STALE: Duration = Duration::from_secs(15);
+/// WO-OPT02B-PARKFIX (F-AUD-OPT02B-1): the coordinator's WAKE bound for feed
+/// publications. The publish floor is the app's own consumption cadence, so an
+/// uncapped `telemetry_interval` (legal 100..10000 ms, `config.rs:416-421`) let a
+/// fresh reading sit unread for a whole interval - 10 s at the ceiling - and
+/// doubled the displayed age. This caps the WAKE only: publishing, the publish
+/// gate, staleness, the TTLs and the EC-3 cadence math are untouched, and a floor
+/// below the cap keeps its own number, so the shipped 300 ms default and the
+/// pinned `park_bound` fixture are unaffected.
+const PUBLISH_WAKE_CAP: Duration = Duration::from_millis(300);
 
 /// WO-QA-03 (TC-4 follow-up F-b, display-only): the provider-health label the hang
 /// detector publishes when a cycle lost probes it could not evaluate. The ONE site that
@@ -258,6 +279,41 @@ fn due(last_attempt: Option<Instant>, period: Duration, now: Instant) -> bool {
     last_attempt
         .map(|last| now.duration_since(last) >= period)
         .unwrap_or(true)
+}
+
+/// WO-OPT02B (finding O1, slice 2): how long a running sampling loop parks,
+/// derived from the deadline the shipped `due` gate already computes -
+/// `last_attempt + interval`, with the loop's own `sampling_interval` /
+/// `backoff_interval` result as `interval` (no new cadence, no interval-math
+/// change). A cleared stamp (`None`) is the shipped "due now", so the park
+/// collapses to the 2 ms floor. `Thread::unpark` INTERRUPTS a `park_timeout`,
+/// which a `sleep` cannot be, so the existing edges (`set_consumers`,
+/// `update_config`, `Drop`/`wake_workers`) reach a RUNNING loop immediately.
+/// The floor keeps the park from spinning when a provider call outlasts the
+/// cadence: that iteration is due again, exactly as the shipped tick made it.
+fn sampling_loop_park(last_attempt: Option<Instant>, interval: Duration, now: Instant) -> Duration {
+    last_attempt
+        .and_then(|last| last.checked_add(interval))
+        .map_or(LOOP_MIN_PARK, |next_due| {
+            next_due.saturating_duration_since(now)
+        })
+        .max(LOOP_MIN_PARK)
+}
+
+/// WO-OPT02B-PARKFIX (F-AUD-OPT02B-2): fold one staleness deadline
+/// (`last_success + stale_after`) into the coordinator's earliest-deadline set. A
+/// cleared success stamp sets NO deadline - nothing is displayed as fresh - which
+/// is the opposite of a cleared ATTEMPT stamp, the shipped `due(None)` = "poll
+/// now", so this is deliberately not the `consider` shape of the poll dues.
+fn park_deadline_min(
+    next: Option<Instant>,
+    last_success: Option<Instant>,
+    bound: Duration,
+) -> Option<Instant> {
+    match last_success.and_then(|last| last.checked_add(bound)) {
+        Some(deadline) => Some(next.map_or(deadline, |current| current.min(deadline))),
+        None => next,
+    }
 }
 
 fn stale(last_success: Option<Instant>, stale_after: Duration, now: Instant) -> bool {
@@ -676,6 +732,100 @@ impl Worker {
         }
         self.update.generation = generation;
         self.publish(generation, &cfg, now)
+    }
+
+    /// WO-OPT02B (finding O1, slice 2): the coordinator's park bound - the
+    /// earliest deadline it owns, made ONLY of the shipped gates: the publish
+    /// floor at `telemetry_interval` (the app's own consumption cadence, the
+    /// change-or-due gate of `publish`) and every coordinator poll arm at its own
+    /// `sampling_interval` / `backoff_interval` result, counted only when that arm
+    /// is enabled and demanded (a gated arm with no consumer performs no poll, so
+    /// it sets no deadline). A cleared attempt stamp is the shipped "due now", so
+    /// the bound collapses to the floor. No new cadence and no interval-math
+    /// change; the `unpark` edges (`set_consumers`, `update_config`,
+    /// `Drop`/`wake_workers`) interrupt the park, so a demand-word, generation or
+    /// shutdown edge lands at once.
+    ///
+    /// WO-OPT02B-PARKFIX (F-AUD-OPT02B-1, -2): the delivered bound is
+    /// `min(PUBLISH_WAKE_CAP-capped publish floor, arm gates, arm TTL deadlines)`,
+    /// floored at 2 ms. The publish floor is capped because it is the app's
+    /// consumption cadence and never a wake budget: uncapped, a legal 10 s
+    /// `telemetry_interval` parked the coordinator for 10 s, so a fresh reading
+    /// stayed unread that long and the displayed age doubled. The three coordinator
+    /// poll arms now also contribute `last_success + stale_after`, read from the
+    /// SAME stamps and bounds `apply_freshness` compares (performance
+    /// `EXTENDED_STALE`, connections `EXTENDED_STALE`, system battery
+    /// `BATTERY_STALE`), so a Current->Stale flip lands AT its deadline instead of
+    /// up to one arm interval late. Both additions are WAKE bounds only: the publish
+    /// gate, the intervals, the TTLs, the staleness math and the EC-3 gates are
+    /// untouched, and the provider-loop arms (headset, lhm, hwinfo, gpu) stay out of
+    /// the set because their own cadence gates already pace their loops.
+    fn park_bound(&self, cfg: &Config, consumers: u64, now: Instant) -> Duration {
+        if self.publish_dirty {
+            return LOOP_MIN_PARK;
+        }
+        let mut next: Option<Instant> = None;
+        let mut consider = |at: Option<Instant>, interval: Duration| {
+            let deadline = match at {
+                Some(last) => last.checked_add(interval),
+                None => Some(now),
+            };
+            if let Some(deadline) = deadline {
+                next = Some(next.map_or(deadline, |current| current.min(deadline)));
+            }
+        };
+        if let Some(last) = self.last_publish {
+            // WO-OPT02B-PARKFIX (F-AUD-OPT02B-1): the term is the WAKE cap of the
+            // publish floor, not the floor itself - `publication_due` keeps the full
+            // `telemetry_interval`, so no publish cadence moved.
+            consider(Some(last), cfg.telemetry_interval.min(PUBLISH_WAKE_CAP));
+        }
+        if enabled(cfg, "controller") && demanded(consumers, "controller") {
+            consider(self.controller_attempt, cfg.controller_poll);
+        }
+        if enabled(cfg, "audio") && demanded(consumers, "audio") {
+            consider(self.audio_attempt, cfg.audio_poll);
+        }
+        if enabled(cfg, "net") && demanded(consumers, "net") {
+            consider(self.net_attempt, NETWORK_POLL);
+        }
+        if demanded(consumers, "performance") {
+            let full = backoff_interval(EXTENDED_POLL, EXTENDED_STALE, self.performance_failures);
+            consider(
+                self.performance_attempt,
+                sampling_interval(cfg, consumers, "performance", full),
+            );
+        }
+        if demanded(consumers, "connections") {
+            consider(
+                self.connections_attempt,
+                sampling_interval(cfg, consumers, "connections", EXTENDED_POLL),
+            );
+        }
+        if demanded(consumers, "system battery") {
+            consider(
+                self.battery_attempt,
+                sampling_interval(cfg, consumers, "system battery", BATTERY_POLL),
+            );
+        }
+        // WO-OPT02B-PARKFIX (F-AUD-OPT02B-2): the same arms' staleness deadlines,
+        // gated by the same demand predicate as their poll due (a row nobody
+        // displays sets no wake), from the fields and bounds `apply_freshness`
+        // already reads: performance `:1432`, connections `:1436`, system battery
+        // `:1440`. No TTL value and no staleness rule changed.
+        if demanded(consumers, "performance") {
+            next = park_deadline_min(next, self.performance_success, EXTENDED_STALE);
+        }
+        if demanded(consumers, "connections") {
+            next = park_deadline_min(next, self.connections_success, EXTENDED_STALE);
+        }
+        if demanded(consumers, "system battery") {
+            next = park_deadline_min(next, self.battery_success, BATTERY_STALE);
+        }
+        next.map_or(LOOP_MIN_PARK, |deadline| {
+            deadline.saturating_duration_since(now)
+        })
+        .max(LOOP_MIN_PARK)
     }
 
     /// WO-TEL-D2 (S5, U-8): publish on change-or-due. A data change (applied
@@ -1499,8 +1649,11 @@ fn spawn_headset(
                             return;
                         }
                     }
+                    // WO-OPT02B: the running arm parks to this loop's own next
+                    // deadline (the `due` gate's `last_attempt + interval`) and is
+                    // interruptible by the shipped `unpark` edges.
+                    std::thread::park_timeout(sampling_loop_park(last_attempt, interval, now));
                 }
-                std::thread::sleep(TICK);
             }
         })
         .expect("headset telemetry thread")
@@ -1583,12 +1736,16 @@ fn spawn_lhm(
                             return;
                         }
                     }
+                    // WO-OPT02B: park to the loop's own next deadline, which is the
+                    // `due` gate's `last_attempt + interval` - so the backoff ladder
+                    // paces the loop exactly as the shipped tick did, and the
+                    // `unpark` edges interrupt it.
+                    std::thread::park_timeout(sampling_loop_park(last_attempt, interval, now));
                 } else {
                     last_attempt = None;
                     std::thread::park();
                     continue;
                 }
-                std::thread::sleep(TICK);
             }
         })
         .expect("LHM telemetry thread")
@@ -1633,12 +1790,14 @@ fn spawn_hwinfo(
                             return;
                         }
                     }
+                    // WO-OPT02B: park to the loop's own next deadline; the shipped
+                    // `unpark` edges interrupt it.
+                    std::thread::park_timeout(sampling_loop_park(last_attempt, interval, now));
                 } else {
                     last_attempt = None;
                     std::thread::park();
                     continue;
                 }
-                std::thread::sleep(TICK);
             }
         })
         .expect("HWiNFO telemetry thread")
@@ -1897,6 +2056,10 @@ fn spawn_gpu(
                             return;
                         }
                     }
+                    // WO-OPT02B: park to the loop's own next deadline (the `due`
+                    // gate's `last_attempt + interval`, backoff included); the
+                    // shipped `unpark` edges interrupt it.
+                    std::thread::park_timeout(sampling_loop_park(last_attempt, interval, now));
                 } else {
                     last_attempt = None;
                     provider = gpu::Provider::new("off");
@@ -1922,7 +2085,6 @@ fn spawn_gpu(
                     std::thread::park();
                     continue;
                 }
-                std::thread::sleep(TICK);
             }
         })
         .expect("GPU telemetry thread")
@@ -2044,9 +2206,7 @@ pub fn spawn(cfg: &Config, initial_consumers: u64) -> Telemetry {
                 }
             };
             let mut worker = worker;
-            while !coordinator_shutdown.load(Ordering::Relaxed) && worker.tick() {
-                std::thread::sleep(TICK);
-            }
+            coordinator_run(&mut worker, &coordinator_shutdown);
         })
         .expect("telemetry thread");
     threads.push(coordinator);
@@ -2058,6 +2218,33 @@ pub fn spawn(cfg: &Config, initial_consumers: u64) -> Telemetry {
         shutdown,
         threads,
     }
+}
+
+/// WO-OPT02B (finding O1, slice 2): the coordinator loop, retired from the fixed
+/// 50 ms tick. The shipped order is untouched and load-bearing: every iteration
+/// runs `Worker::tick`, which CLEARS the inbound state by draining each of the
+/// four publication feeds to EMPTY (`slow_rx`, `presentmon_rx`, `hang_rx`,
+/// `network_rx` in that order, each a full `while let Ok(..) = try_recv()`
+/// sweep) before it polls, marks freshness and publishes; a publication that
+/// lands after a sweep is read on the next iteration, which is why the sweep
+/// order and the full drain are pinned. The tick is followed by a park to
+/// `Worker::park_bound` - the earliest deadline the coordinator owns - and
+/// `Thread::unpark` interrupts that park, so the demand-word, generation and
+/// shutdown edges (`set_consumers`, `update_config`, `Drop`/`wake_workers`) land
+/// at once, which a `sleep` made impossible. Publication feeds the runtime cannot
+/// be woken for (the presentmon / hang / network senders keep their frozen
+/// signatures) are bounded by the publish floor - `telemetry_interval` capped at
+/// `PUBLISH_WAKE_CAP`, so a long interval binds on the app's own consumption.
+fn coordinator_run(worker: &mut Worker, shutdown: &AtomicBool) -> bool {
+    while !shutdown.load(Ordering::Relaxed) {
+        if !worker.tick() {
+            return false;
+        }
+        let cfg = current_config(&worker.config);
+        let consumers = worker.consumers.load(Ordering::Relaxed);
+        std::thread::park_timeout(worker.park_bound(&cfg, consumers, Instant::now()));
+    }
+    true
 }
 
 #[cfg(test)]
@@ -5838,5 +6025,784 @@ mod tests {
             worker.presentmon_success, None,
             "(vi) the disabled arm clears the success stamp"
         );
+    }
+
+    // WO-OPT02B (finding O1, slice 2): coverage of the dormancy conversion.
+    //
+    // RED-FIRST set - these compile on the unit-50 base tree and are RED there,
+    // because the base's running arms `sleep(TICK)` (which `Thread::unpark`
+    // cannot interrupt) and its coordinator paces on the same fixed tick:
+    //   `a_running_sampling_loop_adopts_a_demand_change_before_its_tick`,
+    //   `coordinator_drains_the_hang_publication_below_the_sampling_tick`,
+    //   `coordinator_drains_the_slow_event_feed_below_the_sampling_tick`,
+    //   `telemetry_loops_park_to_their_own_deadlines_source_pin`.
+    // Mechanism set - GREEN by construction on the delivered tree only, because
+    // they drive the new production entry points (`sampling_loop_park`,
+    // `Worker::park_bound`, `coordinator_run`) that the base tree does not have,
+    // so they cannot compile there. Disclosed in the receipt; the per-feed
+    // publication latency of the presentmon and network feeds has no
+    // RED-capable spawn-level test for the same reason (presentmon keeps its
+    // slice-3 50 ms worker tick, and the network probe's observable health row
+    // needs its own >= 250 ms probe cadence, which is above the 50 ms bound).
+
+    /// The WO-OPT02B bound: a wake must land INSIDE the retired 50 ms tick.
+    const O2B_EDGE_BOUND: Duration = Duration::from_millis(50);
+    /// The same bound minus the host timer's ~15.6 ms granularity, used where the
+    /// base tree's fixed sleep is the thing being beaten (base lands at 50 + 15.6).
+    const O2B_SUB_TICK_EDGE: Duration = Duration::from_millis(40);
+    /// The publish floor the coordinator fixture runs at, so its own deadline park
+    /// is far inside `O2B_EDGE_BOUND` and the tick's absence is what is measured.
+    const O2B_PUBLISH_FLOOR: Duration = Duration::from_millis(10);
+    /// The bounded drain budget of the WO-OPT02B helpers (loud, never a hang).
+    const O2B_DRAIN_WAIT: Duration = Duration::from_millis(2_000);
+
+    static O2B_RUNNING_HEADSET_SAMPLER: OnceLock<ScriptedSampler<Result<headset::Status, String>>> =
+        OnceLock::new();
+
+    fn o2b_running_headset_sampler(_timeout: Duration) -> Result<headset::Status, String> {
+        sampled_in_slot(&O2B_RUNNING_HEADSET_SAMPLER)
+    }
+
+    /// B3-1, RED on the base tree. The headset loop runs the shipped production
+    /// body with a demanded, enabled provider on a 30 s cadence, so after its
+    /// first sample it sits in the RUNNING arm - on the base tree that arm is a
+    /// fixed 50 ms `sleep(TICK)`, which `unpark` cannot interrupt, so the shipped
+    /// config-apply edge (write, generation bump, `wake_workers`) lands no earlier
+    /// than ~50 ms + the host timer. Delivered, the arm is a
+    /// `park_timeout(sampling_loop_park(..))` of the same 30 s deadline and the
+    /// edge lands at once.
+    #[test]
+    fn a_running_sampling_loop_adopts_a_demand_change_before_its_tick() {
+        assert_injected_sampler_is_io_free("o2b_running_headset_sampler");
+        let (enter_rx, release_tx) = install_scripted_sampler(
+            &O2B_RUNNING_HEADSET_SAMPLER,
+            vec![headset_ok(1), headset_ok(2)],
+        );
+        let config = Arc::new(RwLock::new(Config {
+            headset_enabled: true,
+            headset_poll: BEHAVIORAL_LONG,
+            headset_query_timeout: Duration::from_millis(1),
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(8);
+        let loop_thread = spawn_headset(
+            Arc::clone(&config),
+            Arc::clone(&generation),
+            Arc::new(AtomicU64::new(ALL_CONSUMERS)),
+            Arc::clone(&shutdown),
+            tx,
+            o2b_running_headset_sampler,
+        );
+        enter_rx
+            .recv_timeout(BEHAVIORAL_WAIT)
+            .expect("(i) the demanded headset loop samples through the seam");
+        release_tx.send(()).expect("release #1");
+        let (gen1, _) = headset_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(i) the first sample publishes"),
+        );
+        assert_eq!(gen1, 1, "(i) the first sample carries generation 1");
+        // (ii) the edge, applied while the loop is in its running arm.
+        retune(&config, |cfg| cfg.headset_poll = BEHAVIORAL_DRIVEN);
+        let edge = Instant::now();
+        generation.fetch_add(1, Ordering::SeqCst);
+        loop_thread.thread().unpark();
+        enter_rx.recv_timeout(O2B_SUB_TICK_EDGE).expect(
+            "(ii) the demand/generation edge reaches the RUNNING loop before its 50 ms tick; \
+             RED on the base tree, where the running arm sleeps the TICK and ignores unpark",
+        );
+        let latency = edge.elapsed();
+        assert!(
+            latency < O2B_EDGE_BOUND,
+            "(ii) the adopted edge landed in {latency:?}, inside the 50 ms bound"
+        );
+        release_tx.send(()).expect("release #2");
+        let (gen2, _) = headset_event(
+            rx.recv_timeout(BEHAVIORAL_WAIT)
+                .expect("(ii) the adopted edge publishes its sample"),
+        );
+        assert_eq!(
+            gen2, 2,
+            "(ii) the edge-adopted sample is published on the new generation"
+        );
+        shutdown.store(true, Ordering::Release);
+        loop_thread.thread().unpark();
+        loop_thread
+            .join()
+            .expect("the headset loop joins within the sampler's loud 5 s budget");
+    }
+
+    /// The production shape with every gated provider unparked and every
+    /// window/probe collector off, so the coordinator performs no device I/O and
+    /// the only publications are the runtime's own state edges.
+    fn o2b_quiet_config() -> Config {
+        Config {
+            safe_mode: false,
+            telemetry_interval: O2B_PUBLISH_FLOOR,
+            headset_enabled: false,
+            lhm_mode: "off".into(),
+            controller_enabled: false,
+            audio_enabled: false,
+            gpu_provider: "off".into(),
+            hwinfo_cpu_temp_sensor: String::new(),
+            hang_enabled: false,
+            network_probe_enabled: false,
+            presentmon_enabled: false,
+            ..Config::default()
+        }
+    }
+
+    /// Drain the app-facing channel until an update matches, returning the update
+    /// and the elapsed time of its arrival. Bounded and loud, never a hang.
+    fn o2b_drain_within(
+        updates: &LatestUpdates,
+        budget: Duration,
+        want: impl Fn(&Update) -> bool,
+    ) -> Option<(Update, Duration)> {
+        let at = Instant::now();
+        loop {
+            if let Ok(update) = updates.try_recv() {
+                if want(&update) {
+                    return Some((update, at.elapsed()));
+                }
+            }
+            if at.elapsed() >= budget {
+                return None;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// B3-2 (hang feed), RED on the base tree. The config-apply edge is the shipped
+    /// `update_config` (write, bump, `wake_workers`). The disabled detector arm is
+    /// an interruptible park, so it publishes the new generation at once and the
+    /// coordinator drains it inside its deadline park. On the base tree the
+    /// detector sleeps 50 ms (unpark cannot interrupt a sleep) AND the coordinator
+    /// sleeps 50 ms, so the row lands at roughly 130 ms: RED against the bound.
+    #[test]
+    fn coordinator_drains_the_hang_publication_below_the_sampling_tick() {
+        let cfg = o2b_quiet_config();
+        let runtime = spawn(&cfg, 0);
+        let _ = o2b_drain_within(&runtime.updates, O2B_DRAIN_WAIT, |update| {
+            update.generation == 1
+        });
+        let at = Instant::now();
+        let generation = runtime.update_config(&cfg);
+        assert_eq!(generation, 2, "(i) the apply bumps the generation");
+        let (update, _) =
+            o2b_drain_within(&runtime.updates, Duration::from_millis(500), |update| {
+                update.generation == 2
+                    && update
+                        .providers
+                        .iter()
+                        .any(|(name, ok)| name == "Hung window detector" && !*ok)
+            })
+            .expect(
+                "(ii) the hang feed is drained and published; RED on the base tree, where the \
+             detector's 50 ms sleep and the coordinator's 50 ms sleep are both in the path",
+            );
+        assert_eq!(
+            update.generation, 2,
+            "(ii) the drained publication carries the applied generation"
+        );
+        let latency = at.elapsed();
+        assert!(
+            latency < O2B_EDGE_BOUND,
+            "(ii) the hang publication was drained in {latency:?}, inside the 50 ms tick bound"
+        );
+        drop(runtime);
+    }
+
+    /// B3-2 (slow feed), RED on the base tree. The four sampling loops publish
+    /// through `send_slow`; the gpu loop's park statement is the payload (the
+    /// WO-U46I #16 core-unavailable rows, hardware id `gpu:core`), republished for
+    /// the new generation by the shipped `wake_workers` edge. The coordinator's own
+    /// tick is the only latency left on the delivered tree.
+    #[test]
+    fn coordinator_drains_the_slow_event_feed_below_the_sampling_tick() {
+        let cfg = o2b_quiet_config();
+        let runtime = spawn(&cfg, 0);
+        let _ = o2b_drain_within(&runtime.updates, O2B_DRAIN_WAIT, |update| {
+            update.generation == 1
+        });
+        let at = Instant::now();
+        let generation = runtime.update_config(&cfg);
+        assert_eq!(generation, 2, "(i) the apply bumps the generation");
+        let (update, _) =
+            o2b_drain_within(&runtime.updates, Duration::from_millis(500), |update| {
+                update.generation == 2
+                    && update
+                        .gpu_readings
+                        .iter()
+                        .any(|reading| reading.hardware_id == "gpu:core")
+            })
+            .expect(
+                "(ii) the slow feed is drained and published; RED on the base tree, where the \
+             coordinator drains only on its 50 ms sleep",
+            );
+        assert!(
+            update.gpu_readings.iter().all(|reading| !reading.has_value),
+            "(ii) the drained slow-feed state is the park's explicit unavailable core rows"
+        );
+        let latency = at.elapsed();
+        assert!(
+            latency < O2B_EDGE_BOUND,
+            "(ii) the send_slow publication was drained in {latency:?}, inside the 50 ms bound"
+        );
+        drop(runtime);
+    }
+
+    /// B3-5: the cadence-parity source pins. Every converted sampling loop parks to
+    /// its own deadline and performs no fixed-tick sleep; the coordinator's park
+    /// follows the drain, and the four drains keep the shipped order and the shipped
+    /// clear-to-EMPTY shape, so no publication can be left behind a park.
+    #[test]
+    fn telemetry_loops_park_to_their_own_deadlines_source_pin() {
+        const PARK: &str =
+            "std::thread::park_timeout(sampling_loop_park(last_attempt, interval, now));";
+        for fn_head in [
+            "fn spawn_headset(",
+            "fn spawn_lhm(",
+            "fn spawn_hwinfo(",
+            "fn spawn_gpu(",
+        ] {
+            let loop_src = shipped_loop_source(fn_head);
+            assert_eq!(
+                loop_src.matches("std::thread::sleep(TICK)").count(),
+                0,
+                "{fn_head}: the fixed 50 ms sleep is gone from the converted arm"
+            );
+            assert_eq!(
+                loop_src.matches(PARK).count(),
+                1,
+                "{fn_head}: exactly one deadline park in the running arm"
+            );
+            assert_eq!(
+                loop_src.matches("std::thread::park();").count(),
+                1,
+                "{fn_head}: the disabled/zero-demand arm keeps its unbounded native park"
+            );
+        }
+        let source = include_str!("telemetry.rs").replace("\r\n", "\n");
+        let production = source.split("mod tests {").next().unwrap_or_default();
+        assert_eq!(
+            production.matches("std::thread::sleep(TICK)").count(),
+            0,
+            "the retired tick has no production site left in this module"
+        );
+        let run_at = production
+            .find("fn coordinator_run(worker: &mut Worker, shutdown: &AtomicBool) -> bool {")
+            .expect("the coordinator loop is a function of its own");
+        let rest = &production[run_at..];
+        let run_body = &rest[..rest.find("\nfn ").unwrap_or(rest.len())];
+        let drain = run_body
+            .find("worker.tick()")
+            .expect("the coordinator drains inside the tick");
+        let park = run_body
+            .find("std::thread::park_timeout(worker.park_bound(")
+            .expect("the coordinator parks to its own earliest deadline");
+        assert!(
+            drain < park,
+            "the drain (all four sweeps) happens before the loop parks, never after"
+        );
+        assert_eq!(
+            run_body.matches("while ").count(),
+            1,
+            "one loop, one park per iteration (no nested tick loop)"
+        );
+        let tick_at = production
+            .find("fn tick(&mut self) -> bool {")
+            .expect("the coordinator tick exists");
+        let tick_rest = &production[tick_at..];
+        let tick_body = &tick_rest[..tick_rest.find("\n    fn ").unwrap_or(tick_rest.len())];
+        let slow = tick_body
+            .find("while let Ok(event) = self.slow_rx.try_recv()")
+            .expect("the slow feed is swept to EMPTY");
+        let presentmon = tick_body
+            .find("while let Ok(update) = self.presentmon_rx.try_recv()")
+            .expect("the presentmon feed is swept to EMPTY");
+        let hang = tick_body
+            .find("while let Ok(update) = self.hang_rx.try_recv()")
+            .expect("the hang feed is swept to EMPTY");
+        let network = tick_body
+            .find("while let Ok(update) = self.network_rx.try_recv()")
+            .expect("the network feed is swept to EMPTY");
+        assert!(
+            slow < presentmon && presentmon < hang && hang < network,
+            "the four sweeps keep the shipped order, and each clears its channel before the park"
+        );
+        assert!(
+            tick_body.contains("self.publish_dirty |= applied;"),
+            "a swept publication marks the state dirty, so the publish that follows is the change, not the tick"
+        );
+    }
+
+    /// B3-4: the sampling-loop deadline park, as exact `Duration`s.
+    #[test]
+    fn sampling_loop_park_is_the_loop_deadline_with_the_local_floor() {
+        let now = Instant::now();
+        let interval = Duration::from_millis(400);
+        assert_eq!(
+            sampling_loop_park(None, interval, now),
+            Duration::from_millis(2),
+            "a cleared stamp is the shipped `due(None)` = sample now, so the park is the floor"
+        );
+        assert_eq!(
+            sampling_loop_park(Some(now), interval, now),
+            interval,
+            "a fresh stamp parks exactly the cadence the `due` gate compares"
+        );
+        assert_eq!(
+            sampling_loop_park(Some(now), interval, now + Duration::from_millis(150)),
+            Duration::from_millis(250),
+            "elapsed time shortens the park by the same amount"
+        );
+        assert_eq!(
+            sampling_loop_park(Some(now - Duration::from_secs(5)), interval, now),
+            Duration::from_millis(2),
+            "a provider call that outlasted the cadence floors at 2 ms, never a negative park"
+        );
+        assert_eq!(
+            sampling_loop_park(Some(now), Duration::ZERO, now),
+            Duration::from_millis(2),
+            "a zero interval floors at 2 ms, so the loop can never spin below the host timer"
+        );
+        assert!(
+            due(Some(now), interval, now + interval),
+            "the deadline is inclusive: the park's end is a due tick, so the wake lands AT it"
+        );
+    }
+
+    /// B3-4: the coordinator's park bound, as exact `Duration`s - only the shipped
+    /// gates and the publish floor, floored at the local 2 ms.
+    #[test]
+    fn coordinator_park_bound_is_the_earliest_deadline_with_the_local_floor() {
+        let cfg = Config {
+            telemetry_interval: Duration::from_millis(300),
+            controller_enabled: true,
+            controller_poll: Duration::from_millis(120),
+            audio_enabled: false,
+            ..Config::default()
+        };
+        let controller = extended_consumer_bit("controller");
+        let mut worker = test_worker(cfg.clone());
+        worker.publish_dirty = false;
+        worker.consumers.store(controller, Ordering::Relaxed);
+        let base = Instant::now();
+        worker.last_publish = Some(base);
+        worker.controller_attempt = Some(base);
+        assert_eq!(
+            worker.park_bound(&cfg, controller, base + Duration::from_millis(50)),
+            Duration::from_millis(70),
+            "the demanded controller arm (120 ms cadence) is the earliest deadline, ahead of the 300 ms publish floor"
+        );
+        assert_eq!(
+            worker.park_bound(&cfg, 0, base + Duration::from_millis(50)),
+            Duration::from_millis(250),
+            "with no arm demanded, only the publish floor paces the coordinator"
+        );
+        assert_eq!(
+            worker.park_bound(&cfg, 0, base + Duration::from_secs(9)),
+            Duration::from_millis(2),
+            "past every deadline the bound is the floor, never a negative park"
+        );
+        worker.publish_dirty = true;
+        assert_eq!(
+            worker.park_bound(&cfg, 0, base),
+            Duration::from_millis(2),
+            "a dirty publish state parks at the floor: a change never waits for the cadence"
+        );
+        worker.publish_dirty = false;
+        worker.controller_attempt = None;
+        assert_eq!(
+            worker.park_bound(&cfg, controller, base),
+            Duration::from_millis(2),
+            "a cleared stamp is the shipped `due(None)` = poll now"
+        );
+    }
+
+    // WO-OPT02B-PARKFIX set (audit findings F-AUD-OPT02B-1 and -2, both P2).
+    // RED-FIRST on the frozen 02B delta `9b90f791`: the three tests below compile
+    // there (they name only the shipped `park_bound`, the shipped constants and
+    // explicit `Duration` literals) and are RED there, for the two findings:
+    //   `park_bound_caps_the_publish_wake_at_the_legal_ceiling` - the publish
+    //     floor is `cfg.telemetry_interval` uncapped, so a legal 10 s config
+    //     parks the coordinator for 10 s (the row lands 10 s late, displayed age
+    //     doubles to 20 s, a gpu row reads Current for ~40 s of a 30 s bound);
+    //   `park_bound_respects_a_poll_arm_staleness_deadline` - the
+    //     `apply_freshness` TTL set is absent from the bound, so the
+    //     Current->Stale flip of the three coordinator poll arms lands up to one
+    //     arm interval late (battery 5 s, performance 3 s, connections 1 s);
+    //   `park_bound_publish_wake_cap_is_a_min_and_keeps_the_floor` - row (v) is
+    //     RED for the same TTL reason; rows (i)-(iv) are parity rows, GREEN on
+    //     both trees, and pin that the cap is a `min` and that the 2 ms floor and
+    //     the never-negative rule are unchanged.
+
+    /// F-AUD-OPT02B-1, RED on the frozen delta. The publish floor is the app's
+    /// own consumption cadence, so the coordinator's WAKE for it is capped: at
+    /// the legal ceiling `telemetry_interval = 10 s` (`config.rs:416-421`, legal
+    /// range 100..10000 ms) the frozen tree parks the whole interval. The cap is
+    /// a WAKE bound only - the publish gate, the intervals, the TTLs and the
+    /// publish-once contract stay exactly as shipped.
+    #[test]
+    fn park_bound_caps_the_publish_wake_at_the_legal_ceiling() {
+        let cfg = Config {
+            telemetry_interval: Duration::from_secs(10),
+            ..Config::default()
+        };
+        let mut worker = test_worker(cfg.clone());
+        worker.publish_dirty = false;
+        worker.consumers.store(0, Ordering::Relaxed);
+        let base = Instant::now();
+        worker.last_publish = Some(base);
+        // The cap as an explicit number, so the RED row IS the finding: the
+        // frozen tree lands 10 s, the delivered wake is 300 ms.
+        assert_eq!(
+            worker.park_bound(&cfg, 0, base),
+            Duration::from_millis(300),
+            "(i) at the legal 10 s ceiling the wake for a feed publication is the 300 ms cap, \
+             never the whole interval (RED on the frozen delta: the park lands at 10 s)"
+        );
+        assert_eq!(
+            worker.park_bound(&cfg, 0, base + Duration::from_millis(200)),
+            Duration::from_millis(100),
+            "(ii) elapsed time shortens the capped wake by the same amount"
+        );
+        assert!(
+            worker.park_bound(&cfg, 0, base) <= Duration::from_millis(300),
+            "(iii) a publication on a feed with no wake edge waits at most 300 ms to be applied, \
+             so the worst displayed age is the 300 ms wake plus the app's own 300 ms consumption"
+        );
+    }
+
+    /// F-AUD-OPT02B-2, RED on the frozen delta for all three coordinator poll
+    /// arms. `apply_freshness` flips a row Current->Stale at
+    /// `last_success + stale_after` (`:1432` performance and `:1436` connections at
+    /// `EXTENDED_STALE`, `:1440` system battery at `BATTERY_STALE`). The frozen
+    /// bound carries only each arm's POLL due, so the flip lands up to one arm
+    /// interval late. The fix adds the very same fields and the very same bounds to
+    /// the wake set: no staleness math, no TTL value, no new config.
+    #[test]
+    fn park_bound_respects_a_poll_arm_staleness_deadline() {
+        let remaining = Duration::from_millis(50);
+        // A 100 ms publish floor sits BEHIND the fixture's TTL remnant, so the
+        // arm's own staleness deadline is the term that must bind.
+        let cfg = Config {
+            telemetry_interval: Duration::from_millis(100),
+            ..Config::default()
+        };
+        let base = Instant::now();
+        let mut offenders: Vec<String> = Vec::new();
+        for (provider, bit, stale_after, poll) in [
+            (
+                "performance",
+                consumer_bit("performance"),
+                EXTENDED_STALE,
+                EXTENDED_POLL,
+            ),
+            (
+                "connections",
+                consumer_bit("connections"),
+                EXTENDED_STALE,
+                EXTENDED_POLL,
+            ),
+            (
+                "system battery",
+                consumer_bit("system battery"),
+                BATTERY_STALE,
+                BATTERY_POLL,
+            ),
+        ] {
+            let mut worker = test_worker(cfg.clone());
+            worker.publish_dirty = false;
+            worker.consumers.store(bit, Ordering::Relaxed);
+            worker.last_publish = Some(base);
+            // The arm polled just now (its poll due is a full `poll` away) and its
+            // last success is `stale_after - remaining` old, so the flip is due in
+            // `remaining`. `remaining < poll` for all three arms, and no arm's
+            // interval equals its TTL (1 s / 1 s / 5 s against 3 s / 3 s / 15 s), so
+            // each arm is a real gap and none of them is a parity pin.
+            worker.performance_attempt = Some(base);
+            worker.connections_attempt = Some(base);
+            worker.battery_attempt = Some(base);
+            let stamp = Some(base - (stale_after - remaining));
+            match provider {
+                "performance" => worker.performance_success = stamp,
+                "connections" => worker.connections_success = stamp,
+                _ => worker.battery_success = stamp,
+            }
+            assert!(
+                remaining < poll,
+                "{provider}: the fixture makes the gap visible - the TTL remnant \
+                 ({remaining:?}) is inside the arm's own poll interval ({poll:?})"
+            );
+            let park = worker.park_bound(&cfg, bit, base);
+            if park > remaining {
+                offenders.push(format!(
+                    "{provider}: park {park:?} outlives the staleness deadline {remaining:?} \
+                     (arm poll {poll:?})"
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "each coordinator poll arm's wake lands AT its staleness deadline, never one poll \
+             interval late; offenders: {offenders:?} (RED on the frozen delta: every park is the \
+             100 ms publish floor, because the TTL set is missing from the bound)"
+        );
+    }
+
+    /// F-AUD-OPT02B-1/-2 parity: the cap is a `min`, so the shipped default
+    /// `telemetry_interval = 300 ms` keeps its own number (the figure the pinned
+    /// `coordinator_park_bound_is_the_earliest_deadline_with_the_local_floor`
+    /// asserts), a floor below the cap is never raised by it, and the 2 ms floor
+    /// and the never-negative rule apply to every term, the new TTL terms
+    /// included. Rows (i)-(iv) are GREEN on the frozen delta (parity); row (v) is
+    /// RED there, for the F-AUD-OPT02B-2 reason.
+    #[test]
+    fn park_bound_publish_wake_cap_is_a_min_and_keeps_the_floor() {
+        let base = Instant::now();
+        let cfg = Config {
+            telemetry_interval: Duration::from_millis(300),
+            ..Config::default()
+        };
+        let mut worker = test_worker(cfg.clone());
+        worker.publish_dirty = false;
+        worker.consumers.store(0, Ordering::Relaxed);
+        worker.last_publish = Some(base);
+        assert_eq!(
+            worker.park_bound(&cfg, 0, base + Duration::from_millis(50)),
+            Duration::from_millis(250),
+            "(i) a 300 ms config is unaffected: the publish-floor term is still 300 ms"
+        );
+        let short = Config {
+            telemetry_interval: Duration::from_millis(100),
+            ..Config::default()
+        };
+        assert_eq!(
+            worker.park_bound(&short, 0, base),
+            Duration::from_millis(100),
+            "(ii) a floor below the cap is never raised by it: the cap is a `min`"
+        );
+        worker.publish_dirty = true;
+        assert_eq!(
+            worker.park_bound(&cfg, 0, base),
+            Duration::from_millis(2),
+            "(iii) a dirty publish still parks at the 2 ms floor"
+        );
+        worker.publish_dirty = false;
+        assert_eq!(
+            worker.park_bound(&cfg, 0, base + Duration::from_secs(9)),
+            Duration::from_millis(2),
+            "(iv) past every deadline the bound is the floor, never a negative park"
+        );
+        let battery = consumer_bit("system battery");
+        worker.consumers.store(battery, Ordering::Relaxed);
+        worker.battery_attempt = Some(base);
+        worker.battery_success = Some(base - BATTERY_STALE * 2);
+        assert_eq!(
+            worker.park_bound(&cfg, battery, base),
+            Duration::from_millis(2),
+            "(v) a staleness term past its deadline floors at 2 ms, never negative (RED on the \
+             frozen delta: no staleness term exists there, so the 5 s battery poll paces the park)"
+        );
+    }
+
+    /// B3-2, mechanism form: every publication feed of the coordinator loop is
+    /// drained inside the retired 50 ms tick, driven on the real loop body with the
+    /// four feed senders retained by the test. GREEN-only on the base tree is
+    /// impossible: the base has no reachable coordinator loop body.
+    #[test]
+    fn coordinator_run_drains_every_publication_feed_before_the_next_deadline() {
+        struct Feeds {
+            worker: Worker,
+            slow_tx: mpsc::SyncSender<SlowEvent>,
+            presentmon_tx: mpsc::Sender<presentmon::Update>,
+            hang_tx: mpsc::Sender<hang::Update>,
+            network_tx: mpsc::Sender<network::Update>,
+            updates: LatestUpdates,
+            shutdown: Arc<AtomicBool>,
+        }
+        let cfg = Config {
+            safe_mode: false,
+            telemetry_interval: O2B_PUBLISH_FLOOR,
+            // The three feeds whose state the coordinator keeps through
+            // `apply_freshness` must be enabled, or the shipped disable arms erase
+            // the very rows this test measures. No worker is spawned in this
+            // fixture, so enabling the probe dials nothing: the probe lives in the
+            // `network` worker, and the coordinator only applies published updates.
+            headset_enabled: true,
+            presentmon_enabled: true,
+            network_probe_enabled: true,
+            network_probe_target: "127.0.0.1:1".into(),
+            controller_enabled: false,
+            audio_enabled: false,
+            lhm_mode: "off".into(),
+            gpu_provider: "off".into(),
+            hang_enabled: false,
+            ..Config::default()
+        };
+        let (slow_tx, slow_rx) = mpsc::sync_channel(8);
+        let (presentmon_tx, presentmon_rx) = mpsc::channel();
+        let (hang_tx, hang_rx) = mpsc::channel();
+        let (network_tx, network_rx) = mpsc::channel();
+        let (tx, updates) = latest_channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker = Worker {
+            config: Arc::new(RwLock::new(cfg.clone())),
+            config_generation: Arc::new(AtomicU64::new(1)),
+            request_cache: (0u64, Arc::new(cfg.clone())),
+            consumers: Arc::new(AtomicU64::new(0)),
+            tx,
+            slow_rx,
+            update: Update {
+                generation: 1,
+                ..Default::default()
+            },
+            net: netif::NetProvider::new(),
+            performance: performance::Provider::new(),
+            headset_success: None,
+            lhm_success: None,
+            gpu_success: None,
+            performance_success: None,
+            connections_success: None,
+            battery_success: None,
+            hwinfo_success: None,
+            network_success: None,
+            presentmon_success: None,
+            controller_attempt: None,
+            audio_attempt: None,
+            net_attempt: None,
+            performance_attempt: None,
+            connections_attempt: None,
+            battery_attempt: None,
+            performance_failures: 0,
+            presentmon_rx,
+            hang_rx,
+            network_rx,
+            hwinfo_cpu_temp: Metric::default(),
+            lhm_cpu_temp: Metric::default(),
+            native_gpu_temp: Metric::default(),
+            lhm_gpu_temp: Metric::default(),
+            gpu_backend: String::new(),
+            native_gpu_power: None,
+            lhm_readings: Vec::new(),
+            hwinfo_readings: Vec::new(),
+            performance_readings: Vec::new(),
+            connection_reading: None,
+            hwinfo_diagnostic: None,
+            lhm_diagnostic: None,
+            generation: 1,
+            safe_mode_active: false,
+            publish_dirty: true,
+            last_publish: None,
+        };
+        let feeds = Feeds {
+            worker,
+            slow_tx,
+            presentmon_tx,
+            hang_tx,
+            network_tx,
+            updates,
+            shutdown: Arc::clone(&shutdown),
+        };
+        let mut worker = feeds.worker;
+        let loop_shutdown = Arc::clone(&feeds.shutdown);
+        let loop_thread = std::thread::Builder::new()
+            .name("telemetry-coordinator-fixture".into())
+            .spawn(move || coordinator_run(&mut worker, &loop_shutdown))
+            .expect("the coordinator loop runs on its own thread");
+        let drained = |want: &dyn Fn(&Update) -> bool| {
+            o2b_drain_within(&feeds.updates, Duration::from_millis(500), want)
+        };
+        let _ = drained(&|update| update.generation == 1);
+        // (1) the slow feed: a headset sample publishes the `headset` health row.
+        let at = Instant::now();
+        feeds
+            .slow_tx
+            .try_send(SlowEvent::Headset(1, headset_ok(3)))
+            .expect("the slow feed accepts the event");
+        let latency = drained(&|update| {
+            update
+                .providers
+                .iter()
+                .any(|(name, ok)| name == "headset" && *ok)
+        })
+        .expect("(1) the send_slow publication is drained and published");
+        assert!(
+            at.elapsed() < O2B_EDGE_BOUND && latency.1 < O2B_EDGE_BOUND,
+            "(1) the slow feed was drained in {:?}, inside the retired 50 ms tick",
+            latency.1
+        );
+        // (2) the presentmon feed.
+        feeds
+            .presentmon_tx
+            .send(presentmon::Update {
+                generation: 1,
+                available: true,
+                game: GameStats {
+                    active: true,
+                    process_name: "synthetic.exe".into(),
+                    fps: Metric::valid(61.0, SystemTime::UNIX_EPOCH),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .expect("the presentmon feed accepts the update");
+        let at = Instant::now();
+        let (_, latency) = drained(&|update| update.game.fps.valid)
+            .expect("(2) the presentmon publication is drained and published");
+        assert!(
+            at.elapsed() < O2B_EDGE_BOUND && latency < O2B_EDGE_BOUND,
+            "(2) the presentmon feed was drained in {latency:?}, inside the retired 50 ms tick"
+        );
+        // (3) the hang feed.
+        feeds
+            .hang_tx
+            .send(hang::Update {
+                generation: 1,
+                targets: Vec::new(),
+                available: true,
+                error: None,
+                probe_indeterminate: 0,
+            })
+            .expect("the hang feed accepts the update");
+        let (_, latency) = drained(&|update| {
+            update
+                .providers
+                .iter()
+                .any(|(name, ok)| name == "Hung window detector" && *ok)
+        })
+        .expect("(3) the hang publication is drained and published");
+        assert!(
+            latency < O2B_EDGE_BOUND,
+            "(3) the hang feed was drained in {latency:?}, inside the retired 50 ms tick"
+        );
+        // (4) the network feed.
+        feeds
+            .network_tx
+            .send(network::Update {
+                generation: 1,
+                ping: Metric::valid(11.0, SystemTime::UNIX_EPOCH),
+                jitter: Metric::valid(2.0, SystemTime::UNIX_EPOCH),
+                loss: Metric::valid(0.0, SystemTime::UNIX_EPOCH),
+                available: true,
+                error: None,
+            })
+            .expect("the network feed accepts the update");
+        let (_, latency) = drained(&|update| update.ping_ms.valid)
+            .expect("(4) the network publication is drained and published");
+        assert!(
+            latency < O2B_EDGE_BOUND,
+            "(4) the network feed was drained in {latency:?}, inside the retired 50 ms tick"
+        );
+        feeds
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        loop_thread
+            .join()
+            .expect("the coordinator loop exits on the shutdown edge");
     }
 }
