@@ -3164,15 +3164,19 @@ mod tests {
 
         pub struct Counters {
             pub polls: AtomicUsize,
-            pub client_id: Mutex<String>,
-            pub revision: AtomicUsize,
         }
 
         pub static CALLS: Counters = Counters {
             polls: AtomicUsize::new(0),
-            client_id: Mutex::new(String::new()),
-            revision: AtomicUsize::new(0),
         };
+
+        /// WO-48B (F-AUD-OPT01R-5): ONE stub session's state, reached ONLY through the component
+        /// handle the host passed back from `start`; see the module-end isolation note. The
+        /// component's revision is the per-session constant 1 (the host's publish-on-change gate
+        /// fires once per session), so no shared counter is read. shortcut: the box is never freed.
+        pub struct Session {
+            client_id: String,
+        }
         extern "system" fn stub_start(
             settings: *const LcsdSettings,
             settings_len: u32,
@@ -3191,8 +3195,7 @@ mod tests {
             let pod = unsafe { &*settings };
             let text =
                 String::from_utf8_lossy(&pod.client_id[..pod.client_id_len as usize]).into_owned();
-            *CALLS.client_id.lock().unwrap_or_else(|e| e.into_inner()) = text;
-            CALLS.revision.store(1, Ordering::Relaxed);
+            let session = Box::into_raw(Box::new(Session { client_id: text }));
             // The component's credential touch crosses the host API, exercised hermetically: the
             // host's `provide_token` callback runs (counting the touch) and refuses on the
             // malformed user id BEFORE any filesystem access, so the test never reads the real
@@ -3211,7 +3214,7 @@ mod tests {
             if code != LCSD_E_ARG {
                 return LCSD_E_ARG;
             }
-            unsafe { *out_handle = &CALLS.polls as *const AtomicUsize as *mut c_void };
+            unsafe { *out_handle = session as *mut c_void };
             LCSD_OK
         }
 
@@ -3229,7 +3232,8 @@ mod tests {
             let pod = unsafe { &*settings };
             let text =
                 String::from_utf8_lossy(&pod.client_id[..pod.client_id_len as usize]).into_owned();
-            *CALLS.client_id.lock().unwrap_or_else(|e| e.into_inner()) = text;
+            let session = unsafe { &mut *(handle as *mut Session) };
+            session.client_id = text;
             LCSD_OK
         }
 
@@ -3252,21 +3256,17 @@ mod tests {
             {
                 return LCSD_E_SIZE;
             }
-            let client = CALLS
-                .client_id
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
+            let session = unsafe { &*(handle as *const Session) };
             let pod = unsafe { &mut *out };
             *pod = LcsdState::default();
             pod.size = std::mem::size_of::<LcsdState>() as u32;
-            pod.revision = CALLS.revision.load(Ordering::Relaxed) as u64;
+            pod.revision = 1;
             pod.connected = 1;
             pod.authenticated = 1;
             pod.voice_ping_ms = 12.5;
             pod.self_mute = 1;
             pod.self_deaf = 1;
-            let channel = format!("channel-of-{client}");
+            let channel = format!("channel-of-{}", session.client_id);
             let bytes = channel.as_bytes();
             let len = bytes.len().min(LCSD_CHANNEL_CAPACITY);
             pod.channel_name[..len].copy_from_slice(&bytes[..len]);
@@ -3399,7 +3399,7 @@ mod tests {
             let pod = unsafe { &mut *out };
             *pod = LcsdState::default();
             pod.size = std::mem::size_of::<LcsdState>() as u32;
-            pod.revision = CALLS.revision.load(Ordering::Relaxed) as u64;
+            pod.revision = 1;
             pod.connected = 1;
             pod.authenticated = 1;
             pod.updated_unix_ms = u64::MAX;
@@ -5073,4 +5073,13 @@ mod tests {
         );
         drop(runtime);
     }
+
+    // WO-48B (F-AUD-OPT01R-5) ISOLATION NOTE - why the stub is session-scoped:
+    // `stub_v1::CALLS` used to carry `client_id` + `revision` as process-global state, so every
+    // session's published `channel-of-<id>` row was the LAST client id any parallel test wrote
+    // (stub_start / stub_set_config) and the revision gate (1577) let each session publish only
+    // ONE row. The reads at :3636, :4304 and :4326 therefore depended on suite scheduling: the
+    // census measured RED 2/10 idle and 7/10 under contention pre-fix. Each session now owns its
+    // client id and revision behind the handle the host passes to every component call, so those
+    // assertions are self-contained. No test body, assertion or bound changed.
 }
