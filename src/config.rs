@@ -20,6 +20,36 @@ pub const MAX_CONFIG_STRING_BYTES: usize = 4 * 1024;
 pub const MAX_CONFIG_LIST_ITEMS: usize = 256;
 const MAX_CCD_PROCESSOR_INDEX: u32 = 63;
 
+/// WO-OPT01 (C1): the content signature of one configuration file.
+///
+/// The digest is of the EXACT bytes a caller hands to `of_bytes`, so the code
+/// that consumes the bytes and the code that signs them share ONE source: no
+/// second read of the file and no post-parse rehash. `modified` and `len` are
+/// the metadata gate for the watcher's cheap sweep only; the digest is the
+/// authority, so a write that collides on both metadata fields is still found
+/// by the watcher's bounded full content recheck (`src\app.rs`,
+/// `WATCHER_FULL_RECHECK_CHECKS`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileSignature {
+    pub modified: Option<std::time::SystemTime>,
+    pub len: u64,
+    pub digest: String,
+}
+
+impl FileSignature {
+    /// The signature of `bytes` as they were read from `path`. `None` when the
+    /// metadata cannot be read, which the watcher treats as "unseen": such a
+    /// path is never marked applied.
+    pub fn of_bytes(path: &std::path::Path, bytes: &[u8]) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(FileSignature {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+            digest: crate::sha256::sha256_hex(bytes),
+        })
+    }
+}
+
 /// The four button-aligned slot defaults, byte-identical to the shipped
 /// LCDSirPlus portable configuration.
 pub const DEFAULT_SLOTS: [&[&str]; 4] = [

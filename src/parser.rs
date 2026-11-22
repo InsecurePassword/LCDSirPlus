@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{
-    parse_processor_list, validate, validate_config_string, Config, MAX_CONFIG_AGGREGATE_BYTES,
-    MAX_CONFIG_FILES, MAX_CONFIG_INCLUDE_DIRECTIVES, MAX_CONFIG_LINES, MAX_CONFIG_LIST_ITEMS,
-    MAX_CONFIG_STRING_BYTES, MAX_CONFIG_TOKEN_BYTES, MAX_INCLUDES,
+    parse_processor_list, validate, validate_config_string, Config, FileSignature,
+    MAX_CONFIG_AGGREGATE_BYTES, MAX_CONFIG_FILES, MAX_CONFIG_INCLUDE_DIRECTIVES, MAX_CONFIG_LINES,
+    MAX_CONFIG_LIST_ITEMS, MAX_CONFIG_STRING_BYTES, MAX_CONFIG_TOKEN_BYTES, MAX_INCLUDES,
 };
 
 #[cfg(test)]
@@ -43,12 +43,20 @@ pub struct LoadedConfig {
     pub config: Config,
     /// Canonical paths of every file in the include graph, primary first.
     pub files: Vec<PathBuf>,
+    /// WO-OPT01 (C1): the signature of the EXACT bytes this parse consumed, one
+    /// entry per file in `files`, in the same order. A path is listed only when
+    /// its bytes were read and handed to the line parser, so a caller that
+    /// records "applied" from this table can never record a version that was
+    /// never parsed. A path is missing from the table only when its metadata
+    /// could not be read, which the watcher treats as pending, never applied.
+    pub signatures: Vec<(PathBuf, FileSignature)>,
 }
 
 struct ParseContext {
     cfg: Config,
     stack: Vec<String>,
     files: Vec<PathBuf>,
+    signatures: Vec<(PathBuf, FileSignature)>,
     completed: Vec<String>,
     seen_in_file: HashMap<String, usize>,
     total_bytes: usize,
@@ -58,8 +66,24 @@ struct ParseContext {
 
 /// Load and parse a configuration file from disk (includes allowed).
 pub fn load(path: &Path) -> Result<LoadedConfig, ParseError> {
+    let mut consumed = Vec::new();
+    load_with_consumed(path, &mut consumed)
+}
+
+/// WO-OPT01R (F-AUD-OPT01-1): `load`, plus the signature of EVERY file this
+/// attempt consumed, on success AND on failure, handed back through `consumed`.
+/// A rejected load reports only the file that failed, yet the watcher must know
+/// all the bytes that attempt read - the root plus every include, named by an
+/// error or not - to re-verify the whole consumed graph at its bounded full
+/// recheck. The signatures are the parser's own, produced from the bytes it
+/// consumed (C1), so no caller has to re-read anything to learn the set.
+pub fn load_with_consumed(
+    path: &Path,
+    consumed: &mut Vec<(PathBuf, FileSignature)>,
+) -> Result<LoadedConfig, ParseError> {
     #[cfg(test)]
     LOAD_CALLS.set(LOAD_CALLS.get() + 1);
+    *consumed = Vec::new();
     let canonical = std::fs::canonicalize(path).map_err(|e| ParseError {
         file: path.display().to_string(),
         line: 0,
@@ -69,13 +93,16 @@ pub fn load(path: &Path) -> Result<LoadedConfig, ParseError> {
         cfg: Config::default(),
         stack: Vec::new(),
         files: Vec::new(),
+        signatures: Vec::new(),
         completed: Vec::new(),
         seen_in_file: HashMap::new(),
         total_bytes: 0,
         total_lines: 0,
         include_directives: 0,
     };
-    ctx.parse_file(&canonical, 0)?;
+    let parsed = ctx.parse_file(&canonical, 0);
+    *consumed = ctx.signatures;
+    parsed?;
     ctx.cfg.path = ctx.files[0].display().to_string();
     validate(&ctx.cfg).map_err(|message| ParseError {
         file: canonical.display().to_string(),
@@ -85,6 +112,7 @@ pub fn load(path: &Path) -> Result<LoadedConfig, ParseError> {
     Ok(LoadedConfig {
         config: ctx.cfg,
         files: ctx.files,
+        signatures: consumed.clone(),
     })
 }
 
@@ -97,6 +125,7 @@ pub fn parse_standalone(contents: &[u8]) -> Result<Config, ParseError> {
         cfg: Config::default(),
         stack: Vec::new(),
         files: vec![PathBuf::from(SOURCE)],
+        signatures: Vec::new(),
         completed: Vec::new(),
         seen_in_file: HashMap::new(),
         total_bytes: 0,
@@ -166,6 +195,13 @@ impl ParseContext {
             message: "configuration must be valid UTF-8".into(),
         })?;
         self.files.push(path.to_path_buf());
+        // WO-OPT01 (C1): the signature is produced from `raw`, the very bytes this
+        // parse is about to hand to the line parser, so "read bytes" and
+        // "signature" share one read. The watcher records applied state from
+        // this table, so no post-parse rehash of the disk is involved.
+        if let Some(signature) = FileSignature::of_bytes(path, &raw) {
+            self.signatures.push((path.to_path_buf(), signature));
+        }
         self.stack.push(key.clone());
         let source = path.display().to_string();
         self.parse_lines(&source, text, depth, false)?;
