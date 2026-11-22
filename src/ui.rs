@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
 
+use crate::backends::WakeSender;
+
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -111,7 +113,7 @@ struct UiShared {
     scale: AtomicU32,
     preview_visible: AtomicBool,
     manual_visibility: AtomicBool,
-    event_tx: OnceLock<Sender<UiEvent>>,
+    event_tx: OnceLock<WakeSender<UiEvent>>,
     hwnd: AtomicIsize,
 }
 
@@ -133,7 +135,11 @@ pub struct Ui {
 impl Ui {
     /// Spawn the UI thread with a tray icon; the preview window appears per
     /// `show_preview` (config `preview_mode` resolution).
-    pub fn spawn(scale: u32, show_preview: bool, event_tx: Sender<UiEvent>) -> Ui {
+    ///
+    /// WO-OPT02A (finding O1): `event_tx` is the app's wake-wrapped sender, so a
+    /// preview click and a tray Exit are immediate app-loop wakes (the Exit edge
+    /// is what lets a parked loop take the graceful exit at once).
+    pub fn spawn(scale: u32, show_preview: bool, event_tx: WakeSender<UiEvent>) -> Ui {
         let (frame_tx, frame_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         UI.scale.store(scale.max(1), Ordering::Relaxed);
         UI.preview_visible.store(show_preview, Ordering::Relaxed);
@@ -290,7 +296,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let scale = UI.scale.load(Ordering::Relaxed);
             let slot = (x / (FRAME_W * scale / 4)).min(3) as usize;
             if let Some(tx) = UI.event_tx.get() {
-                let _ = tx.send(UiEvent::SlotCycle { slot, backward });
+                tx.send(UiEvent::SlotCycle { slot, backward });
             }
             LRESULT(0)
         }
@@ -310,7 +316,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             ID_MENU_EXIT => {
                 if let Some(tx) = UI.event_tx.get() {
-                    let _ = tx.send(UiEvent::Exit);
+                    tx.send(UiEvent::Exit);
                 }
                 PostQuitMessage(0);
                 LRESULT(0)
@@ -323,7 +329,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_CLOSE | WM_DESTROY => {
             if let Some(tx) = UI.event_tx.get() {
-                let _ = tx.send(UiEvent::Exit);
+                tx.send(UiEvent::Exit);
             }
             PostQuitMessage(0);
             LRESULT(0)

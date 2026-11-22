@@ -4,7 +4,7 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::backends::{Backend, BackendKind, BackendState, LossCause, Message};
+use crate::backends::{Backend, BackendKind, BackendState, LossCause, Message, WakeSender};
 use crate::config::{Config, FileSignature};
 use crate::hardware_test::{self, TestConfig, Transport};
 use crate::logging::Level;
@@ -142,8 +142,15 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
     crate::log_info!("CCD topology: {}", topology.detail);
 
     // Backend.
+    // WO-OPT02A (finding O1): ONE capacity-1 wake token for the whole app loop.
+    // The backend worker and the UI publisher route their sends through a
+    // `WakeSender` that posts this token, and telemetry/discord keep their
+    // existing capacity-1 notify tokens, which the loop drains with the same
+    // `try_recv` sweep. `wake_tx` is cloned per spawn, so a reload's fresh
+    // worker publishes through the same edge.
+    let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let backend_kind = crate::backends::resolve_kind(&cfg.logitech_backend);
-    let mut backend = match Backend::spawn(backend_kind, &cfg) {
+    let mut backend = match Backend::spawn(backend_kind, &cfg, wake_tx.clone()) {
         Ok(backend) => backend,
         Err(error) => {
             // WO-U46G item 5: the worker thread is the transport's only driver,
@@ -161,7 +168,11 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
     let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
     let show_preview =
         opts.preview_always || (!cfg.start_minimized && cfg.preview_mode.as_str() == "always");
-    let ui = Ui::spawn(cfg.preview_scale.max(1) as u32, show_preview, ui_tx);
+    let ui = Ui::spawn(
+        cfg.preview_scale.max(1) as u32,
+        show_preview,
+        WakeSender::new(ui_tx, wake_tx.clone()),
+    );
 
     // Providers.
     let mut cpu_provider = cpu::CpuLoadProvider::new();
@@ -229,6 +240,21 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
     while running {
         let now = Instant::now();
 
+        // WO-OPT02A (finding O1): clear the wake token FIRST, then drain every
+        // inbound channel below. A publish that lands before its channel's drain
+        // is read in this iteration; a publish that lands after it leaves the
+        // capacity-1 token pending, so the park at the loop end returns at once.
+        // That order is what makes a coalesced edge (N publishes, one token)
+        // unable to drop a message, and it is why the token-wired channels (the
+        // backend worker and the UI) no longer need a poll. F-AUD-OPT02A-2: the
+        // two channels below are NOT token-wired - telemetry and discord publish
+        // on their own private capacity-1 notify pair, wired to nothing that
+        // posts this token - so those two stays are POLLS drained on wakes from
+        // the other edges, and their visibility latency is the loop's shortest
+        // cadence contributor (production 100 ms, legal worst 5000 ms), not the
+        // old 10 ms.
+        let _ = wake_rx.try_recv();
+
         while let Ok(update) = telemetry_runtime.updates.try_recv() {
             if update.generation == telemetry_runtime.generation() {
                 telemetry = update;
@@ -285,6 +311,7 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
                             match backend.reconfigure(
                                 crate::backends::resolve_kind(&cfg.logitech_backend),
                                 &cfg,
+                                wake_tx.clone(),
                             ) {
                                 Ok(()) => backend_state = BackendState::Discovering,
                                 Err(error) => {
@@ -555,7 +582,32 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
             crate::log_info!("{}", soak_resources_line(&sample));
         }
 
-        std::thread::sleep(Duration::from_millis(10));
+        // WO-OPT02A (finding O1, A2): the deadline park replaces the fixed
+        // 10 ms sleep. The backend and UI publishes are wake edges (A1), so the
+        // only wake left to schedule is TIME: the min of the gates' own remaining
+        // cadences, the recovery horizons and the hang-hold press deadline. A
+        // ZERO result means a gate is due; the park keeps only the
+        // F-AUD-OPT02A-1 floor below, so the startup-immediate cadence survives
+        // (an unstamped cadence is due), the loop never parks past work it
+        // owes, and a body at/above the shortest legal cadence cannot spin.
+        let park_now = Instant::now();
+        let deadline = app_loop_deadline(
+            &cfg,
+            last_telemetry.map(|last| park_now.saturating_duration_since(last)),
+            last_render.map(|last| park_now.saturating_duration_since(last)),
+            park_now.saturating_duration_since(watcher.last_check),
+            park_now.saturating_duration_since(last_soak_resources),
+            recovery
+                .next_deadline()
+                .map(|at| at.saturating_duration_since(park_now)),
+            press_hold_remaining(hang_hold.progress(park_now, &cfg), cfg.hang_hold),
+        );
+        // F-AUD-OPT02A-1: the floor is applied HERE and not inside
+        // `app_loop_deadline`, so the deadline function stays pure and its ZERO
+        // return (the `cadence_due` == `cadence_remaining().is_zero()` seam) is
+        // unchanged: the spin ceiling is 1 / 2 ms = 500 iterations a second.
+        let deadline = deadline.max(APP_LOOP_MIN_PARK);
+        let _ = wake_rx.recv_timeout(deadline);
     }
 
     crate::log_info!("shutting down");
@@ -567,10 +619,21 @@ pub fn run(opts: RunOptions) -> Result<i32, (i32, String)> {
 
 /// SOAK-OBS2: one ASCII resource line per minute in the soak log.
 ///
-/// The 60 s cadence is CODE-DERIVED, not a measured value: it is 6,000
-/// iterations of the app loop's own 10 ms sleep, gated in the shape of the
-/// existing `config_refresh` compare. It adds no config key, no thread, no
-/// timer and no per-frame allocation.
+/// The 60 s cadence is CODE-DERIVED, not a measured value: the gate is the
+/// `config_refresh` compare shape on an `Instant` elapsed and it rides the app
+/// loop's own wake budget. WO-OPT02A (finding O1) replaced the fixed 10 ms
+/// sleep with the `app_loop_deadline` park, and this interval is one of that
+/// min's contributors, so the line lands AT the boundary and is never late by
+/// more than the loop's shortest contributor (the 100 ms render cadence in the
+/// production shape) - the measured rows are
+/// `app_loop_deadline_keeps_the_60s_soak_line` in this module's tests (60 s
+/// exactly is due, so ZERO; one nanosecond short returns the remaining time to
+/// the boundary) and the untouched
+/// `soak_resources_cadence_gate_fires_at_60s_never_earlier`. The claim this
+/// paragraph used to carry, "6,000 iterations of the app loop's own 10 ms
+/// sleep", is stale from this unit on: the loop runs ~10 iterations a second at
+/// the production render cadence, not 100. It adds no config key, no thread,
+/// no timer and no per-frame allocation.
 const SOAK_RESOURCES_INTERVAL_SECS: u64 = 60;
 const SOAK_RESOURCES_INTERVAL: Duration = Duration::from_secs(SOAK_RESOURCES_INTERVAL_SECS);
 
@@ -1632,6 +1695,89 @@ fn cadence_initial_state(_now: Instant, _interval: Duration) -> Option<Instant> 
 /// stamp is due once `elapsed >= interval`.
 fn cadence_due(elapsed: Option<Duration>, interval: Duration) -> bool {
     elapsed.is_none_or(|elapsed| elapsed >= interval)
+}
+
+/// WO-OPT02A (finding O1, A2): `cadence_due`'s SAME boundary expressed as the
+/// time a gate still owes, so the loop can park instead of polling: never
+/// stamped (the WO-U46H #2 startup seed) is due at once, so ZERO, and a stamp
+/// owes `interval - elapsed`, saturated at ZERO so an overdue gate asks for no
+/// park. The invariant the deadline tests pin is
+/// `cadence_due(e, i) == cadence_remaining(e, i).is_zero()`.
+fn cadence_remaining(elapsed: Option<Duration>, interval: Duration) -> Duration {
+    match elapsed {
+        None => Duration::ZERO,
+        Some(elapsed) => interval.saturating_sub(elapsed),
+    }
+}
+
+/// F-AUD-OPT02A-1: a ZERO deadline means "work is due now", not "spin": park at
+/// least this long so a body at/above the shortest legal cadence (render 25 ms)
+/// cannot peg a core. 2 ms stays far inside the pre-unit 10 ms poll floor, so
+/// every wake latency measured by this unit is unchanged in the worst case.
+const APP_LOOP_MIN_PARK: Duration = Duration::from_millis(2);
+
+/// WO-OPT02A (finding O1, A2): the app loop's park deadline, ONE pure function
+/// in `Duration` space - the same seam shape as `cadence_due` and
+/// `soak_resources_due`, so it owns no clock and the boundary tests are exact.
+///
+/// The wake budget before this unit: a fixed 10 ms sleep plus four `try_recv`
+/// polls, so ~100 iterations a second, each re-running the watcher compare, the
+/// snapshot build, the render gate, the recovery tick and the hang reconcile.
+/// The backend and UI message wakes are now edges (`WakeSender` posts the app's
+/// capacity-1 token). F-AUD-OPT02A-2: telemetry and discord keep their own
+/// private capacity-1 notify pair, wired to nothing that posts that token, so
+/// those two inbound stays are POLLS drained on wakes from the other edges, and
+/// the cadence terms below are what bound their latency. Contributors,
+/// each the same compare the gate performs, passed as the elapsed/remaining
+/// times the caller already has:
+///
+/// - `telemetry_elapsed` against `cfg.telemetry_interval` (the snapshot cadence),
+/// - `render_elapsed` against `cfg.render_interval` (the frame + consumer word),
+/// - `watcher_elapsed` against `cfg.config_refresh` (the L202 compare shape),
+/// - `soak_elapsed` against the 60 s `SOAK_RESOURCES_INTERVAL` resource line,
+/// - `recovery_remaining` from `Recovery::next_deadline()` (the RC-2 stall and
+///   GRACE horizons; the getter reads the shipped comparisons, no math),
+/// - `press_remaining` from `press_hold_remaining` (the live hang-hold press).
+///
+/// The result is ZERO exactly when a contributor is due, because every term is
+/// saturated at ZERO; a ZERO return means "work is due now". The park's floor
+/// (`APP_LOOP_MIN_PARK`, F-AUD-OPT02A-1) is applied by the CALLER, so this
+/// function stays pure and that ZERO rule is untouched.
+fn app_loop_deadline(
+    cfg: &Config,
+    telemetry_elapsed: Option<Duration>,
+    render_elapsed: Option<Duration>,
+    watcher_elapsed: Duration,
+    soak_elapsed: Duration,
+    recovery_remaining: Option<Duration>,
+    press_remaining: Option<Duration>,
+) -> Duration {
+    let mut deadline = cadence_remaining(telemetry_elapsed, cfg.telemetry_interval)
+        .min(cadence_remaining(render_elapsed, cfg.render_interval))
+        .min(cadence_remaining(Some(watcher_elapsed), cfg.config_refresh))
+        .min(cadence_remaining(
+            Some(soak_elapsed),
+            SOAK_RESOURCES_INTERVAL,
+        ));
+    for remaining in [recovery_remaining, press_remaining].into_iter().flatten() {
+        deadline = deadline.min(remaining);
+    }
+    deadline
+}
+
+/// WO-OPT02A: the live hang-hold press's remaining time, from the published
+/// progress fraction. `HoldState::progress` is `elapsed / hang_hold` for the ONE
+/// bound, live press and 0.0 when none is bound, so the fraction is the seam
+/// into a provider this unit does not touch: the press owes `(1 - fraction) *
+/// hang_hold` more, and at fraction 1.0 that is ZERO - the `hold.tick` terminate
+/// the loop must not sleep past. No bound press contributes nothing.
+fn press_hold_remaining(progress: f64, hang_hold: Duration) -> Option<Duration> {
+    if progress <= 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(
+        (1.0 - progress).max(0.0) * hang_hold.as_secs_f64(),
+    ))
 }
 
 /// WO-U46H #4: one reload-rejection row per rejection identity - true (log the
@@ -4071,6 +4217,666 @@ mod tests {
                 "{interval:?}: the first tick must not wait"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // WO-OPT02A (finding O1, slice 1 of 3) - the deadline park and the real
+    // wake edges. The wake map BEFORE this unit (cited on the base commit
+    // 4d71e7e): the app loop ended every iteration on a fixed
+    // `std::thread::sleep(Duration::from_millis(10))` (app.rs:558) and polled
+    // four inbound channels with `try_recv` - telemetry app.rs:232, discord
+    // app.rs:237, backend `msg_rx` app.rs:438, `ui_rx` app.rs:511 - so an idle
+    // process woke 100 times a second and re-ran the whole loop body
+    // (watcher sweep, snapshot, render gate, recovery tick, hang reconcile)
+    // every 10 ms. The frozen production-shape baseline W6C measured
+    // 13.350 CPU-s/min (sd 1.045) with 2.0-3.2 M context switches per 2-min
+    // kernel trace. AFTER: one capacity-1 wake token, posted by `WakeSender` on
+    // every backend and UI publish (F-AUD-OPT02A-2: the telemetry/discord notify
+    // tokens are private to those providers and post NOTHING here, so those two
+    // inbound stays remain polls drained on wakes from the other edges), and a
+    // park bounded by the pure `app_loop_deadline` plus the `APP_LOOP_MIN_PARK`
+    // floor (F-AUD-OPT02A-1).
+    // -----------------------------------------------------------------------
+
+    /// Every contributor is the min in turn, so the park rides the shortest
+    /// gate, not a fixed poll: the render cadence (100 ms, the production
+    /// shape), the telemetry cadence, the watcher `config_refresh`, the 60 s
+    /// resource line, then the recovery and press horizons.
+    #[test]
+    fn app_loop_deadline_min_takes_each_contributor_in_turn() {
+        let fresh = Some(Duration::ZERO);
+        let cfg_with = |render_ms: u64, telemetry_ms: u64, refresh_ms: u64| Config {
+            render_interval: Duration::from_millis(render_ms),
+            telemetry_interval: Duration::from_millis(telemetry_ms),
+            config_refresh: Duration::from_millis(refresh_ms),
+            ..Config::default()
+        };
+        // The long trio (5 s render, 10 s telemetry, 60 s refresh) is the floor
+        // every leg below measures against, with every cadence freshly stamped.
+        let long = cfg_with(5_000, 10_000, 60_000);
+        assert_eq!(
+            app_loop_deadline(
+                &long,
+                fresh,
+                fresh,
+                Duration::ZERO,
+                Duration::ZERO,
+                None,
+                None
+            ),
+            Duration::from_millis(5_000),
+            "the render cadence (5 s) is the min of the fresh cadences"
+        );
+        let render_floor = cfg_with(100, 10_000, 60_000);
+        assert_eq!(
+            app_loop_deadline(
+                &render_floor,
+                fresh,
+                fresh,
+                Duration::ZERO,
+                Duration::ZERO,
+                None,
+                None
+            ),
+            Duration::from_millis(100),
+            "the production 100 ms render cadence owns the wake budget"
+        );
+        let telemetry_nested = cfg_with(100, 300, 60_000);
+        assert_eq!(
+            app_loop_deadline(
+                &telemetry_nested,
+                fresh,
+                fresh,
+                Duration::ZERO,
+                Duration::ZERO,
+                None,
+                None
+            ),
+            Duration::from_millis(100),
+            "a 300 ms telemetry cadence is inside the 100 ms render cadence"
+        );
+        let telemetry_floor = cfg_with(5_000, 300, 60_000);
+        assert_eq!(
+            app_loop_deadline(
+                &telemetry_floor,
+                fresh,
+                fresh,
+                Duration::ZERO,
+                Duration::ZERO,
+                None,
+                None
+            ),
+            Duration::from_millis(300),
+            "a telemetry cadence shorter than the render cadence is the min"
+        );
+        let refresh_floor = cfg_with(5_000, 10_000, 1_000);
+        assert_eq!(
+            app_loop_deadline(
+                &refresh_floor,
+                fresh,
+                fresh,
+                Duration::ZERO,
+                Duration::ZERO,
+                None,
+                None
+            ),
+            Duration::from_millis(1_000),
+            "the watcher sweep cadence is the min when the panel cadences are longer"
+        );
+        // The 60 s resource line is the min in the last second before its
+        // boundary, against cadences longer than that second.
+        assert_eq!(
+            app_loop_deadline(
+                &long,
+                fresh,
+                fresh,
+                Duration::ZERO,
+                Duration::from_secs(59),
+                None,
+                None
+            ),
+            Duration::from_secs(1),
+            "the soak line (60 s - 59 s) is the min against 5 s/10 s/60 s cadences"
+        );
+        // The recovery horizon and the press deadline beat every cadence.
+        assert_eq!(
+            app_loop_deadline(
+                &long,
+                fresh,
+                fresh,
+                Duration::ZERO,
+                Duration::ZERO,
+                Some(Duration::from_millis(250)),
+                None
+            ),
+            Duration::from_millis(250),
+            "a recovery horizon shorter than every cadence is the min"
+        );
+        assert_eq!(
+            app_loop_deadline(
+                &long,
+                fresh,
+                fresh,
+                Duration::ZERO,
+                Duration::ZERO,
+                Some(Duration::from_millis(250)),
+                Some(Duration::from_millis(10))
+            ),
+            Duration::from_millis(10),
+            "a press deadline shorter than the recovery horizon is the min"
+        );
+    }
+
+    /// ZERO = "do not park": it is returned exactly when a contributor is due,
+    /// so the park can never sleep past work the loop owes. The startup seed
+    /// (`None` = never stamped) is due at once, which is what keeps the first
+    /// collection and the first render immediate.
+    #[test]
+    fn app_loop_deadline_is_zero_when_any_contributor_is_due() {
+        let fresh = Some(Duration::ZERO);
+        let long = Duration::from_secs(60);
+        assert_eq!(
+            app_loop_deadline(
+                &Config::default(),
+                None,
+                fresh,
+                Duration::ZERO,
+                Duration::ZERO,
+                None,
+                None
+            ),
+            Duration::ZERO,
+            "an unstamped snapshot cadence parks for nothing"
+        );
+        assert_eq!(
+            app_loop_deadline(
+                &Config::default(),
+                fresh,
+                None,
+                Duration::ZERO,
+                Duration::ZERO,
+                None,
+                None
+            ),
+            Duration::ZERO,
+            "an unstamped render cadence parks for nothing (the startup render stays immediate)"
+        );
+        // Each cadence at its own boundary with every OTHER contributor fresh:
+        // one tick short is not due, exactly the interval is.
+        for (label, elapsed, want_zero) in [
+            ("render", Duration::from_millis(99), false),
+            ("render", Duration::from_millis(100), true),
+            ("telemetry", Duration::from_millis(99), false),
+            ("telemetry", Duration::from_millis(100), true),
+            ("config_refresh", Duration::from_millis(99), false),
+            ("config_refresh", Duration::from_millis(100), true),
+            ("soak", Duration::from_millis(59_999), false),
+            ("soak", Duration::from_millis(60_000), true),
+        ] {
+            let cfg = Config {
+                render_interval: if label == "render" {
+                    Duration::from_millis(100)
+                } else {
+                    long
+                },
+                telemetry_interval: if label == "telemetry" {
+                    Duration::from_millis(100)
+                } else {
+                    long
+                },
+                config_refresh: if label == "config_refresh" {
+                    Duration::from_millis(100)
+                } else {
+                    long
+                },
+                ..Config::default()
+            };
+            let (telemetry, render, watcher, soak) = match label {
+                "render" => (fresh, Some(elapsed), Duration::ZERO, Duration::ZERO),
+                "telemetry" => (Some(elapsed), fresh, Duration::ZERO, Duration::ZERO),
+                "config_refresh" => (fresh, fresh, elapsed, Duration::ZERO),
+                _ => (fresh, fresh, Duration::ZERO, elapsed),
+            };
+            let deadline = app_loop_deadline(&cfg, telemetry, render, watcher, soak, None, None);
+            assert_eq!(
+                deadline.is_zero(),
+                want_zero,
+                "{label} at {elapsed:?}: due={want_zero}, deadline {deadline:?}"
+            );
+        }
+        // A recovery horizon or a press whose remaining time has elapsed.
+        assert_eq!(
+            app_loop_deadline(
+                &Config::default(),
+                fresh,
+                fresh,
+                Duration::ZERO,
+                Duration::ZERO,
+                Some(Duration::ZERO),
+                None
+            ),
+            Duration::ZERO,
+            "an elapsed recovery horizon is due at once"
+        );
+        assert_eq!(
+            app_loop_deadline(
+                &Config::default(),
+                fresh,
+                fresh,
+                Duration::ZERO,
+                Duration::ZERO,
+                None,
+                Some(Duration::ZERO)
+            ),
+            Duration::ZERO,
+            "a press at its hold boundary is due at once (the terminate must not sleep past)"
+        );
+    }
+
+    /// The 60 s resource line rides the park: one nanosecond short of the
+    /// boundary the remaining time is exactly that nanosecond, at the boundary
+    /// it is ZERO, so the line lands at 60 s and never later than the loop's
+    /// shortest contributor after it. This replaces the stale doc claim of
+    /// "6,000 iterations of the app loop's own 10 ms sleep".
+    #[test]
+    fn app_loop_deadline_keeps_the_60s_soak_line() {
+        let cfg = Config {
+            render_interval: Duration::from_millis(5_000),
+            telemetry_interval: Duration::from_millis(10_000),
+            config_refresh: Duration::from_millis(60_000),
+            ..Config::default()
+        };
+        // Every OTHER contributor is freshly stamped, so the 60 s line is the
+        // only one that can drive the deadline to zero.
+        for (label, soak_elapsed, want) in [
+            (
+                "one nanosecond short of 60 s is not due",
+                SOAK_RESOURCES_INTERVAL - Duration::from_nanos(1),
+                Duration::from_nanos(1),
+            ),
+            (
+                "exactly 60 s is due, so the loop never parks past the resource line",
+                SOAK_RESOURCES_INTERVAL,
+                Duration::ZERO,
+            ),
+            (
+                "an overdue soak gate asks for no park (no negative accumulates)",
+                SOAK_RESOURCES_INTERVAL * 2,
+                Duration::ZERO,
+            ),
+        ] {
+            assert_eq!(
+                app_loop_deadline(
+                    &cfg,
+                    Some(Duration::ZERO),
+                    Some(Duration::ZERO),
+                    Duration::ZERO,
+                    soak_elapsed,
+                    None,
+                    None
+                ),
+                want,
+                "{label}"
+            );
+        }
+    }
+
+    /// The press horizon comes from the published progress fraction, the only
+    /// seam into `hang::HoldState` this unit owns: no bound press is `None`,
+    /// half a hold leaves half the budget, a full hold is ZERO (due at once).
+    #[test]
+    fn press_hold_remaining_is_the_live_press_boundary() {
+        let hold = Duration::from_millis(2_000);
+        assert_eq!(
+            press_hold_remaining(0.0, hold),
+            None,
+            "no bound press contributes no horizon"
+        );
+        assert_eq!(
+            press_hold_remaining(0.5, hold),
+            Some(Duration::from_millis(1_000)),
+            "half a spent hold owes the other half"
+        );
+        assert_eq!(
+            press_hold_remaining(1.0, hold),
+            Some(Duration::ZERO),
+            "a full hold is due at once"
+        );
+        let cfg = Config {
+            render_interval: Duration::from_millis(100),
+            ..Config::default()
+        };
+        assert_eq!(
+            app_loop_deadline(
+                &cfg,
+                Some(Duration::ZERO),
+                Some(Duration::ZERO),
+                Duration::ZERO,
+                Duration::ZERO,
+                None,
+                press_hold_remaining(1.0, hold)
+            ),
+            Duration::ZERO,
+            "the parked loop wakes for the terminate at the hold boundary"
+        );
+    }
+
+    /// `cadence_remaining` is `cadence_due` as a time, so the park and the gate
+    /// cannot disagree at any boundary, including the never-stamped seed.
+    #[test]
+    fn cadence_remaining_matches_cadence_due_at_every_boundary() {
+        for interval in [
+            Duration::from_millis(25),
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+        ] {
+            for (elapsed, due) in [
+                (None, true),
+                (Some(Duration::ZERO), false),
+                (Some(interval - Duration::from_nanos(1)), false),
+                (Some(interval), true),
+                (Some(interval + Duration::from_secs(30)), true),
+            ] {
+                assert_eq!(
+                    cadence_due(elapsed, interval),
+                    cadence_remaining(elapsed, interval).is_zero(),
+                    "{interval:?} at {elapsed:?}: the gate and the park agree"
+                );
+                assert_eq!(
+                    cadence_due(elapsed, interval),
+                    due,
+                    "{interval:?} at {elapsed:?}: the shipped gate is unchanged"
+                );
+            }
+        }
+    }
+
+    /// The wake edge itself, on real channels: a publish unblocks a waiting
+    /// `recv_timeout` (the loop's park) inside 50 ms, and N publishes coalesce
+    /// to ONE token while the drain sweep still reads every message.
+    #[test]
+    fn wake_sender_publish_wakes_the_park_and_coalesces_to_one_token() {
+        let (tx, rx) = std::sync::mpsc::channel::<Message>();
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let publisher = WakeSender::new(tx, wake_tx);
+        // The loop's order: clear the token, then drain. A publish that lands
+        // before the drain is read; the token it posted is cleared next
+        // iteration, so coalescing cannot strand a message.
+        publisher.send(Message::PhysicalHealthy(BackendKind::Hid));
+        assert_eq!(
+            wake_rx.try_recv(),
+            Ok(()),
+            "the publish posted the wake edge"
+        );
+        assert!(
+            wake_rx.try_recv().is_err(),
+            "capacity 1: a second token is never queued"
+        );
+        assert!(matches!(rx.try_recv(), Ok(Message::PhysicalHealthy(_))));
+        for _ in 0..64 {
+            publisher.send(Message::ReconnectStarted);
+        }
+        assert_eq!(
+            wake_rx.try_recv(),
+            Ok(()),
+            "64 publishes post exactly one edge"
+        );
+        assert!(
+            wake_rx.try_recv().is_err(),
+            "the burst never overflows the token"
+        );
+        let mut drained = 0;
+        while rx.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert_eq!(drained, 64, "the sweep reads every coalesced message");
+
+        // The behavioral half: a park is unblocked by the publish, not by time.
+        let (tx2, rx2) = std::sync::mpsc::channel::<Message>();
+        let (wake_tx2, wake_rx2) = std::sync::mpsc::sync_channel::<()>(1);
+        let publisher2 = WakeSender::new(tx2, wake_tx2);
+        let park = std::thread::spawn(move || {
+            let started = Instant::now();
+            // A bound far beyond the budget: only a wake edge can end the park.
+            let _ = wake_rx2.recv_timeout(Duration::from_secs(30));
+            started.elapsed()
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        publisher2.send(Message::State(BackendState::Discovering));
+        let woke_after = park.join().unwrap();
+        assert!(
+            woke_after < Duration::from_millis(50),
+            "the publish woke the park in {woke_after:?} (budget 50 ms)"
+        );
+        assert!(matches!(
+            rx2.recv_timeout(Duration::from_millis(50)),
+            Ok(Message::State(BackendState::Discovering))
+        ));
+    }
+
+    /// WO-OPT02A (A4), the `app.rs:5680` / `:6014-6052` pin form: sliced at
+    /// `mod tests {` so the pin's own literals cannot self-count. Pins the
+    /// wake map in source: the app loop has ONE deadline park and no fixed
+    /// 10 ms sleep, the token is cleared before the four drains, no new channel
+    /// was added, every backend publish site goes through the publisher, the
+    /// 100 ms shutdown clamp is gone from the backend's sleep helpers, and the
+    /// `CommandQueue` keeps its worker wake.
+    #[test]
+    fn app_loop_source_pin_deadline_park_wake_edges_and_backend_clamp() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let production = source.split("mod tests {").next().unwrap_or_default();
+        let loop_start = production
+            .find("while running {")
+            .expect("the app loop exists");
+        let loop_end = production
+            .find("crate::log_info!(\"shutting down\")")
+            .expect("the loop's exit tail");
+        let loop_body = &production[loop_start..loop_end];
+        assert_eq!(
+            loop_body
+                .matches("std::thread::sleep(Duration::from_millis(10))")
+                .count(),
+            0,
+            "the fixed 10 ms sleep is gone from the app loop"
+        );
+        assert_eq!(
+            production.matches("std::thread::sleep").count(),
+            0,
+            "the app module performs no blocking sleep at all"
+        );
+        assert_eq!(
+            loop_body.matches("wake_rx.recv_timeout(deadline)").count(),
+            1,
+            "one deadline park closes every iteration"
+        );
+        assert_eq!(
+            loop_body
+                .matches("let deadline = app_loop_deadline(")
+                .count(),
+            1,
+            "the park's bound is the pure deadline function"
+        );
+        assert_eq!(
+            loop_body.matches("let _ = wake_rx.try_recv();").count(),
+            1,
+            "the wake token is cleared exactly once per iteration"
+        );
+        let clear = loop_body
+            .find("let _ = wake_rx.try_recv();")
+            .expect("the token clear");
+        for drain in [
+            "telemetry_runtime.updates.try_recv()",
+            "discord_runtime.updates.try_recv()",
+            "backend.msg_rx.try_recv()",
+            "ui_rx.try_recv()",
+        ] {
+            assert_eq!(
+                loop_body.matches(drain).count(),
+                1,
+                "{drain}: the existing poll drain stays, exactly once"
+            );
+            assert!(
+                clear < loop_body.find(drain).expect("the drain site"),
+                "{drain}: the token is cleared BEFORE the drains, which is what makes a coalesced edge safe"
+            );
+        }
+        assert_eq!(
+            production.matches("sync_channel").count(),
+            1,
+            "ONE new capacity-1 wake token: telemetry/discord keep their existing notify channels"
+        );
+        assert_eq!(
+            production
+                .matches("WakeSender::new(ui_tx, wake_tx.clone())")
+                .count(),
+            1,
+            "the UI publisher is wake-wrapped"
+        );
+        assert_eq!(
+            production.matches("wake_tx.clone()").count(),
+            3,
+            "startup spawn, reload spawn and the UI publisher take the token"
+        );
+        assert_eq!(
+            loop_body.matches("next_deadline()").count(),
+            1,
+            "the recovery horizon enters the park min, inside the loop"
+        );
+
+        let back = include_str!("backends/mod.rs").replace("\r\n", "\n");
+        let back_prod = back.split("mod tests {").next().unwrap_or_default();
+        assert_eq!(
+            back_prod.matches("min(Duration::from_millis(100))").count(),
+            0,
+            "the 100 ms shutdown/reconnect clamp is deleted (the wake edge replaced it)"
+        );
+        assert_eq!(
+            back_prod.matches("let _ = msg_tx.send(").count(),
+            0,
+            "no backend publish site bypasses the publisher"
+        );
+        assert_eq!(
+            back_prod.matches("msg_tx.send(").count(),
+            23,
+            "every backend publish site is a publisher send (the enumerated count)"
+        );
+        assert_eq!(
+            back_prod.matches("impl Publish<Message>").count(),
+            4,
+            "worker, physical_worker, virtual_worker and virtual_fallback_loop publish through the seam"
+        );
+        assert_eq!(
+            back_prod
+                .matches("std::sync::mpsc::Sender<Message>")
+                .count(),
+            0,
+            "no worker body keeps a bare `Sender<Message>`"
+        );
+        assert!(
+            back_prod.contains("fn shutdown(&self) {")
+                && back_prod
+                    .split("fn shutdown(&self) {")
+                    .nth(1)
+                    .unwrap_or_default()
+                    .contains("self.wake.try_send(())"),
+            "CommandQueue::shutdown keeps the worker wake edge the clamp removal depends on"
+        );
+    }
+
+    /// F-AUD-OPT02A-1 (P2): the park has a floor, so a saturated loop body
+    /// cannot spin. The effective park is `deadline.max(APP_LOOP_MIN_PARK)` at
+    /// the call site, so the ZERO-deadline shape - a body at/above the shortest
+    /// legal cadence (`render_interval_ms` 25, `config.rs:422-427`), which
+    /// saturates every contributor at ZERO - parks exactly 2 ms, and the
+    /// iteration rate is capped at 1 / 2 ms = 500 per second. The auditor
+    /// measured 12,373,669 it/s with no floor; the pre-unit fixed 10 ms sleep
+    /// capped the loop at 100/s.
+    #[test]
+    fn app_loop_deadline_park_floor_bounds_the_spin_rate() {
+        // The shipped floor, as numbers.
+        assert_eq!(APP_LOOP_MIN_PARK, Duration::from_millis(2));
+        assert_eq!(APP_LOOP_MIN_PARK.as_micros(), 2_000);
+        assert_eq!(
+            Duration::from_secs(1).div_duration_f64(APP_LOOP_MIN_PARK),
+            500.0,
+            "the spin ceiling the floor implies: 500 iterations a second"
+        );
+        // The ZERO-deadline shape: every cadence contributor overdue at a 30 ms
+        // body against the 25 ms legal floor. The pure min stays ZERO - the floor
+        // is NOT applied inside `app_loop_deadline`, so the shipped ZERO
+        // invariant (`cadence_due` == `cadence_remaining().is_zero()`) is intact.
+        let cfg = Config {
+            render_interval: Duration::from_millis(25),
+            telemetry_interval: Duration::from_millis(25),
+            config_refresh: Duration::from_millis(100),
+            ..Config::default()
+        };
+        let overdue = Duration::from_millis(30);
+        let zero = app_loop_deadline(
+            &cfg,
+            Some(overdue),
+            Some(overdue),
+            overdue,
+            overdue,
+            None,
+            None,
+        );
+        assert_eq!(
+            zero,
+            Duration::ZERO,
+            "a saturated body asks for no park: work is due now"
+        );
+        // The park the loop performs on that ZERO is exactly the floor: 2 ms.
+        assert_eq!(
+            zero.max(APP_LOOP_MIN_PARK),
+            Duration::from_millis(2),
+            "the effective park is the floor, not ZERO"
+        );
+        // The other ZERO shape: an elapsed recovery horizon and a press at its
+        // hold boundary. An immediately-due wake waits 2 ms at worst, inside the
+        // 10 ms this unit replaced.
+        assert_eq!(
+            app_loop_deadline(
+                &cfg,
+                Some(Duration::ZERO),
+                Some(Duration::ZERO),
+                Duration::ZERO,
+                Duration::ZERO,
+                Some(Duration::ZERO),
+                Some(Duration::ZERO)
+            )
+            .max(APP_LOOP_MIN_PARK),
+            Duration::from_millis(2),
+            "an immediately-due wake is at most 2 ms late"
+        );
+        // The structural half, in the `app_loop_source_pin...` include_str! form
+        // (sliced at `mod tests {` so these literals cannot self-count).
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let production = source.split("mod tests {").next().unwrap_or_default();
+        let loop_start = production
+            .find("while running {")
+            .expect("the app loop exists");
+        let loop_end = production
+            .find("crate::log_info!(\"shutting down\")")
+            .expect("the loop's exit tail");
+        let loop_body = &production[loop_start..loop_end];
+        assert_eq!(
+            loop_body.matches(".max(APP_LOOP_MIN_PARK)").count(),
+            1,
+            "the loop's park expression applies the floor exactly once"
+        );
+        assert_eq!(
+            loop_body.matches("recv_timeout(Duration::ZERO)").count(),
+            0,
+            "no bare zero-timeout park is left in the loop"
+        );
+        assert_eq!(
+            loop_body.matches("wake_rx.recv_timeout(deadline)").count(),
+            1,
+            "the deadline park still closes every iteration"
+        );
     }
 
     /// WO-U46H #4: the reload attempt continues on every refresh tick (a repair

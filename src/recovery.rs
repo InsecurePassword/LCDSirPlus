@@ -572,6 +572,57 @@ impl Recovery {
                 .is_some_and(|since| now.saturating_duration_since(since) >= self.stall_deadline)
     }
 
+    /// WO-OPT02A (finding O1, A2): the earliest instant on which the next `tick`
+    /// can act, so the app loop's deadline park bounds the recovery poll. PURE
+    /// READ of the fields the shipped comparisons already use - `stall_due`
+    /// (`liveness_since + stall_deadline`), `due` (the Fresh stage's
+    /// `lost_since + GRACE`, the Resumed/LogitechResult stages'
+    /// `waiting_since + GRACE`) and the logitech-result worker timeout
+    /// (`waiting_since + GRACE` while a receiver is live and untimed) - so NO
+    /// math changes: each horizon is the same `since + bound` pair the tick
+    /// compares. `None` = this state owns no pending deadline, so recovery
+    /// contributes nothing to the park min.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let mut best: Option<Instant> = None;
+        let mut consider = |at: Instant| {
+            if best.is_none_or(|current| at < current) {
+                best = Some(at);
+            }
+        };
+        // RC-2 liveness: the same two guards `stall_due` requires.
+        if !self.awaiting_reconnect && !self.stall_actioned {
+            if let Some(since) = self.liveness_since {
+                if let Some(at) = since.checked_add(self.stall_deadline) {
+                    consider(at);
+                }
+            }
+        }
+        // The journal stage GRACE horizons, in `due`'s shape.
+        if let Some(stage) = self.journal.as_ref().map(|journal| journal.stage) {
+            match stage {
+                Stage::Fresh => {
+                    if let Some(since) = self.lost_since {
+                        if let Some(at) = since.checked_add(GRACE) {
+                            consider(at);
+                        }
+                    }
+                }
+                Stage::Resumed | Stage::LogitechResult => {
+                    if let Some(at) = self.waiting_since.checked_add(GRACE) {
+                        consider(at);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if self.logitech_result.is_some() && !self.worker_timed_out {
+            if let Some(at) = self.waiting_since.checked_add(GRACE) {
+                consider(at);
+            }
+        }
+        best
+    }
+
     /// Called only by the responsive dashboard loop. True requests normal app shutdown.
     pub fn tick(&mut self, now: Instant, enabled: bool, request_reconnect: impl FnOnce()) -> bool {
         // The app-side wake may be spent once per tick: by the successful

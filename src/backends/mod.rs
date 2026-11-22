@@ -11,7 +11,7 @@ pub mod hid;
 pub mod sdk;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -190,6 +190,59 @@ pub enum Message {
     Buttons(Vec<Event>),
     PhysicalHealthy(BackendKind),
     ReconnectStarted,
+}
+
+/// WO-OPT02A (finding O1): the real wake edge for one inbound message.
+///
+/// Before this unit the app loop polled every inbound channel on a fixed 10 ms
+/// sleep, so an idle process woke 100 times a second with no work, and a
+/// published message waited up to 10 ms for its next poll. A publisher that
+/// forwards and then posts a capacity-1 token makes the publish itself the
+/// wake: `try_send` never blocks and never grows (the single token coalesces N
+/// publishes into one edge), and the app loop's own `try_recv` sweep drains
+/// every message channel after clearing the token, so a coalesced edge can
+/// never drop a message - the clear-then-read order is what makes that true.
+///
+/// `Send` is a trait (`Publish`) so the worker bodies keep their existing
+/// `&msg_tx` call shape: production passes a `WakeSender`, the worker-level
+/// tests keep passing a bare `Sender<Message>` (no wake token exists there),
+/// and every publish site stays one line.
+pub struct WakeSender<T> {
+    tx: Sender<T>,
+    wake: SyncSender<()>,
+}
+
+impl<T> WakeSender<T> {
+    pub fn new(tx: Sender<T>, wake: SyncSender<()>) -> Self {
+        Self { tx, wake }
+    }
+
+    /// Forward the message, then post the wake edge. Both are best-effort by
+    /// design: a closed message channel (the app is exiting) makes the token
+    /// pointless, and a full token channel already promises a wake.
+    pub fn send(&self, message: T) {
+        let _ = self.tx.send(message);
+        let _ = self.wake.try_send(());
+    }
+}
+
+/// What the worker bodies publish through: the production `WakeSender` plus the
+/// bare `Sender` the worker tests build, so no worker publish site needs a
+/// branch on which one it owns.
+pub trait Publish<T> {
+    fn send(&self, message: T);
+}
+
+impl<T> Publish<T> for Sender<T> {
+    fn send(&self, message: T) {
+        let _ = Sender::send(self, message);
+    }
+}
+
+impl<T> Publish<T> for WakeSender<T> {
+    fn send(&self, message: T) {
+        WakeSender::send(self, message);
+    }
 }
 
 pub struct Backend {
@@ -429,7 +482,17 @@ impl Backend {
     /// a panic. The callers (app.rs startup and reload) publish the established
     /// `Disconnected` row; the reconnect ladder owns the re-attempts, so one
     /// failure here starts no restart storm.
-    pub fn spawn(kind: BackendKind, cfg: &Config) -> Result<Backend, LossError> {
+    ///
+    /// WO-OPT02A (finding O1): `app_wake` is the app loop's capacity-1 token
+    /// sender. The worker publishes every message through a `WakeSender` built
+    /// from it, so a state change, a button batch and a health row are each an
+    /// immediate app-loop wake. The caller keeps its own sender (it is cloned
+    /// per spawn, and `reconfigure` supplies the clone for the new worker).
+    pub fn spawn(
+        kind: BackendKind,
+        cfg: &Config,
+        app_wake: SyncSender<()>,
+    ) -> Result<Backend, LossError> {
         let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
         let commands = Arc::new(CommandQueue {
             latest: Mutex::new(None),
@@ -442,6 +505,7 @@ impl Backend {
             wake_sends: AtomicUsize::new(0),
         });
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        let publisher = WakeSender::new(msg_tx, app_wake);
         let reconnect = cfg.logitech_reconnect;
         let reconnect_max = cfg.logitech_reconnect_max;
         let button_poll = cfg.logitech_button_poll;
@@ -464,7 +528,7 @@ impl Backend {
                     kind,
                     worker_commands,
                     wake_rx,
-                    msg_tx,
+                    publisher,
                     reconnect,
                     reconnect_max,
                     button_poll,
@@ -507,9 +571,14 @@ impl Backend {
     /// the stopped backend: the app keeps its loop, publishes the named loss
     /// row, submits drop into the shutdown queue, and no thread exists to
     /// restart - the ladder owns re-attempts, so there is no restart storm.
-    pub fn reconfigure(&mut self, kind: BackendKind, cfg: &Config) -> Result<(), LossError> {
+    pub fn reconfigure(
+        &mut self,
+        kind: BackendKind,
+        cfg: &Config,
+        app_wake: SyncSender<()>,
+    ) -> Result<(), LossError> {
         self.stop();
-        *self = Self::spawn(kind, cfg)?;
+        *self = Self::spawn(kind, cfg, app_wake)?;
         Ok(())
     }
 }
@@ -530,7 +599,7 @@ fn worker(
     kind: BackendKind,
     commands: Arc<CommandQueue>,
     wake_rx: Receiver<()>,
-    msg_tx: std::sync::mpsc::Sender<Message>,
+    msg_tx: impl Publish<Message>,
     reconnect: Duration,
     reconnect_max: Duration,
     button_poll: Duration,
@@ -539,7 +608,7 @@ fn worker(
     invert: bool,
     friendly_name: String,
 ) {
-    let _ = msg_tx.send(Message::State(BackendState::Discovering));
+    msg_tx.send(Message::State(BackendState::Discovering));
     match kind {
         BackendKind::Virtual => virtual_worker(commands, wake_rx, msg_tx),
         BackendKind::Auto | BackendKind::Sdk | BackendKind::Hid => {
@@ -558,7 +627,7 @@ fn worker(
                 open_physical,
                 device_candidates_present,
             );
-            let _ = msg_tx.send(Message::State(BackendState::ShutDown));
+            msg_tx.send(Message::State(BackendState::ShutDown));
         }
     }
 }
@@ -903,7 +972,7 @@ fn physical_worker(
     kind: BackendKind,
     commands: &CommandQueue,
     wake_rx: &Receiver<()>,
-    msg_tx: &std::sync::mpsc::Sender<Message>,
+    msg_tx: &impl Publish<Message>,
     reconnect: Duration,
     reconnect_max: Duration,
     button_poll: Duration,
@@ -926,7 +995,7 @@ fn physical_worker(
         let reconnect_requested = commands.reconnect.swap(false, Ordering::AcqRel);
         if reconnect_requested {
             backoff = reconnect;
-            let _ = msg_tx.send(Message::ReconnectStarted);
+            msg_tx.send(Message::ReconnectStarted);
         }
         if terminal {
             // RC-6: the ladder is terminal. Device-open attempts are skipped;
@@ -941,7 +1010,7 @@ fn physical_worker(
                 if probe(kind) {
                     terminal = false;
                     absent_passes = 0;
-                    let _ = msg_tx.send(Message::State(BackendState::Discovering));
+                    msg_tx.send(Message::State(BackendState::Discovering));
                 } else {
                     continue 'outer;
                 }
@@ -961,11 +1030,11 @@ fn physical_worker(
                 if !terminal && absent_passes >= ABSENT_TERMINATION_PASSES {
                     terminal = true;
                     last_probe = None;
-                    let _ = msg_tx.send(Message::State(BackendState::Absent {
+                    msg_tx.send(Message::State(BackendState::Absent {
                         reason: error.to_string(),
                     }));
                 } else {
-                    let _ = msg_tx.send(disconnect(&error));
+                    msg_tx.send(disconnect(&error));
                 }
                 if sleep_interruptible(commands, wake_rx, backoff) {
                     break 'outer;
@@ -976,10 +1045,10 @@ fn physical_worker(
             Ok(mut device) => {
                 absent_passes = 0;
                 let active_kind = device.kind();
-                let _ = msg_tx.send(Message::State(BackendState::Connected {
+                msg_tx.send(Message::State(BackendState::Connected {
                     kind: active_kind,
                 }));
-                let _ = msg_tx.send(Message::Buttons(
+                msg_tx.send(Message::Buttons(
                     tracker.disconnect(Instant::now(), active_kind.name()),
                 ));
                 let mut last_sent: Option<Vec<u8>> = None;
@@ -989,7 +1058,7 @@ fn physical_worker(
                 loop {
                     if commands.is_shutdown() {
                         if let Err(error) = device.close(true) {
-                            let _ = msg_tx.send(disconnect(&shutdown_close_error(&error)));
+                            msg_tx.send(disconnect(&shutdown_close_error(&error)));
                         }
                         break 'outer;
                     }
@@ -998,8 +1067,8 @@ fn physical_worker(
                             replay = current.take();
                         }
                         let _ = device.close(false);
-                        let _ = msg_tx.send(Message::State(BackendState::Discovering));
-                        let _ = msg_tx.send(Message::Buttons(
+                        msg_tx.send(Message::State(BackendState::Discovering));
+                        msg_tx.send(Message::Buttons(
                             tracker.disconnect(Instant::now(), active_kind.name()),
                         ));
                         continue 'outer;
@@ -1010,8 +1079,8 @@ fn physical_worker(
                                 replay = current.take();
                             }
                             let _ = device.close(false);
-                            let _ = msg_tx.send(Message::State(BackendState::Discovering));
-                            let _ = msg_tx.send(Message::Buttons(
+                            msg_tx.send(Message::State(BackendState::Discovering));
+                            msg_tx.send(Message::Buttons(
                                 tracker.disconnect(Instant::now(), active_kind.name()),
                             ));
                             continue 'outer;
@@ -1021,7 +1090,7 @@ fn physical_worker(
                                 replay = current.take();
                             }
                             let _ = device.close(false);
-                            let _ = msg_tx.send(disconnect(&error));
+                            msg_tx.send(disconnect(&error));
                             continue 'outer;
                         }
                         Ok(false) => {}
@@ -1066,8 +1135,8 @@ fn physical_worker(
                                     // EC-1: the frame never became visible and the
                                     // close blanked the panel: drop the cached content.
                                     commands.invalidate_identity();
-                                    let _ = msg_tx.send(disconnect(&error));
-                                    let _ = msg_tx.send(Message::Buttons(
+                                    msg_tx.send(disconnect(&error));
+                                    msg_tx.send(Message::Buttons(
                                         tracker.disconnect(Instant::now(), active_kind.name()),
                                     ));
                                     if sleep_interruptible(commands, wake_rx, backoff) {
@@ -1092,7 +1161,7 @@ fn physical_worker(
                         && poll.is_ok()
                         && health_report_due(last_health, completed_at)
                     {
-                        let _ = msg_tx.send(Message::PhysicalHealthy(active_kind));
+                        msg_tx.send(Message::PhysicalHealthy(active_kind));
                         last_health = Some(completed_at);
                     }
                     match poll {
@@ -1104,7 +1173,7 @@ fn physical_worker(
                                 active_kind.name(),
                             );
                             if !events.is_empty() {
-                                let _ = msg_tx.send(Message::Buttons(events));
+                                msg_tx.send(Message::Buttons(events));
                             }
                         }
                         Ok(None) => {}
@@ -1118,8 +1187,8 @@ fn physical_worker(
                             // EC-1: the blanking close erased the cached visible
                             // frame, so the next submitted frame goes out.
                             commands.invalidate_identity();
-                            let _ = msg_tx.send(disconnect(&error));
-                            let _ = msg_tx.send(Message::Buttons(
+                            msg_tx.send(disconnect(&error));
+                            msg_tx.send(Message::Buttons(
                                 tracker.disconnect(Instant::now(), active_kind.name()),
                             ));
                             if sleep_interruptible(commands, wake_rx, backoff) {
@@ -1141,6 +1210,16 @@ fn health_report_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(1))
 }
 
+/// WO-OPT02A (finding O1, A3): the backoff park. It sleeps the FULL `duration`
+/// and wakes on a real edge: `CommandQueue::shutdown` (`:415-418`) and
+/// `request_reconnect` (`:424-430`) each post the capacity-1 token, and a
+/// frame-submit wake re-checks both flags, so shutdown and reconnect are
+/// answered at the edge, not at the next poll. The `min(remaining, 100 ms)`
+/// clamp this park used to carry is therefore deleted: it made every long
+/// ladder sleep a 10 Hz poll (measured: a 60 s backoff = 600 wakes) for a
+/// responsiveness the wake edge already provides. `remaining` is never zero
+/// here (the `is_zero` guard returns first), so the park never degenerates to a
+/// spin.
 fn sleep_interruptible(
     commands: &CommandQueue,
     wake_rx: &Receiver<()>,
@@ -1158,16 +1237,18 @@ fn sleep_interruptible(
         if commands.reconnect.load(Ordering::Acquire) {
             return false;
         }
-        match wake_rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+        match wake_rx.recv_timeout(remaining) {
             Ok(()) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return true,
         }
     }
 }
 
-/// Terminal-state wait: keeps the same 100 ms shutdown responsiveness as
-/// `sleep_interruptible`, but returns at the first wake so the terminal worker
-/// can re-probe for a hotplugged candidate instead of sleeping out the backoff.
+/// Terminal-state wait: the same shutdown/reconnect wake edges as
+/// `sleep_interruptible` (WO-OPT02A A3: the wake edge, not a 100 ms poll
+/// clamp, is what answers them), but returns at the first wake so the terminal
+/// worker can re-probe for a hotplugged candidate instead of sleeping out the
+/// backoff.
 fn sleep_until_wake(commands: &CommandQueue, wake_rx: &Receiver<()>, duration: Duration) -> bool {
     let deadline = Instant::now() + duration;
     loop {
@@ -1181,7 +1262,7 @@ fn sleep_until_wake(commands: &CommandQueue, wake_rx: &Receiver<()>, duration: D
         if commands.reconnect.load(Ordering::Acquire) {
             return false;
         }
-        match wake_rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+        match wake_rx.recv_timeout(remaining) {
             Ok(()) => return false,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return true,
@@ -1192,9 +1273,9 @@ fn sleep_until_wake(commands: &CommandQueue, wake_rx: &Receiver<()>, duration: D
 fn virtual_fallback_loop(
     commands: &CommandQueue,
     wake_rx: &Receiver<()>,
-    msg_tx: &std::sync::mpsc::Sender<Message>,
+    msg_tx: &impl Publish<Message>,
 ) {
-    let _ = msg_tx.send(Message::State(BackendState::Connected {
+    msg_tx.send(Message::State(BackendState::Connected {
         kind: BackendKind::Virtual,
     }));
     while !commands.is_shutdown() {
@@ -1212,13 +1293,13 @@ fn virtual_fallback_loop(
 fn virtual_worker(
     commands: Arc<CommandQueue>,
     wake_rx: Receiver<()>,
-    msg_tx: std::sync::mpsc::Sender<Message>,
+    msg_tx: impl Publish<Message>,
 ) {
-    let _ = msg_tx.send(Message::State(BackendState::Connected {
+    msg_tx.send(Message::State(BackendState::Connected {
         kind: BackendKind::Virtual,
     }));
     virtual_fallback_loop(&commands, &wake_rx, &msg_tx);
-    let _ = msg_tx.send(Message::State(BackendState::ShutDown));
+    msg_tx.send(Message::State(BackendState::ShutDown));
 }
 
 /// Resolve configured backend selection to a concrete kind for startup.
@@ -1492,6 +1573,15 @@ mod tests {
         Box::new([value; crate::model::WIDTH * crate::model::HEIGHT])
     }
 
+    /// WO-OPT02A (finding O1): the app-side wake sender the `Backend::spawn`
+    /// tests supply. Production owns the real token pair in `app::run`; here the
+    /// receiver is dropped, which is exactly the state a closed app loop leaves,
+    /// and `WakeSender::send` is best-effort by design, so the worker keeps
+    /// publishing and the tests observe the message channel as before.
+    fn app_wake() -> SyncSender<()> {
+        std::sync::mpsc::sync_channel(1).0
+    }
+
     #[test]
     fn command_queue_retains_only_latest_frame_and_shutdown_is_reliable() {
         let (queue, wake) = command_queue();
@@ -1557,6 +1647,40 @@ mod tests {
         assert_eq!(backend.commands.take_latest().unwrap()[0], 7);
         backend.shutdown();
         assert!(!result.unwrap(), "retry, not shutdown");
+    }
+
+    /// WO-OPT02A (finding O1, A3): the sibling the reconnect test above never
+    /// had. A SHUTDOWN issued while a worker parks a 120 s backoff is answered
+    /// inside the same 150 ms budget the reconnect sibling uses, on the wake
+    /// edge (`CommandQueue::shutdown` posts the capacity-1 token), not on a
+    /// poll. The first assert is the guard that removing the
+    /// `min(remaining, 100 ms)` clamp did NOT shorten the ladder (the park is
+    /// the full backoff); the second is the shutdown edge the clamp used to be
+    /// the only guarantee of.
+    #[test]
+    fn shutdown_wakes_a_worker_in_long_backoff_within_the_reconnect_budget() {
+        let (commands, wake) = command_queue();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_commands = Arc::clone(&commands);
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let shutdown = sleep_interruptible(&worker_commands, &wake, Duration::from_secs(120));
+            done_tx.send(shutdown).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "a 120 s backoff stays a 120 s backoff after the clamp removal"
+        );
+        commands.shutdown();
+        let result = done_rx.recv_timeout(Duration::from_millis(150));
+        assert_eq!(
+            result.ok(),
+            Some(true),
+            "shutdown returns within the 150 ms budget, on the wake edge"
+        );
+        thread.join().unwrap();
     }
 
     // EC-1 seams: the identity gate is exercised on the queue's own wake
@@ -1864,7 +1988,7 @@ mod tests {
             logitech_invert: true,
             ..Default::default()
         };
-        let mut backend = Backend::spawn(BackendKind::Virtual, &base)
+        let mut backend = Backend::spawn(BackendKind::Virtual, &base, app_wake())
             .expect("the virtual backend spawns (WO-U46G item 5: the signature row)");
         let mut frame = Frame::new();
         frame.set(3, 4, true);
@@ -1884,7 +2008,7 @@ mod tests {
 
         let before = Arc::clone(&backend.commands);
         backend
-            .reconfigure(BackendKind::Virtual, &rotated)
+            .reconfigure(BackendKind::Virtual, &rotated, app_wake())
             .expect("the virtual backend reconfigures (WO-U46G item 5: the signature row)");
         // F-1: pin the fresh-queue intent. The send counter is per queue, so a
         // reused queue carrying a stale cache would read the same 1; the queue
@@ -3742,7 +3866,7 @@ mod tests {
             ..Default::default()
         };
         inject_backend_spawn_failures(1);
-        let error = match Backend::spawn(BackendKind::Virtual, &cfg) {
+        let error = match Backend::spawn(BackendKind::Virtual, &cfg, app_wake()) {
             Ok(_) => panic!("the injected spawn failure must yield the named loss"),
             Err(error) => error,
         };
@@ -3759,7 +3883,7 @@ mod tests {
             },
             "the state app.rs publishes is the established loss-cause row, built by the worker's own construction point"
         );
-        let backend = Backend::spawn(BackendKind::Virtual, &cfg)
+        let backend = Backend::spawn(BackendKind::Virtual, &cfg, app_wake())
             .expect("the injection is one token, so the next spawn succeeds");
         backend.shutdown();
     }
