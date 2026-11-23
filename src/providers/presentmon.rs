@@ -3472,13 +3472,33 @@ fn foreground_process() -> Result<ProcessInfo, String> {
 /// exit race. Population today: 0 - and 0 today proves NOTHING about an anti-cheat title, because
 /// the image-query policy is per-process and per-build. No such pid is presenting in any count, so
 /// no live pair exists here. Registered as F-AUD-OPT06-1 (P2) with the owner-manual
-/// repro (run a game under a protected driver and confirm the presenting choice is unchanged); the
-/// closing change is to make the ranking outcome depend on the pid being a CURRENT candidate
-/// (a tracked flag, allocation-free), which restores the shipped outcome for that row WITHOUT the
-/// image query, and is the first decision of the follow-up unit.
+/// repro (run a game under a protected driver and confirm the presenting choice is unchanged).
+/// WO-OPT07 (A1) RULED THAT ROW (NEQ), so the shipped 0 is BEHAVIOUR, not an equivalence, and the
+/// row stays OPEN for the owner: in the two branches where the foreground value is read -
+/// `best_workload(now, foreground.pid, ..)` here at :1064, reached from TWO producers,
+/// `prepare_presenting` -> `pick_presenter` with `self.target` = default (`current.pid == 0`: the
+/// startup state, the target-not-in-set reset at :2049-2051, the expiry reset at :2080-2084) AND
+/// `reconcile:2029-2030` -> `pick_presenter:2097` with `current.pid != 0` and NO workload score for
+/// the current target (:1052), so the divergence is WIDER than the first producer alone - and
+/// `best_activity(now, foreground.pid, ..)` at :1074 (producer: no candidate carries a workload
+/// score, i.e. a CSV without valid CPU/GPU occupancy (:640-645), fewer than 3 consecutive complete
+/// trace seconds, or per-second gaps) -
+/// the shipped 0 and the pid pick DIFFERENT winners, pinned by
+/// `ranking_foreground_divergent_row_flips_the_presenting_choice`. The round-1 closing proposal
+/// ("gate the ranking input on the pid being a CURRENT candidate, a tracked flag") is a NO-OP for
+/// this row and was dropped: the row's own premises make that predicate true (the pid was admitted
+/// at entry by (a) and is kept running by (b)), so the flag yields the pid, not the shipped 0; and
+/// for a pid OUTSIDE the candidate set the value is already outcome-equal to 0 through the
+/// `required_pid` filtering (:977, :1012). The only mechanism that reproduces the shipped 0 is
+/// re-running the identity query per ranking iteration, which restores the 5 allocations / 1
+/// over-256-byte block (65,536 B) / 4 small blocks per call measured in unit 58's A3 census - a
+/// revert of this unit, not a fix, so it is NOT done here. No proxy (name compare, creation-time
+/// re-read, handle cache) is substituted: a proxy that diverges is a silent behaviour change.
 /// Identity validation of candidates, targets, challengers and the selected presenter is NOT
-/// relaxed anywhere: only the ranking input is, and only for the rows whose shipped outcome is
-/// reproduced (rows 1-3, kept) plus every pid that is not a current candidate.
+/// relaxed anywhere: only the ranking input is. The relaxation applies to EVERY pid on the
+/// dropped rows 4-8, and its outcome matches the shipped one for rows 1-3 (kept) and for every
+/// pid that is not a current candidate; for the divergent current-candidate row it does NOT
+/// match - that gap is F-AUD-OPT06-1, ruled NEQ above, and it is open to the owner's decision.
 fn foreground_ranking_pid() -> u32 {
     ranking_foreground_pid_for(foreground_window_pid())
 }
@@ -5325,6 +5345,140 @@ mod tests {
         println!(
             "A2-MATRIX workload-best={} foreground-preference={} weak-foreground={} self-outside-set=Alpha.exe tie-foreground=Beta.exe tie-outside-set=Alpha.exe",
             game.name, comparable.name, low_ui.name
+        );
+    }
+
+    /// WO-OPT07 (A1): F-AUD-OPT06-1 pinned as (NEQ), over exactly the state dimensions
+    /// `ranking_decision` reads. The divergent row is a pid that passed the identity chain at ENTRY
+    /// (`ActivityTracker::record` resolves through `open_process_info`, :781), is a CURRENT
+    /// candidate kept by `validate_processes` (handle LIVENESS only, :855-862), is presenting, and
+    /// LATER denies the image query while running: shipped ranking saw `0` (no foreground
+    /// preference), this tree's ranking input sees the pid. The branches that read the value, each
+    /// with the code path that produces it:
+    ///  - workload branch at :1064, reached with `current.pid == 0` (producer:
+    ///    `prepare_presenting` :2087-2088 calls `pick_presenter` while `self.target` is the
+    ///    default - the shipped "waiting for an active frame presenter" state) AND with
+    ///    `current.pid != 0` and no workload score for the current target (producer: `reconcile`
+    ///    :2029-2030 -> `pick_presenter` :2097, guarded at :1052): `0` takes the global best and
+    ///    the pid takes the within-margin foreground candidate. FLIP.
+    ///  - activity branch, no workload score in the window (producer: the shipped CSV carries no
+    ///    valid CPU/GPU occupancy for the buckets, the shape
+    ///    `missing_workload_uses_deterministic_activity_and_foreground_fallback` pins): the
+    ///    foreground is read at :1074. FLIP.
+    ///  - stickiness branch, `current.pid != 0` WITH a workload score (:1051-1063 returns before
+    ///    the foreground is ever consulted): both values give the same winner. NO FLIP.
+    ///  - foreground pid outside the candidate set: `required_pid` filtering (:977, :1012) yields
+    ///    nothing, so both values give the same winner. NO FLIP - and that is the entire domain of
+    ///    the round-1 "tracked current-candidate flag" proposal: outcome-equal to `0` for a
+    ///    non-candidate, and TRUE (so it keeps the pid) for the divergent row, which is a candidate
+    ///    by premise. The flag is a NO-OP; it is not implemented.
+    #[test]
+    fn ranking_foreground_divergent_row_flips_the_presenting_choice() {
+        let base = Instant::now();
+        // The shipped fixture vocabulary: the global-best presenter and a foreground presenter
+        // inside SWITCH_MARGIN of it (0.835 vs 0.824 on unit 58's workload formula).
+        let game = ProcessInfo {
+            pid: 42,
+            creation_time: 1,
+            name: "BestPresenter.exe".into(),
+            image_path: String::new(),
+        };
+        let near = ProcessInfo {
+            pid: 8,
+            creation_time: 2,
+            name: "NearMargin.exe".into(),
+            image_path: String::new(),
+        };
+        let mut activity = ActivityTracker::default();
+        for second in 0..=3 {
+            let observed_at = base + Duration::from_secs(second);
+            record_workload_second(&mut activity, &game, observed_at, second, 120, 0.20, 0.90);
+            record_workload_second(&mut activity, &near, observed_at, second, 120, 0.18, 0.90);
+        }
+        let now = base + Duration::from_secs(3);
+        let catalog = CatalogState::Unavailable;
+        let none = ProcessInfo::default();
+        let decide = |pid: u32, current: &ProcessInfo| -> ProcessInfo {
+            ranking_decision(&activity, now, ForegroundInfo { pid }, current, &catalog)
+                .map(|candidate| candidate.process)
+                .expect("the fixture always ranks a candidate")
+        };
+        assert_eq!(
+            activity.candidates.len(),
+            2,
+            "both presenters are CURRENT candidates, the divergent row's premise (b)"
+        );
+        let workload_with_0 = decide(0, &none);
+        let workload_with_pid = decide(near.pid, &none);
+        assert_eq!(
+            workload_with_0, game,
+            "the shipped row-4 outcome: foreground 0 takes the global best workload"
+        );
+        assert_eq!(
+            workload_with_pid, near,
+            "this tree's outcome: the within-margin foreground pid keeps the shipped preference"
+        );
+        assert_ne!(
+            workload_with_0, workload_with_pid,
+            "A1 (NEQ): the workload-branch presenting choice differs between 0 and the pid"
+        );
+        // A foreground pid outside the candidate set: already outcome-equal to 0, the whole domain
+        // of the dropped tracked-flag proposal.
+        assert_eq!(
+            decide(std::process::id(), &none),
+            workload_with_0,
+            "a foreground pid that is not a current candidate is outcome-equal to the shipped 0"
+        );
+        // The stickiness branch never consults the foreground value, so it cannot diverge.
+        assert_eq!(
+            decide(0, &near),
+            decide(game.pid, &near),
+            "a current presenter with a workload score is decided without the foreground input"
+        );
+        // The activity-only branch (no workload score) and its tie-breaks.
+        let tie_at = base + Duration::from_secs(20);
+        let mut plain = ActivityTracker::default();
+        for (pid, application) in [(20u32, "Beta.exe"), (30u32, "Alpha.exe")] {
+            plain.record_test(
+                &Frame {
+                    pid,
+                    application: application.into(),
+                    observed_at: tie_at,
+                    frame_ms: 16.0,
+                    ..Default::default()
+                },
+                pid as u64,
+            );
+        }
+        let decide_activity = |pid: u32| -> ProcessInfo {
+            ranking_decision(&plain, tie_at, ForegroundInfo { pid }, &none, &catalog)
+                .map(|candidate| candidate.process)
+                .expect("the tie fixture always ranks a candidate")
+        };
+        let activity_with_0 = decide_activity(0);
+        let activity_with_pid = decide_activity(20);
+        assert_eq!(
+            activity_with_0.name, "Alpha.exe",
+            "the shipped tie-break order at foreground 0"
+        );
+        assert_eq!(
+            activity_with_pid.name, "Beta.exe",
+            "the foreground pid is the activity-branch preference"
+        );
+        assert_ne!(
+            activity_with_0.name, activity_with_pid.name,
+            "A1 (NEQ): the activity-branch presenting choice differs between 0 and the pid"
+        );
+        println!(
+            "A1-NEQ workload fg0={} fgpid={} noncandidate={} sticky0={} stickypid={} activity fg0={} fgpid={} candidates={}",
+            workload_with_0.name,
+            workload_with_pid.name,
+            decide(std::process::id(), &none).name,
+            decide(0, &near).name,
+            decide(game.pid, &near).name,
+            activity_with_0.name,
+            activity_with_pid.name,
+            activity.candidates.len()
         );
     }
 
