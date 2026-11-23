@@ -49,9 +49,13 @@ static CONVERSIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 /// WO-OPT03 seam: notify edges produced (one `WM_APP_FRAME` post per edge).
 #[cfg(test)]
 static NOTIFY_EDGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// WO-OPT03 repair seam (F-AUD-OPT03-4): `WM_APP_FRAME` posts actually DELIVERED
-/// to a window, counted inside the `hwnd != 0` leg of `notify_frame`. An edge is
-/// not a paint: only this counter proves delivery.
+/// WO-OPT03 repair seam (F-AUD-OPT03-4, wording per F-AUD-OPT032-1): `WM_APP_FRAME` posts
+/// TARGETED AT A KNOWN WINDOW, counted inside the `hwnd != 0` leg of `notify_frame`. An edge
+/// is not a paint: only this counter proves a post was addressed to a window whose handle is
+/// known. It does NOT prove OS-queue acceptance: the increment precedes the `PostMessageW`
+/// return, which is ignored, so a queue-quota rejection is not detected. The armed edge is
+/// the recovery path (a quota-failed post leaves `pending` armed; visibility 0->1 recovers
+/// it) - registered residual, not closed by this counter.
 #[cfg(test)]
 static POSTS_DELIVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// WO-OPT03 repair seam: `WM_DESTROY` posts delivered (the loop-end signal), at

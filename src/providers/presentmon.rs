@@ -1575,7 +1575,6 @@ fn run(
         // thread's send returns `recv_timeout`), so the CSV pump is data-driven and no
         // queued line can age into the `line_overflow` reset; with no capture there is
         // nothing to drain, so the worker parks to its gates.
-        let step = capture.idle_deadline(&cfg, Instant::now());
         if capture.capture_running() {
             // WO-OPT02C-PUMPCAP2 (S14, F-AUD-OPT02C-1/-2): the plain form of the pump
             // bound. `step.min(BOUND)` alone was measured at 64.2 iterations/s in the
@@ -1589,6 +1588,9 @@ fn run(
             // `park_timeout` branch below.
             capture.pump_step(PRESENTMON_PUMP_BOUND);
         } else {
+            // F-AUD-OPT02C2-3: the deadline is computed where it is consumed, so the
+            // running-capture branch cannot read it (no behavior change).
+            let step = capture.idle_deadline(&cfg, Instant::now());
             std::thread::park_timeout(step);
         }
     }
@@ -6597,13 +6599,73 @@ mod tests {
         (tx, capture, Config::default())
     }
 
-    /// WO-OPT02C-PUMPCAP (S13) fixture teardown: reap the probe child THIS test launched.
+    /// WO-OPT02C-PUMPCAP (S13) fixture teardown: reap the probe child THIS test launched AND
+    /// its descendant tree. The probe is `cmd.exe /C ping -n 120 127.0.0.1`, so killing only
+    /// the DIRECT child (F-AUD-OPT02C2-2) left the `ping` grandchild orphaned and alive for
+    /// its full 120 s. Every leg is scoped to this `Child`'s own pid, read from `Child::id()`
+    /// (the pid the OS gave THIS test): never a name, never a pattern, so no process this test
+    /// did not launch can be touched. The tree-kill runs FIRST - a dead parent is no longer
+    /// enumerable - and its own report names each terminated descendant as
+    /// `(child process of PID <probe pid>)`, which is the probe-attributed pid set; the
+    /// hygiene leg then reads each one back with the read-only `tasklist /FI "PID eq <pid>"`
+    /// filter and asserts it is gone, so NO probe-attributable `ping` survives the reap.
+    /// (`tasklist` has no `PARENT_PID` filter and a name-only `ping` census cannot attribute
+    /// a pid to this test in-process without a Toolhelp snapshot feature this crate does not
+    /// enable; the raw `ping`/`cmd` name counts are censused per test window by
+    /// WO-P3BUNDLE-scripts\Do-U54-Gate.ps1.)
     fn pumpcap_reap_capture(capture: &mut Capture) {
         if let Some(mut child) = capture.child.take() {
+            let pid = child.id();
+            let tree = pumpcap_probe_tool("taskkill.exe", &["/T", "/F", "/PID", &pid.to_string()]);
+            let report = String::from_utf8_lossy(&tree.stdout).into_owned();
             let _ = child.kill();
             let _ = child.wait();
+            drop(child);
+            let attributed = format!("(child process of PID {pid})");
+            let descendants: Vec<u32> = report
+                .lines()
+                .filter(|line| line.contains(&attributed))
+                .filter_map(|line| {
+                    line.split("PID ")
+                        .nth(1)
+                        .and_then(|tail| tail.split_whitespace().next())
+                        .and_then(|digits| digits.parse().ok())
+                })
+                .collect();
+            assert!(
+                tree.status.success(),
+                "the pid-scoped tree kill of the probe child pid {pid} succeeded (F-AUD-OPT02C2-2): {report}"
+            );
+            assert!(
+                !descendants.is_empty(),
+                "the tree kill enumerated the probe's OWN descendant (the `ping -n 120` grandchild) as a child of pid {pid}, so the tree is what was reaped: {report}"
+            );
+            for probe_pid in descendants.iter().chain(std::iter::once(&pid)) {
+                assert!(
+                    pumpcap_pid_gone(*probe_pid),
+                    "no probe-attributable process survives the reap: pid {probe_pid} (probe child {pid} and its `ping` grandchild) is gone (F-AUD-OPT02C2-2)"
+                );
+            }
         }
         capture.lines = None;
+    }
+
+    /// Run a pid-scoped process tool - the tree kill, and the read-only pid filter probe -
+    /// with no window. Every `pid` argument comes from `Child::id()` of the probe THIS test
+    /// spawned, or from that tree kill's own report of the probe's descendants.
+    fn pumpcap_probe_tool(program: &str, tool_args: &[&str]) -> std::process::Output {
+        Command::new(program)
+            .args(tool_args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .expect("the pid-scoped process tool runs")
+    }
+
+    /// The read-only hygiene probe: `tasklist /FI "PID eq <pid>"` reports no matching task.
+    fn pumpcap_pid_gone(pid: u32) -> bool {
+        let probe = pumpcap_probe_tool("tasklist.exe", &["/FI", &format!("PID eq {pid}"), "/NH"]);
+        probe.status.success()
+            && String::from_utf8_lossy(&probe.stdout).contains("No tasks are running")
     }
 
     /// The capped pump step expression, in ONE place so the seam and the shipped arm
