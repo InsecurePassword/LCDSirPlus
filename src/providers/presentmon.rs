@@ -5924,6 +5924,10 @@ mod tests {
     /// `wake_workers`, whose handle list carries this worker).
     /// RED ON BASE: the base arm sleeps the shipped 50 ms, so the worker iterates ~4 times
     /// inside the 200 ms dormancy window and the first assert below fails.
+    /// WO-FLAKE-HARDEN (F-AUD-P3B-3): that first assert is a RATE bound now, not an exact-zero
+    /// equality - `Thread::park_timeout` MAY RETURN SPURIOUSLY, so the exact-zero form demanded
+    /// a guarantee the platform does not give (unit-54 audit r2 went red on it). The window, the
+    /// 20 ms adoption budget and every shipped bound are UNCHANGED.
     #[test]
     fn the_presentmon_demand_edge_wakes_a_parked_worker() {
         let (_config, _generation, consumers, shutdown, rx, worker) = dormancy_worker(0);
@@ -5932,12 +5936,27 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the zero-demand park publishes the deduped unavailable row");
         assert_eq!(parked.detail, "no display consumer");
+        let at = Instant::now();
         let settled = worker_tick_count(id);
         std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(
-            worker_tick_count(id),
-            settled,
-            "a parked worker performs NO iteration inside 200 ms (the park is the deadline; base steps 50 ms)"
+        let window = at.elapsed();
+        // WO-FLAKE-HARDEN (F-AUD-P3B-3): the zero-iteration equality is replaced by a RATE
+        // bound with a documented margin, normalized by the MEASURED window (under full-suite
+        // load this lane's `sleep(200 ms)` was measured inflating past the worker's 1 s park
+        // deadline, which is what made the exact-zero form, and a plain count bound, unstable).
+        // Delivered rate: 1/s - the park is `worker_idle_deadline(&[])` = TARGET_POLL = 1 s
+        // (the C3.2 census measures 1 iteration in 2 s). Spurious wakes: each costs ONE
+        // iteration and then re-arms a 1 s park, and the host's floor is the 2 ms
+        // `WORKER_MIN_PARK` inside the ~15.6 ms timer granularity, so ~1 wake/s is the
+        // observed census. Bound = 2 iterations per measured second + 2 absolute slack = ~3x
+        // the delivered rate. Discriminating power: the base arm sleeps 50 ms + the host
+        // granularity => ~20 iterations/s (WO-OPT02C audit: 4 in 200 ms, ~40 in 2 s), i.e.
+        // 10x the bound, so the row stays RED on base at any window length.
+        let window_iters = worker_tick_count(id) - settled;
+        let bound = (2 * (window.as_millis() / 1_000) + 2) as u64;
+        assert!(
+            window_iters <= bound,
+            "a parked worker iterates at most 2/s + 2 slack inside the measured dormancy window ({window_iters} iterations in {window:?}, bound {bound}: the 1 s deadline park is 1/s and every extra iteration is a spurious wake that re-arms a 1 s park; base steps 50 ms => ~20/s)"
         );
         let started = Instant::now();
         consumers.store(
@@ -6010,7 +6029,8 @@ mod tests {
     /// this worker); the worker joins in the tests (`owner_thread_stops_and_joins_after_shutdown`,
     /// `presentmon_config_change_midflight_...`) are unbounded and assert no budget.
     /// PARITY GUARD: base is already fast here (a 50 ms sleep), so the 50 ms assert is
-    /// GREEN on base too; the second worker's no-edge leg is the discriminating row.
+    /// GREEN on base too; the no-edge leg (3 workers, spurious-wake bound 1 while the measured
+    /// window is inside the 1 s deadline park) is the discriminating row.
     #[test]
     fn the_presentmon_shutdown_edge_exits_a_parked_worker() {
         let (_config, _generation, _consumers, shutdown, rx, worker) = dormancy_worker(0);
@@ -6035,25 +6055,62 @@ mod tests {
         );
         // The edge is load-bearing: the same park with NO shutdown wake exits only at the
         // worker's deadline, so `wake_workers` is what pays for the long park.
-        let (_config2, _generation2, _consumers2, shutdown2, rx2, worker2) = dormancy_worker(0);
-        let parked2 = rx2
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the second zero-demand park publishes the deduped row");
-        assert_eq!(parked2.detail, "no display consumer");
-        shutdown2.store(true, Ordering::Release);
+        // WO-FLAKE-HARDEN (F-AUD-P3B-3): the old form asserted ONE worker was NOT finished
+        // after 200 ms, i.e. ZERO spurious wakeups, which `park_timeout` does not promise (the
+        // flag is already stored, so any wake ends the park). Rate form: 3 dormant workers, the
+        // flag stored, NO edge posted, and the count that exited inside the MEASURED window is
+        // bounded, not required to be zero. Discriminating power: the base arm sleeps 50 ms + the
+        // host's ~15.6 ms granularity, so ALL 3 have exited inside any window shorter than the
+        // 1 s deadline (WO-OPT02C audit: "base no-edge leg exits at 50 ms") - 3 > 1.
+        let mut edgeless = Vec::new();
+        for _ in 0..3 {
+            edgeless.push(dormancy_worker(0));
+        }
+        for (_, _, _, _, parked_rx, _) in &edgeless {
+            let parked2 = parked_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the zero-demand park publishes the deduped row");
+            assert_eq!(parked2.detail, "no display consumer");
+        }
+        let at = Instant::now();
+        for (_, _, _, shutdown2, _, _) in &edgeless {
+            shutdown2.store(true, Ordering::Release);
+        }
         std::thread::sleep(Duration::from_millis(200));
-        let woke_without_edge = worker2.is_finished();
-        worker2.thread().unpark();
+        let window = at.elapsed();
+        let woke_without_edge = edgeless
+            .iter()
+            .filter(|(_, _, _, _, _, worker2)| worker2.is_finished())
+            .count();
+        // Reap BEFORE the assert, so a RED cannot leak a worker thread.
+        for (_, _, _, _, _, worker2) in &edgeless {
+            worker2.thread().unpark();
+        }
+        for (_, _, _, _, _, worker2) in edgeless {
+            assert!(
+                worker2.join().is_ok(),
+                "the parked workers exit once the edge is posted"
+            );
+        }
+        // The bound is a function of the MEASURED window: while the window is inside the 1 s
+        // deadline park, ONE of the 3 may exit on a spurious wake, because each exit needs its own
+        // wake. Measured census on this lane: the shipped single-worker form reddened once in four
+        // full-suite runs (unit-54 audit, F-AUD-P3B-3) and the 3-worker form recorded 0 exits in
+        // 30 worker-windows across the 10-round baseline (logs\stress-baseline-*.log), so the
+        // per-window wake probability is small and bound 1 leaves one full event of slack. A
+        // window that inflated PAST the 1 s deadline (this lane does that under full-suite load)
+        // is not an observation of the park at all, because the deadline expires on its own, so
+        // the row asserts nothing there and says so in the census print.
+        // Discriminating power: the base arm sleeps 50 ms + the host's ~15.6 ms granularity, so
+        // in any window shorter than the 1 s deadline ALL 3 have exited (WO-OPT02C audit: "base
+        // no-edge leg exits at 50 ms") - 3 > 1, so the row stays RED on base.
+        let allowed = if window < PRESENTMON_IDLE_BOUND { 1 } else { 3 };
         assert!(
-            worker2.join().is_ok(),
-            "the second worker exits once its edge is posted"
-        );
-        assert!(
-            !woke_without_edge,
-            "RED ON BASE: a flag store alone must not end a deadline park inside 200 ms (base exits in <=50 ms, which is why base needs no edge)"
+            woke_without_edge <= allowed,
+            "RED ON BASE: at most {allowed} of 3 parked workers may end a deadline park inside a measured window of {window:?} (bound 1 is the spurious-wake margin while the window is inside the 1 s park; base's 50 ms step ends all 3, which is why base needs no edge)"
         );
         println!(
-            "WO-OPT02C-WAKES shutdown edge: parked worker joined in {latency:?} (parity bound 50 ms, the retired step; the telemetry.rs:93 join carries NO budget); no-edge leg finished_within_200ms={woke_without_edge} (false proves the edge is what pays for the long park)"
+            "WO-OPT02C-WAKES shutdown edge: parked worker joined in {latency:?} (parity bound 50 ms, the retired step; the telemetry.rs:93 join carries NO budget); no-edge leg measured_window={window:?} finished_without_edge={woke_without_edge}/3 bound={allowed} (0 proves the edge is what pays for the long park; allowed=3 only when load inflated the window past the 1 s deadline, which is not an observation of the park)"
         );
     }
 

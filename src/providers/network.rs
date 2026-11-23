@@ -930,6 +930,11 @@ mod tests {
     /// Production interrupts the same park at once through the shipped
     /// `wake_workers` unpark (`Telemetry::update_config` / `set_consumers` / `Drop`);
     /// the bound is what the direct test spawns, which have no wake wiring, rely on.
+    /// WO-FLAKE-HARDEN (F-AUD-P3B-3): the census row is now a RATE bound over the TWO
+    /// phase-known gaps (at most ONE of them fast), not a single-gap floor equality: one
+    /// spurious `park_timeout` wake after an edge republishes at once and reddened the row.
+    /// The 250 ms floor, the 1600 ms ceiling, the shipped `DISABLED_PARK` and every drain
+    /// window are UNCHANGED; the row costs one extra edge (about 3.2 s).
     /// The active probe arm (the `current.interval` gate) keeps its shipped 50 ms
     /// sleep: the base tree's EC-8 mid-flight test shuts the worker down from that
     /// arm and joins without any wake edge, so a cadence-length park there would
@@ -978,10 +983,10 @@ mod tests {
             rx.recv_timeout(Duration::from_millis(1_200)).is_err(),
             "(dormancy) the parked disabled arm publishes zero rows across 1.2 s"
         );
-        // (edge + wake census) two enabling edges; the SECOND gap is the phase-known
-        // one (the drain ends 1.6 s after the arm's last publication).
+        // (edge + wake census) three enabling edges; gaps[1..] are the phase-known
+        // ones (each drain ends 1.6 s after the arm's last publication).
         let mut gaps = Vec::new();
-        for generation_want in 2..=3u64 {
+        for generation_want in 2..=4u64 {
             generation.fetch_add(1, Ordering::SeqCst);
             let at = Instant::now();
             let republished = rx
@@ -1003,11 +1008,23 @@ mod tests {
             {}
         }
         println!("WO-OPT02B wake census (network disabled arm): gaps={gaps:?}");
+        // WO-FLAKE-HARDEN (F-AUD-P3B-3): the old row was `gaps[1] > 250 ms`, i.e. ZERO spurious
+        // wakeups in the phase-known window - `park_timeout` does not promise that, and one wake
+        // after the bump republishes the new generation at once, so the floor goes red. Rate form
+        // over the TWO phase-known gaps (each measured right after a full `DISABLED_PARK + 600 ms`
+        // drain, the shipped phase): at most ONE of the two may land at or below the floor, so
+        // reddening it needs a spurious wake in BOTH ~1 s windows. Base wakes every 50 ms + the
+        // host's ~15.6 ms granularity => EVERY gap is fast (WO-OPT02B RED rows: gaps=[45.5 ms,
+        // 11.3 ms]) - 2 fast of 2 > 1, so the row stays RED on base.
+        let phase_known = &gaps[1..];
+        let fast = phase_known
+            .iter()
+            .filter(|gap| **gap <= DORMANT_GAP_FLOOR)
+            .count();
         assert!(
-            gaps[1] > DORMANT_GAP_FLOOR,
-            "(census) the parked arm's wake period is {:?}, far beyond the shipped 50 ms tick; \
-             RED on the base tree, where the arm sleeps the tick and wakes every ~65 ms",
-            gaps[1]
+            fast <= 1,
+            "(census) at most ONE of the {} phase-known wake gaps lands at or below the 250 ms floor (fast={fast}, gaps={phase_known:?}); the parked arm's wake period is the park, the shipped arm wakes every ~65 ms and is fast in EVERY window",
+            phase_known.len()
         );
         shutdown.store(true, Ordering::Release);
         thread
