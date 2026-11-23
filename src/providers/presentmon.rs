@@ -248,6 +248,16 @@ struct RankedCandidate {
     workload: Option<WorkloadScore>,
 }
 
+/// WO-OPT06 (A2): the only foreground input the ranking decision reads. `pid` is the value the
+/// shipped `foreground_process()` chain left behind on the ranking path: the real pid when the
+/// full identity query succeeded, and `0` - "no foreground preference" - on every path where that
+/// chain returned `Err` or a default (A1). It carries no identity, so it can never be used where
+/// a pid + creation-time identity is validated.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ForegroundInfo {
+    pid: u32,
+}
+
 #[derive(Clone, Debug)]
 struct ChallengerState {
     key: CandidateKey,
@@ -912,7 +922,9 @@ impl ActivityTracker {
     fn strongest(&mut self, now: Instant, foreground_pid: u32) -> ProcessInfo {
         self.ranked(
             now,
-            foreground_pid,
+            ForegroundInfo {
+                pid: foreground_pid,
+            },
             &ProcessInfo::default(),
             &CatalogState::Unavailable,
         )
@@ -945,36 +957,12 @@ impl ActivityTracker {
     fn ranked(
         &mut self,
         now: Instant,
-        foreground_pid: u32,
+        foreground: ForegroundInfo,
         current: &ProcessInfo,
         catalog: &CatalogState,
     ) -> Option<RankedCandidate> {
         self.prune(now);
-        if let Some(best) = self.best_workload(now, 0, catalog) {
-            if current.pid != 0 {
-                if let Some(workload) = self.workload_score(current) {
-                    if best.process != *current
-                        && best.workload?.value >= workload.value + SWITCH_MARGIN
-                    {
-                        return Some(best);
-                    }
-                    return Some(RankedCandidate {
-                        process: current.clone(),
-                        workload: Some(workload),
-                    });
-                }
-            }
-            if let Some(foreground) = self.best_workload(now, foreground_pid, catalog) {
-                if best.process == foreground.process
-                    || best.workload?.value - foreground.workload?.value < SWITCH_MARGIN
-                {
-                    return Some(foreground);
-                }
-            }
-            return Some(best);
-        }
-        self.best_activity(now, foreground_pid, catalog)
-            .or_else(|| self.best_activity(now, 0, catalog))
+        ranking_decision(self, now, foreground, current, catalog)
     }
 
     fn best_workload(
@@ -1043,6 +1031,48 @@ impl ActivityTracker {
             .get(&CandidateKey::new(process))?
             .workload_score()
     }
+}
+
+/// WO-OPT06 (A2): the presenting-ranking decision as a PURE function of the tracker's candidates
+/// and the `ForegroundInfo` the Windows layer built, so the eligibility and tie-break semantics
+/// are testable over foreground states a live desktop cannot produce on demand (foreground
+/// absent, foreground = self, = a present candidate, = a process outside the activity set, the
+/// shipped `Err`-shaped 0, a reused pid, and the tie-breaks). The body is the shipped `ranked`
+/// decision verbatim; only `self` became a `&ActivityTracker` parameter and the pid became
+/// `foreground.pid`. `ranked` keeps the shipped `prune` before it.
+fn ranking_decision(
+    activity: &ActivityTracker,
+    now: Instant,
+    foreground: ForegroundInfo,
+    current: &ProcessInfo,
+    catalog: &CatalogState,
+) -> Option<RankedCandidate> {
+    if let Some(best) = activity.best_workload(now, 0, catalog) {
+        if current.pid != 0 {
+            if let Some(workload) = activity.workload_score(current) {
+                if best.process != *current
+                    && best.workload?.value >= workload.value + SWITCH_MARGIN
+                {
+                    return Some(best);
+                }
+                return Some(RankedCandidate {
+                    process: current.clone(),
+                    workload: Some(workload),
+                });
+            }
+        }
+        if let Some(foreground) = activity.best_workload(now, foreground.pid, catalog) {
+            if best.process == foreground.process
+                || best.workload?.value - foreground.workload?.value < SWITCH_MARGIN
+            {
+                return Some(foreground);
+            }
+        }
+        return Some(best);
+    }
+    activity
+        .best_activity(now, foreground.pid, catalog)
+        .or_else(|| activity.best_activity(now, 0, catalog))
 }
 
 #[derive(Default)]
@@ -1935,9 +1965,7 @@ impl Capture {
             self.activity
                 .apply_catalog(selection_catalog(cfg, &self.catalog.state));
             self.activity.validate_processes();
-            self.prepare_presenting(cfg, generation, tx, now, || {
-                foreground_process().map(|process| process.pid).unwrap_or(0)
-            });
+            self.prepare_presenting(cfg, generation, tx, now, foreground_ranking_pid);
         }
         if let Err(error) = self.drain(cfg, generation, tx, now) {
             let stderr = self.stop();
@@ -1999,9 +2027,7 @@ impl Capture {
             }
         }
         if presenting {
-            self.pick_presenter(cfg, now, || {
-                foreground_process().map(|process| process.pid).unwrap_or(0)
-            });
+            self.pick_presenter(cfg, now, foreground_ranking_pid);
             if self.target.pid == 0 {
                 self.unavailable(
                     tx,
@@ -2070,7 +2096,9 @@ impl Capture {
         }
         let Some(candidate) = self.activity.ranked(
             now,
-            foreground_pid(),
+            ForegroundInfo {
+                pid: foreground_pid(),
+            },
             &self.target,
             selection_catalog(cfg, &self.catalog.state),
         ) else {
@@ -3412,6 +3440,96 @@ fn foreground_process() -> Result<ProcessInfo, String> {
         let mut pid = 0u32;
         GetWindowThreadProcessId(window, Some(&mut pid));
         process_info(pid)
+    }
+}
+
+/// WO-OPT06 (A1): the value the presenting-ranking closures pass as the foreground preference.
+/// The shipped expression was `foreground_process().map(|p| p.pid).unwrap_or(0)`, so ranking saw
+/// `0` - "no preference" - on EVERY failure path of the full identity chain, and the pid only when
+/// that chain succeeded. This helper reproduces exactly that outcome with the cheapest queries that
+/// decide it, and drops the work ranking discards (the 64 KiB UTF-16 buffer, the image-path query,
+/// the creation-time query and the owned path/name strings).
+///
+/// Dropped rows 4-8 are safe for a pid under TWO conditions, and the comment states both, because
+/// the second is NOT re-checked per iteration (F-AUD-OPT06-1):
+/// (a) ENTRY: `ActivityTracker::record` admits a candidate only after `open_process_info`
+///     succeeded, so rows 4-8 passed at least once; and
+/// (b) CONTINUATION: every iteration that ranks runs `validate_processes` FIRST, and the
+///     foreground pid is filtered through the candidates.
+/// For a pid that never passed (a), `required_pid` filtering yields nothing = the shipped 0.
+/// For a pid that passed once and LATER denies the image query while still running, (b) does not
+/// catch it: `validate_processes` checks handle LIVENESS (`ProcessHandle::is_running`), not a
+/// re-validation of the image/creation-time identity. Shipped ranking then yields `0` (no
+/// preference) and this path yields the pid. That is the residual, measured as of 2026-11-23:
+/// row-4-shaped processes (OpenProcess succeeds, `QueryFullProcessImageNameW` fails, the production
+/// mask `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE`, `PROCESS_NAME_WIN32`) are **0 of
+/// ~417 pids** across three back-to-back probes (the auditor's own probe twice, the manager's
+/// interleaved). An earlier 2-of-420 sighting (`VGC.exe`, `LCore.exe`) is NOT reproducible: the
+/// round-1 probe's source is not preserved, `VGC.exe` is not running here, and `LCore.exe` answers
+/// the image query with BOTH the 32,768-unit and 260-unit buffers (last error 0). On a
+/// NON-ELEVATED host the protected/SYSTEM class fails at `OpenProcess` and lands in row 3a, so a
+/// genuine row-4 sighting needs an elevated or PPL-adjacent probe (denied at the QUERY) or the
+/// exit race. Population today: 0 - and 0 today proves NOTHING about an anti-cheat title, because
+/// the image-query policy is per-process and per-build. No such pid is presenting in any count, so
+/// no live pair exists here. Registered as F-AUD-OPT06-1 (P2) with the owner-manual
+/// repro (run a game under a protected driver and confirm the presenting choice is unchanged); the
+/// closing change is to make the ranking outcome depend on the pid being a CURRENT candidate
+/// (a tracked flag, allocation-free), which restores the shipped outcome for that row WITHOUT the
+/// image query, and is the first decision of the follow-up unit.
+/// Identity validation of candidates, targets, challengers and the selected presenter is NOT
+/// relaxed anywhere: only the ranking input is, and only for the rows whose shipped outcome is
+/// reproduced (rows 1-3, kept) plus every pid that is not a current candidate.
+fn foreground_ranking_pid() -> u32 {
+    ranking_foreground_pid_for(foreground_window_pid())
+}
+
+/// WO-OPT06 (A1): the composition, factored over a pid so every row of the failure-path table is
+/// testable against the shipped builder (`ranking_foreground_value_matches_the_shipped_identity_chain_on_reachable_pids`).
+fn ranking_foreground_pid_for(pid: u32) -> u32 {
+    ranking_foreground_pid(pid, foreground_process_openable(pid))
+}
+
+/// WO-OPT06 (A1): the outcome contract, pure so every row of the failure-path table is testable.
+/// `0` is the shipped `Err`/absent-window value (no foreground preference).
+fn ranking_foreground_pid(window_pid: u32, openable: bool) -> u32 {
+    if window_pid == 0 || !openable {
+        0
+    } else {
+        window_pid
+    }
+}
+
+/// WO-OPT06: the window-thread pid of the foreground window, `0` when there is no foreground
+/// window - the two shipped paths that already produced a default `ProcessInfo` (pid 0).
+fn foreground_window_pid() -> u32 {
+    unsafe {
+        let window = GetForegroundWindow();
+        if window.0.is_null() {
+            return 0;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(window, Some(&mut pid));
+        pid
+    }
+}
+
+/// WO-OPT06: the kept query - `OpenProcess` with the shipped access mask, closed on drop. The mask
+/// is identical to `open_process_info`'s so this probe fails exactly where the shipped chain's
+/// first query fails (access denied on an elevated/protected process, exited pid, invalid pid),
+/// which is the row that decides whether ranking sees the pid or `0`.
+fn foreground_process_openable(pid: u32) -> bool {
+    unsafe {
+        match OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        ) {
+            Ok(handle) => {
+                drop(ProcessHandle(handle));
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -4994,6 +5112,450 @@ mod tests {
         selected.select_presenter(ProcessInfo::default(), &cfg);
         selected.pick_presenter(&cfg, now, || comparable_foreground.pid);
         assert_eq!(selected.target, comparable_foreground);
+    }
+
+    /// WO-OPT06 (A1): the shipped ranking expression is
+    /// `foreground_process().map(|p| p.pid).unwrap_or(0)`, so ranking saw `0` (no preference) on
+    /// every failure path of the full identity chain. This is the outcome contract that the
+    /// ranking-only relaxation must keep, stated per row. The rows whose shipped `Err` happens
+    /// AFTER `OpenProcess` succeeded (image-path query, image name, creation-time query) are the
+    /// rows whose query this unit drops. Their outcome contract is `0` on a pid that is not a
+    /// candidate, which is the case these rows produce at ENTRY. The CONTINUATION case - a pid
+    /// that passed identity once, later denies the image query while still running and is a
+    /// current candidate - is NOT covered by the dropped queries; it is registered as
+    /// F-AUD-OPT06-1 (P2) in the `foreground_ranking_pid` header, measured 0 of ~417 pids today,
+    /// and closed by the follow-up unit's current-candidate flag. The eligibility row of
+    /// `ranking_decision_keeps_the_shipped_foreground_eligibility_and_tie_breaks` proves the
+    /// entry-shaped case: such a pid is not an activity candidate, so `0` and the pid give the
+    /// same decision.
+    #[test]
+    fn ranking_foreground_pid_contract_covers_every_shipped_failure_path() {
+        let rows = [
+            (
+                "no foreground window (GetForegroundWindow null)",
+                0u32,
+                true,
+                0u32,
+            ),
+            ("no foreground window, chain would also fail", 0, false, 0),
+            ("window-thread pid 0 (GetWindowThreadProcessId)", 0, true, 0),
+            (
+                "OpenProcess access denied: elevated/protected game process",
+                4242,
+                false,
+                0,
+            ),
+            (
+                "OpenProcess on an exited pid (pid died between reads)",
+                4243,
+                false,
+                0,
+            ),
+            ("OpenProcess on an invalid pid", 4244, false, 0),
+            (
+                "shipped chain Ok: image, name and creation time all valid",
+                4245,
+                true,
+                4245,
+            ),
+        ];
+        // F-AUD-OPT06-A-4: the row print used to carry a hand-modeled `shipped=` column and a
+        // literal `EQUAL=True`. The contract rows are compared to literal expectations by the
+        // assert above; the REAL shipped-vs-new comparison, computed from the shipped builder,
+        // lives in `ranking_foreground_value_matches_the_shipped_identity_chain_on_reachable_pids`.
+        for (label, window_pid, openable, expected) in rows {
+            assert_eq!(
+                ranking_foreground_pid(window_pid, openable),
+                expected,
+                "A1 row: {label}"
+            );
+            println!(
+                "A1-ROW {label} window_pid={window_pid} openable={openable} contract={expected}"
+            );
+        }
+    }
+
+    /// WO-OPT06 (A1, the trap guard): for every pid this machine can reach, the new chain must
+    /// hand ranking the SAME value the shipped full-identity chain handed it. `process_info` is the
+    /// shipped builder `foreground_process()` uses, so its `Ok`/`Err` shape is the shipped
+    /// outcome. Any row where the two disagree is a behavior change, so this test is the STOP
+    /// condition of the unit, not a style check.
+    #[test]
+    fn ranking_foreground_value_matches_the_shipped_identity_chain_on_reachable_pids() {
+        let mut mismatches = 0usize;
+        for pid in [std::process::id(), 0, 4, 0x0011_0000, u32::MAX] {
+            let shipped = process_info(pid).map(|process| process.pid).unwrap_or(0);
+            let openable = foreground_process_openable(pid);
+            let new = ranking_foreground_pid_for(pid);
+            if shipped != new {
+                mismatches += 1;
+            }
+            println!(
+                "A1-EQUIV pid={pid} shipped={shipped} new={new} openable={openable} shipped-chain={} MATCH={}",
+                if shipped == 0 && pid != 0 { "Err" } else { "Ok" },
+                shipped == new
+            );
+        }
+        assert_eq!(
+            mismatches, 0,
+            "the ranking-only relaxation must return 0 exactly where the shipped chain returned Err"
+        );
+    }
+
+    /// WO-OPT06 (A2): the ranking decision on the pure layer, over foreground states a live
+    /// desktop cannot produce on demand. Every row compares the shipped value with the value the
+    /// new chain produces for that row, so the eligibility and tie-break semantics are pinned
+    /// without a game, an elevated process or a real presenter.
+    #[test]
+    fn ranking_decision_keeps_the_shipped_foreground_eligibility_and_tie_breaks() {
+        let base = Instant::now();
+        let game = ProcessInfo {
+            pid: 42,
+            creation_time: 1,
+            name: "Background.exe".into(),
+            image_path: String::new(),
+        };
+        let low_ui = ProcessInfo {
+            pid: 7,
+            creation_time: 2,
+            name: "ForegroundUI.exe".into(),
+            image_path: String::new(),
+        };
+        let comparable = ProcessInfo {
+            pid: 8,
+            creation_time: 3,
+            name: "ForegroundWork.exe".into(),
+            image_path: String::new(),
+        };
+        let mut activity = ActivityTracker::default();
+        for second in 0..=3 {
+            let observed_at = base + Duration::from_secs(second);
+            record_workload_second(&mut activity, &game, observed_at, second, 120, 0.20, 0.90);
+            record_workload_second(&mut activity, &low_ui, observed_at, second, 280, 0.01, 0.04);
+            record_workload_second(
+                &mut activity,
+                &comparable,
+                observed_at,
+                second,
+                120,
+                0.18,
+                0.90,
+            );
+        }
+        let now = base + Duration::from_secs(3);
+        let catalog = CatalogState::Unavailable;
+        let none = ProcessInfo::default();
+        let decide = |pid: u32, current: &ProcessInfo| -> ProcessInfo {
+            ranking_decision(&activity, now, ForegroundInfo { pid }, current, &catalog)
+                .map(|candidate| candidate.process)
+                .expect("the fixture always ranks a candidate")
+        };
+        // foreground absent (the shipped no-window / pid-0 / OpenProcess-denied rows all land here).
+        assert_eq!(
+            decide(0, &none),
+            game,
+            "absent foreground takes the global best"
+        );
+        // foreground = this process, which is not in the activity set.
+        assert_eq!(
+            decide(std::process::id(), &none),
+            game,
+            "a foreground pid outside the activity set must not change the pick"
+        );
+        // foreground = a present candidate whose workload is far below the best.
+        assert_eq!(
+            decide(low_ui.pid, &none),
+            game,
+            "a present foreground below the switch margin does not win"
+        );
+        // foreground = a present candidate within the margin: the shipped preference.
+        assert_eq!(
+            decide(comparable.pid, &none),
+            comparable,
+            "a comparable foreground candidate wins, the shipped preference"
+        );
+        // stickiness: the current presenter keeps a within-margin seat against the global best.
+        assert_eq!(
+            decide(low_ui.pid, &comparable),
+            comparable,
+            "the current presenter is not displaced by a weak foreground"
+        );
+        assert_eq!(
+            decide(comparable.pid, &low_ui),
+            game,
+            "the global best displaces a weak current presenter"
+        );
+
+        // The no-workload (activity-only) branch and its tie-breaks, where the foreground input
+        // is the whole decision: Beta/Alpha tie on score and the shipped order picks Alpha.
+        let tie_at = base + Duration::from_secs(20);
+        let mut plain = ActivityTracker::default();
+        for (pid, application) in [(20u32, "Beta.exe"), (30u32, "Alpha.exe")] {
+            plain.record_test(
+                &Frame {
+                    pid,
+                    application: application.into(),
+                    observed_at: tie_at,
+                    frame_ms: 16.0,
+                    ..Default::default()
+                },
+                pid as u64,
+            );
+        }
+        let decide_activity = |pid: u32| -> ProcessInfo {
+            ranking_decision(&plain, tie_at, ForegroundInfo { pid }, &none, &catalog)
+                .map(|candidate| candidate.process)
+                .expect("the tie fixture always ranks a candidate")
+        };
+        assert_eq!(
+            decide_activity(0).name,
+            "Alpha.exe",
+            "the shipped tie-break order"
+        );
+        assert_eq!(
+            decide_activity(20).name,
+            "Beta.exe",
+            "the foreground pid is the tie-break preference, so a 0-vs-pid difference is observable"
+        );
+        assert_eq!(
+            decide_activity(999).name,
+            "Alpha.exe",
+            "a foreground pid outside the activity set yields the shipped 0 outcome"
+        );
+        println!(
+            "A2-MATRIX workload-best={} foreground-preference={} weak-foreground={} self-outside-set=Alpha.exe tie-foreground=Beta.exe tie-outside-set=Alpha.exe",
+            game.name, comparable.name, low_ui.name
+        );
+    }
+
+    /// WO-OPT06 (A2): an exited/reused pid between the two reads. Ranking filters by pid only, as
+    /// shipped, so the winner is always a TRACKED identity (pid + creation time) and never a bare
+    /// pid: the downstream candidate/target/challenger identity validation - untouched by this
+    /// unit - is what rejects a stale instance.
+    #[test]
+    fn ranking_decision_never_adopts_an_untracked_pid_identity() {
+        let base = Instant::now();
+        let old = ProcessInfo {
+            pid: 42,
+            creation_time: 1,
+            name: "Exited.exe".into(),
+            image_path: String::new(),
+        };
+        let reused = ProcessInfo {
+            pid: 42,
+            creation_time: 9,
+            name: "Reused.exe".into(),
+            image_path: String::new(),
+        };
+        let mut activity = ActivityTracker::default();
+        for (process, count) in [(&old, 4u32), (&reused, 6u32)] {
+            for tick in 0..count {
+                activity.record_test(
+                    &Frame {
+                        pid: process.pid,
+                        application: process.name.clone(),
+                        observed_at: base + Duration::from_millis(tick as u64 * 10),
+                        frame_ms: 16.0,
+                        ..Default::default()
+                    },
+                    process.creation_time,
+                );
+            }
+        }
+        assert_eq!(activity.candidates.len(), 2, "both instances are tracked");
+        let winner = ranking_decision(
+            &activity,
+            base,
+            ForegroundInfo { pid: 42 },
+            &ProcessInfo::default(),
+            &CatalogState::Unavailable,
+        )
+        .map(|candidate| candidate.process)
+        .expect("the reused pid is tracked");
+        assert_ne!(
+            winner.creation_time, 0,
+            "ranking hands on a tracked identity"
+        );
+        assert!(
+            winner == old || winner == reused,
+            "the winner is one of the tracked instances, never a bare pid"
+        );
+        println!(
+            "A2-REUSED pid=42 tracked={} winner={} winner-creation_time={}",
+            activity.candidates.len(),
+            winner.name,
+            winner.creation_time
+        );
+    }
+
+    /// A3 base-shape fixture (test-harness-fixture): the shipped identity builder's blocks,
+    /// measured on the same pid, so the byte totals of the ranking path's base side are MEASURED
+    /// decomposition prints and not std-layout asserts.
+    fn base_ranking_identity_bytes(pid: u32) -> Option<(usize, usize, usize, usize)> {
+        unsafe {
+            let handle = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                false,
+                pid,
+            )
+            .ok()?;
+            let handle = ProcessHandle(handle);
+            let mut path = vec![0u16; 32_768];
+            let mut len = path.len() as u32;
+            QueryFullProcessImageNameW(
+                handle.0,
+                PROCESS_NAME_WIN32,
+                windows::core::PWSTR(path.as_mut_ptr()),
+                &mut len,
+            )
+            .ok()?;
+            if len == 0 || len as usize > path.len() {
+                return None;
+            }
+            path.truncate(len as usize);
+            let text = String::from_utf16_lossy(&path);
+            let name = Path::new(&text)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_string();
+            let image_path = text.to_string();
+            Some((
+                std::mem::size_of::<u16>() * 32_768,
+                text.capacity(),
+                name.capacity(),
+                image_path.capacity(),
+            ))
+        }
+    }
+
+    /// WO-OPT06 (A3): the allocation census of the relaxation, on the lane's counting allocator.
+    /// The asserts are the classes ranking discards (the 64 KiB buffer and the owned path/name
+    /// strings) going to ZERO, the base side being non-zero, the scaling of the 64 KiB class with
+    /// calls, and the counter's non-vacuity on a known single block. Byte totals are PRINTS: std's
+    /// layout and growth law is not pinned (the unit-56 F-AUD-OPT04-1 rule). No CPU is measured and
+    /// no CPU claim is made; the per-second figure is a count RATE at the shipped 50 ms cadence.
+    #[test]
+    fn ranking_foreground_identity_cost_is_measured_and_the_ranking_path_drops_it() {
+        use crate::backends::alloc_count;
+
+        let measure = |run: &mut dyn FnMut()| -> alloc_count::Counts {
+            let _window = alloc_count::window();
+            alloc_count::watch_thread();
+            alloc_count::reset();
+            let before = alloc_count::snapshot();
+            run();
+            alloc_count::subtract(alloc_count::snapshot(), before)
+        };
+
+        // Non-vacuity of the counter: a known single block of 1,024 B (over the 256 B class).
+        let known = measure(&mut || {
+            std::hint::black_box(vec![0u8; 1_024]);
+        });
+        assert_eq!(known.4, 1, "the counting allocator sees the known block");
+        assert_eq!(known.3, 1, "1,024 B is one over-256-byte block");
+        // The shipped buffer's own shape: one block of exactly 65,536 B.
+        let buffer = measure(&mut || {
+            std::hint::black_box(vec![0u16; 32_768]);
+        });
+        let buffer_bytes = std::mem::size_of::<u16>() * 32_768;
+        assert_eq!(buffer.4, 1, "the shipped 64 KiB buffer is one block");
+        assert_eq!(
+            buffer.3, 1,
+            "the shipped 64 KiB buffer is the over-256-byte class"
+        );
+        assert_eq!(buffer_bytes, 65_536, "the shipped buffer is 64 KiB");
+
+        // base: the identity builder the shipped ranking closure paid, on a pid whose chain
+        // succeeds (the self pid), and the shipped expression as written on the live desktop.
+        let self_pid = std::process::id();
+        let base1 = measure(&mut || {
+            std::hint::black_box(
+                process_info(self_pid)
+                    .map(|process| process.pid)
+                    .unwrap_or(0),
+            );
+        });
+        let base3 = measure(&mut || {
+            for _ in 0..3 {
+                std::hint::black_box(
+                    process_info(self_pid)
+                        .map(|process| process.pid)
+                        .unwrap_or(0),
+                );
+            }
+        });
+        let base_foreground = measure(&mut || {
+            std::hint::black_box(foreground_process().map(|process| process.pid).unwrap_or(0));
+        });
+        // changed: the ranking path of this unit.
+        let changed1 = measure(&mut || {
+            std::hint::black_box(foreground_ranking_pid());
+        });
+        let changed20 = measure(&mut || {
+            for _ in 0..20 {
+                std::hint::black_box(foreground_ranking_pid());
+            }
+        });
+
+        assert!(base1.4 > 0, "the shipped shape allocates at all");
+        assert!(
+            base1.3 > 0,
+            "the shipped shape pays the 64 KiB-class block ranking discards"
+        );
+        assert!(
+            base1.2 > 0,
+            "the shipped shape pays the owned path/name string blocks ranking discards"
+        );
+        assert_eq!(
+            base3.3,
+            base1.3 * 3,
+            "the 64 KiB-class count scales with the number of shipped calls"
+        );
+        assert_eq!(
+            changed1.3, 0,
+            "the ranking path pays no 64 KiB buffer / over-256-byte block"
+        );
+        assert_eq!(
+            changed1.2, 0,
+            "the ranking path pays no owned image-path or name string block"
+        );
+        assert_eq!(changed1.4, 0, "the ranking path allocates nothing per call");
+        assert_eq!(
+            changed20.4, 0,
+            "20 ranking iterations (the shipped 50 ms cadence) allocate nothing"
+        );
+
+        let bytes =
+            base_ranking_identity_bytes(self_pid).expect("the self pid's identity is queryable");
+        assert_eq!(
+            bytes.0, 65_536,
+            "the measured 64 KiB buffer of the shipped shape"
+        );
+        assert!(
+            bytes.1 > 0 && bytes.2 > 0 && bytes.3 > 0,
+            "the shipped shape's owned strings are sized"
+        );
+        let base_bytes = bytes.0 + bytes.1 + bytes.2 + bytes.3;
+        println!(
+            "A3-ALLOC base-per-call total={} gt256={} le256={} | base-3-calls total={} gt256={} le256={} | base-foreground-expression total={} gt256={} le256={} | changed-per-call total={} gt256={} le256={} | changed-20-calls total={} gt256={} le256={} | NONVACUOUS known-1024B-block={} SIXTYFOURKIB-BYTES={}",
+            base1.4, base1.3, base1.2,
+            base3.4, base3.3, base3.2,
+            base_foreground.4, base_foreground.3, base_foreground.2,
+            changed1.4, changed1.3, changed1.2,
+            changed20.4, changed20.3, changed20.2,
+            known.4,
+            bytes.0
+        );
+        println!(
+            "A3-BYTES base-per-call buffer={} utf16-name-string={} name-string={} image-path-string={} TOTAL={} B (measured decomposition, PRINT not assert) | changed-per-call=0 B",
+            bytes.0, bytes.1, bytes.2, bytes.3, base_bytes
+        );
+        println!(
+            "A3-RATE cadence=button_poll 50 ms (config.rs:279) iterations=20/s => shipped ranking turnover {} B/s and {} over-256-byte blocks/s; this unit's ranking path 0 B/s and 0 blocks/s. RATE of counts, NOT CPU.",
+            base_bytes * 20,
+            base1.3 * 20
+        );
     }
 
     #[test]
@@ -7536,8 +8098,10 @@ mod tests {
                 let changed = stats.model(now_wall, observed_now, *window, "game.exe");
                 assert_game_stats_bits(&base, &changed, &format!("{name} {gap_label}"));
                 equal_rows += 1;
+                // F-AUD-OPT06-A-4: the literal `BIT-EQUAL=True` claim is gone; the
+                // `assert_game_stats_bits` above is the evidence.
                 println!(
-                    "A3-CASE {name} {gap_label} frames={} window={:?} base=(fps={:.6},1%={:.6},0.1%={:.6},ft={:.6},active={}) changed=(fps={:.6},1%={:.6},0.1%={:.6},ft={:.6},active={}) BIT-EQUAL=True",
+                    "A3-CASE {name} {gap_label} frames={} window={:?} base=(fps={:.6},1%={:.6},0.1%={:.6},ft={:.6},active={}) changed=(fps={:.6},1%={:.6},0.1%={:.6},ft={:.6},active={})",
                     frames.len(),
                     window,
                     base.fps.value,
@@ -8109,10 +8673,9 @@ mod tests {
                 close(got, want),
                 "{name}: the model published {got}, the shipped arithmetic gives {want}"
             );
-            println!(
-                "A3-VALUE {name} model={:.12} shipped={:.12} MATCH=True",
-                got, want
-            );
+            // F-AUD-OPT06-A-4: this print used to claim `MATCH=True` as a literal. The assert
+            // above is the evidence; a print must not dress up as one.
+            println!("A3-VALUE {name} model={:.12} shipped={:.12}", got, want);
         };
         let model_at = |stats: &mut Stats, gap: Duration| -> GameStats {
             let observed_now = now_after(stats, gap);
