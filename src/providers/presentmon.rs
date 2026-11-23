@@ -35,7 +35,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use crate::config::Config;
-use crate::history::{mean, percentile_high};
+use crate::history::{mean, tail_means};
 use crate::json::Json;
 use crate::model::{GameStats, Metric};
 
@@ -1168,12 +1168,76 @@ fn csv_fields(line: &str) -> Result<Vec<String>, String> {
     Ok(fields)
 }
 
+/// Model-shape census counters (WO-OPT05 A1). The lane's precedent shape is
+/// `WORKER_TICKS`/`worker_tick_count` (`:1476-1492`) and the unit-56 `SNAPSHOT_CREATIONS` in
+/// `hid.rs`: a per-THREAD map counted at the named production site, so a census reads the
+/// calling test's own model calls and not the whole process (the shipped suite runs tests in
+/// parallel). One entry per test thread in the test binary, `cfg(test)` only, never compiled
+/// into the shipped artifact. They count CALLS, not time: no CPU is measured here and no CPU
+/// claim is made from these rows.
+#[cfg(test)]
+static MODEL_SHAPE_BUILDS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, (u64, u64)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn model_build_map(
+) -> &'static std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, (u64, u64)>> {
+    MODEL_SHAPE_BUILDS.get_or_init(std::sync::Mutex::default)
+}
+
+/// `(model builds, stale-path model builds)` for the calling thread. The discarded-stale count
+/// is derived in the census as `stale builds - publications`, both measured, so no counter
+/// needs a site in code that no longer discards anything.
+#[cfg(test)]
+fn model_shape_counts() -> (u64, u64) {
+    let map = model_build_map();
+    let map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.get(&std::thread::current().id())
+        .copied()
+        .unwrap_or((0, 0))
+}
+
+#[cfg(test)]
+fn model_shape_reset() {
+    let map = model_build_map();
+    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.insert(std::thread::current().id(), (0, 0));
+}
+
+#[cfg(test)]
+fn model_build_tick() {
+    let map = model_build_map();
+    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.entry(std::thread::current().id()).or_insert((0, 0)).0 += 1;
+}
+
+#[cfg(test)]
+fn stale_build_tick() {
+    let map = model_build_map();
+    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.entry(std::thread::current().id()).or_insert((0, 0)).1 += 1;
+}
+
+#[cfg(not(test))]
+fn model_build_tick() {}
+
+#[cfg(not(test))]
+fn stale_build_tick() {}
+
 struct Stats {
     frames: VecDeque<(Instant, f64)>,
     session_start: Option<SystemTime>,
     stutters: i32,
     threshold: f64,
     window: Duration,
+    /// WO-OPT05 (A2.2): the window filter's reusable scratch. Cleared and refilled by
+    /// `model`, then sorted IN PLACE for the two tail means, so a warm `model` call
+    /// allocates no window vector, no 1 s vector and no sort clone. Retained capacity
+    /// only: `Vec::clear` never shrinks, so this is per-`Stats` private memory sized by
+    /// the window occupancy (reported in WO-OPT05-RECEIPT.md), never released to the
+    /// allocator.
+    scratch: Vec<f64>,
 }
 
 impl Stats {
@@ -1184,6 +1248,7 @@ impl Stats {
             stutters: 0,
             threshold,
             window,
+            scratch: Vec::new(),
         }
     }
 
@@ -1207,37 +1272,76 @@ impl Stats {
         Ok(())
     }
 
+    /// The published model. `&mut self` for ONE reason: the reusable `scratch` window
+    /// buffer, sorted in place. Nothing else on `Stats` is touched, so the numbers are
+    /// the same function of the same frames as the shipped `&self` form.
     fn model(
-        &self,
+        &mut self,
         now: SystemTime,
         observed_now: Instant,
         window: Duration,
         process: &str,
     ) -> GameStats {
+        model_build_tick();
         let cutoff = observed_now.checked_sub(window);
-        let frame_times: Vec<f64> = self
-            .frames
-            .iter()
-            .filter(|(at, _)| cutoff.is_none_or(|cutoff| *at >= cutoff))
-            .map(|(_, value)| *value)
-            .collect();
-        if frame_times.is_empty() {
+        let recent_cutoff = observed_now.checked_sub(Duration::from_secs(1));
+        // One scan: the window filter goes into the reused scratch buffer, and the last-1 s
+        // set is recorded as the CONTIGUOUS SUFFIX of it that starts at the first in-recent
+        // frame. `mean` then runs on a slice of the scratch: the same values in the same
+        // order as the shipped `mean(&recent)`, so it is bit-identical, with no vector.
+        // (A running sum is NOT exact here: `Iterator::sum` and a manual `+=` fold give
+        // different NaN payloads for `inf + -inf`, proved by the A3 matrix.)
+        self.scratch.clear();
+        let mut recent_start: Option<usize> = None;
+        let mut recent_in_window = 0usize;
+        let mut recent_outside_window = 0usize;
+        let mut last_window = 0.0f64;
+        for (at, value) in self.frames.iter() {
+            let in_window = cutoff.is_none_or(|cutoff| *at >= cutoff);
+            let in_recent = recent_cutoff.is_none_or(|cutoff| *at >= cutoff);
+            if in_window {
+                if in_recent {
+                    if recent_start.is_none() {
+                        recent_start = Some(self.scratch.len());
+                    }
+                    recent_in_window += 1;
+                }
+                self.scratch.push(*value);
+                last_window = *value;
+            } else if in_recent {
+                recent_outside_window += 1;
+            }
+        }
+        if self.scratch.is_empty() {
             return GameStats::default();
         }
-        let recent_cutoff = observed_now.checked_sub(Duration::from_secs(1));
-        let recent: Vec<f64> = self
-            .frames
-            .iter()
-            .filter(|(at, _)| recent_cutoff.is_none_or(|cutoff| *at >= cutoff))
-            .map(|(_, value)| *value)
-            .collect();
-        let current = if recent.is_empty() {
-            *frame_times.last().unwrap()
-        } else {
-            mean(&recent)
+        let current = match recent_start {
+            // The shipped fallback: an empty recent set takes the LAST frame time of the
+            // window in arrival order, never the sorted tail.
+            None if recent_outside_window == 0 => last_window,
+            Some(start)
+                if recent_outside_window == 0 && start + recent_in_window == self.scratch.len() =>
+            {
+                mean(&self.scratch[start..])
+            }
+            // A window narrower than 1 s, or non-monotonic stamps, makes the recent set
+            // reach outside the window: the shipped vector path is kept verbatim there.
+            _ => {
+                let recent: Vec<f64> = self
+                    .frames
+                    .iter()
+                    .filter(|(at, _)| recent_cutoff.is_none_or(|cutoff| *at >= cutoff))
+                    .map(|(_, value)| *value)
+                    .collect();
+                if recent.is_empty() {
+                    last_window
+                } else {
+                    mean(&recent)
+                }
+            }
         };
-        let one = percentile_high(&frame_times, 0.01);
-        let point_one = percentile_high(&frame_times, 0.001);
+        // A2.1: one ordering yields both tail means (see `history::tail_means`).
+        let (one, point_one) = tail_means(&mut self.scratch);
         GameStats {
             active: true,
             process_name: process.to_string(),
@@ -1862,26 +1966,35 @@ impl Capture {
             return;
         }
         if !presenting {
-            if let (Some(last), Some(stats)) = (self.last_frame, self.stats.as_ref()) {
+            if let (Some(last), true) = (self.last_frame, self.stats.is_some()) {
                 let idle = now.duration_since(last);
-                let Some((game, detail)) = stale_projection(
-                    stats,
-                    SystemTime::now(),
-                    now,
-                    cfg.presentmon_window,
-                    &self.target.name,
-                    idle,
-                ) else {
+                // WO-OPT05 (A2.3): the phase and the detail string are decided FIRST, so
+                // the model is built only on a real transition. The shipped shape is kept
+                // exactly: `idle <= STALE_AFTER` keeps the shipped early return, the two
+                // detail strings are verbatim, and the `last_unavailable` bookkeeping is
+                // the shipped write-then-send.
+                let Some(phase) = stale_phase(idle) else {
                     return;
                 };
-                if self.last_unavailable != detail {
-                    self.last_unavailable = detail.clone();
-                    let _ = tx.send(Update {
-                        generation,
-                        game,
-                        detail,
-                        ..Default::default()
-                    });
+                if stale_publishes(&self.last_unavailable, phase) {
+                    if let Some(stats) = self.stats.as_mut() {
+                        let detail = stale_detail(phase);
+                        let game = stale_game(
+                            stats,
+                            SystemTime::now(),
+                            now,
+                            cfg.presentmon_window,
+                            &self.target.name,
+                            phase,
+                        );
+                        self.last_unavailable = detail.to_string();
+                        let _ = tx.send(Update {
+                            generation,
+                            game,
+                            detail: detail.to_string(),
+                            ..Default::default()
+                        });
+                    }
                 }
             }
         }
@@ -1910,35 +2023,39 @@ impl Capture {
         if self.target.pid != 0 && !self.activity.contains(&self.target) {
             self.select_presenter(ProcessInfo::default(), cfg);
         }
-        let stale = self
-            .last_frame
-            .zip(self.stats.as_ref())
-            .and_then(|(last, stats)| {
-                let idle = now.duration_since(last);
-                stale_projection(
-                    stats,
-                    SystemTime::now(),
-                    now,
-                    cfg.presentmon_window,
-                    &self.target.name,
-                    idle,
-                )
-                .map(|projection| (idle, projection))
-            });
-        if let Some((idle, (game, detail))) = stale {
-            if self.last_unavailable != detail {
-                self.last_unavailable = detail.clone();
-                let _ = tx.send(Update {
-                    generation,
-                    game,
-                    detail,
-                    ..Default::default()
-                });
-            }
-            if idle > ACTIVITY_EXPIRY {
-                let expired = self.target.clone();
-                self.activity.remove(&expired);
-                self.select_presenter(ProcessInfo::default(), cfg);
+        if let (Some(last), true) = (self.last_frame, self.stats.is_some()) {
+            let idle = now.duration_since(last);
+            // WO-OPT05 (A2.3): the phase and the detail string are decided before any
+            // model exists, so a stale iteration that the shipped dedupe would discard
+            // builds nothing. The shipped `ACTIVITY_EXPIRY` action stays on EVERY
+            // projected iteration, transition or not, exactly as the shipped dedupe left
+            // it, and the fresh case stays a no-op (no early return here in the shipped form).
+            if let Some(phase) = stale_phase(idle) {
+                if stale_publishes(&self.last_unavailable, phase) {
+                    if let Some(stats) = self.stats.as_mut() {
+                        let detail = stale_detail(phase);
+                        let game = stale_game(
+                            stats,
+                            SystemTime::now(),
+                            now,
+                            cfg.presentmon_window,
+                            &self.target.name,
+                            phase,
+                        );
+                        self.last_unavailable = detail.to_string();
+                        let _ = tx.send(Update {
+                            generation,
+                            game,
+                            detail: detail.to_string(),
+                            ..Default::default()
+                        });
+                    }
+                }
+                if idle > ACTIVITY_EXPIRY {
+                    let expired = self.target.clone();
+                    self.activity.remove(&expired);
+                    self.select_presenter(ProcessInfo::default(), cfg);
+                }
             }
         }
         if self.target.pid == 0 {
@@ -2226,7 +2343,12 @@ impl Capture {
                 .unwrap_or(true)
         {
             self.last_publish = Some(now);
-            let game = self.stats.as_ref().unwrap().model(
+            // WO-OPT05 A2.2: `as_mut()` is only for the scratch buffer. The mutable
+            // borrow of `self.stats` and the shared borrow of `self.target.name` are
+            // DISJOINT FIELDS of `Capture`, so the process name goes in by reference:
+            // no `to_string()`/`clone()` is added to this path (that allocation is the
+            // one this unit removes, not one to reintroduce).
+            let game = self.stats.as_mut().unwrap().model(
                 SystemTime::now(),
                 now,
                 cfg.presentmon_window,
@@ -2409,33 +2531,70 @@ fn retry_pending(retry_after: Option<Instant>, now: Instant) -> bool {
     retry_after.map(|retry| now < retry).unwrap_or(false)
 }
 
-fn stale_projection(
-    stats: &Stats,
+/// Which stale arm a frame-idle age selects. The shipped bounds are unchanged:
+/// `idle <= STALE_AFTER` is fresh (no projection at all), `idle > 2 * STALE_AFTER` is the
+/// expired/unavailable arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StalePhase {
+    Stale,
+    Expired,
+}
+
+fn stale_phase(idle: Duration) -> Option<StalePhase> {
+    if idle <= STALE_AFTER {
+        return None;
+    }
+    Some(if idle > STALE_AFTER + STALE_AFTER {
+        StalePhase::Expired
+    } else {
+        StalePhase::Stale
+    })
+}
+
+/// The two shipped detail strings, verbatim.
+fn stale_detail(phase: StalePhase) -> &'static str {
+    match phase {
+        StalePhase::Stale => "capture stale: no frames for 5 seconds",
+        StalePhase::Expired => "capture unavailable: stale data expired",
+    }
+}
+
+/// WO-OPT05 (A2.3): the publication decision, computed BEFORE any model exists.
+/// `true` = the state/detail is a transition, so the model is genuinely needed;
+/// `false` = the shipped dedupe would throw the model away, so it is never built.
+fn stale_publishes(last_unavailable: &str, phase: StalePhase) -> bool {
+    last_unavailable != stale_detail(phase)
+}
+
+/// The shipped stale projection's payload, reached only on a transition. `stats` and
+/// `process` come from DISJOINT fields of `Capture` at both call sites (`self.stats`
+/// vs `self.target.name`), which is why no process-name clone appears on this path.
+/// The expired arm is the shipped `GameStats::default()`; the stale arm is the shipped
+/// model over `window + STALE_AFTER` with `metric.stale = metric.valid` folding.
+fn stale_game(
+    stats: &mut Stats,
     now: SystemTime,
     observed_now: Instant,
     window: Duration,
     process: &str,
-    idle: Duration,
-) -> Option<(GameStats, String)> {
-    if idle <= STALE_AFTER {
-        return None;
+    phase: StalePhase,
+) -> GameStats {
+    match phase {
+        StalePhase::Expired => GameStats::default(),
+        StalePhase::Stale => {
+            stale_build_tick();
+            let mut game = stats.model(now, observed_now, window + STALE_AFTER, process);
+            for metric in [
+                &mut game.fps,
+                &mut game.one_percent,
+                &mut game.point_one_low,
+                &mut game.frame_time_ms,
+            ] {
+                metric.stale = metric.valid;
+            }
+            game
+        }
     }
-    if idle > STALE_AFTER + STALE_AFTER {
-        return Some((
-            GameStats::default(),
-            "capture unavailable: stale data expired".into(),
-        ));
-    }
-    let mut game = stats.model(now, observed_now, window + STALE_AFTER, process);
-    for metric in [
-        &mut game.fps,
-        &mut game.one_percent,
-        &mut game.point_one_low,
-        &mut game.frame_time_ms,
-    ] {
-        metric.stale = metric.valid;
-    }
-    Some((game, "capture stale: no frames for 5 seconds".into()))
 }
 
 #[derive(Default)]
@@ -5323,27 +5482,75 @@ mod tests {
             })
             .unwrap();
 
-        let (stale, _) = stale_projection(
-            &stats,
+        // WO-OPT05: the shipped `stale_projection` is now the `stale_phase` gate plus the
+        // transition-gated `stale_game` builder. Same arms, same bounds, same values.
+        let stale_arm = stale_phase(Duration::from_secs(6)).expect("6 s idle is stale");
+        let stale = stale_game(
+            &mut stats,
             frame_at + Duration::from_secs(6),
             observed + Duration::from_secs(6),
             Duration::from_secs(5),
             "game.exe",
-            Duration::from_secs(6),
-        )
-        .unwrap();
+            stale_arm,
+        );
         assert!(stale.active && stale.fps.valid && stale.fps.stale);
 
-        let (expired, _) = stale_projection(
-            &stats,
+        let expired_arm = stale_phase(Duration::from_secs(11)).expect("11 s idle is expired");
+        let expired = stale_game(
+            &mut stats,
             frame_at + Duration::from_secs(11),
             observed + Duration::from_secs(11),
             Duration::from_secs(5),
             "game.exe",
-            Duration::from_secs(11),
-        )
-        .unwrap();
+            expired_arm,
+        );
         assert!(!expired.active && !expired.fps.valid);
+
+        // The shipped bounds and the two verbatim detail strings, at the new seams.
+        assert_eq!(stale_phase(Duration::from_secs(4)), None);
+        assert_eq!(
+            stale_phase(Duration::from_secs(5)),
+            None,
+            "idle == STALE_AFTER is fresh"
+        );
+        assert_eq!(
+            stale_phase(Duration::from_secs(6)),
+            Some(StalePhase::Stale),
+            "idle in (5 s, 10 s] is the stale arm"
+        );
+        assert_eq!(
+            stale_phase(Duration::from_secs(10)),
+            Some(StalePhase::Stale),
+            "idle == 2 * STALE_AFTER is still the stale arm"
+        );
+        assert_eq!(
+            stale_phase(Duration::from_secs(11)),
+            Some(StalePhase::Expired),
+            "idle > 2 * STALE_AFTER is the expired arm"
+        );
+        assert_eq!(
+            stale_detail(StalePhase::Stale),
+            "capture stale: no frames for 5 seconds"
+        );
+        assert_eq!(
+            stale_detail(StalePhase::Expired),
+            "capture unavailable: stale data expired"
+        );
+        assert!(
+            stale_publishes("", StalePhase::Stale),
+            "an empty ledger publishes the stale detail"
+        );
+        assert!(
+            !stale_publishes("capture stale: no frames for 5 seconds", StalePhase::Stale),
+            "the shipped dedupe: an unchanged detail publishes nothing, so no model is built"
+        );
+        assert!(
+            stale_publishes(
+                "capture stale: no frames for 5 seconds",
+                StalePhase::Expired
+            ),
+            "the stale -> expired edge is a transition"
+        );
     }
 
     #[test]
@@ -6877,5 +7084,1193 @@ mod tests {
             took <= PRESENTMON_PUMP_BOUND + Duration::from_millis(20),
             "a queued line is taken on the capped step, not after it: {took:?}"
         );
+    }
+    // ==== WO-OPT05 (unit 57): the A1 shape census and the A3 numerical-equality matrix ====
+
+    use crate::history::{mean, percentile_high};
+
+    /// The shipped shape's two `Vec` collect sites, counted here (test-only) because the
+    /// changed production path has none: a production counter with no site would be a
+    /// dead-code warning, and a counter that can only read 0 is vacuous. Per-thread, the
+    /// `WORKER_TICKS` shape, so the parallel suite cannot contaminate a census read.
+    static TEST_VEC_COLLECTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, u64>>,
+    > = std::sync::OnceLock::new();
+
+    fn test_vec_collect_map(
+    ) -> &'static std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, u64>> {
+        TEST_VEC_COLLECTS.get_or_init(std::sync::Mutex::default)
+    }
+
+    fn test_vec_collect_tick() {
+        let map = test_vec_collect_map();
+        let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(std::thread::current().id()).or_insert(0) += 1;
+    }
+
+    fn test_vec_collect_count() -> u64 {
+        let map = test_vec_collect_map();
+        let map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.get(&std::thread::current().id()).copied().unwrap_or(0)
+    }
+
+    fn test_vec_collect_reset() {
+        let map = test_vec_collect_map();
+        let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.insert(std::thread::current().id(), 0);
+    }
+
+    /// The unit-56 `Stats::model` body, kept VERBATIM as the numerical oracle the changed
+    /// path is compared against (A3) and as the base side of the A1 shape census. The two
+    /// collect ticks mark its two window vectors; nothing else was touched.
+    /// test-harness-fixture: never reached by production code.
+    fn base_model_shape(
+        stats: &Stats,
+        now: SystemTime,
+        observed_now: Instant,
+        window: Duration,
+        process: &str,
+    ) -> GameStats {
+        let cutoff = observed_now.checked_sub(window);
+        test_vec_collect_tick();
+        let frame_times: Vec<f64> = stats
+            .frames
+            .iter()
+            .filter(|(at, _)| cutoff.is_none_or(|cutoff| *at >= cutoff))
+            .map(|(_, value)| *value)
+            .collect();
+        if frame_times.is_empty() {
+            return GameStats::default();
+        }
+        let recent_cutoff = observed_now.checked_sub(Duration::from_secs(1));
+        test_vec_collect_tick();
+        let recent: Vec<f64> = stats
+            .frames
+            .iter()
+            .filter(|(at, _)| recent_cutoff.is_none_or(|cutoff| *at >= cutoff))
+            .map(|(_, value)| *value)
+            .collect();
+        let current = if recent.is_empty() {
+            *frame_times.last().unwrap()
+        } else {
+            mean(&recent)
+        };
+        let one = percentile_high(&frame_times, 0.01);
+        let point_one = percentile_high(&frame_times, 0.001);
+        GameStats {
+            active: true,
+            process_name: process.to_string(),
+            game_name: Path::new(process)
+                .file_stem()
+                .and_then(|v| v.to_str())
+                .unwrap_or(process)
+                .to_string(),
+            fps: Metric::valid(1000.0 / current, now),
+            one_percent: Metric::valid(1000.0 / one, now),
+            point_one_low: Metric::valid(1000.0 / point_one, now),
+            frame_time_ms: Metric::valid(current, now),
+            stutters: stats.stutters,
+            session_start: stats.session_start,
+        }
+    }
+
+    /// One measured shape of the model path: builds, stale builds, sorts, clones, collects.
+    fn shape_counts() -> (u64, u64, u64, u64, u64) {
+        let (builds, stale_builds) = model_shape_counts();
+        let (sorts, clones) = crate::history::model_census_counts();
+        (
+            builds,
+            stale_builds,
+            sorts,
+            clones,
+            test_vec_collect_count(),
+        )
+    }
+
+    fn shape_reset() {
+        model_shape_reset();
+        crate::history::model_census_reset();
+        test_vec_collect_reset();
+    }
+
+    /// Every published field compared by BIT PATTERN, so `NaN`/`+-inf` are equal to
+    /// themselves and a tail mean that moved into the NaN class is caught, not tolerated.
+    fn assert_game_stats_bits(base: &GameStats, changed: &GameStats, case: &str) {
+        let metric = |m: &Metric| (m.value.to_bits(), m.valid, m.stale, m.updated);
+        assert_eq!(changed.active, base.active, "{case}: active");
+        assert_eq!(
+            changed.process_name, base.process_name,
+            "{case}: process_name"
+        );
+        assert_eq!(changed.game_name, base.game_name, "{case}: game_name");
+        for (name, b, c) in [
+            ("fps", &base.fps, &changed.fps),
+            ("one_percent", &base.one_percent, &changed.one_percent),
+            ("point_one_low", &base.point_one_low, &changed.point_one_low),
+            ("frame_time_ms", &base.frame_time_ms, &changed.frame_time_ms),
+        ] {
+            assert_eq!(metric(b), metric(c), "{case}: {name} bit pattern");
+        }
+        assert_eq!(changed.stutters, base.stutters, "{case}: stutters");
+        assert_eq!(
+            changed.session_start, base.session_start,
+            "{case}: session_start"
+        );
+    }
+
+    /// A frame stamp `offset_ms` away from `observed` (negative = older).
+    fn observed_at(observed: Instant, offset_ms: i64) -> Instant {
+        let magnitude = Duration::from_millis(offset_ms.unsigned_abs());
+        if offset_ms >= 0 {
+            observed.checked_add(magnitude)
+        } else {
+            observed.checked_sub(magnitude)
+        }
+        .expect("fixture offset is inside the monotonic clock")
+    }
+
+    /// A `Stats` whose frames, stutter count and session start are the fixture's, loaded by
+    /// direct field assignment (the shape the shipped capacity test uses).
+    fn fixture_stats(window: Duration, stutters: i32, frames: &[(i64, f64)]) -> Stats {
+        let observed = Instant::now();
+        let mut stats = Stats::new(30.0, window);
+        stats.stutters = stutters;
+        stats.session_start = Some(SystemTime::UNIX_EPOCH);
+        stats.frames = frames
+            .iter()
+            .map(|(offset, value)| (observed_at(observed, *offset), *value))
+            .collect();
+        stats
+    }
+
+    fn secs(seconds: u64) -> Duration {
+        Duration::from_secs(seconds)
+    }
+
+    /// `count` frames one millisecond apart, the newest at offset -1 ms.
+    fn spread(count: usize, value_at: impl Fn(usize) -> f64) -> Vec<(i64, f64)> {
+        (0..count)
+            .map(|index| (index as i64 - count as i64, value_at(index)))
+            .collect()
+    }
+
+    /// The reconciliation stamp: one tick after the newest stored frame.
+    fn now_after(stats: &Stats, gap: Duration) -> Instant {
+        stats
+            .frames
+            .back()
+            .map(|(at, _)| *at)
+            .unwrap_or(Instant::now())
+            + gap
+    }
+
+    /// One A3 case: `(name, window, stutters, frames as (offset ms, frame_ms))`.
+    type MatrixCase = (&'static str, Duration, i32, Vec<(i64, f64)>);
+
+    fn a3_matrix() -> Vec<MatrixCase> {
+        vec![
+            ("empty-window", secs(60), 0, vec![]),
+            ("one-frame", secs(60), 0, vec![(0, 16.0)]),
+            (
+                "all-duplicate",
+                secs(60),
+                3,
+                vec![
+                    (-500, 16.0),
+                    (-400, 16.0),
+                    (-300, 16.0),
+                    (-200, 16.0),
+                    (-100, 16.0),
+                    (0, 16.0),
+                ],
+            ),
+            (
+                "recent-empty-window-not",
+                secs(60),
+                0,
+                vec![(-30_000, 16.0), (-29_000, 20.0), (-28_000, 30.0)],
+            ),
+            (
+                "window-cutoff-exact",
+                secs(60),
+                0,
+                vec![(-59_999, 42.0), (-59_998, 20.0), (0, 10.0)],
+            ),
+            (
+                "window-cutoff-one-tick-off",
+                secs(60),
+                0,
+                vec![(-60_000, 42.0), (-59_998, 20.0), (0, 10.0)],
+            ),
+            (
+                "recent-cutoff-exact",
+                secs(60),
+                0,
+                vec![(-999, 24.0), (0, 16.0)],
+            ),
+            (
+                "recent-cutoff-one-tick-off",
+                secs(60),
+                0,
+                vec![(-1_000, 24.0), (0, 16.0)],
+            ),
+            ("len1", secs(60), 0, vec![(0, 7.0)]),
+            ("len2", secs(60), 0, vec![(-100, 3.0), (0, 9.0)]),
+            (
+                "len3",
+                secs(60),
+                0,
+                vec![(-200, 5.0), (-100, 1.0), (0, 3.0)],
+            ),
+            (
+                "len4",
+                secs(60),
+                1,
+                vec![(-300, 4.0), (-200, 2.0), (-100, 8.0), (0, 6.0)],
+            ),
+            (
+                "len5",
+                secs(60),
+                5,
+                vec![(-400, 5.0), (-300, 3.0), (-200, 9.0), (-100, 1.0), (0, 7.0)],
+            ),
+            ("len99", secs(60), 0, spread(99, |index| (index + 1) as f64)),
+            (
+                "len100",
+                secs(60),
+                0,
+                spread(100, |index| (index + 1) as f64),
+            ),
+            (
+                "len101",
+                secs(60),
+                0,
+                spread(101, |index| (index + 1) as f64),
+            ),
+            (
+                "len1000",
+                secs(60),
+                0,
+                spread(1_000, |index| (index % 97) as f64),
+            ),
+            (
+                "len1001",
+                secs(60),
+                0,
+                spread(1_001, |index| (index % 89) as f64),
+            ),
+            (
+                "len1001-ascending",
+                secs(60),
+                0,
+                spread(1_001, |index| index as f64),
+            ),
+            (
+                "unsorted-descending",
+                secs(60),
+                0,
+                spread(50, |index| (50 - index) as f64),
+            ),
+            (
+                "unsorted-sawtooth",
+                secs(60),
+                2,
+                spread(60, |index| {
+                    if index % 3 == 0 {
+                        1.0
+                    } else {
+                        40.0 + index as f64
+                    }
+                }),
+            ),
+            (
+                "nan-first",
+                secs(60),
+                0,
+                vec![(-500, f64::NAN), (-400, 16.0), (0, 16.0)],
+            ),
+            (
+                "nan-last",
+                secs(60),
+                0,
+                vec![(-500, 16.0), (-400, 16.0), (0, f64::NAN)],
+            ),
+            (
+                "nan-middle",
+                secs(60),
+                0,
+                vec![(-500, 16.0), (-300, f64::NAN), (0, 16.0)],
+            ),
+            ("nan-only", secs(60), 0, spread(40, |_| f64::NAN)),
+            (
+                "nan-early-1-percent-tail",
+                secs(60),
+                0,
+                spread(100, |index| if index == 0 { f64::NAN } else { 16.0 }),
+            ),
+            (
+                "nan-early-01-percent-tail",
+                secs(60),
+                0,
+                spread(1_000, |index| if index < 3 { f64::NAN } else { 16.0 }),
+            ),
+            (
+                "nan-duplicate-run",
+                secs(60),
+                0,
+                spread(200, |index| {
+                    if index < 2 {
+                        f64::NAN
+                    } else if index % 2 == 0 {
+                        16.0
+                    } else {
+                        33.0
+                    }
+                }),
+            ),
+            (
+                "nan-at-every-tenth",
+                secs(60),
+                0,
+                spread(300, |index| if index % 10 == 0 { f64::NAN } else { 16.0 }),
+            ),
+            (
+                "inf-and-nan",
+                secs(60),
+                0,
+                vec![
+                    (-900, f64::INFINITY),
+                    (-800, f64::NEG_INFINITY),
+                    (-700, f64::NAN),
+                    (0, 16.0),
+                ],
+            ),
+            (
+                "positive-infinity",
+                secs(60),
+                0,
+                vec![(-500, f64::INFINITY), (-400, 16.0), (0, 16.0)],
+            ),
+            (
+                "negative-infinity",
+                secs(60),
+                0,
+                vec![(-500, f64::NEG_INFINITY), (-400, 16.0), (0, 16.0)],
+            ),
+            (
+                "zero-frame-times",
+                secs(60),
+                0,
+                vec![(-500, 0.0), (-400, 0.0), (0, 0.0)],
+            ),
+            (
+                "window-shorter-than-recent",
+                Duration::from_millis(500),
+                0,
+                vec![(-2_000, 7.0), (-1_000, 11.0), (-400, 5.0), (-100, 9.0)],
+            ),
+            (
+                "window-one-ms",
+                Duration::from_millis(1),
+                0,
+                spread(20, |index| (index * 3) as f64),
+            ),
+            (
+                "non-monotonic-stamps",
+                secs(60),
+                0,
+                vec![(-100, 5.0), (-2_000, 9.0), (0, 7.0), (-500, 12.0)],
+            ),
+            (
+                "empty-recent-fallback",
+                secs(60),
+                0,
+                vec![(-30_000, 42.0), (-29_000, 7.0), (-28_000, 3.0)],
+            ),
+            (
+                "stutters-passthrough",
+                secs(60),
+                i32::MAX,
+                spread(10, |index| (index + 1) as f64),
+            ),
+            (
+                "default-window-occupancy-60fps",
+                secs(60),
+                12,
+                (0..3_600usize)
+                    .map(|index| {
+                        (
+                            -((3_600 - index) as i64) * 17,
+                            if index % 4 == 0 { 16.7 } else { 33.3 },
+                        )
+                    })
+                    .collect(),
+            ),
+            ("old-frames-plus-recent", secs(60), 0, {
+                let mut frames: Vec<(i64, f64)> = (0..100usize)
+                    .map(|index| ((index * 500) as i64 - 60_000, (101 + index) as f64))
+                    .collect();
+                frames.extend((1..=100i64).map(|index| (-index, index as f64)));
+                frames
+            }),
+        ]
+    }
+
+    /// A3: the changed model is BIT-IDENTICAL to the shipped shape on every case. The
+    /// reconciliation stamp is swept over three gaps so the `recent`-empty fallback and the
+    /// recent/window cutoffs are crossed inside each fixture.
+    #[test]
+    fn stats_model_is_bit_identical_to_the_shipped_shape() {
+        let now_wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let matrix = a3_matrix();
+        let mut equal_rows = 0usize;
+        for (name, window, stutters, frames) in &matrix {
+            for (gap_label, gap) in [
+                ("gap-1ms", Duration::from_millis(1)),
+                ("gap-5s", Duration::from_secs(5)),
+                ("gap-2s", Duration::from_secs(2)),
+            ] {
+                let mut stats = fixture_stats(*window, *stutters, frames);
+                let observed_now = now_after(&stats, gap);
+                let base = base_model_shape(&stats, now_wall, observed_now, *window, "game.exe");
+                let changed = stats.model(now_wall, observed_now, *window, "game.exe");
+                assert_game_stats_bits(&base, &changed, &format!("{name} {gap_label}"));
+                equal_rows += 1;
+                println!(
+                    "A3-CASE {name} {gap_label} frames={} window={:?} base=(fps={:.6},1%={:.6},0.1%={:.6},ft={:.6},active={}) changed=(fps={:.6},1%={:.6},0.1%={:.6},ft={:.6},active={}) BIT-EQUAL=True",
+                    frames.len(),
+                    window,
+                    base.fps.value,
+                    base.one_percent.value,
+                    base.point_one_low.value,
+                    base.frame_time_ms.value,
+                    base.active,
+                    changed.fps.value,
+                    changed.one_percent.value,
+                    changed.point_one_low.value,
+                    changed.frame_time_ms.value,
+                    changed.active,
+                );
+            }
+        }
+        assert_eq!(equal_rows, matrix.len() * 3, "every A3 case ran");
+    }
+
+    /// A1: the model-shape census. Every number is MEASURED by the counting seams
+    /// (`MODEL_BUILDS`/`STALE_BUILDS` at production `cfg(test)` sites,
+    /// `MODEL_SORTS`/`MODEL_CLONES` in `history.rs`, `TEST_VEC_COLLECTS` for the shipped
+    /// shape's two vectors) and by the lane's `alloc_count` counting allocator. The base
+    /// side is the same measurement over `base_model_shape`, the verbatim unit-56 body.
+    /// No CPU is measured and no CPU claim is made from these rows.
+    #[test]
+    fn model_shape_census_reports_sorts_clones_and_allocations() {
+        use crate::backends::alloc_count;
+
+        let measure = |run: &mut dyn FnMut()| -> alloc_count::Counts {
+            let _window = alloc_count::window();
+            alloc_count::watch_thread();
+            alloc_count::reset();
+            let before = alloc_count::snapshot();
+            run();
+            alloc_count::subtract(alloc_count::snapshot(), before)
+        };
+
+        // The default 60 s window at 60/120/240/360 FPS is ORDINARY OCCUPANCY; 600 s is
+        // the LEGAL MAXIMUM; 600 s at 1000 FPS is the cap's own basis; 602,048 frames is
+        // the SOURCE CAP (`MAX_WINDOW_FRAMES`). No cap row is a claim about observed load.
+        let sizes: Vec<(&str, usize, Duration, &str)> = vec![
+            ("1-frame", 1, secs(60), "ordinary occupancy (minimum)"),
+            ("60s@60fps", 3_600, secs(60), "ordinary occupancy"),
+            ("60s@120fps", 7_200, secs(60), "ordinary occupancy"),
+            ("60s@240fps", 14_400, secs(60), "ordinary occupancy"),
+            ("60s@360fps", 21_600, secs(60), "ordinary occupancy"),
+            (
+                "600s@60fps",
+                36_000,
+                secs(600),
+                "legal-max window, ordinary density",
+            ),
+            (
+                "600s@1000fps",
+                600_000,
+                secs(600),
+                "legal-max window at 1000 FPS, the cap's basis (cap-adjacent, not observed)",
+            ),
+            (
+                "MAX_WINDOW_FRAMES",
+                MAX_WINDOW_FRAMES,
+                secs(600),
+                "SOURCE CAP 602,048 frames (not an observed load)",
+            ),
+        ];
+        let now_wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for (label, frames, window, status) in sizes {
+            let period_ns = (window.as_nanos() as u64) / (frames as u64);
+            let observed = Instant::now();
+            let mut stats = Stats::new(30.0, window);
+            stats.frames = (0..frames)
+                .map(|index| {
+                    (
+                        observed - Duration::from_nanos(period_ns * (frames as u64 - index as u64)),
+                        16.0,
+                    )
+                })
+                .collect();
+            // Warm-up: the scratch capacity is paid once, then excluded (A2.2).
+            let _ = stats.model(now_wall, observed, window, "game.exe");
+
+            shape_reset();
+            let base_allocs = measure(&mut || {
+                let _ = base_model_shape(&stats, now_wall, observed, window, "game.exe");
+            });
+            let base = shape_counts();
+
+            shape_reset();
+            let changed_allocs = measure(&mut || {
+                let _ = stats.model(now_wall, observed, window, "game.exe");
+            });
+            let changed = shape_counts();
+
+            // Attribution: std's STABLE sort (the shipped comparator and sort kind that
+            // A2.1 must keep) allocates its own merge scratch. A bare `tail_means` over the
+            // same length names that block, so the model's over-256-byte count is measured
+            // against it, not assumed away.
+            shape_reset();
+            let mut sort_buffer = vec![16.0f64; frames];
+            let sort_probe = measure(&mut || {
+                let _ = crate::history::tail_means(&mut sort_buffer);
+            });
+
+            println!(
+                "A1-MODEL {label} frames={frames} window={window:?} status={status} SHAPED-BASELINE model-calls=1 sorts={} clones={} vec-collects={} vec-allocs={} alloc-total={} alloc-gt256={} alloc-le256={}",
+                base.2,
+                base.3,
+                base.4,
+                base.3 + base.4,
+                base_allocs.4,
+                base_allocs.3,
+                base_allocs.2
+            );
+            println!(
+                "A1-MODEL {label} frames={frames} window={window:?} status={status} THIS-TREE builds={} sorts={} clones={} vec-collects={} vec-allocs={} alloc-total={} alloc-gt256={} alloc-le256={}",
+                changed.0,
+                changed.2,
+                changed.3,
+                changed.4,
+                changed.3 + changed.4,
+                changed_allocs.4,
+                changed_allocs.3,
+                changed_allocs.2
+            );
+            println!(
+                "A1-SORTSCRATCH {label} frames={frames} bare-tail_means alloc-total={} alloc-gt256={} alloc-le256={} (std stable sort, the shipped comparator and sort kind)",
+                sort_probe.4, sort_probe.3, sort_probe.2
+            );
+            println!(
+                "A1-SCRATCH {label} frames={frames} window={window:?} retained-scratch={} B ({} f64 slots, private memory, not CPU)",
+                stats.scratch.capacity() * size_of::<f64>(),
+                stats.scratch.capacity()
+            );
+
+            // The base side of the census (the shipped shape, measured on this tree).
+            assert_eq!(
+                base.2, 2,
+                "the shipped shape sorts the window twice ({label})"
+            );
+            assert_eq!(
+                base.3, 2,
+                "the shipped shape clones the window twice ({label})"
+            );
+            assert_eq!(base.4, 2, "the shipped shape builds two vectors ({label})");
+            if frames >= 100 {
+                assert!(
+                    base_allocs.3 >= 3,
+                    "the shipped shape allocates over-256-byte blocks ({label})"
+                );
+            }
+            assert!(
+                base_allocs.4 >= changed_allocs.4 + 3,
+                "the shipped shape pays at least three more allocations: the window vector, \
+                 the 1 s vector and the two sort clones ({label})"
+            );
+            // The A3 counter claims, measured on this tree.
+            assert_eq!(changed.0, 1, "one model call ({label})");
+            assert_eq!(changed.2, 1, "A3 counter: sorts per model == 1 ({label})");
+            assert_eq!(
+                changed.3, 0,
+                "A3 counter: to_vec clones per model == 0 ({label})"
+            );
+            assert_eq!(
+                changed.4, 0,
+                "A3 counter: window/1 s vectors per model == 0 ({label})"
+            );
+            assert_eq!(
+                changed_allocs.2, 2,
+                "a warm model call allocates exactly the two GameStats name strings ({label})"
+            );
+            assert_eq!(
+                changed_allocs.3, sort_probe.3,
+                "a warm model call pays no over-256-byte allocation beyond std's stable-sort scratch ({label})"
+            );
+            assert!(
+                changed_allocs.4 < base_allocs.4,
+                "the warm model call allocates fewer blocks than the shipped shape ({label})"
+            );
+        }
+    }
+
+    /// The counting seams are NOT vacuous: a known tick of each is seen by the reader, so a
+    /// census row that reads 0 means "the site did not run", not "the counter is dead".
+    #[test]
+    fn model_shape_counters_are_not_vacuous() {
+        shape_reset();
+        model_build_tick();
+        stale_build_tick();
+        test_vec_collect_tick();
+        crate::history::model_sort_tick();
+        crate::history::model_clone_tick();
+        let counts = shape_counts();
+        println!(
+            "A1-NONVACUOUS known-ticks builds={} stale={} sorts={} clones={} collects={}",
+            counts.0, counts.1, counts.2, counts.3, counts.4
+        );
+        assert_eq!(
+            counts,
+            (1, 1, 1, 1, 1),
+            "each counter must see exactly one known tick"
+        );
+        shape_reset();
+        assert_eq!(
+            shape_counts(),
+            (0, 0, 0, 0, 0),
+            "the reset clears every counter"
+        );
+    }
+
+    /// A1: the stale-window census over the CURRENT cadence. It drives the shipped
+    /// reconciliation loop, so it measures the shipped and the changed shape on the same
+    /// seam; the cadence is read from `idle_deadline` (the unit-52 shape), not assumed.
+    #[test]
+    fn stale_window_census_counts_reconciliations_and_discarded_models() {
+        let cfg = Config {
+            presentmon_target_mode: "foreground".into(),
+            ..Config::default()
+        };
+        let (line_tx, line_rx) = mpsc::sync_channel(4);
+        line_tx
+            .send("Application,ProcessID,FrameTime".into())
+            .unwrap();
+        line_tx.send("game.exe,42,16.0".into()).unwrap();
+        let (updates, rx) = mpsc::channel();
+        let mut capture = Capture::default();
+        capture.lines = Some(line_rx);
+        capture.target = ProcessInfo {
+            pid: 42,
+            creation_time: 1,
+            name: "game.exe".into(),
+            image_path: String::new(),
+        };
+        capture.stats = Some(Stats::new(30.0, cfg.presentmon_window));
+        capture
+            .drain(&cfg, 1, &updates, Instant::now())
+            .expect("the fresh frame drains");
+        assert!(rx.recv().unwrap().available, "the fresh frame publishes");
+
+        // The CURRENT cadence, measured from the shipped deadline set.
+        let mut probe = Capture::default();
+        probe.last_frame = Some(Instant::now() - Duration::from_secs(6));
+        println!(
+            "A1-CADENCE stale-idle-6s running-capture-pump-step={:?} no-capture-idle-deadline={:?} (the handoff's nominal 50 ms loop is HISTORICAL: unit 52 parks on last_frame+STALE_AFTER and +2*STALE_AFTER)",
+            PRESENTMON_PUMP_BOUND,
+            probe.idle_deadline(&cfg, Instant::now())
+        );
+
+        shape_reset();
+        // The shipped stale window: idle 6.00..9.85 s at the 50 ms pump cadence = 78
+        // reconciliations, the first of which is the fresh -> stale transition. The bound
+        // stays strictly inside (5 s, 10 s]: `reconcile` stamps its own `now`, so the
+        // effective idle drifts by microseconds and a nominal 10.000 s row would cross
+        // into the expired arm.
+        let steps = 78usize;
+        let mut publications = 0usize;
+        for index in 0..steps {
+            let idle = Duration::from_secs(6) + Duration::from_millis(50 * index as u64);
+            let last = Instant::now() - idle;
+            capture.last_frame = Some(last);
+            capture.last_publish = Some(last);
+            capture.last_target_poll = Some(Instant::now());
+            capture.reconcile(&cfg, 1, &updates, &|_, _| unreachable!());
+            if rx.try_recv().is_ok() {
+                publications += 1;
+            }
+        }
+        let stale_window = shape_counts();
+        println!(
+            "A1-STALE window=idle-6.00-to-9.85s cadence=50ms reconciliations={steps} THIS-TREE model-builds={} stale-model-builds={} publications={} discarded={} (the shipped shape at HEAD, same seam and cadence, is measured in the u57-census-base log)",
+            stale_window.0,
+            stale_window.1,
+            publications,
+            stale_window.1.saturating_sub(publications as u64)
+        );
+        assert_eq!(publications, 1, "the stale detail publishes exactly once");
+        assert_eq!(
+            stale_window.1, 1,
+            "A3 counter: exactly one model per fresh -> stale transition"
+        );
+        assert_eq!(
+            stale_window.1 - publications as u64,
+            0,
+            "A3 counter: stale reconciliations that build a model to discard == 0"
+        );
+
+        // The stale -> unavailable(expired) edge: idle 11..15 s, same cadence.
+        shape_reset();
+        let mut expired_publications = 0usize;
+        for index in 0..steps {
+            let idle = Duration::from_secs(11) + Duration::from_millis(50 * index as u64);
+            let last = Instant::now() - idle;
+            capture.last_frame = Some(last);
+            capture.last_publish = Some(last);
+            capture.last_target_poll = Some(Instant::now());
+            capture.reconcile(&cfg, 1, &updates, &|_, _| unreachable!());
+            if rx.try_recv().is_ok() {
+                expired_publications += 1;
+            }
+        }
+        let expired_window = shape_counts();
+        println!(
+            "A1-STALE window=idle-11.00-to-14.85s cadence=50ms reconciliations={steps} THIS-TREE model-builds={} stale-model-builds={} publications={} discarded={} (the expired arm builds no model in either shape)",
+            expired_window.0,
+            expired_window.1,
+            expired_publications,
+            expired_window.1.saturating_sub(expired_publications as u64)
+        );
+        assert_eq!(
+            expired_publications, 1,
+            "the expired detail publishes exactly once"
+        );
+        assert_eq!(
+            expired_window.1, 0,
+            "A3 counter: the expired arm builds no model, so it discards none"
+        );
+    }
+
+    /// A2.3 + A3: the shipped publication sequence end to end, on the seams the shipped
+    /// tests use. `fresh -> stale -> unavailable(expired) -> fresh`, both detail strings
+    /// verbatim, the `metric.stale = metric.valid` folding, and the `last_unavailable`
+    /// bookkeeping including the shipped frame-site clear.
+    #[test]
+    fn stale_publication_sequence_is_the_shipped_shape_and_builds_no_discarded_model() {
+        let cfg = Config {
+            presentmon_target_mode: "foreground".into(),
+            ..Config::default()
+        };
+        let (line_tx, line_rx) = mpsc::sync_channel(4);
+        line_tx
+            .send("Application,ProcessID,FrameTime".into())
+            .unwrap();
+        line_tx.send("game.exe,42,16.0".into()).unwrap();
+        let (updates, rx) = mpsc::channel();
+        let mut capture = Capture::default();
+        capture.lines = Some(line_rx);
+        capture.target = ProcessInfo {
+            pid: 42,
+            creation_time: 1,
+            name: "game.exe".into(),
+            image_path: String::new(),
+        };
+        capture.stats = Some(Stats::new(30.0, cfg.presentmon_window));
+        shape_reset();
+        capture
+            .drain(&cfg, 1, &updates, Instant::now())
+            .expect("the fresh frame drains");
+        let fresh = rx.recv().unwrap();
+        assert!(
+            fresh.available && !fresh.error && fresh.game.fps.valid && !fresh.game.fps.stale,
+            "the fresh publish is valid and not stale"
+        );
+        assert_eq!(fresh.detail, "game.exe");
+
+        // fresh -> stale: 78 iterations at the 50 ms cadence, one publication.
+        let stale_at = Instant::now() - Duration::from_secs(6);
+        let mut stale_update = None;
+        for index in 0..78 {
+            let last = stale_at - Duration::from_millis(50 * index);
+            capture.last_frame = Some(last);
+            capture.last_publish = Some(last);
+            capture.last_target_poll = Some(Instant::now());
+            capture.reconcile(&cfg, 1, &updates, &|_, _| unreachable!());
+            while let Ok(update) = rx.try_recv() {
+                assert!(
+                    stale_update.is_none(),
+                    "the stale detail is published once, at the transition"
+                );
+                stale_update = Some(update);
+            }
+        }
+        let stale = stale_update.expect("the fresh -> stale edge published");
+        assert_eq!(stale.detail, "capture stale: no frames for 5 seconds");
+        assert!(stale.game.active && stale.game.fps.valid && stale.game.fps.stale);
+        assert!(stale.game.one_percent.stale && stale.game.point_one_low.stale);
+        assert!(stale.game.frame_time_ms.stale);
+        assert!(stale.game.one_percent.valid && stale.game.point_one_low.valid);
+        let mid = shape_counts();
+        println!(
+            "A2-3 STALE-SEQUENCE fresh->stale model-builds={} stale-model-builds={} publications=1",
+            mid.0, mid.1
+        );
+        assert_eq!(mid.1, 1, "the 78 stale iterations built ONE model");
+
+        // stale -> unavailable(expired): 78 iterations, one publication, no model at all.
+        shape_reset();
+        let expired_at = Instant::now() - Duration::from_secs(11);
+        let mut expired_update = None;
+        for index in 0..78 {
+            let last = expired_at - Duration::from_millis(50 * index);
+            capture.last_frame = Some(last);
+            capture.last_publish = Some(last);
+            capture.last_target_poll = Some(Instant::now());
+            capture.reconcile(&cfg, 1, &updates, &|_, _| unreachable!());
+            while let Ok(update) = rx.try_recv() {
+                assert!(
+                    expired_update.is_none(),
+                    "the expired detail is published once, at the transition"
+                );
+                expired_update = Some(update);
+            }
+        }
+        let expired = expired_update.expect("the stale -> expired edge published");
+        assert_eq!(expired.detail, "capture unavailable: stale data expired");
+        assert!(!expired.game.active && !expired.game.fps.valid);
+        let after_expired = shape_counts();
+        println!(
+            "A2-3 STALE-SEQUENCE stale->expired model-builds={} stale-model-builds={} publications=1",
+            after_expired.0, after_expired.1
+        );
+        assert_eq!(after_expired.1, 0, "the expired arm built no model");
+
+        // The fresh edge clears the ledger at the shipped site and republishes.
+        line_tx.send("game.exe,42,16.0".into()).unwrap();
+        capture.last_target_poll = Some(Instant::now());
+        capture.reconcile(&cfg, 1, &updates, &|_, _| unreachable!());
+        let fresh_again = rx.recv().unwrap();
+        assert!(fresh_again.available, "a new frame returns to fresh");
+        assert_eq!(fresh_again.detail, "game.exe");
+        assert!(rx.try_recv().is_err(), "the fresh edge publishes once");
+        assert!(
+            capture.last_unavailable.is_empty(),
+            "the shipped frame site clears the unavailable ledger"
+        );
+        println!(
+            "A2-3 STALE-SEQUENCE fresh->stale->expired->fresh published=3 total-model-builds={} stale-model-builds={}",
+            after_expired.0, after_expired.1
+        );
+    }
+
+    /// A2.2: a warm `model` call allocates NOTHING on the window path, and no process-name
+    /// clone was added. Measured with the lane's counting allocator; what remains is the
+    /// two owned `GameStats` name strings (which the shipped shape also pays) and std's own
+    /// stable-sort merge scratch, named by the `tail_means` attribution probe.
+    #[test]
+    fn warm_model_call_allocates_no_window_vector_and_no_name_clone() {
+        use crate::backends::alloc_count;
+        let window = Config::default().presentmon_window;
+        let frames = 3_600usize;
+        let period_ns = (window.as_nanos() as u64) / (frames as u64);
+        let observed = Instant::now();
+        let mut stats = Stats::new(30.0, window);
+        stats.frames = (0..frames)
+            .map(|index| {
+                (
+                    observed - Duration::from_nanos(period_ns * (frames as u64 - index as u64)),
+                    16.0,
+                )
+            })
+            .collect();
+        let now_wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let _ = stats.model(now_wall, observed, window, "game.exe");
+        let warm = {
+            let _window = alloc_count::window();
+            alloc_count::watch_thread();
+            alloc_count::reset();
+            let before = alloc_count::snapshot();
+            let _ = stats.model(now_wall, observed, window, "game.exe");
+            alloc_count::subtract(alloc_count::snapshot(), before)
+        };
+        let base_warm = {
+            let _window = alloc_count::window();
+            alloc_count::watch_thread();
+            alloc_count::reset();
+            let before = alloc_count::snapshot();
+            let _ = base_model_shape(&stats, now_wall, observed, window, "game.exe");
+            alloc_count::subtract(alloc_count::snapshot(), before)
+        };
+        let mut sort_buffer = vec![16.0f64; frames];
+        let sort_probe = {
+            let _window = alloc_count::window();
+            alloc_count::watch_thread();
+            alloc_count::reset();
+            let before = alloc_count::snapshot();
+            let _ = crate::history::tail_means(&mut sort_buffer);
+            alloc_count::subtract(alloc_count::snapshot(), before)
+        };
+        println!(
+            "A2-2-ALLOC default-window frames=3600 window={:?} SHAPED-BASELINE total={} gt256={} le256={} | THIS-TREE total={} gt256={} le256={} | SORT-PROBE total={} gt256={} le256={}",
+            window,
+            base_warm.4,
+            base_warm.3,
+            base_warm.2,
+            warm.4,
+            warm.3,
+            warm.2,
+            sort_probe.4,
+            sort_probe.3,
+            sort_probe.2
+        );
+        println!(
+            "A2-2-SCRATCH default-window frames=3600 retained-scratch={} B ({} f64 slots)",
+            stats.scratch.capacity() * size_of::<f64>(),
+            stats.scratch.capacity()
+        );
+        assert_eq!(
+            warm.2, 2,
+            "a warm model call allocates exactly the two GameStats name strings, so no \
+             process-name clone was added to this path"
+        );
+        assert_eq!(
+            warm.3, sort_probe.3,
+            "a warm model call pays no over-256-byte allocation beyond std's stable-sort scratch"
+        );
+        assert_eq!(
+            warm.4,
+            sort_probe.4 + 2,
+            "a warm model call is the sort's own scratch plus the two name strings"
+        );
+        assert!(
+            base_warm.3 >= 3 && base_warm.4 > warm.4,
+            "the shipped shape allocated the window/clone blocks this unit removed"
+        );
+    }
+
+    /// A2.1/A3 counters, stated as the acceptance assertions for this tree.
+    #[test]
+    fn model_shape_is_one_sorting_no_clone_and_no_scratch_vector() {
+        let window = Config::default().presentmon_window;
+        let observed = Instant::now();
+        let mut stats = Stats::new(30.0, window);
+        stats.frames = (0..3_600usize)
+            .map(|index| {
+                (
+                    observed - Duration::from_nanos(index as u64 * 16_666_667),
+                    16.0,
+                )
+            })
+            .rev()
+            .collect();
+        let now_wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let _ = stats.model(now_wall, observed, window, "game.exe");
+        shape_reset();
+        let _ = stats.model(now_wall, observed, window, "game.exe");
+        let counts = shape_counts();
+        println!(
+            "A1-AFTER model-per-call builds={} sorts={} clones={} vec-collects={} vec-allocs={}",
+            counts.0,
+            counts.2,
+            counts.3,
+            counts.4,
+            counts.3 + counts.4
+        );
+        assert_eq!(counts.0, 1, "one model call");
+        assert_eq!(counts.2, 1, "A3 counter: sorts per model == 1");
+        assert_eq!(counts.3, 0, "A3 counter: to_vec clones per model == 0");
+        assert_eq!(counts.4, 0, "A3 counter: window/1 s vectors per model == 0");
+        assert!(
+            stats.scratch.capacity() >= 3_600,
+            "the scratch keeps its capacity after a warm call (retained memory)"
+        );
+        println!(
+            "A1-AFTER retained-scratch={} B at the default 60 s window",
+            stats.scratch.capacity() * size_of::<f64>()
+        );
+    }
+
+    /// A3: the tail means pinned BY ABSOLUTE VALUE to the shipped definition, so a
+    /// mutation of the SHARED arithmetic (a `floor` where the shipped code says `ceil`, a
+    /// dropped `clamp`, a whole-window mean for the 1 s mean, a dropped last-window
+    /// fallback) goes RED even where the base fixture and the changed model share the code.
+    /// The shipped arithmetic: `n = ceil(len * p)` clamped to `[1, len]`, the mean over the
+    /// highest `n` of a STABLE ordering, `fps = 1000 / mean`. Every `want` is hand-derived.
+    #[test]
+    fn model_tail_means_match_the_shipped_arithmetic_by_value() {
+        let now_wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(1.0);
+        let check = |name: &str, got: f64, want: f64| {
+            assert!(
+                close(got, want),
+                "{name}: the model published {got}, the shipped arithmetic gives {want}"
+            );
+            println!(
+                "A3-VALUE {name} model={:.12} shipped={:.12} MATCH=True",
+                got, want
+            );
+        };
+        let model_at = |stats: &mut Stats, gap: Duration| -> GameStats {
+            let observed_now = now_after(stats, gap);
+            let window = stats.window;
+            stats.model(now_wall, observed_now, window, "game.exe")
+        };
+
+        // len 100, values 1..=100, all inside the 1 s recent window.
+        // 1%: n = ceil(100 * 0.01) = 1 -> tail {100} -> 1000/100.
+        // 0.1%: n = ceil(100 * 0.001) = 1 -> tail {100} -> 1000/100.
+        // recent mean = 50.5 -> fps = 1000/50.5.
+        let mut stats = fixture_stats(secs(60), 0, &spread(100, |i| (i + 1) as f64));
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("len100-1percent", game.one_percent.value, 10.0);
+        check("len100-01percent", game.point_one_low.value, 10.0);
+        check("len100-fps", game.fps.value, 1000.0 / 50.5);
+        check("len100-frametime", game.frame_time_ms.value, 50.5);
+
+        // len 101, values 1..=101. 1%: n = ceil(1.01) = 2 (a `floor` lands on 1) ->
+        // tail {100,101} mean 100.5. 0.1%: n = ceil(0.101) = 1 -> 1000/101.
+        let mut stats = fixture_stats(secs(60), 0, &spread(101, |i| (i + 1) as f64));
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("len101-1percent", game.one_percent.value, 1000.0 / 100.5);
+        check("len101-01percent", game.point_one_low.value, 1000.0 / 101.0);
+        check("len101-fps", game.fps.value, 1000.0 / 51.0);
+
+        // len 1001, values 0..=1000, offsets -1001..-1 ms: the 1 s recent window drops the
+        // oldest frame (the boundary the shipped filter pins) and keeps 1..=1000.
+        // 1%: n = ceil(10.01) = 11 (a `floor` lands on 10) -> tail 990..=1000 mean 995.
+        // 0.1%: n = ceil(1.001) = 2 (a `floor` lands on 1) -> tail {999,1000} mean 999.5.
+        let mut stats = fixture_stats(secs(60), 0, &spread(1_001, |i| i as f64));
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("len1001-1percent", game.one_percent.value, 1000.0 / 995.0);
+        check(
+            "len1001-01percent",
+            game.point_one_low.value,
+            1000.0 / 999.5,
+        );
+        check("len1001-fps", game.fps.value, 1000.0 / 500.5);
+
+        // The clamp, by value: len 1 -> n = ceil(0.01) = 1 -> the only frame.
+        let mut stats = fixture_stats(secs(60), 0, &[(0, 25.0)]);
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("len1-1percent", game.one_percent.value, 40.0);
+        check("len1-01percent", game.point_one_low.value, 40.0);
+        check("len1-fps", game.fps.value, 40.0);
+
+        // The stable-ordering requirement, by value: a NaN at the head of 100 equal frames
+        // stays OUT of the 1% tail (n = 1), so the 1% low is exactly 1000/16. An unstable
+        // sort may permute the NaN into the tail and publish NaN.
+        let mut stats = fixture_stats(
+            secs(60),
+            0,
+            &spread(100, |i| if i == 0 { f64::NAN } else { 16.0 }),
+        );
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("nan-head-100-1percent", game.one_percent.value, 62.5);
+        check("nan-head-100-01percent", game.point_one_low.value, 62.5);
+        let mut stats = fixture_stats(
+            secs(60),
+            0,
+            &spread(1_000, |i| if i < 3 { f64::NAN } else { 16.0 }),
+        );
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("nan-head-1000-01percent", game.point_one_low.value, 62.5);
+
+        // The 1 s mean is the RECENT set, not the whole window: the last 1 s is 1..=100
+        // (mean 50.5) while the whole 60 s window tops out at 200,199.
+        let mut frames: Vec<(i64, f64)> = (0..100usize)
+            .map(|index| ((index * 500) as i64 - 60_000, (101 + index) as f64))
+            .collect();
+        frames.extend((1..=100i64).map(|index| (-index, index as f64)));
+        let mut stats = fixture_stats(secs(60), 0, &frames);
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("recent-not-whole-window-fps", game.fps.value, 1000.0 / 50.5);
+        check(
+            "whole-window-1percent",
+            game.one_percent.value,
+            1000.0 / 199.5,
+        );
+
+        // The empty-recent fallback is the LAST frame time OF THE WINDOW in arrival order
+        // (not the sorted tail): with a 5 s gap the recent set is empty, the newest
+        // in-window frame is 3.0 and the sorted tail is 42.0.
+        let mut stats = fixture_stats(
+            secs(60),
+            0,
+            &[(-30_000, 42.0), (-29_000, 7.0), (-28_000, 3.0)],
+        );
+        let game = model_at(&mut stats, Duration::from_secs(5));
+        check(
+            "empty-recent-fallback-frametime",
+            game.frame_time_ms.value,
+            3.0,
+        );
+        check("empty-recent-fallback-fps", game.fps.value, 1000.0 / 3.0);
+        check(
+            "empty-recent-tail-1percent",
+            game.one_percent.value,
+            1000.0 / 42.0,
+        );
+        check(
+            "empty-recent-tail-01percent",
+            game.point_one_low.value,
+            1000.0 / 42.0,
+        );
+
+        // The two filters stay INDEPENDENT: with a window shorter than 1 s the recent set
+        // legitimately includes frames outside the window (the shipped shape).
+        // window 500 ms, observed_now = -99 ms: window = {-400, -100} = {5, 9};
+        // recent (>= -1099 ms) = {-1000, -400, -100} = {11, 5, 9} -> mean 25/3.
+        let mut stats = fixture_stats(
+            Duration::from_millis(500),
+            0,
+            &[(-2_000, 7.0), (-1_000, 11.0), (-400, 5.0), (-100, 9.0)],
+        );
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check(
+            "independent-filters-frametime",
+            game.frame_time_ms.value,
+            25.0 / 3.0,
+        );
+        check(
+            "independent-filters-1percent",
+            game.one_percent.value,
+            1000.0 / 9.0,
+        );
+
+        // The window cutoff boundary, by value: the frame exactly at `now - window` is IN,
+        // one tick earlier is OUT, and that changes the published 1% low.
+        let mut stats = fixture_stats(secs(60), 0, &[(-59_999, 42.0), (0, 10.0)]);
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check(
+            "cutoff-exact-in-window-1percent",
+            game.one_percent.value,
+            1000.0 / 42.0,
+        );
+        check("cutoff-exact-fps", game.fps.value, 100.0);
+        let mut stats = fixture_stats(secs(60), 0, &[(-60_000, 42.0), (0, 10.0)]);
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check(
+            "cutoff-out-of-window-1percent",
+            game.one_percent.value,
+            100.0,
+        );
+        check(
+            "cutoff-out-of-window-frametime",
+            game.frame_time_ms.value,
+            10.0,
+        );
+
+        // The 1 s recent boundary, by value: observed_now = newest + 1 ms, so the recent
+        // cutoff is -999 ms: a frame at -999 is exactly in, -1000 is one tick out.
+        let mut stats = fixture_stats(secs(60), 0, &[(-999, 42.0), (-100, 8.0), (0, 10.0)]);
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("recent-exact-in-frametime", game.frame_time_ms.value, 20.0);
+        let mut stats = fixture_stats(secs(60), 0, &[(-1_000, 42.0), (-100, 8.0), (0, 10.0)]);
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("recent-out-frametime", game.frame_time_ms.value, 9.0);
     }
 }
