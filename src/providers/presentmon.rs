@@ -66,6 +66,32 @@ const MAX_WINDOW_FRAMES: usize = 600 * 1_000 + LINE_QUEUE_CAPACITY;
 const _: () = assert!(MAX_WINDOW_FRAMES == 602_048);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const RETRY_DELAY: Duration = Duration::from_secs(10);
+/// WO-OPT02C (finding O1, slice 3): the bound of a worker park that has nothing to
+/// wait for, named from the shipped target-poll cadence (`TARGET_POLL`), not a magic
+/// number. It is a WAKE bound, never an adoption bound: the demand edge
+/// (`telemetry.rs:121-125` stores the word, then `wake_workers`), the config edge
+/// (`telemetry.rs:99-106`) and the shutdown edge (`telemetry.rs:88-96`, store ->
+/// unpark -> join) each `Thread::unpark` this worker's handle, which `telemetry.rs:2133-2149`
+/// owns in `Telemetry::threads`, so a publish lands without waiting for the park.
+const PRESENTMON_IDLE_BOUND: Duration = TARGET_POLL;
+/// WO-OPT02C: the floor of every presentmon worker park. The host timer resolution is
+/// ~15.6 ms, so a park shorter than this is a spin. Local constant mirroring
+/// `telemetry.rs::LOOP_MIN_PARK`; the value is deliberately not imported across files.
+const WORKER_MIN_PARK: Duration = Duration::from_millis(2);
+/// WO-OPT02C-PUMPCAP (F-AUD-OPT02C-1): the longest step of the live-capture pump.
+/// WO-OPT02C-PUMPCAP2 (S14): the pump step IS this constant, not a clamp of the
+/// deadline. Two measured facts fix that shape: a `min` cap alone leaves 64.2
+/// iterations/s in the past-`STALE_AFTER` shape, because `worker_idle_deadline`
+/// collapses a deadline set whose gates are already due to `WORKER_MIN_PARK` (2 ms)
+/// and a `min` cannot lift a collapsed set - the 50 ms step is what bounds that spin
+/// (F-AUD-OPT02C-2, measured 16.1/s); and `Thread::unpark` cannot interrupt a running
+/// `recv_timeout`, so in the running-capture shape this timeout IS the demand-adoption
+/// bound (100 ms app publish cadence + this step = the shipped 150 ms promise).
+/// Parity: the live-capture pump step is the shipped 50 ms step - the retired arm's
+/// `sleep(Duration::from_millis(50))` - only the no-capture branch parks to the
+/// deadline, and the running-capture shape gains NO wake-count reduction: its win is
+/// `sleep` -> data-driven pump plus the shipped `line_overflow` reset reachability.
+const PRESENTMON_PUMP_BOUND: Duration = Duration::from_millis(50);
 const STOP_TIMEOUT_MS: u32 = 2_000;
 const MAX_STDERR_BYTES: usize = 16 * 1024;
 const MAX_DIAGNOSTIC_CHARS: usize = 1024;
@@ -1254,7 +1280,8 @@ fn current_request(config: &RwLock<Config>, generation: &AtomicU64) -> (u64, Con
     }
 }
 
-/// WO-TEL-D2 (S5, U-8): the 50 ms loop head reuses the cached `Arc<Config>`
+/// WO-TEL-D2 (S5, U-8): the worker-loop head (WO-OPT02C: parked on its own deadline)
+/// reuses the cached `Arc<Config>`
 /// under an unchanged generation (no 20 Hz `Config` clone); a changed
 /// generation takes the module's shipped `current_request` rule copy, so the
 /// cached value belongs to the generation reported with it. Generation
@@ -1417,6 +1444,56 @@ fn join_thread_bounded<T>(
     thread.join().map_err(|_| "reader panicked")
 }
 
+/// WO-OPT02C (C1.3): the worker's next wake, built ONLY from gates this file already
+/// computes. The earliest remaining deadline wins; a gate that is already due collapses
+/// to `WORKER_MIN_PARK` (never negative, never a spin); a gate further away than
+/// `PRESENTMON_IDLE_BOUND` is capped to it, because the demand / config / shutdown
+/// `unpark` edges are what make a long park safe; and an empty set (nothing to wait
+/// for) is the idle bound. Pure: no clocks read, no state touched, exact `Duration`s.
+fn worker_idle_deadline(deadlines: &[Option<Instant>], now: Instant) -> Duration {
+    let earliest = deadlines
+        .iter()
+        .flatten()
+        .fold(None, |acc: Option<Duration>, deadline| {
+            let remaining = deadline.saturating_duration_since(now);
+            Some(acc.map_or(remaining, |acc| acc.min(remaining)))
+        });
+    match earliest {
+        Some(remaining) if remaining <= WORKER_MIN_PARK => WORKER_MIN_PARK,
+        Some(remaining) => remaining.min(PRESENTMON_IDLE_BOUND),
+        None => PRESENTMON_IDLE_BOUND,
+    }
+}
+
+#[cfg(test)]
+static WORKER_TICKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, u64>>,
+> = std::sync::OnceLock::new();
+
+/// WO-OPT02C (C3 seam): test-only per-worker iteration counter, so the wake census and
+/// the dormancy tests measure THIS worker's loop and not the process. Bounded: one
+/// entry per worker thread in the test binary, never compiled into the release artifact.
+#[cfg(test)]
+fn worker_tick() {
+    let ticks = WORKER_TICKS.get_or_init(std::sync::Mutex::default);
+    let mut ticks = ticks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *ticks.entry(std::thread::current().id()).or_insert(0) += 1;
+}
+
+#[cfg(test)]
+fn worker_tick_count(thread: std::thread::ThreadId) -> u64 {
+    let ticks = WORKER_TICKS.get_or_init(std::sync::Mutex::default);
+    let ticks = ticks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ticks.get(&thread).copied().unwrap_or(0)
+}
+
+#[cfg(not(test))]
+fn worker_tick() {}
+
 fn run(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
@@ -1431,10 +1508,17 @@ fn run(
         Arc::new(config.read().unwrap_or_else(|e| e.into_inner()).clone()),
     );
     while !shutdown.load(Ordering::Relaxed) {
+        worker_tick();
         let (request_generation, cfg) = cached_request(&config, &generation, &mut request);
         if request_generation != current_generation {
             if capture.stop_and_report_cleanup(&tx, request_generation, Instant::now()) {
-                std::thread::sleep(Duration::from_millis(50));
+                // WO-OPT02C (C1.3): the cleanup-pending retry parks on the gate this arm
+                // itself stamps - `stop_and_report_cleanup` -> `schedule_retry` sets
+                // `retry_after` (RETRY_DELAY) on a failed stop - capped to the idle bound.
+                std::thread::park_timeout(worker_idle_deadline(
+                    &[capture.retry_after],
+                    Instant::now(),
+                ));
                 continue;
             }
             capture = Capture::default();
@@ -1448,17 +1532,31 @@ fn run(
         // `stop_and_report_cleanup` once, one deduped `unavailable` publication
         // (health: `providers["presentmon"]` false => the availability
         // predicate `app.rs:745-763` keeps falling through, fed by publication,
-        // not by fresh polls), then the existing 50 ms sleep. Demand return
-        // re-enters reconcile: the 1 s target-poll gate is due
-        // (`last_target_poll` stale), so selection runs on the next worker tick
-        // after publication (<=100 ms render + 50 ms loop).
+        // not by fresh polls), then the dormancy park (WO-OPT02C: the idle bound,
+        // not the retired 50 ms step). Demand return re-enters reconcile: the 1 s
+        // target-poll gate is due (`last_target_poll` stale), so selection runs on
+        // the worker tick the demand `unpark` edge drives (<=100 ms render cadence +
+        // an immediate wake).
         if !crate::telemetry::demanded(consumers.load(Ordering::Relaxed), "presentmon") {
             if capture.stop_and_report_cleanup(&tx, request_generation, Instant::now()) {
-                std::thread::sleep(Duration::from_millis(50));
+                // WO-OPT02C (C1.3): same shipped retry gate as the generation arm.
+                std::thread::park_timeout(worker_idle_deadline(
+                    &[capture.retry_after],
+                    Instant::now(),
+                ));
                 continue;
             }
             capture.unavailable(&tx, request_generation, "no display consumer".into());
-            std::thread::sleep(Duration::from_millis(50));
+            // WO-OPT02C (C1.3/C1.1): the zero-demand park has NOTHING in this file to
+            // wait for - the reconcile gates are behind the demand gate, so a
+            // target-poll deadline that is already due must NOT collapse the park
+            // (`last_target_poll` ages, it is never stamped here). The set is empty,
+            // so the park is the idle bound (`TARGET_POLL`), and the demand edge is
+            // what pays for it: `telemetry.rs::set_consumers` stores the word and
+            // `wake_workers` unparks this handle, so adoption is the publish cadence,
+            // not the park. The shipped narrative's "50 ms loop" is now "an immediate
+            // unpark", which is why the 150 ms re-arm bound stays an UPPER bound.
+            std::thread::park_timeout(worker_idle_deadline(&[], Instant::now()));
             continue;
         }
         capture.reconcile(&cfg, request_generation, &tx, &|target, key| {
@@ -1472,7 +1570,27 @@ fn run(
                 key,
             )
         });
-        std::thread::sleep(Duration::from_millis(50));
+        // WO-OPT02C (C1.3/C1.4): the tail step is the worker's own deadline, not a 20 Hz
+        // tick. With a capture running, the line channel IS a real wake edge (the reader
+        // thread's send returns `recv_timeout`), so the CSV pump is data-driven and no
+        // queued line can age into the `line_overflow` reset; with no capture there is
+        // nothing to drain, so the worker parks to its gates.
+        let step = capture.idle_deadline(&cfg, Instant::now());
+        if capture.capture_running() {
+            // WO-OPT02C-PUMPCAP2 (S14, F-AUD-OPT02C-1/-2): the plain form of the pump
+            // bound. `step.min(BOUND)` alone was measured at 64.2 iterations/s in the
+            // past-`STALE_AFTER` shape - `worker_idle_deadline` collapses a deadline set
+            // whose gates are permanently due (a frozen game, a stalled pipe) to
+            // `WORKER_MIN_PARK` and a `min` cannot lift it, so the bound is carried as a
+            // constant, not as a clamp of a deadline that is already gone. And because
+            // `Thread::unpark` cannot cut a running `recv_timeout`, this step is the
+            // demand-adoption bound of the running-capture shape. It is the shipped 50 ms
+            // step (base parity); the deadline stays where it pays, in the no-capture
+            // `park_timeout` branch below.
+            capture.pump_step(PRESENTMON_PUMP_BOUND);
+        } else {
+            std::thread::park_timeout(step);
+        }
     }
     let mut stderr = String::new();
     for _ in 0..3 {
@@ -1498,6 +1616,10 @@ struct Capture {
     child: Option<Child>,
     owned_session: Option<String>,
     lines: Option<mpsc::Receiver<String>>,
+    /// WO-OPT02C (C1.4): one line stashed by `pump_step` (the channel is the worker's
+    /// data edge, and `recv_timeout` CONSUMES), handed to the next `drain_with`, so the
+    /// data-driven step never drops a CSV line. Cleared with `lines` on every stop/start.
+    pump_line: Option<String>,
     line_overflow: Option<Arc<AtomicBool>>,
     reader: Option<std::thread::JoinHandle<()>>,
     stderr: Option<Arc<std::sync::Mutex<BoundedDiagnostic>>>,
@@ -1519,6 +1641,52 @@ struct Capture {
 }
 
 impl Capture {
+    /// WO-OPT02C (C1.3): this worker's own deadline set, from the stamps the shipped
+    /// gates already read: the target-poll cadence, the catalog refresh, the retry
+    /// cooldown, the staleness and expiry edges, the publish gate and the startup
+    /// timeout. `VERIFIER_BOUND` needs no term: the Authenticode verification runs
+    /// INSIDE `reconcile` (`run_bounded_verifier` blocks this thread in
+    /// `recv_timeout(VERIFIER_BOUND)`), so the worker is never parked with a pending
+    /// verifier; after a timeout the shipped decline is retried by the target-poll gate,
+    /// which IS in this set.
+    fn idle_deadline(&self, cfg: &Config, now: Instant) -> Duration {
+        worker_idle_deadline(
+            &[
+                self.last_target_poll.map(|last| last + TARGET_POLL),
+                self.catalog.checked_at.map(|last| last + CATALOG_REFRESH),
+                self.retry_after,
+                self.last_frame.map(|last| last + STALE_AFTER),
+                self.last_frame.map(|last| last + STALE_AFTER + STALE_AFTER),
+                self.last_publish
+                    .filter(|_| self.last_frame > self.last_publish)
+                    .map(|last| last + cfg.presentmon_interval),
+                self.started_at.map(|started| started + STARTUP_TIMEOUT),
+            ],
+            now,
+        )
+    }
+
+    /// WO-OPT02C (C1.4): a capture whose CSV pipe is live. Its lines must keep draining:
+    /// the shipped `line_overflow` reset fires once the bounded queue passes
+    /// `LINE_QUEUE_CAPACITY`, so this is the one shape with a data edge, not a timer.
+    fn capture_running(&self) -> bool {
+        self.child.is_some() && self.lines.is_some()
+    }
+
+    /// WO-OPT02C (C1.4): the inter-iteration step while a capture runs. The reader
+    /// thread's `send` is a real wake edge, so the worker waits on the channel to its own
+    /// deadline; the received line is stashed for the next `drain_with` (no CSV line is
+    /// dropped by the wait). With an empty queue the timeout IS the park.
+    fn pump_step(&mut self, step: Duration) {
+        let line = self
+            .lines
+            .as_ref()
+            .and_then(|lines| lines.recv_timeout(step).ok());
+        if line.is_some() {
+            self.pump_line = line;
+        }
+    }
+
     fn reconcile(
         &mut self,
         cfg: &Config,
@@ -1907,6 +2075,7 @@ impl Capture {
                 return Err(self.stop_error(format!("start PresentMon output reader: {error}")));
             }
         };
+        self.pump_line = None;
         self.lines = Some(line_rx);
         self.line_overflow = Some(overflow);
         self.reader = Some(reader);
@@ -1976,12 +2145,17 @@ impl Capture {
         let mut identity_queries = 0;
         let mut selected_invalid = false;
         for _ in 0..MAX_LINES_PER_TICK {
-            let line = match lines.try_recv() {
-                Ok(line) => line,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    return Err("PresentMon output reader disconnected".into());
-                }
+            // WO-OPT02C (C1.4): a line the data-driven step already took from the
+            // channel is drained first, so `pump_step` never loses CSV data.
+            let line = match self.pump_line.take() {
+                Some(line) => line,
+                None => match lines.try_recv() {
+                    Ok(line) => line,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err("PresentMon output reader disconnected".into());
+                    }
+                },
             };
             let mut frame = match self.parser.parse_line(&line, SystemTime::now()) {
                 Ok(Some(frame)) => frame,
@@ -2109,6 +2283,7 @@ impl Capture {
             }
         }
         self.lines = None;
+        self.pump_line = None;
         self.line_overflow = None;
         let deadline = Instant::now() + Duration::from_millis(STOP_TIMEOUT_MS.into());
         if let Some(reader) = self.reader.take() {
@@ -5635,7 +5810,8 @@ mod tests {
     /// native tests). Claims: the worker loop reads the demand word exactly
     /// once; the demand gate precedes `capture.reconcile(`; the park arm stops
     /// a running child (`stop_and_report_cleanup`) and publishes the deduped
-    /// unavailable reason on the shipped 50 ms sleep; the child-spawn machinery
+    /// unavailable reason, parked on the worker's own deadline (WO-OPT02C re-baselines
+    /// the shipped 4x 50 ms needle to a 4x `park_timeout(` needle); the child-spawn machinery
     /// (`resolve_executable`, `.spawn()`, the `TARGET_POLL` selection) occurs
     /// ZERO times inside the `run` slice — it lives behind the gate, inside
     /// reconcile, which the demand-0 path never reaches.
@@ -5693,9 +5869,352 @@ mod tests {
             "the park arm publishes the unavailable state through the dedupe exactly once per iteration"
         );
         assert_eq!(
-            run.matches("std::thread::sleep(Duration::from_millis(50))").count(),
+            run.matches("std::thread::park_timeout(").count(),
             4,
-            "generation cleanup, demand park (cleanup-pending), demand park (settled) and the main loop all reuse the shipped 50 ms sleep"
+            "WO-OPT02C S3 (the re-baselined 4x needle): generation cleanup, demand park (cleanup-pending), demand park (settled) and the main loop each park on the worker's own deadline"
+        );
+        assert_eq!(
+            run.matches("std::thread::sleep(Duration::from_millis(50))")
+                .count(),
+            0,
+            "WO-OPT02C S3: the 50 ms step is retired from every worker arm, so the shipped 150 ms re-arm bound is edge-driven, not a step size"
+        );
+    }
+
+    /// WO-OPT02C (C3) fixture: the production QUIET shape of the worker, run on a real
+    /// thread with no child and no ETW (the shipped config gate parks the capture path),
+    /// so no PresentMon.exe and no LCDSirPlus instance is involved. `presentmon_enabled`
+    /// false makes the demanded leg publish a DISTINCT deduped reason ("disabled"), which
+    /// is the observable adoption signal on the worker's own channel.
+    type DormancyWorker = (
+        Arc<RwLock<Config>>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+        Arc<AtomicBool>,
+        mpsc::Receiver<Update>,
+        std::thread::JoinHandle<()>,
+    );
+
+    fn dormancy_worker(consumers: u64) -> DormancyWorker {
+        let config = Arc::new(RwLock::new(Config {
+            presentmon_enabled: false,
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let consumers = Arc::new(AtomicU64::new(consumers));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let worker = {
+            let config = Arc::clone(&config);
+            let generation = Arc::clone(&generation);
+            let consumers = Arc::clone(&consumers);
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::Builder::new()
+                .name("telemetry-presentmon-test".into())
+                .spawn(move || run(config, generation, consumers, shutdown, tx))
+                .expect("the presentmon worker under test")
+        };
+        (config, generation, consumers, shutdown, rx, worker)
+    }
+
+    /// WO-OPT02C (C3.1): the demand wake edge adopts a parked worker. The word is written
+    /// and THEN unparked, exactly as `telemetry.rs:121-125` (`set_consumers` ->
+    /// `wake_workers`, whose handle list carries this worker).
+    /// RED ON BASE: the base arm sleeps the shipped 50 ms, so the worker iterates ~4 times
+    /// inside the 200 ms dormancy window and the first assert below fails.
+    #[test]
+    fn the_presentmon_demand_edge_wakes_a_parked_worker() {
+        let (_config, _generation, consumers, shutdown, rx, worker) = dormancy_worker(0);
+        let id = worker.thread().id();
+        let parked = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the zero-demand park publishes the deduped unavailable row");
+        assert_eq!(parked.detail, "no display consumer");
+        let settled = worker_tick_count(id);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            worker_tick_count(id),
+            settled,
+            "a parked worker performs NO iteration inside 200 ms (the park is the deadline; base steps 50 ms)"
+        );
+        let started = Instant::now();
+        consumers.store(
+            crate::telemetry::extended_consumer_bit("presentmon"),
+            Ordering::Relaxed,
+        );
+        worker.thread().unpark();
+        let adopted = rx
+            .recv_timeout(Duration::from_millis(20))
+            .expect("the demand edge adopted the word inside 20 ms");
+        let adopted_after = started.elapsed();
+        assert_eq!(
+            adopted.detail, "disabled",
+            "the demanded worker re-enters reconcile and reaches the shipped config gate"
+        );
+        assert!(
+            adopted_after < Duration::from_millis(20),
+            "the wake drove adoption in {adopted_after:?} (budget 20 ms, inside the retired 50 ms step)"
+        );
+        assert!(
+            worker_tick_count(id) > settled,
+            "the wake drove the adoption iteration"
+        );
+        println!(
+            "WO-OPT02C-WAKES demand edge: adoption {adopted_after:?} after the unpark (budget 20 ms, retired step 50 ms); the pre-edge 200 ms window held {} iterations",
+            worker_tick_count(id) - settled - 1
+        );
+        shutdown.store(true, Ordering::Release);
+        worker.thread().unpark();
+        assert!(worker.join().is_ok());
+    }
+
+    /// WO-OPT02C (C3.2): the idle step is the worker's deadline, not the retired tick.
+    /// RED ON BASE: the base loop is 20 wakes/s (~40 in the 2 s window); the assertion
+    /// caps at 10.
+    #[test]
+    fn the_presentmon_worker_idle_step_is_the_deadline_not_the_tick() {
+        let (_config, _generation, _consumers, shutdown, rx, worker) = dormancy_worker(0);
+        let id = worker.thread().id();
+        let parked = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the zero-demand park publishes the deduped unavailable row");
+        assert_eq!(parked.detail, "no display consumer");
+        let window = Duration::from_millis(2_000);
+        let before = worker_tick_count(id);
+        std::thread::sleep(window);
+        let ticks = worker_tick_count(id) - before;
+        println!(
+            "WO-OPT02C-WAKES presentmon quiet shape (collection not due, no demand): {ticks} iterations in {window:?} = {:.1} wakes/s (base 50 ms step = 20/s; target ~1/s = TARGET_POLL)",
+            ticks as f64 * 1000.0 / window.as_millis() as f64
+        );
+        shutdown.store(true, Ordering::Release);
+        worker.thread().unpark();
+        assert!(worker.join().is_ok());
+        assert!(
+            ticks >= 1,
+            "the worker stays alive (it is dormant, not stopped)"
+        );
+        assert!(
+            ticks <= 10,
+            "the idle step is the deadline, not the retired 20/s tick: {ticks} iterations in {window:?} (base gives ~40; the shipped wake census number is this count / 2 s)"
+        );
+    }
+
+    /// WO-OPT02C (C3.3): the shutdown wake edge exits a parked worker inside the shipped
+    /// step budget. The teardown path is `telemetry.rs:88-96`: store -> `wake_workers` ->
+    /// join, and that join (`telemetry.rs:93`) is UNBOUNDED, so this edge is what keeps
+    /// teardown finite. Join budgets read at delivery: `telemetry.rs:93` unbounded;
+    /// `presentmon.rs` `join_thread_bounded` = `STOP_TIMEOUT_MS` 2 s (reader threads, not
+    /// this worker); the worker joins in the tests (`owner_thread_stops_and_joins_after_shutdown`,
+    /// `presentmon_config_change_midflight_...`) are unbounded and assert no budget.
+    /// PARITY GUARD: base is already fast here (a 50 ms sleep), so the 50 ms assert is
+    /// GREEN on base too; the second worker's no-edge leg is the discriminating row.
+    #[test]
+    fn the_presentmon_shutdown_edge_exits_a_parked_worker() {
+        let (_config, _generation, _consumers, shutdown, rx, worker) = dormancy_worker(0);
+        let parked = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the zero-demand park publishes the deduped unavailable row");
+        assert_eq!(parked.detail, "no display consumer");
+        // S13 P3 (F-AUD-OPT02C-3): the `elapsed()` read sits AFTER the join, so
+        // `latency` is the JOIN latency the row claims, not the store + unpark cost.
+        // The 50 ms budget is the shipped one; no budget moved.
+        let started = Instant::now();
+        shutdown.store(true, Ordering::Release);
+        worker.thread().unpark();
+        assert!(
+            worker.join().is_ok(),
+            "the worker exits on the shipped shutdown edge"
+        );
+        let latency = started.elapsed();
+        assert!(
+            latency < Duration::from_millis(50),
+            "observed join latency {latency:?} must stay inside the retired 50 ms step, the last pinned teardown cadence (the `telemetry.rs:93` join itself has NO budget, so the unpark edge is the bound)"
+        );
+        // The edge is load-bearing: the same park with NO shutdown wake exits only at the
+        // worker's deadline, so `wake_workers` is what pays for the long park.
+        let (_config2, _generation2, _consumers2, shutdown2, rx2, worker2) = dormancy_worker(0);
+        let parked2 = rx2
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the second zero-demand park publishes the deduped row");
+        assert_eq!(parked2.detail, "no display consumer");
+        shutdown2.store(true, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(200));
+        let woke_without_edge = worker2.is_finished();
+        worker2.thread().unpark();
+        assert!(
+            worker2.join().is_ok(),
+            "the second worker exits once its edge is posted"
+        );
+        assert!(
+            !woke_without_edge,
+            "RED ON BASE: a flag store alone must not end a deadline park inside 200 ms (base exits in <=50 ms, which is why base needs no edge)"
+        );
+        println!(
+            "WO-OPT02C-WAKES shutdown edge: parked worker joined in {latency:?} (parity bound 50 ms, the retired step; the telemetry.rs:93 join carries NO budget); no-edge leg finished_within_200ms={woke_without_edge} (false proves the edge is what pays for the long park)"
+        );
+    }
+
+    /// WO-OPT02C (C3.4): the shipped promise. GREEN ON BASE AND delivered: demand
+    /// adoption stays inside the 150 ms upper bound (the app's 100 ms publish cadence
+    /// plus the wake).
+    #[test]
+    fn the_presentmon_demand_edge_adopts_within_the_shipped_bound() {
+        let (_config, _generation, consumers, shutdown, rx, worker) = dormancy_worker(0);
+        let parked = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the zero-demand park publishes the deduped unavailable row");
+        assert_eq!(parked.detail, "no display consumer");
+        let started = Instant::now();
+        consumers.store(
+            crate::telemetry::extended_consumer_bit("presentmon"),
+            Ordering::Relaxed,
+        );
+        worker.thread().unpark();
+        let mut adopted = None;
+        while adopted.is_none() && started.elapsed() <= Duration::from_millis(150) {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(150)) {
+                adopted = Some(update);
+            }
+        }
+        let adopted = adopted.expect("the demand is adopted inside the shipped 150 ms bound");
+        let adopted_after = started.elapsed();
+        assert_eq!(adopted.detail, "disabled");
+        assert!(
+            adopted_after <= Duration::from_millis(150),
+            "re-arm happened in {adopted_after:?}, inside the shipped 150 ms upper bound"
+        );
+        shutdown.store(true, Ordering::Release);
+        worker.thread().unpark();
+        assert!(worker.join().is_ok());
+    }
+
+    /// WO-OPT02C (C3.5): the deadline math as exact `Duration`s - no clocks read, no
+    /// re-implementation of the arm.
+    #[test]
+    fn worker_idle_deadline_is_the_earliest_gate_with_the_local_floor() {
+        let now = Instant::now();
+        let bound = PRESENTMON_IDLE_BOUND;
+        assert_eq!(
+            bound, TARGET_POLL,
+            "the idle bound is NAMED from TARGET_POLL"
+        );
+        assert_eq!(WORKER_MIN_PARK, Duration::from_millis(2));
+        // Nothing to wait for => the idle bound.
+        assert_eq!(worker_idle_deadline(&[], now), bound);
+        // Far gate => the bound (the cap is what the edges pay for).
+        assert_eq!(
+            worker_idle_deadline(&[Some(now + Duration::from_secs(30))], now),
+            bound
+        );
+        // Near gate => exactly the remaining time.
+        let near = now + Duration::from_millis(300);
+        assert_eq!(
+            worker_idle_deadline(&[Some(near)], now),
+            Duration::from_millis(300)
+        );
+        // Past gate => the local floor, never negative, never zero.
+        let past = now - Duration::from_millis(500);
+        assert_eq!(worker_idle_deadline(&[Some(past)], now), WORKER_MIN_PARK);
+        assert!(worker_idle_deadline(&[Some(past)], now) > Duration::ZERO);
+        // The earliest gate wins, and a `None` gate contributes nothing.
+        assert_eq!(
+            worker_idle_deadline(&[Some(near), Some(past)], now),
+            WORKER_MIN_PARK
+        );
+        assert_eq!(
+            worker_idle_deadline(&[None, Some(near)], now),
+            Duration::from_millis(300)
+        );
+        // The shipped shipped-cadence gates stay inside the bound: the 1 s target poll is
+        // the bound itself, the 5 s / 10 s gates are capped to it.
+        assert_eq!(
+            worker_idle_deadline(&[Some(now + RETRY_DELAY), Some(now + CATALOG_REFRESH)], now),
+            bound
+        );
+    }
+
+    /// WO-OPT02C (C3.6): structural pins in repo form - the four arms park on the
+    /// deadline, the retired step is absent, the 10 ms pumps stay (they are bounded child
+    /// and reader polls, not idle waits), and the two wake edges keep their order.
+    /// S14 (F-AUD-OPT02C-6): the pump needle is re-baselined to the shipped call form
+    /// `capture.pump_step(PRESENTMON_PUMP_BOUND)`; every other assertion here - the 4x
+    /// `park_timeout(` count, the 0x retired step, the branch containment and the three
+    /// wake-edge order pins - is unchanged.
+    #[test]
+    fn presentmon_worker_arms_park_and_the_wake_edges_keep_their_order() {
+        let source = include_str!("presentmon.rs").replace("\r\n", "\n");
+        let start = source.find("fn run(\n").expect("the worker exists");
+        let rest = &source[start..];
+        let end = rest
+            .find("\n    let mut stderr = String::new();")
+            .expect("the loop-end marker closes the worker loop");
+        let run = &rest[..end];
+        assert_eq!(
+            run.matches("std::thread::park_timeout(").count(),
+            4,
+            "all four retired 50 ms arms park"
+        );
+        assert_eq!(
+            run.matches("std::thread::sleep(Duration::from_millis(50))")
+                .count(),
+            0,
+            "no arm keeps the retired 50 ms step"
+        );
+        assert_eq!(
+            run.matches("worker_idle_deadline(").count(),
+            3,
+            "the three timer-only arms build their park from the deadline helper"
+        );
+        assert!(
+            run.contains("capture.pump_step(PRESENTMON_PUMP_BOUND)")
+                && run.contains("capture.capture_running()"),
+            "the tail arm's live-capture step is the data edge, with the park as its no-capture branch"
+        );
+        // C1.4 as shipped: the two 10 ms arms stay (bounded pumps on a child and on
+        // reader threads, each with its own shipped deadline).
+        assert!(
+            source.contains("fn wait_bounded(")
+                && source[..source.find("fn wait_bounded(").unwrap() + 700]
+                    .contains("std::thread::sleep(Duration::from_millis(10))"),
+            "the bounded child-exit pump keeps its 10 ms confirm cadence (no wake edge exists for a child process)"
+        );
+        assert!(
+            source
+                .find("fn join_thread_bounded(")
+                .map(|at| &source[at..at + 400])
+                .is_some_and(|body| body.contains("std::thread::sleep(Duration::from_millis(10))")),
+            "the bounded reader-join pump keeps its 10 ms cadence (the deadline is STOP_TIMEOUT_MS and the readers own no edge to this worker)"
+        );
+        // The wake edges, pinned in the sliced sequence form.
+        let runtime = include_str!("../telemetry.rs").replace("\r\n", "\n");
+        let runtime = runtime
+            .split("mod tests {")
+            .next()
+            .expect("the telemetry runtime has a production region");
+        let publish = runtime
+            .find("pub fn set_consumers(&self, consumers: u64)")
+            .expect("the demand-publish site");
+        let body = &runtime[publish..publish + 240];
+        assert!(
+            body.find("self.consumers.swap(consumers, Ordering::Relaxed)")
+                .expect("the demand-word write")
+                < body
+                    .find("self.wake_workers()")
+                    .expect("the demand wake edge"),
+            "the demand site writes the word, then posts the wake"
+        );
+        let drop = runtime
+            .find("fn drop(&mut self)")
+            .expect("the teardown path");
+        let body = &runtime[drop..drop + 320];
+        assert!(
+            body.find("self.shutdown.store(true, Ordering::Relaxed)")
+                .expect("the shutdown store")
+                < body.find("self.wake_workers()").expect("the shutdown wake")
+                && body.find("self.wake_workers()").expect("the shutdown wake")
+                    < body.find(".join()").expect("the worker join"),
+            "shutdown stores, unparks, and only then joins, so no join blocks on a park"
         );
     }
 
@@ -6044,6 +6563,200 @@ mod tests {
         assert!(
             gate.is_none(),
             "(#3a) the gate ends cleared: no permanent latch"
+        );
+    }
+
+    /// WO-OPT02C-PUMPCAP (S13) fixture: the shipped tail arm of `run` on a LIVE child
+    /// and a LIVE line channel carrying zero lines - the capture-running shape the
+    /// audit measured (F-AUD-OPT02C-1/-2). The production loop has no capture-injection
+    /// seam, so this seam executes the arm's own expression (`idle_deadline` +
+    /// `pump_step`), which IS the step the worker blocks in. The child is
+    /// `cmd.exe /C ping` with `CREATE_NO_WINDOW` (no visible window), killed and waited
+    /// by the test itself: no PresentMon, no ETW session, no LCDSirPlus instance.
+    fn pumpcap_probe_capture(stale: bool) -> (mpsc::Sender<String>, Capture, Config) {
+        let child = Command::new("cmd.exe")
+            .args(["/C", "ping", "-n", "120", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("the hidden probe child");
+        let (tx, rx) = mpsc::channel();
+        let mut capture = Capture::default();
+        capture.child = Some(child);
+        capture.lines = Some(rx);
+        let now = Instant::now();
+        capture.last_target_poll = Some(now);
+        capture.catalog.checked_at = Some(now);
+        capture.started_at = Some(now);
+        capture.last_frame = Some(if stale {
+            now - STALE_AFTER - Duration::from_secs(1)
+        } else {
+            now
+        });
+        (tx, capture, Config::default())
+    }
+
+    /// WO-OPT02C-PUMPCAP (S13) fixture teardown: reap the probe child THIS test launched.
+    fn pumpcap_reap_capture(capture: &mut Capture) {
+        if let Some(mut child) = capture.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        capture.lines = None;
+    }
+
+    /// The capped pump step expression, in ONE place so the seam and the shipped arm
+    /// cannot drift (S14: `run`'s running-capture branch pumps the plain
+    /// `PRESENTMON_PUMP_BOUND`; the `min`/`max` here is algebraically that same constant,
+    /// so the seam measures the shipped 50 ms step, and the structural pin of the shipped
+    /// call form lives in the test below).
+    fn pumpcap_capped_step(capture: &Capture, cfg: &Config) -> Duration {
+        capture
+            .idle_deadline(cfg, Instant::now())
+            .min(PRESENTMON_PUMP_BOUND)
+            .max(PRESENTMON_PUMP_BOUND)
+    }
+
+    /// WO-OPT02C-PUMPCAP S13.1 (F-AUD-OPT02C-1, P2, measured 1000 ms expression /
+    /// 1011 ms observed at `8fc5a470`): in the capture-running / child-silent shape the
+    /// pump step is capped to `PRESENTMON_PUMP_BOUND`, so a demand LOWERING posted in
+    /// the middle of an in-flight pump is adopted inside the shipped 150 ms bound.
+    /// RED ON THE FROZEN 02C TREE: the step is
+    /// `recv_timeout(min(earliest gate, PRESENTMON_IDLE_BOUND = TARGET_POLL))` = 1000 ms,
+    /// and `Thread::unpark` cannot cut a running `recv_timeout` (audit probe
+    /// pump_iters=1 vs park_iters=2), so adoption lands at ~1.1 s.
+    #[test]
+    fn the_presentmon_pump_step_is_capped_while_the_child_is_silent() {
+        let (_tx, mut capture, cfg) = pumpcap_probe_capture(false);
+        let demand = Arc::new(AtomicU64::new(crate::telemetry::extended_consumer_bit(
+            "presentmon",
+        )));
+        let start = Instant::now();
+        let store_at = Arc::new(AtomicU64::new(u64::MAX));
+        // The demand is lowered 5 ms into the first in-flight pump, exactly the shape of
+        // `telemetry.rs:121-125` (`set_consumers` writes the word, then `wake_workers`
+        // unparks): the word is visible while the pump is still blocking.
+        let edge = Arc::clone(&demand);
+        let stamp = Arc::clone(&store_at);
+        let lower = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            edge.store(0, Ordering::Relaxed);
+            stamp.store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        });
+        let window = Duration::from_millis(1_200);
+        let mut iterations = 0u64;
+        let mut worst = Duration::ZERO;
+        let mut adopted_after = None;
+        while start.elapsed() < window {
+            let step = pumpcap_capped_step(&capture, &cfg);
+            let at = Instant::now();
+            capture.pump_step(step);
+            worst = worst.max(at.elapsed());
+            iterations += 1;
+            // The worker reads the demand word once per iteration, at the top of the loop.
+            if !crate::telemetry::demanded(demand.load(Ordering::Relaxed), "presentmon") {
+                adopted_after =
+                    Some(start.elapsed() - Duration::from_micros(store_at.load(Ordering::Relaxed)));
+                break;
+            }
+        }
+        pumpcap_reap_capture(&mut capture);
+        lower.join().ok();
+        let adopted_after = adopted_after.expect("the lowered demand is adopted inside the window");
+        println!(
+            "WO-OPT02C-PUMPCAP shape3 (capture running, child silent): worst_step {worst:?} (bound {PRESENTMON_PUMP_BOUND:?}), {iterations} iterations in {window:?}, demand lowering adopted in {adopted_after:?} (shipped bound 150 ms; frozen 02C measured 1011 ms)",
+        );
+        assert!(
+            worst <= PRESENTMON_PUMP_BOUND + Duration::from_millis(20),
+            "the pump step is capped: {worst:?} exceeds 50 ms + the ~15.6 ms host timer granularity (frozen 02C: 1011 ms, F-AUD-OPT02C-1)"
+        );
+        assert!(
+            adopted_after <= Duration::from_millis(150),
+            "a demand lowering posted in-flight is adopted inside the shipped 150 ms bound: {adopted_after:?} (frozen 02C: ~1.1 s, F-AUD-OPT02C-1)"
+        );
+        assert!(iterations >= 1, "the shape is live: the pump ran");
+    }
+
+    /// WO-OPT02C-PUMPCAP S13.2 (F-AUD-OPT02C-2, P2, measured ~500 iterations/s at
+    /// `8fc5a470`): a running capture whose staleness gates are permanently due must not
+    /// spin the worker. This is the unit-50-class anti-spin census for the shape the
+    /// wake census never looked at. RED ON THE FROZEN 02C TREE: the deadline set
+    /// collapses to `WORKER_MIN_PARK` (2 ms) => ~500 iterations/s, 25x the retired 20/s,
+    /// each iteration calling `reconcile`.
+    #[test]
+    fn a_stale_running_capture_does_not_spin_the_worker() {
+        let (_tx, mut capture, cfg) = pumpcap_probe_capture(true);
+        let window = Duration::from_millis(800);
+        let start = Instant::now();
+        let mut iterations = 0u64;
+        let mut worst = Duration::ZERO;
+        while start.elapsed() < window {
+            let step = pumpcap_capped_step(&capture, &cfg);
+            let at = Instant::now();
+            capture.pump_step(step);
+            worst = worst.max(at.elapsed());
+            iterations += 1;
+        }
+        pumpcap_reap_capture(&mut capture);
+        let elapsed = start.elapsed();
+        let per_second = iterations as f64 * 1000.0 / elapsed.as_millis() as f64;
+        println!(
+            "WO-OPT02C-PUMPCAP shape4 (capture running, past STALE_AFTER): {iterations} iterations in {elapsed:?} = {per_second:.1} iterations/s (worst step {worst:?}); frozen 02C ~500/s, the retired base arm 20/s",
+        );
+        assert!(
+            per_second <= 25.0,
+            "a stale running capture does not spin the worker: {per_second:.1} iterations/s over {elapsed:?} (retired base 20/s; the 2 ms `WORKER_MIN_PARK` floor is right for a DUE gate and wrong for a stale capture; frozen 02C ~500/s, F-AUD-OPT02C-2)"
+        );
+    }
+
+    /// WO-OPT02C-PUMPCAP S13.3: the cap must not starve the shipped `line_overflow`
+    /// reset routine - the pump is how a queued line reaches the drain and ages the
+    /// bounded queue. Structural pin of the capped call in the sliced `run` body (repo
+    /// form), plus the behavioral leg: one live line handed to the capped pump arrives
+    /// in `pump_line`, the input of the shipped `drain_with` the 5 drain tests pin.
+    #[test]
+    fn the_presentmon_pump_cap_keeps_the_line_overflow_reset_reachable() {
+        assert_eq!(
+            PRESENTMON_PUMP_BOUND,
+            Duration::from_millis(50),
+            "the pump bound is the shipped 50 ms step: never slower (the `line_overflow` reset must stay reachable, and 20/s is the retired cadence), and the cap that ends the 1000 ms in-flight pump"
+        );
+        let source = include_str!("presentmon.rs").replace("\r\n", "\n");
+        let start = source.find("fn run(\n").expect("the worker exists");
+        let rest = &source[start..];
+        let end = rest
+            .find("\n    let mut stderr = String::new();")
+            .expect("the loop-end marker closes the worker loop");
+        let run = &rest[..end];
+        let at = run
+            .find("capture.pump_step(")
+            .expect("the tail arm pumps the live capture");
+        let call = &run[at..at + 90];
+        assert!(
+            call.contains("capture.pump_step(PRESENTMON_PUMP_BOUND)"),
+            "S14: the pump call IS the pump bound, the plain form of the cap and the floor: {call}"
+        );
+        assert!(
+            run[..at].contains("if capture.capture_running()"),
+            "the capped pump is the running-capture arm; the no-capture arm keeps the deadline park"
+        );
+        let (tx, mut capture, cfg) = pumpcap_probe_capture(true);
+        tx.send("probe-capped-pump-line".to_string())
+            .expect("the line is queued on the worker's data edge");
+        let step = pumpcap_capped_step(&capture, &cfg);
+        let at = Instant::now();
+        capture.pump_step(step);
+        let took = at.elapsed();
+        pumpcap_reap_capture(&mut capture);
+        assert_eq!(
+            capture.pump_line.as_deref(),
+            Some("probe-capped-pump-line"),
+            "the capped pump hands the queued line to the shipped drain, so the `line_overflow` reset stays reachable"
+        );
+        assert!(
+            took <= PRESENTMON_PUMP_BOUND + Duration::from_millis(20),
+            "a queued line is taken on the capped step, not after it: {took:?}"
         );
     }
 }

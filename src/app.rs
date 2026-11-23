@@ -6813,10 +6813,13 @@ mod tests {
         // BOUND leg (the shipped activation-resume bound, asserted numerically on
         // the production source): the demand word reaches the worker through the
         // app's render gate (<= 100 ms, `app.rs:318`/`app.rs:328`), the worker
-        // reads the published word exactly once per loop iteration and sleeps the
-        // shipped 50 ms, and the 1 s `TARGET_POLL` gate is already due after the
-        // park (`last_target_poll` ages, the park never stamps it) => re-arm
-        // within render 100 ms + worker 50 ms = 150 ms, target poll on that tick.
+        // reads the published word exactly once per loop iteration, and the
+        // publish site's `unpark` (WO-OPT02C C1.1) interrupts the worker's
+        // deadline park, so the word is adopted on the wake, not on a step; the
+        // 1 s `TARGET_POLL` gate is already due after the park
+        // (`last_target_poll` ages, the park never stamps it) => re-arm within
+        // render 100 ms + an immediate wake, i.e. the shipped 150 ms upper bound,
+        // with the target poll running on that tick.
         let source = include_str!("providers/presentmon.rs").replace("\r\n", "\n");
         let start = source.find("fn run(\n").expect("the shipped worker exists");
         let rest = &source[start..];
@@ -6843,10 +6846,65 @@ mod tests {
             "a set demand bit re-enters reconcile on the next loop tick (the park never reaches it)"
         );
         assert_eq!(
+            run.matches("std::thread::park_timeout(").count(),
+            4,
+            "WO-OPT02C S3 (the re-baselined 4x needle): every worker path parks on the worker's own deadline (the arms the shipped 50 ms step used to pace)"
+        );
+        assert_eq!(
             run.matches("std::thread::sleep(Duration::from_millis(50))")
                 .count(),
-            4,
-            "every worker path sleeps the shipped 50 ms (the 50 ms half of the re-arm bound)"
+            0,
+            "WO-OPT02C S3: no worker arm sleeps the retired 50 ms step, so the 50 ms term of the re-arm bound is replaced by an immediate `unpark` - the 150 ms upper bound is unchanged in strength"
+        );
+        // WO-OPT02C (C1.1/C1.2): the two wake edges the long park is paid for, pinned in
+        // the unit-50 `app.rs:4664` sequence form (sliced at `mod tests {`, so this pin's
+        // own literals cannot self-count). The demand-publish site writes the word and
+        // THEN unparks; the shutdown path stores, unparks and only then joins.
+        let runtime = include_str!("telemetry.rs").replace("\r\n", "\n");
+        let runtime = runtime
+            .split("mod tests {")
+            .next()
+            .expect("the telemetry runtime has a production region");
+        let publish = runtime
+            .find("pub fn set_consumers(&self, consumers: u64)")
+            .expect("the demand-publish site exists");
+        let publish_body = &runtime[publish..publish + 240];
+        assert!(
+            publish_body.contains("self.consumers.swap(consumers, Ordering::Relaxed)"),
+            "the demand word is written at the demand-publish site"
+        );
+        assert!(
+            publish_body
+                .find("self.consumers.swap(consumers, Ordering::Relaxed)")
+                .expect("the demand-word write")
+                < publish_body
+                    .find("self.wake_workers()")
+                    .expect("the demand wake edge"),
+            "C1.1 ORDER: the demand wake edge is posted AFTER the demand-word write, so a parked worker is woken with the new word already visible"
+        );
+        let wake_fn = runtime
+            .find("fn wake_workers(&self)")
+            .expect("the runtime's shared wake edge");
+        let wake_body = &runtime[wake_fn..wake_fn + 200];
+        assert!(
+            wake_body.contains("for worker in &self.threads")
+                && wake_body.contains("worker.thread().unpark()"),
+            "C1.1 EDGE: the demand wake unparks every worker handle, which includes the presentmon worker (`telemetry.rs:2133-2149` stores it in `threads`)"
+        );
+        let drop = runtime
+            .find("fn drop(&mut self)")
+            .expect("the runtime's teardown path exists");
+        let drop_body = &runtime[drop..drop + 320];
+        let store = drop_body
+            .find("self.shutdown.store(true, Ordering::Relaxed)")
+            .expect("the shutdown flag is set");
+        let wake = drop_body
+            .find("self.wake_workers()")
+            .expect("the shutdown wake edge");
+        let join = drop_body.find(".join()").expect("the worker join");
+        assert!(
+            store < wake && wake < join,
+            "C1.2 ORDER: shutdown stores, unparks every worker, and only then joins, so no join can block on a parked worker (the join at `telemetry.rs:93` is unbounded, and this is the edge that keeps it finite)"
         );
         assert!(
             source.contains("const TARGET_POLL: Duration = Duration::from_secs(1);"),
@@ -6854,7 +6912,7 @@ mod tests {
         );
         assert!(
             cfg.render_interval <= Duration::from_millis(100),
-            "the app publishes the demand word at most every 100 ms => re-arm bound = 150 ms"
+            "WO-OPT02C S3 (re-worded, unchanged in strength): the app publishes the demand word at most every 100 ms and the publish site `unpark`s immediately AFTER the write, so demand adoption is bounded by 100 ms of publish cadence + one wake => the shipped 150 ms re-arm bound stays an UPPER bound (it is no longer a step size, and no budget moved)"
         );
     }
 
