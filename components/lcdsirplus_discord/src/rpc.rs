@@ -198,13 +198,18 @@ impl Tracker {
         if matches!(data, Json::Null) {
             self.state.channel_id.clear();
             self.state.channel_name.clear();
-            self.state.speakers.clear();
+            self.state.speakers = Vec::new();
             self.state.updated = Some(now);
             return Ok(());
         }
-        self.state.channel_id = field(data, "id");
+        let channel_id = field(data, "id");
+        if !channel_id.is_empty() && channel_id != self.state.channel_id {
+            self.state.speakers = Vec::new();
+        } else {
+            self.state.speakers.clear();
+        }
+        self.state.channel_id = channel_id;
         self.state.channel_name = field(data, "name");
-        self.state.speakers.clear();
         for voice in data
             .get("voice_states")
             .and_then(Json::as_arr)
@@ -1671,6 +1676,70 @@ pub(crate) mod tests {
                 "Discord RPC payload is malformed"
             );
         }
+    }
+
+    #[test]
+    fn selected_channel_releases_old_speaker_storage_at_leave_or_handoff() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let channel = |id: &str, n: usize| {
+            let voices = (0..n)
+                .map(|i| {
+                    Json::Obj(vec![(
+                        "user".into(),
+                        Json::Obj(vec![
+                            ("id".into(), Json::Str((10_000 + i).to_string())),
+                            ("username".into(), Json::Str(format!("synthetic-{i}"))),
+                        ]),
+                    )])
+                })
+                .collect();
+            Json::Obj(vec![
+                ("id".into(), Json::Str(id.into())),
+                ("name".into(), Json::Str(format!("room-{id}"))),
+                ("voice_states".into(), Json::Arr(voices)),
+            ])
+        };
+        let mut tracker = Tracker::default();
+        tracker.state.self_mute = true;
+        tracker.set_channel(&channel("A", 1024), now).unwrap();
+        let peak = tracker.state.speakers.capacity();
+        assert!(peak >= 1024);
+
+        tracker.set_channel(&channel("A", 2), now).unwrap();
+        assert_eq!(tracker.state.speakers.capacity(), peak);
+        assert_eq!(
+            tracker
+                .state
+                .speakers
+                .iter()
+                .map(|s| s.user_id.as_str())
+                .collect::<Vec<_>>(),
+            ["10000", "10001"]
+        );
+        tracker.set_channel(&channel("", 0), now).unwrap();
+        assert_eq!(tracker.state.speakers.capacity(), peak);
+        tracker.set_channel(&channel("A", 2), now).unwrap();
+        let later = now + Duration::from_secs(1);
+        tracker.set_channel(&channel("B", 0), later).unwrap();
+        let handoff_capacity = tracker.state.speakers.capacity();
+        assert_eq!(tracker.state.channel_id, "B");
+        assert_eq!(tracker.state.channel_name, "room-B");
+        assert_eq!(tracker.state.updated, Some(later));
+        assert!(tracker.state.speakers.is_empty());
+        assert!(tracker.state.self_mute);
+
+        tracker.set_channel(&channel("B", 1024), later).unwrap();
+        tracker.set_channel(&Json::Null, later).unwrap();
+        let leave_capacity = tracker.state.speakers.capacity();
+        assert!(tracker.state.speakers.is_empty());
+        assert!(tracker.state.channel_id.is_empty() && tracker.state.channel_name.is_empty());
+        assert_eq!(tracker.state.updated, Some(later));
+        assert!(tracker.state.self_mute);
+        assert_eq!(
+            (handoff_capacity, leave_capacity),
+            (0, 0),
+            "confirmed leave and channel handoff release the old speaker backing storage"
+        );
     }
 
     #[test]
