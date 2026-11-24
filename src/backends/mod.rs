@@ -21,9 +21,7 @@ use std::sync::atomic::AtomicUsize;
 
 use crate::config::Config;
 use crate::input::{ButtonTracker, Event};
-#[cfg(test)]
-use g13::G13_OUTPUT_REPORT_LENGTH;
-use g13::{pack_report, parse_input};
+use g13::{pack_report, parse_input, G13_OUTPUT_REPORT_LENGTH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
@@ -676,6 +674,20 @@ enum PhysicalDevice {
     Scripted(ScriptedDevice),
 }
 
+fn submit_hid(
+    key: Vec<u8>,
+    write: impl FnOnce(&[u8; G13_OUTPUT_REPORT_LENGTH]) -> Result<(), LossError>,
+) -> Result<Vec<u8>, LossError> {
+    let report = key.as_slice().try_into().map_err(|_| {
+        LossError::new(
+            LossCause::ProbeFail,
+            "incorrect internal HID report length".into(),
+        )
+    })?;
+    write(report)?;
+    Ok(key)
+}
+
 impl PhysicalDevice {
     fn kind(&self) -> BackendKind {
         match self {
@@ -686,19 +698,22 @@ impl PhysicalDevice {
         }
     }
 
-    fn submit(&self, frame: &crate::render::Frame) -> Result<Vec<u8>, LossError> {
+    fn submit(&self, frame: &crate::render::Frame, key: Vec<u8>) -> Result<Vec<u8>, LossError> {
         match self {
-            Self::Hid(device) => {
-                let report = pack_report(frame);
-                device.write_report(&report)?;
-                Ok(report.to_vec())
-            }
+            Self::Hid(device) => submit_hid(key, |report| device.write_report(report)),
             Self::Sdk(device) => {
                 // EC-2: the payload bytes ride the device-session's reusable
                 // buffer inside `submit_frame`; the returned key Vec is the
                 // disclosed per-accepted-frame `last_sent` residual.
                 device.submit_frame(frame)?;
                 Ok(frame.logitech_bytes())
+            }
+            #[cfg(test)]
+            Self::Scripted(device) if device.scenario == SCRIPT_HID_PACK => {
+                submit_hid(key, |report| {
+                    device.record("write", report.to_vec());
+                    Ok(())
+                })
             }
             #[cfg(test)]
             Self::Scripted(device) => device.submit(frame),
@@ -775,6 +790,19 @@ const SCRIPT_QUIET: &str = "scripted-quiet-ticks";
 #[cfg(test)]
 const SCRIPT_EXCL: &str = "scripted-excl-window";
 
+#[cfg(test)]
+const SCRIPT_HID_PACK: &str = "scripted-hid-pack";
+#[cfg(test)]
+const HID_PACK_WAIT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+type HidPackPoll = (Sender<usize>, Receiver<()>);
+#[cfg(test)]
+thread_local! {
+    static HID_PACK_POLL: std::cell::RefCell<Option<HidPackPoll>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 /// Scripted device history: `(scenario, event, session, device key)`. Events:
 /// `open`, `write`, `submit-fail`, `poll-fail`, `close-blank`. The `write` key is
 /// the packed report the device received, so a test can name the exact frame.
@@ -827,6 +855,18 @@ impl ScriptedDevice {
     }
 
     fn poll(&self, _timeout: Duration) -> Result<Option<[bool; 4]>, LossError> {
+        if self.scenario == SCRIPT_HID_PACK {
+            HID_PACK_POLL.with(|slot| {
+                let slot = slot.borrow();
+                let (ack, resume) = slot.as_ref().expect("HID pack poll slot installed");
+                self.record("poll-ack", Vec::new());
+                let calls = g13::reset_pack_report_count().expect("HID pack counter armed");
+                ack.send(calls).expect("HID pack poll ack receiver open");
+                resume
+                    .recv_timeout(HID_PACK_WAIT)
+                    .expect("HID pack test resumes the poll");
+            });
+        }
         if self.scenario == SCRIPT_POLL_LOSS && self.session == 1 {
             self.record("poll-fail", Vec::new());
             return Err(LossError::new(
@@ -1117,7 +1157,7 @@ fn physical_worker(
                             _ => unreachable!(),
                         };
                         if last_sent.as_ref() != Some(&key) {
-                            match device.submit(&frame) {
+                            match device.submit(&frame, key) {
                                 Ok(sent) => {
                                     last_sent = Some(sent);
                                     if let Some(old) = current.replace(pixels) {
@@ -1800,6 +1840,8 @@ mod tests {
             SCRIPT_QUIET
         } else if friendly_name == SCRIPT_EXCL {
             SCRIPT_EXCL
+        } else if friendly_name == SCRIPT_HID_PACK {
+            SCRIPT_HID_PACK
         } else {
             panic!("unknown scripted scenario: {friendly_name}");
         };
@@ -1827,6 +1869,129 @@ mod tests {
             .filter(|event| event.0 == scenario)
             .map(|event| (event.1, event.2, event.3.clone()))
             .collect()
+    }
+
+    #[test]
+    fn hid_worker_packs_each_frame_once() {
+        const W: usize = crate::model::WIDTH;
+        let mut a = [1u8; W * crate::model::HEIGHT];
+        for (x, y) in [(5, 0), (5, 2), (97, 8), (13, 42)] {
+            a[y * W + x] = 0;
+        }
+        let mut a_prime = a;
+        a_prime[0] = 0xa5; // Distinct raw byte, still on before inversion.
+        let mut b = a_prime;
+        b[35 * W + 13] = 0;
+        b[8 * W + 97] = 1;
+
+        // Independent complete 992-byte goldens for rotate_180 + invert.
+        let mut report_a = [0u8; 992];
+        report_a[0] = 0x03;
+        report_a[178] = 0x01;
+        report_a[734] = 0x04;
+        report_a[986] = 0x05;
+        let mut report_b = report_a;
+        report_b[178] = 0x81;
+        report_b[734] = 0;
+
+        let (commands, wake) = command_queue();
+        let (tx, msg_rx) = std::sync::mpsc::channel();
+        let mut backend = Backend {
+            commands,
+            msg_rx,
+            thread: None,
+        };
+        // On unwind, drop the test's channel ends before Backend shuts down and joins.
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker_commands = Arc::clone(&backend.commands);
+        backend.commands.submit(&a);
+        backend.thread = Some(std::thread::spawn(move || {
+            HID_PACK_POLL.with(|slot| *slot.borrow_mut() = Some((ack_tx, resume_rx)));
+            assert_eq!(g13::reset_pack_report_count(), None);
+            let interval = Duration::from_millis(10);
+            physical_worker(
+                BackendKind::Hid,
+                &worker_commands,
+                &wake,
+                &tx,
+                interval,
+                interval,
+                interval,
+                interval,
+                "rotate_180".into(),
+                true,
+                SCRIPT_HID_PACK.into(),
+                open_scripted,
+                probe_never,
+            );
+        }));
+
+        let mut counts = [0; 3];
+        let steps = [
+            (Some(&a_prime), None),
+            (Some(&b), Some(&a)),
+            (None, Some(&a_prime)),
+        ];
+        for (index, (next, retired)) in steps.into_iter().enumerate() {
+            counts[index] = ack_rx.recv_timeout(HID_PACK_WAIT).expect("frame poll ack");
+            assert!(
+                backend.commands.latest.lock().unwrap().is_none(),
+                "step {index}: the worker took the staged frame"
+            );
+            {
+                let spare = backend.commands.spare.lock().unwrap();
+                let retired_in_order = match (spare.as_slice(), retired) {
+                    ([], None) => true,
+                    ([released], Some(raw)) => released.as_ref() == raw,
+                    _ => false,
+                };
+                assert!(
+                    retired_in_order,
+                    "step {index}: the worker retired the preceding raw frame"
+                );
+            }
+            if let Some(next) = next {
+                backend.commands.submit(next);
+            } else {
+                backend.commands.shutdown();
+            }
+            resume_tx.send(()).expect("release the worker poll");
+        }
+        backend.thread.take().unwrap().join().unwrap();
+        assert_eq!(backend.commands.wake_sends.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            script_events(SCRIPT_HID_PACK),
+            vec![
+                ("open", 1, Vec::new()),
+                ("write", 1, report_a.to_vec()),
+                ("poll-ack", 1, Vec::new()),
+                ("poll-ack", 1, Vec::new()),
+                ("write", 1, report_b.to_vec()),
+                ("poll-ack", 1, Vec::new()),
+                ("close-blank", 1, Vec::new()),
+            ],
+            "exact ordered worker progress and full HID reports; A' does not write"
+        );
+        let mut messages = backend.msg_rx.try_iter();
+        assert!(matches!(
+            messages.next(),
+            Some(Message::State(BackendState::Connected {
+                kind: BackendKind::Hid
+            }))
+        ));
+        assert!(matches!(
+            messages.next(),
+            Some(Message::Buttons(events)) if events.is_empty()
+        ));
+        assert!(matches!(
+            messages.next(),
+            Some(Message::PhysicalHealthy(BackendKind::Hid))
+        ));
+        assert!(
+            messages.all(|message| matches!(message, Message::PhysicalHealthy(BackendKind::Hid)))
+        );
+        assert_eq!(counts, [1, 1, 1], "pack_report calls for A, A', B");
     }
 
     /// Drain the publication stream for a bounded settle window, counting the

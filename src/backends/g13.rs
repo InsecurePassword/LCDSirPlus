@@ -21,8 +21,24 @@ pub const G13_LCD_HEADER_LENGTH: usize = 32;
 pub const G13_LCD_REPORT_ID: u8 = 0x03;
 pub const G13_INPUT_REPORT_ID: u8 = 0x01;
 
+#[cfg(test)]
+thread_local! {
+    static PACK_REPORT_CALLS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_pack_report_count() -> Option<usize> {
+    PACK_REPORT_CALLS.with(|calls| calls.replace(Some(0)))
+}
+
 /// Pack a 160x43 logical frame into the 992-byte G13 output report.
 pub fn pack_report(frame: &Frame) -> [u8; G13_OUTPUT_REPORT_LENGTH] {
+    #[cfg(test)]
+    PACK_REPORT_CALLS.with(|calls| {
+        if let Some(n) = calls.get() {
+            calls.set(Some(n + 1));
+        }
+    });
     let mut report = [0u8; G13_OUTPUT_REPORT_LENGTH];
     report[0] = G13_LCD_REPORT_ID;
     for y in 0..crate::model::HEIGHT {
