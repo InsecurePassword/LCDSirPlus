@@ -117,7 +117,13 @@ pub(crate) fn decode_payload(body: &[u8]) -> Result<Payload, String> {
             .and_then(Json::as_str)
             .unwrap_or("")
             .to_string(),
-        data: value.get("data").cloned().unwrap_or(Json::Null),
+        data: match value {
+            Json::Obj(pairs) => pairs
+                .into_iter()
+                .find(|(key, _)| key == "data")
+                .map_or(Json::Null, |(_, data)| data),
+            _ => Json::Null,
+        },
     })
 }
 
@@ -1628,6 +1634,35 @@ pub(crate) mod tests {
             read_packet(&mut Cursor::new(pong)).unwrap(),
             (OP_PONG, ping_body.to_vec())
         );
+    }
+
+    #[test]
+    fn rpc_decode_preserves_first_fields_null_defaults_and_malformed_error() {
+        for (input, expected) in [
+            (r#"{"data":null,"data":{"ignored":true}}"#, Json::Null),
+            (
+                r#"{"data":{"valid":42},"data":null}"#,
+                Json::parse(r#"{"valid":42}"#).unwrap(),
+            ),
+            ("{}", Json::Null),
+            ("[]", Json::Null),
+        ] {
+            assert_eq!(decode_payload(input.as_bytes()).unwrap().data, expected);
+        }
+
+        let payload = decode_payload(
+            br#"{"evt":"ONE","evt":"TWO","nonce":"1","nonce":2,"data":{"some":[1,null,2]}}"#,
+        )
+        .unwrap();
+        assert_eq!(payload.event, "ONE");
+        assert_eq!(payload.nonce, "1");
+        assert_eq!(payload.data, Json::parse(r#"{"some":[1,null,2]}"#).unwrap());
+        for invalid in [&b"{"[..], &b"\xff"[..]] {
+            assert_eq!(
+                decode_payload(invalid).unwrap_err(),
+                "Discord RPC payload is malformed"
+            );
+        }
     }
 
     #[test]
