@@ -11,9 +11,9 @@ use std::fs::{File, OpenOptions};
 use std::os::windows::io::AsRawHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::abi::{LcsdHostApi, LCSD_E_LEGACY, LCSD_E_NOT_FOUND, LCSD_OK};
+use crate::abi::{LcsdHostApi, LcsdState, LCSD_E_LEGACY, LCSD_E_NOT_FOUND, LCSD_OK};
 use crate::json::Json;
-use crate::types::{Config, DiscordState, Speaker};
+use crate::types::{project_state, unix_ms, Config, DiscordState, Speaker};
 #[cfg(test)]
 use std::io::{Read, Write};
 
@@ -1200,15 +1200,19 @@ pub(crate) struct Rpc {
     pending_refresh: bool,
     global_subscribed: bool,
     channel_subscribed: String,
-    pub(crate) state: DiscordState,
-    pub(crate) revision: u64,
+    pub(crate) published: LcsdState,
 }
 
 impl Rpc {
     fn clear_session(&mut self) {
         self.account_changed = true;
-        self.state = disconnected_account_state();
-        self.revision += 1;
+        let mut output = LcsdState::default();
+        project_state(
+            &disconnected_account_state(),
+            self.published.revision + 1,
+            &mut output,
+        );
+        self.published = output;
     }
 
     pub(crate) fn handle_event(&mut self, event: &str, data: &Json) -> Result<bool, String> {
@@ -1337,13 +1341,18 @@ impl Rpc {
     }
 
     pub(crate) fn publish(&mut self) {
-        let mut state = self.tracker.state.clone();
-        state.connected = true;
-        state.authenticated = true;
-        state.error.clear();
-        state.updated = Some(SystemTime::now());
-        self.state = state;
-        self.revision += 1;
+        let mut output = LcsdState::default();
+        project_state(
+            &self.tracker.state,
+            self.published.revision + 1,
+            &mut output,
+        );
+        output.connected = 1;
+        output.authenticated = 1;
+        output.error_len = 0;
+        output.error.fill(0);
+        output.updated_unix_ms = unix_ms(Some(SystemTime::now()));
+        self.published = output;
     }
 }
 
@@ -1359,8 +1368,7 @@ pub(crate) fn new_rpc(file: Pipe, api: LcsdHostApi) -> Rpc {
         pending_refresh: false,
         global_subscribed: false,
         channel_subscribed: String::new(),
-        state: DiscordState::default(),
-        revision: 0,
+        published: LcsdState::default(),
     }
 }
 

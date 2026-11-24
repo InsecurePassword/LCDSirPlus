@@ -34,8 +34,7 @@ pub(crate) struct Engine {
     api: LcsdHostApi,
     settings: Config,
     session: Option<crate::rpc::Rpc>,
-    state: DiscordState,
-    revision: u64,
+    published: LcsdState,
     token_owner: TokenExchangeOwner,
 }
 
@@ -89,16 +88,14 @@ impl Engine {
             api,
             settings,
             session: None,
-            state: DiscordState::default(),
-            revision: 0,
+            published: LcsdState::default(),
             token_owner: TokenExchangeOwner::default(),
         }
     }
 
     fn sync(&mut self, rpc: &mut crate::rpc::Rpc) {
-        if rpc.revision != self.revision {
-            self.state = rpc.state.clone();
-            self.revision = rpc.revision;
+        if rpc.published.revision != self.published.revision {
+            self.published = rpc.published;
         }
     }
 
@@ -106,12 +103,14 @@ impl Engine {
         set_last_error(&error);
         drop(rpc);
         self.session = None;
-        self.state = DiscordState {
+        let failed = DiscordState {
             error,
             updated: Some(std::time::SystemTime::now()),
             ..Default::default()
         };
-        self.revision += 1;
+        let mut output = LcsdState::default();
+        project_state(&failed, self.published.revision + 1, &mut output);
+        self.published = output;
         if canceled(&self.api) {
             LCSD_E_CANCELED
         } else {
@@ -384,9 +383,7 @@ extern "system" fn state(handle: *mut c_void, out: *mut LcsdState, capacity: u32
         set_last_error("discord component: state buffer is undersized");
         return LCSD_E_SIZE;
     }
-    let target = unsafe { &mut *out };
-    *target = LcsdState::default();
-    project_state(&borrowed.engine.state, borrowed.engine.revision, target);
+    unsafe { *out = borrowed.engine.published };
     end(borrowed);
     LCSD_OK
 }
