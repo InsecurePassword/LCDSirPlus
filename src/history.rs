@@ -120,13 +120,21 @@ impl Series {
     /// Latest sample in each elapsed one-second bin, oldest to newest.
     pub fn second_bins(&self, end: SystemTime, count: usize) -> Vec<Option<f64>> {
         let mut bins = vec![None; count];
+        self.second_bins_into(end, &mut bins);
+        bins
+    }
+
+    pub fn second_bins_into(&self, end: SystemTime, bins: &mut [Option<f64>]) {
+        bins.fill(None);
+        let count = bins.len();
         if count == 0 {
-            return bins;
+            return;
         }
         let Some(start) = end.checked_sub(Duration::from_secs(count as u64)) else {
-            return bins;
+            return;
         };
-        for sample in self.snapshot() {
+        let (before_wrap, after_start) = self.values.split_at(self.start);
+        for sample in after_start.iter().chain(before_wrap).take(self.size) {
             if sample.at > end {
                 continue;
             }
@@ -136,7 +144,6 @@ impl Series {
             let bin = (offset.as_secs() as usize).min(count - 1);
             bins[bin] = Some(sample.value);
         }
-        bins
     }
 }
 
@@ -222,6 +229,29 @@ mod tests {
 
     fn epoch_plus(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn caller_bins_clear_dirty_output_and_keep_ring_order() {
+        let at = |ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms);
+        let mut ring = Series::new(3);
+        for (time, value) in [(1_100, 2.0), (1_250, 3.0), (2_125, 4.0), (2_125, 5.0)] {
+            ring.add(at(time), value);
+        }
+        ring.add(at(900), f64::NAN);
+        let mut output = [Some(-1.0); 2];
+        ring.second_bins_into(at(2_125), &mut output);
+        assert_eq!(output, [None, Some(5.0)]);
+        ring.second_bins_into(at(1_500), &mut output);
+        assert_eq!(output, [None, Some(3.0)]);
+        assert_eq!(ring.snapshot().len(), 3);
+
+        ring.add(at(500), 7.0);
+        ring.second_bins_into(at(500), &mut output);
+        assert_eq!(output, [None, Some(7.0)]);
+        ring.second_bins_into(at(50_000), &mut output);
+        assert_eq!(output, [None, None]);
+        ring.second_bins_into(at(500), &mut []);
     }
 
     #[test]

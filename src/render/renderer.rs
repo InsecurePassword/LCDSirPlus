@@ -783,8 +783,11 @@ impl Renderer {
         let Some(samples) = self.hist.get(key) else {
             return;
         };
-        let values =
-            samples.second_bins(self.now.or(m.updated).unwrap_or(SystemTime::UNIX_EPOCH), 30);
+        let mut values = [None; 30];
+        samples.second_bins_into(
+            self.now.or(m.updated).unwrap_or(SystemTime::UNIX_EPOCH),
+            &mut values,
+        );
         let count = 30.min(w as usize);
         let start_x = x + (w - count as i32) / 2;
         for (offset, sample) in values[values.len() - count..].iter().enumerate() {
@@ -831,8 +834,10 @@ impl Renderer {
             .now
             .or(network_in.updated.max(network_out.updated))
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        let in_values = in_samples.second_bins(end, 30);
-        let out_values = out_samples.second_bins(end, 30);
+        let mut in_values = [None; 30];
+        in_samples.second_bins_into(end, &mut in_values);
+        let mut out_values = [None; 30];
+        out_samples.second_bins_into(end, &mut out_values);
         let count = 30.min(w as usize);
         let start_x = x + (w - count as i32) / 2;
         let in_start = in_values.len() - count;
@@ -970,8 +975,11 @@ impl Renderer {
         let Some(samples) = self.hist.get(key) else {
             return;
         };
-        let vals =
-            samples.second_bins(self.now.or(m.updated).unwrap_or(SystemTime::UNIX_EPOCH), 30);
+        let mut vals = [None; 30];
+        samples.second_bins_into(
+            self.now.or(m.updated).unwrap_or(SystemTime::UNIX_EPOCH),
+            &mut vals,
+        );
         let min = vals
             .iter()
             .flatten()
@@ -1018,7 +1026,8 @@ impl Renderer {
         let Some(series) = self.hist.get(key) else {
             return;
         };
-        let bins = series.second_bins(end, 30);
+        let mut bins = [None; 30];
+        series.second_bins_into(end, &mut bins);
         let start_x = x + (w - 30) / 2;
         for (column, value) in bins.into_iter().enumerate() {
             let Some(value) = value else { continue };
@@ -1102,19 +1111,21 @@ impl Renderer {
         ) else {
             return;
         };
-        let reads = reads.second_bins(end, 30);
-        let writes = writes.second_bins(end, 30);
+        let mut reads_bins = [None; 30];
+        reads.second_bins_into(end, &mut reads_bins);
+        let mut writes_bins = [None; 30];
+        writes.second_bins_into(end, &mut writes_bins);
         let start_x = x + (w - 30) / 2;
         let baseline = 37;
         f.h_line(start_x, start_x + 29, baseline, true);
         for column in 0..30 {
-            if let Some(value) = reads[column] {
+            if let Some(value) = reads_bins[column] {
                 let h = graph_height(value, ceiling_mbps * 1_000_000.0, 4);
                 if h > 0 {
                     f.v_line(start_x + column as i32, baseline - h, baseline - 1, true);
                 }
             }
-            if let Some(value) = writes[column] {
+            if let Some(value) = writes_bins[column] {
                 let h = graph_height(value, ceiling_mbps * 1_000_000.0, 5);
                 if h > 0 {
                     f.v_line(start_x + column as i32, baseline + 1, baseline + h, true);
@@ -2006,6 +2017,105 @@ mod tests {
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn graph_history_replay_preserves_pixels_across_wrap_and_rollback() {
+        let stamp = |ms| at(1_800_000_000) + Duration::from_millis(ms);
+        let mut renderer = Renderer::new();
+        let mut snapshot = audit_snapshot();
+        let samples = |key: &str| {
+            let mut s = Series::new(320);
+            for i in 0..400 {
+                if i % 17 != 0 {
+                    let t = stamp(i * 275);
+                    let value = (i % 85 + 5) as f64;
+                    let v = if key.starts_with("net") || key.starts_with("disk") {
+                        value * 92_000.0
+                    } else {
+                        value
+                    };
+                    s.add(t, v);
+                    if i % 31 == 0 {
+                        s.add(t, v * 1.25);
+                    }
+                }
+            }
+            assert_eq!(s.snapshot().len(), 320);
+            s
+        };
+        for key in ["netin", "netout", "diskread", "diskwrite", "frame", "fps"] {
+            let series = samples(key);
+            renderer.hist.insert(key, series);
+        }
+        let run = |renderer: &mut Renderer, snapshot: &mut Snapshot, step: usize| {
+            let mut frame = Frame::new();
+            let end = stamp([80_125, 109_999, 100_251, 115_001, 140_000][step]);
+            renderer.now = Some(end);
+            snapshot.now = Some(end);
+            renderer.network_graph_slot(
+                &mut frame,
+                1,
+                38,
+                "I",
+                snapshot.network_in,
+                "netin",
+                100.0,
+            );
+            renderer.network_dual_graph_slot(
+                &mut frame,
+                41,
+                38,
+                snapshot.network_in,
+                snapshot.network_out,
+                100.0,
+                100.0,
+            );
+            if step.is_multiple_of(2) {
+                renderer.graph_slot(
+                    &mut frame,
+                    81,
+                    38,
+                    "FT",
+                    snapshot.game.frame_time_ms,
+                    "frame",
+                    "MS",
+                );
+            } else {
+                renderer.fixed_graph_slot(
+                    &mut frame,
+                    81,
+                    38,
+                    "FPS",
+                    snapshot.game.fps,
+                    "fps",
+                    180.0,
+                    "",
+                );
+            }
+            renderer.disk_graph_slot(&mut frame, 121, 38, snapshot, 600.0);
+            frame
+        };
+
+        let mut digest = 0xcbf29ce484222325u64;
+        for step in 0..5 {
+            let frame = run(&mut renderer, &mut snapshot, step);
+            assert!(frame.pixels.iter().any(|&x| x != 0));
+            for pixel in frame.pixels {
+                digest = (digest ^ u64::from(pixel)).wrapping_mul(0x100000001b3);
+            }
+        }
+        let later = stamp(25_250);
+        renderer.hist.get_mut("diskread").unwrap().add(later, 500.0);
+        assert_eq!(renderer.hist["diskread"].snapshot().len(), 1);
+        let frame = run(&mut renderer, &mut snapshot, 2);
+        for pixel in frame.pixels {
+            digest = (digest ^ u64::from(pixel)).wrapping_mul(0x100000001b3);
+        }
+        assert_eq!(
+            digest, 0xc0d9_0823_9410_3fb4,
+            "baseline graph replay pixels"
+        );
     }
 
     fn sample_snapshot() -> Snapshot {
@@ -3866,6 +3976,27 @@ mod tests {
             *pixel == 0
                 || ((1..39).contains(&(index % WIDTH)) && (27..43).contains(&(index / WIDTH)))
         }));
+
+        // Compare the same graph label and input with and without two populated series.
+        let mut label_only = Renderer::new();
+        let mut label_frame = Frame::new();
+        let mut reused_graph = Frame::new();
+        label_only.disk_graph_slot(&mut label_frame, 1, 38, &latest, 1000.0);
+        let graph_allocations = {
+            let _watch = crate::backends::alloc_count::window();
+            renderer.disk_graph_slot(&mut reused_graph, 1, 38, &latest, 1000.0);
+            crate::backends::alloc_count::snapshot().4
+        };
+        let label_allocations = {
+            let _watch = crate::backends::alloc_count::window();
+            label_only.disk_graph_slot(&mut label_frame, 1, 38, &latest, 1000.0);
+            crate::backends::alloc_count::snapshot().4
+        };
+        assert_eq!(reused_graph.pixels, graph.pixels);
+        assert_eq!(
+            graph_allocations, label_allocations,
+            "the dual history graph must not allocate beyond its label"
+        );
 
         let unavailable = Snapshot::default();
         let mut stale = snapshot(1_000.0, 2_000.0, at(30));
