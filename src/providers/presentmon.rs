@@ -2,6 +2,7 @@
 
 #![cfg(windows)]
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
@@ -1098,9 +1099,9 @@ impl Parser {
                 .enumerate()
                 .map(|(i, h)| (h.trim().to_ascii_lowercase(), i))
                 .collect();
-            if !["FrameTime", "MsBetweenPresents", "MsBetweenDisplayChange"]
+            if !["frametime", "msbetweenpresents", "msbetweendisplaychange"]
                 .iter()
-                .any(|name| header.contains_key(&name.to_ascii_lowercase()))
+                .any(|name| header.contains_key(*name))
             {
                 return Err(
                     "CSV header has no frame-time column (expected FrameTime for --v2_metrics)"
@@ -1110,22 +1111,22 @@ impl Parser {
             self.header = Some(header);
             return Ok(None);
         }
+        // WO-OPT08 (A2): every lookup name below is written already-lowercase, so the probe
+        // borrows a &'static str; the column indices were resolved once when the header was
+        // accepted. The old `name.to_ascii_lowercase()` owned a fresh String per candidate name
+        // for EVERY row. Alias order and the empty-field fallback are unchanged.
         let get = |names: &[&str]| -> &str {
             let header = self.header.as_ref().unwrap();
             names
                 .iter()
-                .find_map(|name| {
-                    header
-                        .get(&name.to_ascii_lowercase())
-                        .and_then(|i| fields.get(*i))
-                })
+                .find_map(|name| header.get(*name).and_then(|i| fields.get(*i)))
                 .map(|v| v.trim())
                 .unwrap_or("")
         };
-        let pid = get(&["ProcessID"])
+        let pid = get(&["processid"])
             .parse::<u32>()
             .map_err(|e| format!("PresentMon ProcessID: {e}"))?;
-        let text = get(&["FrameTime", "MsBetweenPresents", "MsBetweenDisplayChange"]);
+        let text = get(&["frametime", "msbetweenpresents", "msbetweendisplaychange"]);
         if text.is_empty() || text.eq_ignore_ascii_case("NA") {
             return Ok(None);
         }
@@ -1139,16 +1140,17 @@ impl Parser {
             return Ok(None);
         }
         let cpu_start_ms = optional_metric(
-            get(&["CPUStartTime", "CPUStartTimeInMs"]),
+            get(&["cpustarttime", "cpustarttimeinms"]),
             "CPUStartTime",
             u64::MAX as f64,
         )?;
-        let cpu_busy_ms = optional_metric(get(&["CPUBusy", "MsCPUBusy"]), "CPUBusy", 10_000.0)?;
-        let gpu_busy_ms = optional_metric(get(&["GPUBusy", "MsGPUBusy"]), "GPUBusy", 10_000.0)?;
+        let cpu_busy_ms = optional_metric(get(&["cpubusy", "mscpubusy"]), "CPUBusy", 10_000.0)?;
+        let gpu_busy_ms = optional_metric(get(&["gpubusy", "msgpubusy"]), "GPUBusy", 10_000.0)?;
         Ok(Some(Frame {
             at,
             observed_at: Instant::now(),
-            application: get(&["Application"]).to_string(),
+            // The frame outlives the input line, so this field keeps its owned String.
+            application: get(&["application"]).to_string(),
             pid,
             frame_ms,
             cpu_start_ms,
@@ -1175,26 +1177,70 @@ fn optional_metric(text: &str, name: &str, maximum: f64) -> Result<Option<f64>, 
     Ok((0.0..=maximum).contains(&value).then_some(value))
 }
 
-fn csv_fields(line: &str) -> Result<Vec<String>, String> {
-    let mut fields = Vec::new();
-    let mut field = String::new();
-    let mut chars = line.trim().chars().peekable();
+/// WO-OPT08 (A2): the row split borrows every field that contains no quote character, so a
+/// 23-column PresentMon row allocates only the `Vec` itself. A field with a quote is the ONE
+/// case that must be built, because unescaping changes its bytes (`""` becomes `"`), so the
+/// value cannot alias the input; it is owned for that field only. The quote toggle, the doubled
+/// quote escape, the `unterminated quoted ...` error, the line trim, the per-field content and
+/// the trailing field push are the shipped ones, in the shipped order.
+fn csv_fields(line: &str) -> Result<Vec<Cow<'_, str>>, String> {
+    let trimmed = line.trim();
+    let mut fields: Vec<Cow<'_, str>> = Vec::new();
+    let mut start = 0usize;
+    let mut copied = 0usize;
+    let mut owned: Option<String> = None;
     let mut quoted = false;
-    while let Some(ch) = chars.next() {
+    let mut chars = trimmed.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
         match ch {
-            '"' if quoted && chars.peek() == Some(&'"') => {
-                field.push('"');
+            '"' if quoted && chars.peek().is_some_and(|&(_, next)| next == '"') => {
                 chars.next();
+                let text = owned.get_or_insert_with(String::new);
+                if copied < index {
+                    text.push_str(&trimmed[copied..index]);
+                }
+                text.push('"');
+                copied = index + 2;
             }
-            '"' => quoted = !quoted,
-            ',' if !quoted => fields.push(std::mem::take(&mut field)),
-            _ => field.push(ch),
+            '"' => {
+                quoted = !quoted;
+                // A quote changes this field's bytes, so from here it is the owned case.
+                let text = owned.get_or_insert_with(String::new);
+                if copied < index {
+                    text.push_str(&trimmed[copied..index]);
+                }
+                copied = index + 1;
+            }
+            ',' if !quoted => {
+                let value = match owned.take() {
+                    Some(mut text) => {
+                        if copied < index {
+                            text.push_str(&trimmed[copied..index]);
+                        }
+                        Cow::Owned(text)
+                    }
+                    None => Cow::Borrowed(&trimmed[start..index]),
+                };
+                fields.push(value);
+                start = index + 1;
+                copied = start;
+            }
+            _ => {}
         }
     }
     if quoted {
         return Err("unterminated quoted PresentMon CSV field".into());
     }
-    fields.push(field);
+    let end = trimmed.len();
+    fields.push(match owned.take() {
+        Some(mut text) => {
+            if copied < end {
+                text.push_str(&trimmed[copied..end]);
+            }
+            Cow::Owned(text)
+        }
+        None => Cow::Borrowed(&trimmed[start..]),
+    });
     Ok(fields)
 }
 
@@ -3877,6 +3923,402 @@ mod tests {
         assert_eq!(
             (frame.cpu_start_ms, frame.cpu_busy_ms, frame.gpu_busy_ms),
             (Some(2345.0), Some(7.0), Some(3.0))
+        );
+    }
+
+    /// WO-OPT08 (A1): the 23-column header and the rows below are VERBATIM from the pinned
+    /// capture fixture
+    /// `artifacts/phase3/operational-soak/opt/fixtures-pinned/presentmon-pinned-live2.csv`
+    /// (80,341 B, SHA256-16 `FC228FCDD5D2553E`), whose SEGMENT 1/2 rows are byte-equal to the
+    /// live capture `fixtures-live/presentmon-live2.csv` (2,376,062 B, SHA256-16
+    /// `2F9F04C03AFBEE15`, 7,237 data rows, every row 23 fields, no quote character in the
+    /// file). The emitted column count is therefore the MEASURED 23, never an assumed one.
+    /// shortcut: the rows are embedded, the untracked artifact is not opened by this test, so a
+    /// fixture edit cannot fail it; the pinned SHA-16 above is the anchor.
+    const PINNED_HEADER: &str = "Application,ProcessID,SwapChainAddress,PresentRuntime,SyncInterval,PresentFlags,AllowsTearing,PresentMode,CPUStartTime,FrameTime,CPUBusy,CPUWait,GPULatency,GPUTime,GPUBusy,GPUWait,DisplayLatency,DisplayedTime,AnimationError,AnimationTime,MsFlipDelay,AllInputToPhotonLatency,ClickToPhotonLatency";
+    const PINNED_ROW_A: &str = "dwm.exe,2888,0x100000000,Other,-1,0,0,Hardware: Legacy Flip,762.9536,903.0195,903.0195,0.0000,0.0219,903.4377,1.5059,901.9318,905.3810,32.0586,NA,762.9536,NA,NA,NA";
+    const PINNED_ROW_B: &str = "dwm.exe,2888,0x100000000,Other,-1,0,0,Hardware: Legacy Flip,1665.9731,32.0668,32.0668,0.0000,0.4401,31.6522,0.9821,30.6701,34.4201,967.9036,870.9609,1665.9731,NA,NA,NA";
+    const PINNED_ROW_C: &str = "dwm.exe,2888,0x100000000,Other,-1,0,0,Hardware: Legacy Flip,1698.0399,968.9269,968.9269,0.0000,816.0883,152.8613,1.1246,151.7367,970.2569,50.0256,-935.8368,1698.0399,NA,NA,NA";
+    const PINNED_ROW_D: &str = "chrome.exe,27124,0x21DA824ED20,DXGI,0,0,0,Composed: Flip,2483.6828,26.5273,26.3925,0.1348,26.4675,1.2838,1.2838,0.0000,34.8653,206.9345,NA,2483.6828,NA,NA,NA";
+    const PINNED_ROW_QUOTED: &str = r#""Game, Inc. [""beta""]",2888,0x100000000,Other,-1,0,0,Hardware: Legacy Flip,762.9536,903.0195,903.0195,0.0000,0.0219,903.4377,1.5059,901.9318,905.3810,32.0586,NA,762.9536,NA,NA,NA"#;
+    const PINNED_ROW_NON_NUMERIC: &str = "dwm.exe,2888,0x100000000,Other,-1,0,0,Hardware: Legacy Flip,762.9536,not-a-number,903.0195,0.0000,0.0219,903.4377,1.5059,901.9318,905.3810,32.0586,NA,762.9536,NA,NA,NA";
+
+    /// WO-OPT08 (A1/A3): the per-row CSV path counted on the lane's `alloc_count` allocator.
+    /// Asserts are the counter's non-vacuity (a known 1,024 B block), the linearity of the
+    /// per-row cost (1/2/4 of the SAME row) and the row bound this unit ships against; the
+    /// numbers are PRINTS, because std's layout and growth law is not pinned (the F-AUD-OPT04-1
+    /// rule). No CPU is measured and no CPU claim is made - these are counts.
+    #[test]
+    fn row_split_allocation_cost_is_measured_on_pinned_fixture_rows() {
+        use crate::backends::alloc_count;
+
+        let measure = |run: &mut dyn FnMut()| -> alloc_count::Counts {
+            let _window = alloc_count::window();
+            alloc_count::watch_thread();
+            alloc_count::reset();
+            let before = alloc_count::snapshot();
+            run();
+            alloc_count::subtract(alloc_count::snapshot(), before)
+        };
+
+        // Non-vacuity of the counter: one known 1,024 B block is one over-256-byte allocation.
+        let control = measure(&mut || {
+            std::hint::black_box(vec![0u8; 1_024]);
+        });
+        assert_eq!(
+            control.4, 1,
+            "the counter sees the known 1,024 B block: {control:?}"
+        );
+        assert_eq!(
+            control.3, 1,
+            "the known block is the over-256-byte class: {control:?}"
+        );
+
+        // The header is accepted OUTSIDE every window, so the window measures the ROW path.
+        let mut parser = Parser::default();
+        parser
+            .parse_line(PINNED_HEADER, SystemTime::UNIX_EPOCH)
+            .unwrap();
+
+        let row1 = measure(&mut || {
+            std::hint::black_box(
+                parser
+                    .parse_line(PINNED_ROW_A, SystemTime::UNIX_EPOCH)
+                    .unwrap(),
+            );
+        });
+        let row2 = measure(&mut || {
+            for _ in 0..2 {
+                std::hint::black_box(
+                    parser
+                        .parse_line(PINNED_ROW_A, SystemTime::UNIX_EPOCH)
+                        .unwrap(),
+                );
+            }
+        });
+        let row4 = measure(&mut || {
+            for _ in 0..4 {
+                std::hint::black_box(
+                    parser
+                        .parse_line(PINNED_ROW_A, SystemTime::UNIX_EPOCH)
+                        .unwrap(),
+                );
+            }
+        });
+        let a = measure(&mut || {
+            std::hint::black_box(
+                parser
+                    .parse_line(PINNED_ROW_A, SystemTime::UNIX_EPOCH)
+                    .unwrap(),
+            );
+        });
+        let b = measure(&mut || {
+            std::hint::black_box(
+                parser
+                    .parse_line(PINNED_ROW_B, SystemTime::UNIX_EPOCH)
+                    .unwrap(),
+            );
+        });
+        let c = measure(&mut || {
+            std::hint::black_box(
+                parser
+                    .parse_line(PINNED_ROW_C, SystemTime::UNIX_EPOCH)
+                    .unwrap(),
+            );
+        });
+        let d = measure(&mut || {
+            std::hint::black_box(
+                parser
+                    .parse_line(PINNED_ROW_D, SystemTime::UNIX_EPOCH)
+                    .unwrap(),
+            );
+        });
+        let quoted = measure(&mut || {
+            std::hint::black_box(
+                parser
+                    .parse_line(PINNED_ROW_QUOTED, SystemTime::UNIX_EPOCH)
+                    .unwrap(),
+            );
+        });
+        let batch = measure(&mut || {
+            for _ in 0..20 {
+                for row in [PINNED_ROW_A, PINNED_ROW_B, PINNED_ROW_C, PINNED_ROW_D] {
+                    std::hint::black_box(parser.parse_line(row, SystemTime::UNIX_EPOCH).unwrap());
+                }
+            }
+        });
+        println!(
+            "WO-OPT08 A1 row-split (pixel, key, metadata<=256, over-256, total): control1024={control:?} row1={row1:?} row2={row2:?} row4={row4:?} rowA={a:?} rowB={b:?} rowC={c:?} rowD={d:?} quoted={quoted:?} batch80={batch:?} foreign={}",
+            alloc_count::foreign()
+        );
+
+        // Scaling: the per-row cost is linear, so 2 rows is exactly 2x and 4 rows exactly 4x.
+        assert_eq!(
+            row1.4,
+            row2.4 - row1.4,
+            "the 2nd row costs the same as the 1st"
+        );
+        assert_eq!(
+            row2.4,
+            row4.4 - row2.4,
+            "two more rows cost exactly 2x one row"
+        );
+        assert!(row1.4 > 0, "the row path allocates at all (non-vacuity)");
+        // The batch is the sum of its rows: the drain's per-row cost is stateless.
+        assert_eq!(
+            batch.4,
+            20 * (a.4 + b.4 + c.4 + d.4),
+            "the 80-row batch is exactly 20 x (A+B+C+D) allocations"
+        );
+        // The bound this unit ships against: 23 columns split without owning every field.
+        assert!(
+            a.4 <= 12,
+            "one 23-column row costs at most 12 allocations, measured: {a:?}"
+        );
+        assert!(
+            quoted.4 <= a.4 + 8,
+            "the escaped/quoted row costs at most 8 more than a plain row, measured: {quoted:?} vs {a:?}"
+        );
+    }
+
+    /// WO-OPT08 (A3): the shipped CSV outcomes over the pinned fixture matrix - real rows,
+    /// quoted commas with escaped quotes, aliases in a non-production header order, optional and
+    /// missing columns, whitespace, malformed rows (unterminated quote, too few columns,
+    /// non-numeric metric, repeated header, trailing separator) and the no-frame-time-column
+    /// error. Every row here is a PINNED SHIPPED OUTCOME; the test drives production
+    /// `Parser::parse_line` only.
+    #[test]
+    fn parser_replays_the_pinned_fixture_matrix_with_identical_outcomes() {
+        let at = SystemTime::UNIX_EPOCH;
+        let mut parser = Parser::default();
+        assert!(parser.parse_line(PINNED_HEADER, at).unwrap().is_none());
+
+        let a = parser.parse_line(PINNED_ROW_A, at).unwrap().unwrap();
+        assert_eq!(a.application, "dwm.exe");
+        assert_eq!(a.pid, 2888);
+        assert_eq!(a.frame_ms, 903.0195);
+        assert_eq!(a.cpu_start_ms, Some(762.9536));
+        assert_eq!(a.cpu_busy_ms, Some(903.0195));
+        assert_eq!(a.gpu_busy_ms, Some(1.5059));
+        assert_eq!(a.at, at);
+        let b = parser.parse_line(PINNED_ROW_B, at).unwrap().unwrap();
+        assert_eq!(
+            (b.frame_ms, b.cpu_start_ms, b.cpu_busy_ms, b.gpu_busy_ms),
+            (32.0668, Some(1665.9731), Some(32.0668), Some(0.9821))
+        );
+        let c = parser.parse_line(PINNED_ROW_C, at).unwrap().unwrap();
+        assert_eq!(
+            (c.frame_ms, c.cpu_start_ms, c.cpu_busy_ms, c.gpu_busy_ms),
+            (968.9269, Some(1698.0399), Some(968.9269), Some(1.1246))
+        );
+        let d = parser.parse_line(PINNED_ROW_D, at).unwrap().unwrap();
+        assert_eq!(d.application, "chrome.exe");
+        assert_eq!(
+            (d.pid, d.frame_ms, d.cpu_busy_ms, d.gpu_busy_ms),
+            (27124, 26.5273, Some(26.3925), Some(1.2838))
+        );
+
+        // SEGMENT 5: an embedded comma AND escaped quotes inside the Application field.
+        let quoted = parser.parse_line(PINNED_ROW_QUOTED, at).unwrap().unwrap();
+        assert_eq!(quoted.application, "Game, Inc. [\"beta\"]");
+        assert_eq!(quoted.pid, 2888);
+        assert_eq!(quoted.frame_ms, 903.0195);
+        assert_eq!(quoted.gpu_busy_ms, Some(1.5059));
+
+        // SEGMENT 6: the malformed tail keeps the shipped outcomes.
+        assert_eq!(
+            parser
+                .parse_line(r#""unterminated, 1, 2, 3"#, at)
+                .unwrap_err(),
+            "unterminated quoted PresentMon CSV field"
+        );
+        assert!(parser
+            .parse_line("a,b", at)
+            .unwrap_err()
+            .contains("PresentMon ProcessID"));
+        assert!(parser
+            .parse_line(PINNED_ROW_NON_NUMERIC, at)
+            .unwrap_err()
+            .contains("PresentMon frame metric"));
+        // A repeated header row is a data row once the header is accepted, as shipped.
+        assert!(parser
+            .parse_line(PINNED_HEADER, at)
+            .unwrap_err()
+            .contains("PresentMon ProcessID"));
+        // A trailing separator adds one empty field and changes nothing else.
+        let trailing = parser
+            .parse_line(&format!("{PINNED_ROW_A},"), at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                trailing.application.as_str(),
+                trailing.pid,
+                trailing.frame_ms,
+                trailing.gpu_busy_ms
+            ),
+            ("dwm.exe", 2888, 903.0195, Some(1.5059))
+        );
+
+        // Aliases: the header order is NOT the production order, and names arrive in any case.
+        let mut alias = Parser::default();
+        alias
+            .parse_line(
+                "GPUBusy,ProcessID,FrameTime,Application,CPUBusy,CPUStartTime",
+                at,
+            )
+            .unwrap();
+        let frame = alias
+            .parse_line("1.25,77,8.5,game.exe,9.5,100.5", at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                frame.application.as_str(),
+                frame.pid,
+                frame.frame_ms,
+                frame.cpu_start_ms,
+                frame.cpu_busy_ms,
+                frame.gpu_busy_ms
+            ),
+            ("game.exe", 77, 8.5, Some(100.5), Some(9.5), Some(1.25))
+        );
+        // Mixed case and header names carrying whitespace: the shipped gate at :1093 needs a
+        // field equal to "ProcessID" ignoring CASE only (an untrimmed " processid " header is
+        // NOT accepted), while the map keys and the row values ARE trimmed.
+        let mut mixed_case = Parser::default();
+        mixed_case
+            .parse_line(
+                " APPLICATION ,PROCESSID, CpuStartTimeInMs ,MsCPUBusy,MsGPUBusy, FrameTime",
+                at,
+            )
+            .unwrap();
+        let frame = mixed_case
+            .parse_line(" game.exe , 78 , 1234.5 , 7 , 3 , 8.33 ", at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                frame.application.as_str(),
+                frame.pid,
+                frame.frame_ms,
+                frame.cpu_start_ms,
+                frame.cpu_busy_ms,
+                frame.gpu_busy_ms
+            ),
+            ("game.exe", 78, 8.33, Some(1234.5), Some(7.0), Some(3.0))
+        );
+        // MsBetweenPresents wins over MsBetweenDisplayChange when FrameTime is absent.
+        let mut ladder = Parser::default();
+        ladder
+            .parse_line(
+                "ProcessID,MsBetweenDisplayChange,MsBetweenPresents,Application",
+                at,
+            )
+            .unwrap();
+        assert_eq!(
+            ladder
+                .parse_line("7,20.0,11.5,other.exe", at)
+                .unwrap()
+                .unwrap()
+                .frame_ms,
+            11.5
+        );
+
+        // Optional/missing columns: the shipped empty-string/None outcomes.
+        let mut sparse = Parser::default();
+        sparse.parse_line("ProcessID,FrameTime", at).unwrap();
+        let frame = sparse.parse_line("42,16.5", at).unwrap().unwrap();
+        assert_eq!(frame.application, "");
+        assert!(
+            frame.cpu_start_ms.is_none()
+                && frame.cpu_busy_ms.is_none()
+                && frame.gpu_busy_ms.is_none()
+        );
+        // The shipped header gate: an UNTRIMMED " processid " name is not accepted, so the
+        // stream stays headerless and every row produces no frame.
+        let mut gate = Parser::default();
+        assert!(gate
+            .parse_line(" APPLICATION , processid , FrameTime", at)
+            .unwrap()
+            .is_none());
+        assert!(gate.parse_line("game.exe,42,8.5", at).unwrap().is_none());
+        // A header with no frame-time column keeps the shipped error row.
+        let mut no_metric = Parser::default();
+        assert!(no_metric
+            .parse_line("Application,ProcessID,DisplayedTime", at)
+            .unwrap_err()
+            .contains("expected FrameTime for --v2_metrics"));
+        // A line over the shipped 64 KiB bound is the shipped error, before any split.
+        let mut oversized = Parser::default();
+        assert!(oversized
+            .parse_line(&"x".repeat(MAX_LINE_BYTES + 1), at)
+            .unwrap_err()
+            .contains("exceeds 64 KiB"));
+    }
+
+    /// WO-OPT08 (A3): the pinned rows through the shipped drain - the statistics see the
+    /// DRAIN's timestamp, not the parser's clock read (the clock-overwrite ruling), and the
+    /// sample-loss flag and the per-tick bound keep firing.
+    #[test]
+    fn pinned_fixture_rows_keep_the_drain_timestamp_and_sample_loss() {
+        let (line_tx, line_rx) = mpsc::sync_channel(LINE_QUEUE_CAPACITY);
+        line_tx.send(PINNED_HEADER.into()).unwrap();
+        for row in [PINNED_ROW_A, PINNED_ROW_B, PINNED_ROW_NON_NUMERIC] {
+            line_tx.send(row.into()).unwrap();
+        }
+        let mut capture = Capture::default();
+        capture.lines = Some(line_rx);
+        capture.line_overflow = Some(Arc::new(AtomicBool::new(false)));
+        capture.target = ProcessInfo {
+            pid: 2888,
+            creation_time: 1,
+            name: "dwm.exe".into(),
+            image_path: String::new(),
+        };
+        capture.stats = Some(Stats::new(30.0, Duration::from_secs(60)));
+        let (updates, _rx) = mpsc::channel();
+        let cfg = Config {
+            presentmon_target_mode: "foreground".into(),
+            ..Config::default()
+        };
+        // A `now` 5 s in the future: only the drain's stamp can land in the statistics.
+        let now = Instant::now() + Duration::from_secs(5);
+        assert!(capture
+            .drain(&cfg, 1, &updates, now)
+            .unwrap_err()
+            .contains("PresentMon frame metric"));
+        let frames = &capture.stats.as_ref().unwrap().frames;
+        assert_eq!(
+            frames.len(),
+            2,
+            "the two valid rows are kept, the bad one is not"
+        );
+        assert_eq!(
+            frames.back(),
+            Some(&(now, 32.0668)),
+            "the drain's stamp wins"
+        );
+        assert_eq!(
+            frames.front(),
+            Some(&(now, 903.0195)),
+            "the drain's stamp wins"
+        );
+        assert_eq!(capture.last_frame, Some(now));
+
+        // Sample-loss detection: a set overflow flag is reported over drained rows.
+        let (line_tx, line_rx) = mpsc::sync_channel(LINE_QUEUE_CAPACITY);
+        line_tx.send(PINNED_HEADER.into()).unwrap();
+        line_tx.send(PINNED_ROW_A.into()).unwrap();
+        capture.lines = Some(line_rx);
+        capture.parser = Parser::default();
+        capture.stats = Some(Stats::new(30.0, Duration::from_secs(60)));
+        capture.line_overflow = Some(Arc::new(AtomicBool::new(true)));
+        assert_eq!(
+            capture
+                .drain(&cfg, 1, &updates, Instant::now())
+                .unwrap_err(),
+            "PresentMon output overflowed; statistics reset"
         );
     }
 
