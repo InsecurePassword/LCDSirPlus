@@ -1117,8 +1117,87 @@ fn start_session(
 
 // ---- WO-TEL-D3-C S4: the Runtime, the gated worker, the one-shot authorize ------------------
 
+type PendingSnapshot = Arc<Mutex<Option<DiscordState>>>;
+
+enum Publication {
+    Status(DiscordState),
+    Snapshot(PendingSnapshot),
+}
+
+impl Publication {
+    fn into_state(self) -> DiscordState {
+        match self {
+            Self::Status(state) => state,
+            Self::Snapshot(slot) => slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .expect("one pending Discord snapshot per marker"),
+        }
+    }
+}
+
+pub struct Updates(mpsc::Receiver<Publication>);
+
+impl Updates {
+    pub fn try_recv(&self) -> Result<DiscordState, mpsc::TryRecvError> {
+        self.0.try_recv().map(Publication::into_state)
+    }
+
+    #[cfg(test)]
+    fn recv_timeout(&self, timeout: Duration) -> Result<DiscordState, mpsc::RecvTimeoutError> {
+        self.0.recv_timeout(timeout).map(Publication::into_state)
+    }
+}
+
+#[derive(Clone)]
+struct StatusSender(mpsc::Sender<Publication>);
+
+impl StatusSender {
+    fn send(&self, state: DiscordState) -> bool {
+        self.0.send(Publication::Status(state)).is_ok()
+    }
+}
+
+struct Publisher {
+    status: StatusSender,
+    // Worker-local; each session start and status publication seals the previous run.
+    pending: Option<PendingSnapshot>,
+}
+
+impl Publisher {
+    fn send(&mut self, state: DiscordState) -> bool {
+        self.pending = None;
+        self.status.send(state)
+    }
+
+    fn snapshot(&mut self, state: DiscordState) -> bool {
+        let slot = self
+            .pending
+            .get_or_insert_with(|| Arc::new(Mutex::new(None)));
+        // A popped marker owns the slot until it takes the payload.
+        let replaced = slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(state);
+        if replaced.is_some() {
+            return true;
+        }
+        if self
+            .status
+            .0
+            .send(Publication::Snapshot(Arc::clone(slot)))
+            .is_err()
+        {
+            self.pending = None;
+            return false;
+        }
+        true
+    }
+}
+
 pub struct Runtime {
-    pub updates: mpsc::Receiver<DiscordState>,
+    pub updates: Updates,
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
@@ -1128,7 +1207,7 @@ pub struct Runtime {
     running: Arc<AtomicBool>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     loader: TableLoader,
-    tx: mpsc::Sender<DiscordState>,
+    tx: StatusSender,
 }
 
 /// Test-visible snapshot of the lifecycle census (the same counters the worker increments).
@@ -1257,7 +1336,7 @@ pub fn spawn(config: &Config) -> Runtime {
 pub fn spawn_with(config: &Config, loader: TableLoader) -> Runtime {
     let (tx, rx) = mpsc::channel();
     let runtime = Runtime {
-        updates: rx,
+        updates: Updates(rx),
         config: Arc::new(RwLock::new(config.clone())),
         generation: Arc::new(AtomicU64::new(1)),
         shutdown: Arc::new(AtomicBool::new(false)),
@@ -1267,7 +1346,7 @@ pub fn spawn_with(config: &Config, loader: TableLoader) -> Runtime {
         running: Arc::new(AtomicBool::new(false)),
         thread: Mutex::new(None),
         loader,
-        tx,
+        tx: StatusSender(tx),
     };
     if provider_enabled(config) {
         // WO-U46I (#18): a spawn failure is an outcome, not a startup abort. The `Runtime` is
@@ -1348,6 +1427,10 @@ fn spawn_worker(runtime: &Runtime, config: &Config) -> Result<std::thread::JoinH
     let started = match take_spawn_failure_token() {
         Some(error) => Err(error),
         None => builder.spawn(move || {
+            let mut worker_tx = Publisher {
+                status: worker_tx,
+                pending: None,
+            };
             let mut state = DiscordState::default();
             let mut request = (0u64, seed);
             let mut backoff = Duration::from_secs(1);
@@ -1428,6 +1511,7 @@ fn spawn_worker(runtime: &Runtime, config: &Config) -> Result<std::thread::JoinH
                         .unwrap_or_else(|e| e.into_inner()) = (*config).clone();
                     match start_session(table, &config, &api, &worker_census) {
                         Ok(started_handle) => {
+                            worker_tx.pending = None;
                             handle = started_handle;
                             revision = u64::MAX;
                             first_step = true;
@@ -1477,7 +1561,14 @@ fn spawn_worker(runtime: &Runtime, config: &Config) -> Result<std::thread::JoinH
                     connected_since.get_or_insert(now);
                 }
                 backoff = session_backoff(backoff, connected_since, now);
-                publish_component_state(table, handle, &mut state, &mut revision, &worker_tx);
+                publish_component_state(
+                    table,
+                    handle,
+                    &mut state,
+                    &mut revision,
+                    &mut worker_tx,
+                    code,
+                );
                 match code {
                     LCSD_OK | LCSD_IDLE => {
                         continue;
@@ -1563,7 +1654,8 @@ fn publish_component_state(
     handle: *mut c_void,
     state: &mut DiscordState,
     revision: &mut u64,
-    tx: &mpsc::Sender<DiscordState>,
+    tx: &mut Publisher,
+    poll_result: i32,
 ) {
     if handle.is_null() {
         return;
@@ -1579,7 +1671,15 @@ fn publish_component_state(
     }
     *revision = pod.revision;
     *state = state_from_pod(&pod);
-    let _ = tx.send(state.clone());
+    if matches!(poll_result, LCSD_OK | LCSD_IDLE)
+        && state.connected
+        && state.authenticated
+        && state.error.is_empty()
+    {
+        let _ = tx.snapshot(state.clone());
+    } else {
+        let _ = tx.send(state.clone());
+    }
 }
 
 /// Ends one session (stop -> join -> release of the handle) and keeps the MODULE loaded: the
@@ -5082,4 +5182,467 @@ mod tests {
     // census measured RED 2/10 idle and 7/10 under contention pre-fix. Each session now owns its
     // client id and revision behind the handle the host passes to every component call, so those
     // assertions are self-contained. No test body, assertion or bound changed.
+
+    mod publication_probe {
+        use super::*;
+
+        #[test]
+        fn discord_marker_can_be_replaced_before_take_and_rearmed_after_take() {
+            let (tx, rx) = mpsc::channel();
+            let updates = Updates(rx);
+            let mut publisher = Publisher {
+                status: StatusSender(tx),
+                pending: None,
+            };
+            let snapshot = |name: &str| DiscordState {
+                channel_name: name.into(),
+                ..DiscordState::default()
+            };
+
+            assert!(publisher.snapshot(snapshot("first")));
+            let marker = updates.0.try_recv().unwrap();
+            assert!(publisher.snapshot(snapshot("replacement")));
+            assert!(matches!(updates.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert_eq!(marker.into_state().channel_name, "replacement");
+
+            assert!(publisher.snapshot(snapshot("before status")));
+            assert!(publisher.send(unavailable(&DiscordState::default(), "disabled")));
+            assert!(publisher.snapshot(snapshot("after status")));
+            assert_eq!(updates.try_recv().unwrap().channel_name, "before status");
+            assert_eq!(updates.try_recv().unwrap().error, "disabled");
+            assert_eq!(updates.try_recv().unwrap().channel_name, "after status");
+            assert!(matches!(
+                updates.recv_timeout(Duration::ZERO),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            drop(publisher);
+            assert!(matches!(
+                updates.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+        }
+
+        const WAIT: Duration = Duration::from_secs(5);
+        const BURST: u64 = 128;
+        const CANCELED: &str = "synthetic A poll canceled";
+
+        #[derive(Debug)]
+        enum Step {
+            Through(u64),
+            Cancel,
+            AwaitDisable,
+        }
+
+        struct Gate {
+            id: u8,
+            revision: u64,
+            resume: mpsc::Sender<Step>,
+        }
+
+        // The loader is a fn pointer. This slot only routes gates for this one test; no
+        // session settings, revisions or commands are stored in global state.
+        static GATES: Mutex<Option<mpsc::Sender<Gate>>> = Mutex::new(None);
+
+        struct Driver(mpsc::Receiver<Gate>);
+
+        impl Driver {
+            fn new() -> Self {
+                let (tx, rx) = mpsc::channel();
+                assert!(GATES.lock().unwrap().replace(tx).is_none());
+                Self(rx)
+            }
+
+            // Entering another poll proves the previous poll's state send has returned.
+            fn gate(&self, id: u8, revision: u64) -> mpsc::Sender<Step> {
+                let gate = self.0.recv_timeout(WAIT).unwrap_or_else(|error| {
+                    panic!(
+                        "waiting for poll gate {}:{revision}: {error}",
+                        char::from(id)
+                    )
+                });
+                assert_eq!((gate.id, gate.revision), (id, revision));
+                gate.resume
+            }
+        }
+
+        impl Drop for Driver {
+            fn drop(&mut self) {
+                *GATES.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+
+        struct Session {
+            id: u8,
+            api: LcsdHostApi,
+            gates: mpsc::Sender<Gate>,
+            pod: LcsdState,
+            through: u64,
+            disable_deadline: Option<Instant>,
+        }
+
+        extern "system" fn start(
+            settings: *const LcsdSettings,
+            settings_len: u32,
+            api: *const LcsdHostApi,
+            api_len: u32,
+            out: *mut *mut c_void,
+        ) -> i32 {
+            if settings.is_null()
+                || api.is_null()
+                || out.is_null()
+                || settings_len as usize != std::mem::size_of::<LcsdSettings>()
+                || api_len as usize != std::mem::size_of::<LcsdHostApi>()
+            {
+                return LCSD_E_SIZE;
+            }
+            let settings = unsafe { &*settings };
+            let id = settings.client_id[0];
+            if settings.client_id_len != 1 || !matches!(id, b'R' | b'A' | b'B' | b'C') {
+                return LCSD_E_ARG;
+            }
+            let Ok(slot) = GATES.lock() else {
+                return LCSD_E_STATE;
+            };
+            let Some(gates) = slot.clone() else {
+                return LCSD_E_STATE;
+            };
+            let session = Session {
+                id,
+                api: unsafe { *api },
+                gates,
+                pod: LcsdState::default(),
+                through: 0,
+                disable_deadline: None,
+            };
+            unsafe { *out = Box::into_raw(Box::new(session)).cast() };
+            LCSD_OK
+        }
+
+        fn source_ms(id: u8, revision: u64) -> u64 {
+            1_700_000_000_000 + 10_000 * u64::from(id) + 10 * revision
+        }
+
+        fn snapshot(id: u8, revision: u64) -> LcsdState {
+            let updated = source_ms(id, revision);
+            let mut pod = LcsdState {
+                revision,
+                connected: 1,
+                authenticated: 1,
+                channel_name_len: 1,
+                connection_state_len: 9,
+                updated_unix_ms: updated,
+                speaker_count: 1,
+                ..LcsdState::default()
+            };
+            pod.channel_name[0] = id;
+            pod.connection_state[..9].copy_from_slice(b"CONNECTED");
+            let speaker = &mut pod.speakers[0];
+            speaker.user_id_len = 3;
+            speaker.user_id[..3].copy_from_slice(b"111");
+            speaker.name_len = 6;
+            speaker.name[..6].copy_from_slice(b"linger");
+            speaker.started_unix_ms = updated - 3;
+            speaker.stopped_unix_ms = updated - 1;
+            pod
+        }
+
+        extern "system" fn poll(handle: *mut c_void, _timeout_ms: u32) -> i32 {
+            if handle.is_null() {
+                return LCSD_E_ARG;
+            }
+            // ABI calls are synchronous on the session's owning Runtime worker.
+            let session = unsafe { &mut *handle.cast::<Session>() };
+            if session.disable_deadline.is_none() && session.pod.revision == session.through {
+                let (resume, next) = mpsc::channel();
+                let gate = Gate {
+                    id: session.id,
+                    revision: session.pod.revision,
+                    resume,
+                };
+                if session.gates.send(gate).is_err() {
+                    return LCSD_E_IO;
+                }
+                match next.recv_timeout(WAIT) {
+                    Ok(Step::Through(last))
+                        if (session.pod.revision + 1..=BURST).contains(&last) =>
+                    {
+                        session.through = last;
+                    }
+                    Ok(Step::Cancel) if (session.api.canceled)(session.api.context) != 0 => {
+                        let revision = session.pod.revision + 1;
+                        let mut pod = LcsdState {
+                            revision,
+                            updated_unix_ms: source_ms(session.id, revision),
+                            error_len: CANCELED.len() as u32,
+                            ..LcsdState::default()
+                        };
+                        pod.error[..CANCELED.len()].copy_from_slice(CANCELED.as_bytes());
+                        session.pod = pod;
+                        return LCSD_E_CANCELED;
+                    }
+                    Ok(Step::AwaitDisable) => {
+                        session.disable_deadline = Some(Instant::now() + WAIT)
+                    }
+                    _ => return LCSD_E_IO,
+                }
+            }
+            if let Some(deadline) = session.disable_deadline {
+                // update_config joins synchronously. Wait only for the host cancellation bit,
+                // then let the worker loop head perform disable (not the canceled-poll path).
+                // Stay in this mode if the worker sees the config write before its generation bump.
+                while Instant::now() < deadline {
+                    if (session.api.canceled)(session.api.context) != 0 {
+                        return LCSD_IDLE; // unchanged POD revision
+                    }
+                    std::thread::yield_now();
+                }
+                return LCSD_E_IO;
+            }
+            let revision = session.pod.revision + 1;
+            session.pod = snapshot(session.id, revision);
+            if revision.is_multiple_of(2) {
+                LCSD_IDLE
+            } else {
+                LCSD_OK
+            }
+        }
+
+        extern "system" fn state(handle: *mut c_void, out: *mut LcsdState, cap: u32) -> i32 {
+            if handle.is_null()
+                || out.is_null()
+                || (cap as usize) < std::mem::size_of::<LcsdState>()
+            {
+                return LCSD_E_SIZE;
+            }
+            unsafe { *out = (*handle.cast::<Session>()).pod };
+            LCSD_OK
+        }
+
+        extern "system" fn stop(_handle: *mut c_void) -> i32 {
+            LCSD_OK
+        }
+
+        extern "system" fn join(handle: *mut c_void) -> i32 {
+            match unsafe { handle.cast::<Session>().as_ref() } {
+                Some(session) if session.id == b'R' => LCSD_E_INFLIGHT,
+                Some(_) => LCSD_OK,
+                None => LCSD_E_ARG,
+            }
+        }
+
+        extern "system" fn release(handle: *mut c_void) -> i32 {
+            if handle.is_null() {
+                return LCSD_E_ARG;
+            }
+            unsafe { drop(Box::from_raw(handle.cast::<Session>())) };
+            LCSD_OK
+        }
+
+        fn loader(_: &mut [u8; LOADER_DIAGNOSTIC_CAPACITY]) -> Result<Module, LoadFault> {
+            static TABLE: OnceLock<LcsdV1> = OnceLock::new();
+            let table = TABLE.get_or_init(|| LcsdV1 {
+                start,
+                poll_io: poll,
+                state,
+                stop,
+                join,
+                release,
+                ..LcsdV1::default()
+            });
+            Ok(Module {
+                library: windows::Win32::Foundation::HMODULE(std::ptr::null_mut()),
+                table,
+            })
+        }
+
+        fn disable(runtime: &Runtime, on: &Config, gate: mpsc::Sender<Step>) {
+            gate.send(Step::AwaitDisable).unwrap();
+            runtime.update_config(&Config {
+                discord_enabled: false,
+                ..on.clone()
+            });
+            assert!(!runtime.worker_running());
+        }
+
+        fn drain(runtime: &Runtime, max: usize) -> Vec<DiscordState> {
+            let mut rows = Vec::new();
+            for _ in 0..=max {
+                match runtime.updates.try_recv() {
+                    Ok(row) => rows.push(row),
+                    Err(mpsc::TryRecvError::Empty) => return rows,
+                    Err(error) => panic!("Discord publication drain: {error}"),
+                }
+            }
+            panic!("more than {max} Discord publications");
+        }
+
+        fn at(ms: u64) -> Option<SystemTime> {
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(ms))
+        }
+
+        fn assert_snapshot(row: &DiscordState, id: u8, revision: u64) {
+            let ms = source_ms(id, revision);
+            assert!(row.connected && row.authenticated, "{row:?}");
+            assert_eq!(row.channel_name.as_bytes(), &[id]);
+            assert_eq!(row.connection_state, "CONNECTED");
+            assert_eq!(row.error, "");
+            assert_eq!(row.updated, at(ms));
+            let [speaker] = row.speakers.as_slice() else {
+                panic!("expected the single linger speaker: {row:?}");
+            };
+            assert_eq!(
+                (speaker.user_id.as_str(), speaker.name.as_str()),
+                ("111", "linger")
+            );
+            assert!(!speaker.speaking);
+            assert_eq!(
+                (speaker.started_at, speaker.stopped_at),
+                (at(ms - 3), at(ms - 1))
+            );
+        }
+
+        fn assert_status(row: &DiscordState, error: &str) {
+            assert_eq!(row.error, error);
+            assert!(!row.connected && !row.authenticated, "{row:?}");
+            assert!(
+                row.channel_name.is_empty() && row.speakers.is_empty(),
+                "{row:?}"
+            );
+            assert!(row.updated.is_some(), "{row:?}");
+        }
+
+        fn refused_unload(driver: &Driver) {
+            let on = enabled_config("R");
+            let runtime = spawn_with(&on, loader);
+            driver.gate(b'R', 0).send(Step::Through(1)).unwrap();
+            disable(&runtime, &on, driver.gate(b'R', 1));
+            let rows = drain(&runtime, 3);
+            assert_eq!(rows.len(), 3);
+            assert_snapshot(&rows[0], b'R', 1);
+            assert_status(&rows[1], "discord module retained");
+            assert_status(&rows[2], "disabled");
+            assert!(runtime.module_retained());
+            assert_eq!(runtime.credential_calls(), 0);
+            assert_eq!(
+                runtime.census_snapshot(),
+                CensusSnapshot {
+                    loads: 1,
+                    load_attempts: 1,
+                    starts: 1,
+                    stops: 1,
+                    joins: 1,
+                    retained: 1,
+                    spawns: 1,
+                    worker_joins: 1,
+                    ..CensusSnapshot::default()
+                }
+            );
+            // No re-enable on this Runtime: a real refused join must not release the handle.
+            // Like stub_v1, this branch retains one small synthetic Box until process exit.
+        }
+
+        fn quiescent_handoff(driver: &Driver) -> usize {
+            let mut a = enabled_config("A");
+            let b = enabled_config("B");
+            let c = enabled_config("C");
+            inject_discord_spawn_failures(2);
+            let runtime = spawn_with(&enabled_config("refused-edge-1"), loader);
+            assert!(!runtime.worker_running());
+            runtime.update_config(&enabled_config("refused-edge-2"));
+            assert!(!runtime.worker_running());
+            assert_eq!(runtime.census_snapshot(), CensusSnapshot::default());
+            runtime.update_config(&a);
+
+            driver.gate(b'A', 0).send(Step::Through(1)).unwrap();
+            let a_next = driver.gate(b'A', 1);
+            a.preview_scale += 1;
+            runtime.update_config(&a); // changes generation, not the Discord session
+            a_next.send(Step::Through(BURST)).unwrap();
+            let a_done = driver.gate(b'A', BURST);
+            runtime.update_config(&b);
+            a_done.send(Step::Cancel).unwrap();
+            driver.gate(b'B', 0).send(Step::Through(1)).unwrap();
+            disable(&runtime, &b, driver.gate(b'B', 1));
+            runtime.update_config(&c);
+            driver.gate(b'C', 0).send(Step::Through(1)).unwrap();
+            let c_next = driver.gate(b'C', 1);
+
+            // First read: both refusal edges, the burst, the canceled poll, and the safe
+            // disable/re-enable have all progressed while the receiver was withheld.
+            let rows = drain(&runtime, BURST as usize + 7);
+            let [first, second, pending @ ..] = rows.as_slice() else {
+                panic!("missing spawn refusals: {rows:?}");
+            };
+            let error = std::io::Error::from_raw_os_error(8);
+            let refusal = format!("Discord worker thread could not start: {error}");
+            assert_status(first, &refusal);
+            assert_status(second, &refusal);
+            let (a_rows, tail) = pending.split_at(
+                pending
+                    .iter()
+                    .take_while(|row| row.channel_name == "A")
+                    .count(),
+            );
+            let [poll_error, handoff, b_last, disabled, c_first] = tail else {
+                panic!("expected the exact terminal/handoff/B/disabled/C suffix: {tail:?}");
+            };
+            assert_status(poll_error, CANCELED);
+            assert_eq!(poll_error.updated, at(source_ms(b'A', BURST + 1)));
+            assert_status(handoff, "reconfiguring");
+            assert_snapshot(b_last, b'B', 1);
+            assert_status(disabled, "disabled");
+            assert_snapshot(c_first, b'C', 1);
+
+            // Validate the exact FIFO prefix or the exact replacement, not an arbitrary subset.
+            let first_revision = match a_rows.len() as u64 {
+                1 => BURST,
+                BURST => 1,
+                count => panic!("expected {BURST} FIFO A rows or one collapsed row, got {count}"),
+            };
+            for (revision, row) in (first_revision..=BURST).zip(a_rows) {
+                assert_snapshot(row, b'A', revision);
+            }
+
+            // The old marker has been taken. A later publication must still be receivable.
+            c_next.send(Step::Through(2)).unwrap();
+            let c_last = runtime
+                .updates
+                .recv_timeout(WAIT)
+                .expect("C received after disabled");
+            assert_snapshot(&c_last, b'C', 2);
+            disable(&runtime, &c, driver.gate(b'C', 2));
+            let rows = drain(&runtime, 1);
+            assert_eq!(rows.len(), 1);
+            assert_status(&rows[0], "disabled");
+            assert!(!runtime.module_retained());
+            assert_eq!(runtime.credential_calls(), 0);
+            assert_eq!(
+                runtime.census_snapshot(),
+                CensusSnapshot {
+                    loads: 2,
+                    load_attempts: 2,
+                    starts: 3,
+                    stops: 3,
+                    joins: 3,
+                    releases: 3,
+                    unloads: 2,
+                    spawns: 2,
+                    worker_joins: 2,
+                    ..CensusSnapshot::default()
+                }
+            );
+            a_rows.len()
+        }
+
+        #[test]
+        fn discord_runtime_preserves_status_and_collapses_withheld_healthy_revisions() {
+            let driver = Driver::new();
+            refused_unload(&driver);
+            let retained_healthy_rows = quiescent_handoff(&driver);
+            assert_eq!(
+                retained_healthy_rows, 1,
+                "adjacent healthy A revisions must collapse to the last source snapshot"
+            );
+        }
+    }
 }
