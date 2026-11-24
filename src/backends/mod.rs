@@ -698,15 +698,17 @@ impl PhysicalDevice {
         }
     }
 
-    fn submit(&self, frame: &crate::render::Frame, key: Vec<u8>) -> Result<Vec<u8>, LossError> {
+    fn submit(
+        &self,
+        #[cfg(test)] frame: &crate::render::Frame,
+        key: Vec<u8>,
+    ) -> Result<Vec<u8>, LossError> {
         match self {
             Self::Hid(device) => submit_hid(key, |report| device.write_report(report)),
             Self::Sdk(device) => {
-                // EC-2: the payload bytes ride the device-session's reusable
-                // buffer inside `submit_frame`; the returned key Vec is the
-                // disclosed per-accepted-frame `last_sent` residual.
-                device.submit_frame(frame)?;
-                Ok(frame.logitech_bytes())
+                // The session keeps its own payload until the owner releases it.
+                device.submit_bytes(&key)?;
+                Ok(key)
             }
             #[cfg(test)]
             Self::Scripted(device) if device.scenario == SCRIPT_HID_PACK => {
@@ -1157,7 +1159,11 @@ fn physical_worker(
                             _ => unreachable!(),
                         };
                         if last_sent.as_ref() != Some(&key) {
-                            match device.submit(&frame, key) {
+                            match device.submit(
+                                #[cfg(test)]
+                                &frame,
+                                key,
+                            ) {
                                 Ok(sent) => {
                                     last_sent = Some(sent);
                                     if let Some(old) = current.replace(pixels) {

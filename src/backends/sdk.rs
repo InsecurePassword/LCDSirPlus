@@ -1932,32 +1932,18 @@ impl SdkDevice {
         *self.payload.lock().unwrap() = Some(payload);
     }
 
-    /// EC-2: the frame-boundary submit. The payload bytes are written into the
-    /// session's reusable buffer (the same 0->0, nonzero->255 rule as
-    /// `Frame::logitech_bytes`, straight into the reserved capacity), sent, and
-    /// the buffer returns with the owner's release reply: steady sends allocate
-    /// no payload.
-    pub fn submit_frame(&self, frame: &crate::render::Frame) -> Result<(), LossError> {
-        let mut payload = self.take_payload();
-        payload.clear();
-        payload.reserve(PIXELS);
-        payload.extend(
-            frame
-                .pixels
-                .iter()
-                .map(|&value| if value != 0 { 255 } else { 0 }),
-        );
-        self.submit_payload(payload)
-    }
-
     /// Vec-shaped public surface (the hardware-test transport calls it with an
     /// owned report): the bytes are copied into the reusable payload, so a
     /// steady send allocates no payload either.
     pub fn submit(&self, pixels: Vec<u8>) -> Result<(), LossError> {
+        self.submit_bytes(&pixels)
+    }
+
+    pub(super) fn submit_bytes(&self, pixels: &[u8]) -> Result<(), LossError> {
         let mut payload = self.take_payload();
         payload.clear();
         payload.reserve(pixels.len());
-        payload.extend_from_slice(&pixels);
+        payload.extend_from_slice(pixels);
         self.submit_payload(payload)
     }
 
@@ -2792,7 +2778,7 @@ mod tests {
         };
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let _ = device.submit_frame(&lit_frame(0));
+                let _ = device.submit_bytes(&lit_frame(0).logitech_bytes());
             });
             start_rx
                 .recv_timeout(DRIVEN_HANDSHAKE_BUDGET)
@@ -2801,7 +2787,7 @@ mod tests {
                 .recv_timeout(DRIVEN_HANDSHAKE_BUDGET)
                 .expect("the first send's envelope reached the owner");
             scope.spawn(|| {
-                let _ = device.submit_frame(&lit_frame(1));
+                let _ = device.submit_bytes(&lit_frame(1).logitech_bytes());
             });
             forwarded_rx
                 .recv_timeout(DRIVEN_HANDSHAKE_BUDGET)
@@ -2815,6 +2801,67 @@ mod tests {
         owner.join().unwrap();
         let events = observed.lock().unwrap().clone();
         (events, submits)
+    }
+
+    #[test]
+    fn changed_sdk_submit_reuses_comparison_key_and_session_payload() {
+        use crate::backends::{alloc_count, PhysicalDevice};
+        let _guard = circuit_scenario_guard();
+        let recorder = Recording::new(0);
+        let observed = Arc::clone(&recorder.observed);
+        let (tx, rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || owner_loop(Box::new(recorder), rx));
+        let mut transport = PhysicalDevice::Sdk(SdkDevice {
+            requests: Some(tx),
+            payload: Mutex::new(None),
+            abandoned: Arc::new(AtomicBool::new(false)),
+            generation: NO_OWNER,
+        });
+
+        let mut counts = [0; 2];
+        let mut keys = [0; 3];
+        let mut retained = [0; 3];
+        for index in [0, 1, 2] {
+            let mut input = lit_frame(index);
+            input.pixels[index] = [1, 17, 255][index];
+            let compared = input.logitech_bytes();
+            keys[index] = compared.as_ptr() as usize;
+            let (sent, additional) = {
+                let _window = alloc_count::window();
+                let sent = transport.submit(&input, compared).unwrap();
+                (sent, alloc_count::snapshot().0)
+            };
+            retained[index] = sent.as_ptr() as usize;
+            if index != 0 {
+                counts[index - 1] = additional;
+            }
+            let PhysicalDevice::Sdk(device) = &transport else {
+                unreachable!()
+            };
+            let payload = device.payload.lock().unwrap();
+            assert_eq!(payload.as_deref(), Some(sent.as_slice()));
+            assert_eq!(sent.len(), PIXELS);
+            assert_eq!(sent[index], 255);
+            assert!(sent
+                .iter()
+                .enumerate()
+                .all(|(i, &value)| i == index || value == 0));
+        }
+
+        let PhysicalDevice::Sdk(device) = &mut transport else {
+            unreachable!()
+        };
+        drop(device.requests.take().unwrap());
+        worker.join().unwrap();
+        let observations = observed.lock().unwrap();
+        assert_eq!(observations.len(), 3);
+        let ptr = observations[0].0;
+        for (index, &(payload_ptr, lit, single)) in observations.iter().enumerate() {
+            assert_eq!((payload_ptr, lit, single), (ptr, index, true));
+            assert_ne!(payload_ptr, keys[index], "keep a separate session payload");
+        }
+        assert_eq!(counts, [0, 0], "no new 6880-byte buffer after comparison");
+        assert_eq!(retained, keys, "retain the same already-compared Vec");
     }
 
     #[test]
@@ -2850,8 +2897,9 @@ mod tests {
         crate::backends::alloc_count::reset();
         let mut warm = crate::backends::alloc_count::Counts::default();
         for index in 0..2 {
+            let key = lit_frame(index).logitech_bytes();
             let before = crate::backends::alloc_count::snapshot();
-            device.submit_frame(&lit_frame(index)).unwrap();
+            device.submit_bytes(&key).unwrap();
             warm = crate::backends::alloc_count::subtract(
                 crate::backends::alloc_count::snapshot(),
                 before,
@@ -2859,8 +2907,9 @@ mod tests {
             assert_eq!(warm.1, 0, "the SDK boundary allocates no HID key class");
         }
         for index in 2..12 {
+            let key = lit_frame(index).logitech_bytes();
             let before = crate::backends::alloc_count::snapshot();
-            device.submit_frame(&lit_frame(index)).unwrap();
+            device.submit_bytes(&key).unwrap();
             let steady = crate::backends::alloc_count::subtract(
                 crate::backends::alloc_count::snapshot(),
                 before,
