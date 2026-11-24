@@ -14,7 +14,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -59,8 +59,12 @@ const MAX_CATALOG_PATHS: usize = 64;
 const MAX_CATALOG_PATH_BYTES: usize = 32 * 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const LINE_QUEUE_CAPACITY: usize = 2048;
+// Per capture, charge the requested storage for compact queued UTF-8 text only.
+// Valid byte-heavy stalls can reject new rows before the item cap. In-flight,
+// stashed and parsed data, channel/allocator overhead and stats are not bounded by this.
+const LINE_QUEUE_BYTES: usize = 384 * 1024;
 const MAX_LINES_PER_TICK: usize = 512;
-// At most 128 MiB of CSV payload can wait in the bounded channel, below the prior 512 MiB bound.
+// Gross item-by-line product, not the tighter queued text budget.
 const _: () = assert!(LINE_QUEUE_CAPACITY * MAX_LINE_BYTES == 128 * 1024 * 1024);
 // 600 seconds at 1000 FPS plus the full queued backlog draining at one observed timestamp.
 const MAX_WINDOW_FRAMES: usize = 600 * 1_000 + LINE_QUEUE_CAPACITY;
@@ -1797,7 +1801,7 @@ fn run(
 struct Capture {
     child: Option<Child>,
     owned_session: Option<String>,
-    lines: Option<mpsc::Receiver<String>>,
+    lines: Option<LineReceiver>,
     /// WO-OPT02C (C1.4): one line stashed by `pump_step` (the channel is the worker's
     /// data edge, and `recv_timeout` CONSUMES), handed to the next `drain_with`, so the
     /// data-driven step never drops a CSV line. Cleared with `lines` on every stop/start.
@@ -1849,8 +1853,8 @@ impl Capture {
     }
 
     /// WO-OPT02C (C1.4): a capture whose CSV pipe is live. Its lines must keep draining:
-    /// the shipped `line_overflow` reset fires once the bounded queue passes
-    /// `LINE_QUEUE_CAPACITY`, so this is the one shape with a data edge, not a timer.
+    /// the `line_overflow` reset fires on loss (including queue saturation), so this is
+    /// the one shape with a data edge, not a timer.
     fn capture_running(&self) -> bool {
         self.child.is_some() && self.lines.is_some()
     }
@@ -2256,7 +2260,7 @@ impl Capture {
         let Some(stderr) = self.child.as_mut().and_then(|child| child.stderr.take()) else {
             return Err(self.stop_error("PresentMon stderr pipe unavailable".into()));
         };
-        let (line_tx, line_rx) = mpsc::sync_channel(LINE_QUEUE_CAPACITY);
+        let (line_tx, line_rx) = line_channel(LINE_QUEUE_CAPACITY);
         let overflow = Arc::new(AtomicBool::new(false));
         let reader_overflow = Arc::clone(&overflow);
         let reader = match std::thread::Builder::new()
@@ -2730,8 +2734,120 @@ fn with_diagnostic(reason: String, diagnostic: String) -> String {
     }
 }
 
-fn read_output(mut reader: impl BufRead, tx: mpsc::SyncSender<String>, dropped: Arc<AtomicBool>) {
-    let mut line = Vec::new();
+#[derive(Default)]
+struct LineBudget {
+    bytes: AtomicUsize,
+    closed: AtomicBool,
+}
+
+struct QueuedLine {
+    budget: Arc<LineBudget>,
+    text: Option<Box<str>>,
+}
+
+impl QueuedLine {
+    fn take_text(&mut self) -> Option<Box<str>> {
+        let text = self.text.take()?;
+        self.budget.bytes.fetch_sub(text.len(), Ordering::Relaxed);
+        Some(text)
+    }
+
+    fn into_text(mut self) -> String {
+        self.take_text()
+            .expect("queued line owns text")
+            .into_string()
+    }
+}
+
+impl Drop for QueuedLine {
+    fn drop(&mut self) {
+        drop(self.take_text());
+    }
+}
+
+#[derive(Clone)]
+struct LineSender {
+    tx: mpsc::SyncSender<QueuedLine>,
+    budget: Arc<LineBudget>,
+}
+
+impl LineSender {
+    fn try_send(&self, line: &str) -> Result<(), mpsc::TrySendError<()>> {
+        let bytes = line.len();
+        if self
+            .budget
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                let next = used + bytes;
+                (next <= LINE_QUEUE_BYTES).then_some(next)
+            })
+            .is_err()
+        {
+            // This rejection skips try_send, so it must still observe receiver shutdown.
+            return Err(if self.budget.closed.load(Ordering::Acquire) {
+                mpsc::TrySendError::Disconnected(())
+            } else {
+                mpsc::TrySendError::Full(())
+            });
+        }
+        self.tx
+            .try_send(QueuedLine {
+                budget: Arc::clone(&self.budget),
+                text: Some(line.into()),
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => mpsc::TrySendError::Full(()),
+                mpsc::TrySendError::Disconnected(_) => mpsc::TrySendError::Disconnected(()),
+            })
+    }
+
+    #[cfg(test)]
+    fn send(&self, line: String) -> Result<(), mpsc::TrySendError<()>> {
+        self.try_send(&line)
+    }
+}
+
+struct LineReceiver {
+    rx: mpsc::Receiver<QueuedLine>,
+    budget: Arc<LineBudget>,
+}
+
+impl LineReceiver {
+    fn try_recv(&self) -> Result<String, mpsc::TryRecvError> {
+        self.rx.try_recv().map(QueuedLine::into_text)
+    }
+
+    fn recv_timeout(&self, step: Duration) -> Result<String, mpsc::RecvTimeoutError> {
+        self.rx.recv_timeout(step).map(QueuedLine::into_text)
+    }
+
+    #[cfg(test)]
+    fn into_iter(self) -> impl Iterator<Item = String> {
+        std::iter::from_fn(move || self.rx.recv().ok().map(QueuedLine::into_text))
+    }
+}
+
+impl Drop for LineReceiver {
+    fn drop(&mut self) {
+        // Publish closure before the channel drops any undelivered reservations.
+        self.budget.closed.store(true, Ordering::Release);
+    }
+}
+
+fn line_channel(capacity: usize) -> (LineSender, LineReceiver) {
+    let (tx, rx) = mpsc::sync_channel(capacity);
+    let budget = Arc::new(LineBudget::default());
+    (
+        LineSender {
+            tx,
+            budget: Arc::clone(&budget),
+        },
+        LineReceiver { rx, budget },
+    )
+}
+
+fn read_output(mut reader: impl BufRead, tx: LineSender, dropped: Arc<AtomicBool>) {
+    let mut partial = Vec::new();
     let mut overflow = false;
     loop {
         let buffer = match reader.fill_buf() {
@@ -2742,48 +2858,60 @@ fn read_output(mut reader: impl BufRead, tx: mpsc::SyncSender<String>, dropped: 
             }
         };
         if buffer.is_empty() {
-            if !overflow && !line.is_empty() {
-                if let Ok(text) = String::from_utf8(line) {
-                    send_line(&tx, &dropped, text);
-                } else {
-                    dropped.store(true, Ordering::Release);
-                }
+            if !overflow && !partial.is_empty() {
+                send_output_bytes(&tx, &dropped, &partial);
             }
             return;
         }
         let end = buffer
             .iter()
             .position(|byte| *byte == b'\n')
-            .map(|index| index + 1)
-            .unwrap_or(buffer.len());
-        if !overflow && line.len() + end <= MAX_LINE_BYTES {
-            line.extend_from_slice(&buffer[..end]);
+            .map_or(buffer.len(), |index| index + 1);
+        let complete = buffer[end - 1] == b'\n';
+        let mut connected = true;
+        if !overflow && partial.len() + end <= MAX_LINE_BYTES {
+            let head = &buffer[..end];
+            if complete {
+                // Complete rows only need one allocation, after validation and byte admission.
+                let mut bytes = if partial.is_empty() {
+                    head
+                } else {
+                    partial.extend_from_slice(head);
+                    &partial
+                };
+                while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+                    bytes = &bytes[..bytes.len() - 1];
+                }
+                connected = send_output_bytes(&tx, &dropped, bytes);
+            } else {
+                partial.extend_from_slice(head);
+            }
         } else {
             overflow = true;
             dropped.store(true, Ordering::Release);
         }
-        let complete = buffer.get(end.wrapping_sub(1)) == Some(&b'\n');
         reader.consume(end);
+        if !connected {
+            return;
+        }
         if complete {
-            if !overflow {
-                while matches!(line.last(), Some(b'\n' | b'\r')) {
-                    line.pop();
-                }
-                if let Ok(text) = String::from_utf8(std::mem::take(&mut line)) {
-                    if !send_line(&tx, &dropped, text) {
-                        return;
-                    }
-                } else {
-                    dropped.store(true, Ordering::Release);
-                }
-            }
-            line.clear();
+            partial.clear();
             overflow = false;
         }
     }
 }
 
-fn send_line(tx: &mpsc::SyncSender<String>, dropped: &AtomicBool, line: String) -> bool {
+fn send_output_bytes(tx: &LineSender, dropped: &AtomicBool, bytes: &[u8]) -> bool {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => send_line(tx, dropped, text),
+        Err(_) => {
+            dropped.store(true, Ordering::Release);
+            true
+        }
+    }
+}
+
+fn send_line(tx: &LineSender, dropped: &AtomicBool, line: &str) -> bool {
     match tx.try_send(line) {
         Ok(()) => true,
         Err(mpsc::TrySendError::Full(_)) => {
@@ -4262,7 +4390,7 @@ mod tests {
     /// sample-loss flag and the per-tick bound keep firing.
     #[test]
     fn pinned_fixture_rows_keep_the_drain_timestamp_and_sample_loss() {
-        let (line_tx, line_rx) = mpsc::sync_channel(LINE_QUEUE_CAPACITY);
+        let (line_tx, line_rx) = line_channel(LINE_QUEUE_CAPACITY);
         line_tx.send(PINNED_HEADER.into()).unwrap();
         for row in [PINNED_ROW_A, PINNED_ROW_B, PINNED_ROW_NON_NUMERIC] {
             line_tx.send(row.into()).unwrap();
@@ -4307,7 +4435,7 @@ mod tests {
         assert_eq!(capture.last_frame, Some(now));
 
         // Sample-loss detection: a set overflow flag is reported over drained rows.
-        let (line_tx, line_rx) = mpsc::sync_channel(LINE_QUEUE_CAPACITY);
+        let (line_tx, line_rx) = line_channel(LINE_QUEUE_CAPACITY);
         line_tx.send(PINNED_HEADER.into()).unwrap();
         line_tx.send(PINNED_ROW_A.into()).unwrap();
         capture.lines = Some(line_rx);
@@ -5125,7 +5253,7 @@ mod tests {
             image_path: r"C:\Tools\Desktop.exe".into(),
         };
         let admitted = |cfg: &Config, process: &ProcessInfo, frame_name: &str| {
-            let (line_tx, line_rx) = mpsc::sync_channel(4);
+            let (line_tx, line_rx) = line_channel(4);
             line_tx
                 .send("Application,ProcessID,FrameTime".into())
                 .unwrap();
@@ -6243,7 +6371,7 @@ mod tests {
         capture.activity.validate_with(|_| true);
         let (updates, rx) = mpsc::channel();
 
-        let (line_tx, line_rx) = mpsc::sync_channel(4);
+        let (line_tx, line_rx) = line_channel(4);
         line_tx
             .send("Application,ProcessID,FrameTime".into())
             .unwrap();
@@ -6346,7 +6474,7 @@ mod tests {
         assert_eq!(capture.target, other);
         assert!(rx.recv().unwrap().detail.contains("stale data expired"));
 
-        let (line_tx, line_rx) = mpsc::sync_channel(4);
+        let (line_tx, line_rx) = line_channel(4);
         line_tx
             .send("Application,ProcessID,FrameTime".into())
             .unwrap();
@@ -6475,11 +6603,195 @@ mod tests {
     fn output_reader_discards_oversize_lines_and_recovers() {
         let mut input = vec![b'x'; MAX_LINE_BYTES + 1];
         input.extend_from_slice(b"\nvalid\n");
-        let (tx, rx) = mpsc::sync_channel(2);
+        let (tx, rx) = line_channel(2);
         let dropped = Arc::new(AtomicBool::new(false));
         read_output(std::io::Cursor::new(input), tx, Arc::clone(&dropped));
         assert_eq!(rx.into_iter().collect::<Vec<_>>(), vec!["valid"]);
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn line_queue_slot_is_no_larger_than_a_string() {
+        assert!(std::mem::size_of::<QueuedLine>() <= std::mem::size_of::<String>());
+    }
+
+    #[test]
+    fn output_reader_preserves_split_utf8_crlf_and_unterminated_tail() {
+        for capacity in [1, 2, 3, 8, 8192] {
+            let (tx, rx) = line_channel(10);
+            let dropped = Arc::new(AtomicBool::new(false));
+            read_output(
+                BufReader::with_capacity(capacity, &b"a\r\r\n\r\n\xc3\xa9\nend\r"[..]),
+                tx,
+                Arc::clone(&dropped),
+            );
+            assert_eq!(
+                rx.into_iter().collect::<Vec<_>>(),
+                ["a", "", "\u{e9}", "end\r"]
+            );
+            assert!(!dropped.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn output_reader_recovers_after_split_overlong_and_invalid_lines() {
+        for capacity in [4095, 8192, MAX_LINE_BYTES + 16] {
+            let mut bytes = vec![b'x'; MAX_LINE_BYTES - 1];
+            bytes.push(b'\n');
+            bytes.extend(std::iter::repeat_n(b'x', MAX_LINE_BYTES));
+            bytes.extend_from_slice(b"\n\xff\nok\n\xff");
+            let (tx, rx) = line_channel(10);
+            let dropped = Arc::new(AtomicBool::new(false));
+            read_output(
+                BufReader::with_capacity(capacity, &bytes[..]),
+                tx,
+                Arc::clone(&dropped),
+            );
+            assert_eq!(
+                rx.into_iter().collect::<Vec<_>>(),
+                ["x".repeat(MAX_LINE_BYTES - 1), "ok".to_owned()]
+            );
+            assert!(dropped.load(Ordering::Acquire));
+        }
+    }
+
+    fn fill_and_reject_byte_heavy_csv(line_tx: &LineSender, overflow: &Arc<AtomicBool>) {
+        let mut input = String::from("Application,ProcessID,FrameTime,Note\n");
+        for index in 0..6 {
+            let prefix = format!("game.exe,42,{}.0,", 16 + index);
+            let bytes = if index < 5 { 65_535 } else { 65_505 };
+            let padding = bytes - prefix.len();
+            input.push_str(&prefix);
+            input.push_str(&"\u{e9}".repeat(padding / 2));
+            if padding % 2 != 0 {
+                input.push('x');
+            }
+            input.push('\n');
+        }
+        // The header and six rows use exactly the byte ceiling, excluding the seven LF bytes.
+        assert_eq!(input.len() - 7, 393_216);
+        assert!(!overflow.load(Ordering::Acquire));
+        read_output(
+            std::io::Cursor::new(input),
+            line_tx.clone(),
+            Arc::clone(overflow),
+        );
+        assert!(!overflow.load(Ordering::Acquire), "exact fit was rejected");
+        read_output(
+            std::io::Cursor::new(b"game.exe,42,90.0,rejected"),
+            line_tx.clone(),
+            Arc::clone(overflow),
+        );
+        assert!(
+            overflow.load(Ordering::Acquire),
+            "the short EOF tail must be rejected by bytes, below the item cap"
+        );
+    }
+
+    #[test]
+    fn output_reader_byte_ceiling_rejects_new_and_recovers_after_stop() {
+        let (line_tx, line_rx) = line_channel(LINE_QUEUE_CAPACITY);
+        let overflow = Arc::new(AtomicBool::new(false));
+        fill_and_reject_byte_heavy_csv(&line_tx, &overflow);
+
+        let cfg = Config {
+            presentmon_target_mode: "foreground".into(),
+            ..Config::default()
+        };
+        let install = |capture: &mut Capture, lines, overflow| {
+            capture.lines = Some(lines);
+            capture.line_overflow = Some(overflow);
+            capture.parser = Parser::default();
+            capture.target = ProcessInfo {
+                pid: 42,
+                creation_time: 1,
+                name: "game.exe".into(),
+                image_path: String::new(),
+            };
+            capture.stats = Some(Stats::new(30.0, cfg.presentmon_window));
+        };
+        let (updates, rx) = mpsc::channel();
+        let mut capture = Capture::default();
+        install(&mut capture, line_rx, Arc::clone(&overflow));
+        capture.pump_step(Duration::ZERO);
+        assert_eq!(
+            capture.pump_line.as_deref(),
+            Some("Application,ProcessID,FrameTime,Note")
+        );
+        read_output(
+            std::io::Cursor::new(b"game.exe,42,22.0,accepted"),
+            line_tx.clone(),
+            Arc::clone(&overflow),
+        );
+        assert!(overflow.load(Ordering::Acquire));
+        let now = Instant::now();
+        assert_eq!(
+            capture.drain(&cfg, 1, &updates, now).unwrap_err(),
+            "PresentMon output overflowed; statistics reset"
+        );
+        let frames = &capture.stats.as_ref().unwrap().frames;
+        assert!(frames
+            .iter()
+            .map(|(_, value)| *value)
+            .eq([16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0]));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert_eq!(line_tx.budget.bytes.load(Ordering::Relaxed), 0);
+
+        read_output(
+            std::io::Cursor::new(b"queued\nrows\n"),
+            line_tx.clone(),
+            Arc::clone(&overflow),
+        );
+        capture.pump_step(Duration::ZERO);
+        assert_eq!(capture.pump_line.as_deref(), Some("queued"));
+        assert_eq!(line_tx.budget.bytes.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            capture.stop_with(|_| unreachable!(), |_| unreachable!()),
+            ""
+        );
+        assert!(capture.lines.is_none() && capture.pump_line.is_none());
+        assert!(capture.line_overflow.is_none() && capture.stats.is_none());
+        assert_eq!(line_tx.budget.bytes.load(Ordering::Relaxed), 0);
+
+        let (fresh_tx, fresh_rx) = line_channel(LINE_QUEUE_CAPACITY);
+        let fresh_overflow = Arc::new(AtomicBool::new(false));
+        assert!(!send_line(&line_tx, &fresh_overflow, "stale"));
+        assert_eq!(line_tx.budget.bytes.load(Ordering::Relaxed), 0);
+        read_output(
+            std::io::Cursor::new(b"Application,ProcessID,FrameTime\ngame.exe,42,16.0\n"),
+            fresh_tx.clone(),
+            Arc::clone(&fresh_overflow),
+        );
+        assert!(!fresh_overflow.load(Ordering::Acquire));
+        install(&mut capture, fresh_rx, fresh_overflow);
+        capture.drain(&cfg, 2, &updates, now).unwrap();
+        let update = rx.try_recv().unwrap();
+        assert_eq!(update.generation, 2);
+        assert!(update.available && !update.error && update.game.fps.valid);
+    }
+
+    #[test]
+    fn line_mailbox_releases_failed_sends_and_observes_close_even_when_over_budget() {
+        let (tx, rx) = line_channel(1);
+        let dropped = AtomicBool::new(false);
+        assert!(send_line(&tx, &dropped, "one"));
+        assert!(send_line(&tx, &dropped, "two"));
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(tx.budget.bytes.load(Ordering::Relaxed), 3);
+        drop(rx);
+        assert_eq!(tx.budget.bytes.load(Ordering::Relaxed), 0);
+
+        let (tx, rx) = line_channel(LINE_QUEUE_CAPACITY);
+        fill_and_reject_byte_heavy_csv(&tx, &Arc::new(AtomicBool::new(false)));
+        // Hold raw guards to model removal in flight, before the receiver returns the text.
+        let in_flight: Vec<_> = (0..7).map(|_| rx.rx.try_recv().unwrap()).collect();
+        drop(rx);
+        assert_eq!(tx.budget.bytes.load(Ordering::Relaxed), 393_216);
+        let dropped = AtomicBool::new(false);
+        assert!(!send_line(&tx, &dropped, "stale"));
+        assert!(!dropped.load(Ordering::Acquire));
+        drop(in_flight);
+        assert_eq!(tx.budget.bytes.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -6488,7 +6800,7 @@ mod tests {
         let header = "Application,ProcessID,FrameTime,MsBetweenPresents,DisplayedTime,GPUTime,GPUBusy,GPUWait\n";
         let row = "Palworld-Win64-Shipping.exe,4242,16.667,16.667,16.667,4.100,3.900,0.200\n";
         let input = format!("{header}{}", row.repeat(BURST_FRAMES));
-        let (line_tx, line_rx) = mpsc::sync_channel(LINE_QUEUE_CAPACITY);
+        let (line_tx, line_rx) = line_channel(LINE_QUEUE_CAPACITY);
         let keep_connected = line_tx.clone();
         let overflow = Arc::new(AtomicBool::new(false));
 
@@ -6528,7 +6840,7 @@ mod tests {
 
     #[test]
     fn output_reader_is_bounded_and_reports_saturation_without_blocking() {
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = line_channel(1);
         let dropped = Arc::new(AtomicBool::new(false));
         let reader_dropped = Arc::clone(&dropped);
         let reader = std::thread::spawn(move || {
@@ -6545,7 +6857,7 @@ mod tests {
 
     #[test]
     fn drain_is_tick_bounded_and_malformed_rows_fail_statistics() {
-        let (line_tx, line_rx) = mpsc::sync_channel(LINE_QUEUE_CAPACITY);
+        let (line_tx, line_rx) = line_channel(LINE_QUEUE_CAPACITY);
         line_tx
             .send("Application,ProcessID,FrameTime".into())
             .unwrap();
@@ -6574,7 +6886,7 @@ mod tests {
         );
         assert!(capture.lines.as_ref().unwrap().try_recv().is_ok());
 
-        let (line_tx, line_rx) = mpsc::sync_channel(2);
+        let (line_tx, line_rx) = line_channel(2);
         line_tx
             .send("Application,ProcessID,FrameTime".into())
             .unwrap();
@@ -6589,7 +6901,7 @@ mod tests {
 
     #[test]
     fn drain_reports_disconnection_after_prior_frames() {
-        let (line_tx, line_rx) = mpsc::sync_channel(2);
+        let (line_tx, line_rx) = line_channel(2);
         line_tx
             .send("Application,ProcessID,FrameTime".into())
             .unwrap();
@@ -6618,7 +6930,7 @@ mod tests {
 
     #[test]
     fn output_reader_exits_when_shutdown_drops_its_mailbox() {
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = line_channel(1);
         drop(rx);
         let dropped = Arc::new(AtomicBool::new(false));
         let reader =
@@ -6717,7 +7029,7 @@ mod tests {
             presentmon_target_mode: "foreground".into(),
             ..Config::default()
         };
-        let (line_tx, line_rx) = mpsc::sync_channel(4);
+        let (line_tx, line_rx) = line_channel(4);
         line_tx
             .send("Application,ProcessID,FrameTime".into())
             .unwrap();
@@ -7997,7 +8309,7 @@ mod tests {
     /// `pump_step`), which IS the step the worker blocks in. The child is
     /// `cmd.exe /C ping` with `CREATE_NO_WINDOW` (no visible window), killed and waited
     /// by the test itself: no PresentMon, no ETW session, no LCDSirPlus instance.
-    fn pumpcap_probe_capture(stale: bool) -> (mpsc::Sender<String>, Capture, Config) {
+    fn pumpcap_probe_capture(stale: bool) -> (LineSender, Capture, Config) {
         let child = Command::new("cmd.exe")
             .args(["/C", "ping", "-n", "120", "127.0.0.1"])
             .stdout(Stdio::null())
@@ -8005,7 +8317,7 @@ mod tests {
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .expect("the hidden probe child");
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = line_channel(LINE_QUEUE_CAPACITY);
         let mut capture = Capture::default();
         capture.child = Some(child);
         capture.lines = Some(rx);
@@ -8916,7 +9228,7 @@ mod tests {
             presentmon_target_mode: "foreground".into(),
             ..Config::default()
         };
-        let (line_tx, line_rx) = mpsc::sync_channel(4);
+        let (line_tx, line_rx) = line_channel(4);
         line_tx
             .send("Application,ProcessID,FrameTime".into())
             .unwrap();
@@ -9025,7 +9337,7 @@ mod tests {
             presentmon_target_mode: "foreground".into(),
             ..Config::default()
         };
-        let (line_tx, line_rx) = mpsc::sync_channel(4);
+        let (line_tx, line_rx) = line_channel(4);
         line_tx
             .send("Application,ProcessID,FrameTime".into())
             .unwrap();
