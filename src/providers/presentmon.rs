@@ -1095,6 +1095,7 @@ thread_local! {
 }
 
 struct Columns {
+    row_capacity: usize,
     pid: [Option<usize>; 1],
     application: [Option<usize>; 1],
     frame_ms: [Option<usize>; 3],
@@ -1123,7 +1124,11 @@ impl Parser {
         if line.len() > MAX_LINE_BYTES {
             return Err("PresentMon CSV line exceeds 64 KiB".into());
         }
-        let fields = csv_fields(line)?;
+        let capacity = self
+            .header
+            .as_ref()
+            .map_or(0, |columns| columns.row_capacity);
+        let fields = csv_fields(line, capacity)?;
         if fields.is_empty() {
             return Ok(None);
         }
@@ -1147,6 +1152,7 @@ impl Parser {
             }
             let index = |name: &str| header.get(name).copied();
             self.header = Some(Columns {
+                row_capacity: fields.len().min(32),
                 pid: ["processid"].map(index),
                 application: ["application"].map(index),
                 frame_ms: ["frametime", "msbetweenpresents", "msbetweendisplaychange"].map(index),
@@ -1223,9 +1229,9 @@ fn optional_metric(text: &str, name: &str, maximum: f64) -> Result<Option<f64>, 
 /// value cannot alias the input; it is owned for that field only. The quote toggle, the doubled
 /// quote escape, the `unterminated quoted ...` error, the line trim, the per-field content and
 /// the trailing field push are the shipped ones, in the shipped order.
-fn csv_fields(line: &str) -> Result<Vec<Cow<'_, str>>, String> {
+fn csv_fields(line: &str, capacity: usize) -> Result<Vec<Cow<'_, str>>, String> {
     let trimmed = line.trim();
-    let mut fields: Vec<Cow<'_, str>> = Vec::new();
+    let mut fields: Vec<Cow<'_, str>> = Vec::with_capacity(capacity);
     let mut start = 0usize;
     let mut copied = 0usize;
     let mut owned: Option<String> = None;
@@ -4089,15 +4095,6 @@ mod tests {
         );
     }
 
-    /// WO-OPT08 (A1): the 23-column header and the rows below are VERBATIM from the pinned
-    /// capture fixture
-    /// `artifacts/phase3/operational-soak/opt/fixtures-pinned/presentmon-pinned-live2.csv`
-    /// (80,341 B, SHA256-16 `FC228FCDD5D2553E`), whose SEGMENT 1/2 rows are byte-equal to the
-    /// live capture `fixtures-live/presentmon-live2.csv` (2,376,062 B, SHA256-16
-    /// `2F9F04C03AFBEE15`, 7,237 data rows, every row 23 fields, no quote character in the
-    /// file). The emitted column count is therefore the MEASURED 23, never an assumed one.
-    /// shortcut: the rows are embedded, the untracked artifact is not opened by this test, so a
-    /// fixture edit cannot fail it; the pinned SHA-16 above is the anchor.
     #[test]
     fn alias_selection_distinguishes_absent_from_present_empty_columns() {
         let at = SystemTime::UNIX_EPOCH;
@@ -4135,6 +4132,49 @@ mod tests {
         assert_eq!(calls, 0, "data rows must not hash column names");
     }
 
+    #[test]
+    fn ordinary_csv_row_needs_only_split_and_owned_application_allocations() {
+        let at = SystemTime::UNIX_EPOCH;
+        let mut parser = Parser::default();
+        assert!(parser.parse_line(PINNED_HEADER, at).unwrap().is_none());
+        let (frame, calls) = {
+            let _watch = crate::backends::alloc_count::window();
+            let frame = parser.parse_line(PINNED_ROW_A, at).unwrap().unwrap();
+            (frame, crate::backends::alloc_count::snapshot().4)
+        };
+        assert_eq!(
+            (frame.pid, frame.application.as_str(), frame.at),
+            (2888, "dwm.exe", at)
+        );
+        assert_eq!(frame.frame_ms.to_bits(), 903.0195f64.to_bits());
+        assert_eq!(frame.cpu_start_ms, Some(762.9536));
+        assert_eq!(frame.cpu_busy_ms, Some(903.0195));
+        assert_eq!(frame.gpu_busy_ms, Some(1.5059));
+        let wide = format!("{PINNED_ROW_A}{}", ",".repeat(128));
+        assert_eq!(
+            parser.parse_line(&wide, at).unwrap().unwrap().application,
+            "dwm.exe"
+        );
+        let bad = format!("{wide}\"unterminated");
+        assert!(parser
+            .parse_line(&bad, at)
+            .unwrap_err()
+            .contains("unterminated quoted"));
+        assert_eq!(
+            calls, 2,
+            "ordinary CSV split does not grow through intermediate buffers"
+        );
+    }
+
+    /// WO-OPT08 (A1): the 23-column header and the rows below are VERBATIM from the pinned
+    /// capture fixture
+    /// `artifacts/phase3/operational-soak/opt/fixtures-pinned/presentmon-pinned-live2.csv`
+    /// (80,341 B, SHA256-16 `FC228FCDD5D2553E`), whose SEGMENT 1/2 rows are byte-equal to the
+    /// live capture `fixtures-live/presentmon-live2.csv` (2,376,062 B, SHA256-16
+    /// `2F9F04C03AFBEE15`, 7,237 data rows, every row 23 fields, no quote character in the
+    /// file). The emitted column count is therefore the MEASURED 23, never an assumed one.
+    /// shortcut: the rows are embedded, the untracked artifact is not opened by this test, so a
+    /// fixture edit cannot fail it; the pinned SHA-16 above is the anchor.
     const PINNED_HEADER: &str = "Application,ProcessID,SwapChainAddress,PresentRuntime,SyncInterval,PresentFlags,AllowsTearing,PresentMode,CPUStartTime,FrameTime,CPUBusy,CPUWait,GPULatency,GPUTime,GPUBusy,GPUWait,DisplayLatency,DisplayedTime,AnimationError,AnimationTime,MsFlipDelay,AllInputToPhotonLatency,ClickToPhotonLatency";
     const PINNED_ROW_A: &str = "dwm.exe,2888,0x100000000,Other,-1,0,0,Hardware: Legacy Flip,762.9536,903.0195,903.0195,0.0000,0.0219,903.4377,1.5059,901.9318,905.3810,32.0586,NA,762.9536,NA,NA,NA";
     const PINNED_ROW_B: &str = "dwm.exe,2888,0x100000000,Other,-1,0,0,Hardware: Legacy Flip,1665.9731,32.0668,32.0668,0.0000,0.4401,31.6522,0.9821,30.6701,34.4201,967.9036,870.9609,1665.9731,NA,NA,NA";
