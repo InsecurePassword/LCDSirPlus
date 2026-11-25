@@ -771,13 +771,17 @@ impl ActivityTracker {
         resolve: &mut impl FnMut(u32) -> Result<(ProcessInfo, Option<ProcessHandle>), String>,
     ) -> Option<ProcessInfo> {
         let stream = StreamKey::new(frame.pid, &frame.application);
-        if let Some(key) = self.streams.get(&stream).cloned() {
-            if self.candidates.get(&key).is_some_and(valid) {
-                let activity = self.candidates.get_mut(&key)?;
+        if let Some(key) = self.streams.get(&stream) {
+            if let Some(activity) = self
+                .candidates
+                .get_mut(key)
+                .filter(|activity| valid(activity))
+            {
                 activity.record(frame);
                 return Some(activity.process.clone());
             }
-            self.remove_key(&key);
+            let invalid = key.clone();
+            self.remove_key(&invalid);
         }
         if *queries >= MAX_IDENTITY_QUERIES_PER_TICK {
             return None;
@@ -4831,6 +4835,58 @@ mod tests {
         );
         let reset = capture.stats.as_ref().unwrap();
         assert!(reset.frames.is_empty() && reset.session_start.is_none() && reset.stutters == 0);
+    }
+
+    #[test]
+    fn presenting_warm_stream_does_not_clone_its_stored_key() {
+        let process = ProcessInfo {
+            pid: 42,
+            creation_time: 1,
+            name: "fixture.exe".into(),
+            image_path: "C:\\synthetic\\fixture.exe".into(),
+        };
+        let observed_at = Instant::now();
+        let frame = Frame {
+            pid: process.pid,
+            application: "Fixture.EXE".into(),
+            observed_at,
+            frame_ms: 16.0,
+            ..Default::default()
+        };
+        let mut activity = ActivityTracker::default();
+        assert_eq!(
+            activity.record_test_process(&frame, &process),
+            Some(process.clone())
+        );
+        let mut queries = 0;
+        let mut validations = 0;
+        let (identity, calls) = {
+            let _window = crate::backends::alloc_count::window();
+            let identity = activity.record(
+                &frame,
+                &process,
+                &CatalogState::Unavailable,
+                &mut queries,
+                &mut |_| {
+                    validations += 1;
+                    true
+                },
+                &mut |_| panic!("a valid cached stream must not request process identity"),
+            );
+            (identity, crate::backends::alloc_count::snapshot().4)
+        };
+        assert_eq!(identity, Some(process.clone()));
+        assert_eq!((queries, validations), (0, 1));
+        assert_eq!(activity.streams.len(), 1);
+        assert_eq!(activity.candidates.len(), 1);
+        let retained = &activity.candidates[&CandidateKey::new(&process)];
+        assert_eq!(retained.last_seen(), Some(observed_at));
+        assert_eq!(retained.buckets.len(), 1);
+        assert_eq!(retained.buckets[0].rows, 2);
+        assert_eq!(
+            calls, 3,
+            "warm stream only owns its lookup spelling and returned identity"
+        );
     }
 
     fn record_workload_second(
