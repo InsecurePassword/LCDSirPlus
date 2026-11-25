@@ -875,6 +875,33 @@ fn cached_request(
     (generation, Arc::clone(&cache.1))
 }
 
+#[cfg(test)]
+type DisabledHangProbe = (mpsc::Sender<usize>, mpsc::Receiver<()>, usize);
+
+#[cfg(test)]
+thread_local! {
+    static DISABLED_HANG_PROBE: std::cell::RefCell<Option<DisabledHangProbe>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+fn park_disabled() {
+    #[cfg(test)]
+    if DISABLED_HANG_PROBE.with(|slot| {
+        if let Some((trace, step, count)) = slot.borrow().as_ref() {
+            if trace.send(*count).is_ok() {
+                let _ = step.recv_timeout(Duration::from_secs(5));
+            }
+            true
+        } else {
+            false
+        }
+    }) {
+        return;
+    }
+    std::thread::park_timeout(DISABLED_PARK);
+}
+
 fn worker(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
@@ -886,6 +913,7 @@ fn worker(
     let mut cadence = Cadence::default();
     let mut current_policy = None;
     let mut disabled_published = false;
+    let mut disabled_settled = false;
     let mut published_available = None;
     let mut published_targets = None;
     // TC-4: the not-evaluable count of the CURRENTLY published cycle. Written only
@@ -904,6 +932,7 @@ fn worker(
             cadence.last_attempt = None;
             current_policy = None;
             disabled_published = false;
+            disabled_settled = false;
             published_available = None;
             published_targets = None;
             if tx
@@ -916,6 +945,16 @@ fn worker(
                 return;
             }
         }
+        if disabled_settled {
+            park_disabled();
+            continue;
+        }
+        #[cfg(test)]
+        DISABLED_HANG_PROBE.with(|slot| {
+            if let Some((_, _, count)) = slot.borrow_mut().as_mut() {
+                *count += 1;
+            }
+        });
         let policy = Policy::from(cfg.as_ref());
         if reset_on_policy_change(&mut current_policy, &policy, &mut tracker, &mut cadence) {
             log_worker_transition(
@@ -956,9 +995,11 @@ fn worker(
                 return;
             }
             disabled_published = true;
+            // A nonzero generation reuses this same config until the next change.
+            disabled_settled = request_generation != 0;
             // WO-OPT02B: the disabled arm parks to the enabling edge (generation
             // bump / policy change / shutdown) instead of pacing on the 50 ms tick.
-            std::thread::park_timeout(DISABLED_PARK);
+            park_disabled();
             continue;
         }
         disabled_published = false;
@@ -4580,6 +4621,93 @@ mod tests {
             loop_src.matches("last_attempt = None;").count(),
             loop_src.matches("cadence.last_attempt = None;").count(),
             "L5: the cache change adds no cadence-clear site (every clear stays the shipped `cadence.` form)"
+        );
+    }
+
+    #[test]
+    fn unchanged_disabled_hang_wakes_do_not_rebuild_its_policy() {
+        let config = Arc::new(RwLock::new(Config {
+            hang_enabled: false,
+            hang_ignore: vec!["fixture-one.exe".into(), "fixture-two.exe".into()],
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, updates) = mpsc::channel();
+        let (trace_tx, trace_rx) = mpsc::channel();
+        let (step_tx, step_rx) = mpsc::channel();
+        let task = {
+            let cfg = Arc::clone(&config);
+            let g = Arc::clone(&generation);
+            let stop = Arc::clone(&shutdown);
+            std::thread::spawn(move || {
+                DISABLED_HANG_PROBE.with(|slot| {
+                    slot.replace(Some((trace_tx, step_rx, 0)));
+                });
+                worker(cfg, g, stop, tx);
+            })
+        };
+        struct Stop(Arc<AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _stop = Stop(Arc::clone(&shutdown));
+        let observe = || {
+            trace_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker parked")
+        };
+        let unavailable = |generation| {
+            let rows = updates.try_iter().collect::<Vec<_>>();
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|u| u.generation == generation
+                && !u.available
+                && u.targets.is_empty()
+                && u.error.is_none()
+                && u.probe_indeterminate == 0));
+        };
+        let first = observe();
+        unavailable(1);
+        step_tx.send(()).unwrap();
+        let idle1 = observe();
+        step_tx.send(()).unwrap();
+        let idle2 = observe();
+        assert!(matches!(updates.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        config
+            .write()
+            .unwrap()
+            .hang_ignore
+            .push("fixture-three.exe".into());
+        generation.store(2, Ordering::SeqCst);
+        step_tx.send(()).unwrap();
+        let changed = observe();
+        unavailable(2);
+        step_tx.send(()).unwrap();
+        let settled = observe();
+        assert!(matches!(updates.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        generation.store(0, Ordering::SeqCst);
+        step_tx.send(()).unwrap();
+        let zero = observe();
+        unavailable(0);
+        step_tx.send(()).unwrap();
+        let zero_next = observe();
+        assert!(matches!(updates.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        shutdown.store(true, Ordering::Release);
+        step_tx.send(()).unwrap();
+        task.join().unwrap();
+
+        assert_eq!(first, 1);
+        assert_eq!(changed - idle2, 1);
+        assert_eq!(zero - settled, 1);
+        assert_eq!(zero_next - zero, 1, "uncached generation still snapshots");
+        assert_eq!(
+            [idle1 - first, idle2 - idle1, settled - changed],
+            [0, 0, 0],
+            "settled disabled hang wakes do not rebuild policy"
         );
     }
 
