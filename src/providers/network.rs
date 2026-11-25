@@ -198,14 +198,69 @@ pub fn spawn(
     (rx, thread)
 }
 
+#[cfg(test)]
+type DisabledRequestProbe = (mpsc::Sender<usize>, mpsc::Receiver<()>, usize);
+
+#[cfg(test)]
+thread_local! {
+    static DISABLED_REQUEST_PROBE: std::cell::RefCell<Option<DisabledRequestProbe>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+fn park_disabled() {
+    #[cfg(test)]
+    if DISABLED_REQUEST_PROBE.with(|slot| {
+        if let Some((observed, resume, calls)) = slot.borrow().as_ref() {
+            if observed.send(*calls).is_ok() {
+                let _ = resume.recv_timeout(Duration::from_secs(5));
+            }
+            true
+        } else {
+            false
+        }
+    }) {
+        return;
+    }
+    std::thread::park_timeout(DISABLED_PARK);
+}
+
 fn current_request(config: &RwLock<Config>, generation: &AtomicU64) -> (u64, Config) {
     loop {
         let before = generation.load(Ordering::SeqCst);
+        #[cfg(test)]
+        DISABLED_REQUEST_PROBE.with(|slot| {
+            if let Some((_, _, calls)) = slot.borrow_mut().as_mut() {
+                *calls += 1;
+            }
+        });
         let config = config.read().unwrap_or_else(|e| e.into_inner()).clone();
         if before == generation.load(Ordering::SeqCst) {
             return (before, config);
         }
     }
+}
+
+fn same_disabled_request(
+    config: &RwLock<Config>,
+    generation: &AtomicU64,
+    request_generation: u64,
+    policy: &Policy,
+) -> bool {
+    if generation.load(Ordering::SeqCst) != request_generation {
+        return false;
+    }
+    let same = {
+        let cfg = config.read().unwrap_or_else(|e| e.into_inner());
+        cfg.network_probe_enabled == policy.enabled
+            && cfg.safe_mode == policy.safe_mode
+            && cfg.network_probe_method == policy.method
+            && cfg.network_probe_target == policy.target
+            && cfg.network_probe_interval == policy.interval
+            && cfg.network_probe_timeout == policy.timeout
+            && cfg.network_probe_window.max(1) as usize == policy.window
+    };
+    same && generation.load(Ordering::SeqCst) == request_generation
 }
 
 fn worker(
@@ -221,6 +276,14 @@ fn worker(
     let mut disabled_published = false;
     let mut current_generation = 0;
     while !shutdown.load(Ordering::Relaxed) {
+        if disabled_published
+            && policy.as_ref().is_some_and(|old| {
+                same_disabled_request(&config, &generation, current_generation, old)
+            })
+        {
+            park_disabled();
+            continue;
+        }
         let (request_generation, cfg) = current_request(&config, &generation);
         if request_generation != current_generation {
             current_generation = request_generation;
@@ -260,7 +323,7 @@ fn worker(
             disabled_published = true;
             // WO-OPT02B: the disabled arm parks to the enabling edge (generation
             // bump / policy change / shutdown) instead of pacing on the 50 ms tick.
-            std::thread::park_timeout(DISABLED_PARK);
+            park_disabled();
             continue;
         }
         disabled_published = false;
@@ -916,6 +979,92 @@ mod tests {
         run.thread
             .join()
             .expect("the disabled worker exits within one TICK of shutdown");
+    }
+
+    #[test]
+    fn unchanged_disabled_wakes_do_not_clone_a_request() {
+        let cfg = Arc::new(RwLock::new(Config {
+            network_probe_enabled: false,
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let join = {
+            let cfg = Arc::clone(&cfg);
+            let generation = Arc::clone(&generation);
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || {
+                DISABLED_REQUEST_PROBE.with(|slot| {
+                    slot.replace(Some((observed_tx, resume_rx, 0)));
+                });
+                worker(cfg, generation, shutdown, tx, |_, _, _| {
+                    panic!("a disabled worker must not enter the probe")
+                });
+            })
+        };
+        struct ShutdownOnDrop(Arc<AtomicBool>);
+        impl Drop for ShutdownOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _stop = ShutdownOnDrop(Arc::clone(&shutdown));
+        let wait = Duration::from_secs(5);
+        let observe = || {
+            observed_rx
+                .recv_timeout(wait)
+                .expect("worker reached disabled park")
+        };
+        let initial = observe();
+        let updates = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(updates.len(), 2);
+        assert!(updates
+            .iter()
+            .all(|u| u.generation == 1 && cleared_update(u)));
+        resume_tx.send(()).unwrap();
+        let idle1 = observe();
+        resume_tx.send(()).unwrap();
+        let idle2 = observe();
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        cfg.write().unwrap().network_probe_target = "192.0.2.42".into();
+        resume_tx.send(()).unwrap();
+        let edited = observe();
+        let updates = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            updates.len(),
+            1,
+            "a same-generation disabled policy edit still resets"
+        );
+        assert_eq!(updates[0].generation, 1);
+        assert!(cleared_update(&updates[0]));
+        resume_tx.send(()).unwrap();
+        let after_edit = observe();
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        generation.store(2, Ordering::SeqCst);
+        resume_tx.send(()).unwrap();
+        let new_generation = observe();
+        let updates = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(updates.len(), 2);
+        assert!(updates
+            .iter()
+            .all(|u| u.generation == 2 && cleared_update(u)));
+        shutdown.store(true, Ordering::Release);
+        resume_tx.send(()).unwrap();
+        join.join().unwrap();
+
+        assert_eq!(initial, 1);
+        assert_eq!(edited - idle2, 1);
+        assert_eq!(new_generation - after_edit, 1);
+        assert_eq!(
+            [idle1 - initial, idle2 - idle1, after_edit - edited],
+            [0, 0, 0],
+            "settled disabled wake must not clone a request"
+        );
     }
 
     /// WO-OPT02B (finding O1, slice 2), RED-FIRST on the unit-50 base tree. The
