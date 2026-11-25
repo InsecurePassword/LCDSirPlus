@@ -1080,13 +1080,28 @@ fn ranking_decision(
         .or_else(|| activity.best_activity(now, 0, catalog))
 }
 
+#[cfg(test)]
+thread_local! {
+    static PARSER_CLOCK_COUNT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 #[derive(Default)]
 struct Parser {
     header: Option<HashMap<String, usize>>,
 }
 
 impl Parser {
+    #[cfg(test)]
     fn parse_line(&mut self, line: &str, at: SystemTime) -> Result<Option<Frame>, String> {
+        self.parse_line_at(line, at, Instant::now())
+    }
+
+    fn parse_line_at(
+        &mut self,
+        line: &str,
+        at: SystemTime,
+        observed_at: Instant,
+    ) -> Result<Option<Frame>, String> {
         if line.len() > MAX_LINE_BYTES {
             return Err("PresentMon CSV line exceeds 64 KiB".into());
         }
@@ -1152,7 +1167,7 @@ impl Parser {
         let gpu_busy_ms = optional_metric(get(&["gpubusy", "msgpubusy"]), "GPUBusy", 10_000.0)?;
         Ok(Some(Frame {
             at,
-            observed_at: Instant::now(),
+            observed_at,
             // The frame outlives the input line, so this field keeps its owned String.
             application: get(&["application"]).to_string(),
             pid,
@@ -2354,12 +2369,11 @@ impl Capture {
                     }
                 },
             };
-            let mut frame = match self.parser.parse_line(&line, SystemTime::now()) {
+            let frame = match self.parser.parse_line_at(&line, SystemTime::now(), now) {
                 Ok(Some(frame)) => frame,
                 Ok(None) => continue,
                 Err(error) => return Err(format!("PresentMon CSV invalid: {error}")),
             };
-            frame.observed_at = now;
             if presenting {
                 if !candidate_allowed(
                     frame.pid,
@@ -4385,8 +4399,53 @@ mod tests {
             .contains("exceeds 64 KiB"));
     }
 
+    #[test]
+    fn drained_frames_need_no_discarded_parser_clock() {
+        let (line_tx, line_rx) = line_channel(LINE_QUEUE_CAPACITY);
+        line_tx.send(PINNED_HEADER.into()).unwrap();
+        for row in [
+            PINNED_ROW_A,
+            PINNED_ROW_B,
+            "dwm.exe,2888,,,,,,,,NA",
+            PINNED_ROW_NON_NUMERIC,
+        ] {
+            line_tx.send(row.into()).unwrap();
+        }
+        let mut capture = Capture::default();
+        capture.lines = Some(line_rx);
+        capture.target = ProcessInfo {
+            pid: 2888,
+            creation_time: 1,
+            name: "dwm.exe".into(),
+            image_path: String::new(),
+        };
+        let cfg = Config {
+            presentmon_target_mode: "foreground".into(),
+            ..Config::default()
+        };
+        capture.stats = Some(Stats::new(30.0, cfg.presentmon_window));
+        let (tx, rx) = mpsc::channel();
+        let stamp = Instant::now() + Duration::from_secs(5);
+        PARSER_CLOCK_COUNT.with(|count| count.set(Some(0)));
+        let error = capture.drain(&cfg, 1, &tx, stamp).unwrap_err();
+        let observed = PARSER_CLOCK_COUNT.with(|count| count.replace(None).unwrap());
+        assert!(error.contains("PresentMon frame metric"));
+        assert!(rx.try_recv().is_err(), "malformed batch is not published");
+        let stats = capture.stats.as_ref().unwrap();
+        assert!(stats
+            .frames
+            .iter()
+            .eq(&[(stamp, 903.0195), (stamp, 32.0668)]));
+        assert_eq!(capture.last_frame, Some(stamp));
+        assert!(stats.session_start.is_some());
+        assert_eq!(
+            observed, 0,
+            "the drain must not sample a clock it overwrites"
+        );
+    }
+
     /// WO-OPT08 (A3): the pinned rows through the shipped drain - the statistics see the
-    /// DRAIN's timestamp, not the parser's clock read (the clock-overwrite ruling), and the
+    /// DRAIN's batch timestamp, supplied to the parser, and the
     /// sample-loss flag and the per-tick bound keep firing.
     #[test]
     fn pinned_fixture_rows_keep_the_drain_timestamp_and_sample_loss() {
