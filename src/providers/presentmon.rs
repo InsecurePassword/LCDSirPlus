@@ -1089,9 +1089,23 @@ thread_local! {
     static PARSER_CLOCK_COUNT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static ROW_HEADER_HASH_PROBES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+struct Columns {
+    pid: [Option<usize>; 1],
+    application: [Option<usize>; 1],
+    frame_ms: [Option<usize>; 3],
+    cpu_start_ms: [Option<usize>; 2],
+    cpu_busy_ms: [Option<usize>; 2],
+    gpu_busy_ms: [Option<usize>; 2],
+}
+
 #[derive(Default)]
 struct Parser {
-    header: Option<HashMap<String, usize>>,
+    header: Option<Columns>,
 }
 
 impl Parser {
@@ -1131,25 +1145,31 @@ impl Parser {
                         .into(),
                 );
             }
-            self.header = Some(header);
+            let index = |name: &str| header.get(name).copied();
+            self.header = Some(Columns {
+                pid: ["processid"].map(index),
+                application: ["application"].map(index),
+                frame_ms: ["frametime", "msbetweenpresents", "msbetweendisplaychange"].map(index),
+                cpu_start_ms: ["cpustarttime", "cpustarttimeinms"].map(index),
+                cpu_busy_ms: ["cpubusy", "mscpubusy"].map(index),
+                gpu_busy_ms: ["gpubusy", "msgpubusy"].map(index),
+            });
             return Ok(None);
         }
-        // WO-OPT08 (A2): every lookup name below is written already-lowercase, so the probe
-        // borrows a &'static str; the column indices were resolved once when the header was
-        // accepted. The old `name.to_ascii_lowercase()` owned a fresh String per candidate name
-        // for EVERY row. Alias order and the empty-field fallback are unchanged.
-        let get = |names: &[&str]| -> &str {
-            let header = self.header.as_ref().unwrap();
-            names
+        let columns = self.header.as_ref().unwrap();
+        // Only an absent cell allows the next alias; a present empty cell wins.
+        let get = |indices: &[Option<usize>]| -> &str {
+            indices
                 .iter()
-                .find_map(|name| header.get(*name).and_then(|i| fields.get(*i)))
+                .flatten()
+                .find_map(|i| fields.get(*i))
                 .map(|v| v.trim())
                 .unwrap_or("")
         };
-        let pid = get(&["processid"])
+        let pid = get(&columns.pid)
             .parse::<u32>()
             .map_err(|e| format!("PresentMon ProcessID: {e}"))?;
-        let text = get(&["frametime", "msbetweenpresents", "msbetweendisplaychange"]);
+        let text = get(&columns.frame_ms);
         if text.is_empty() || text.eq_ignore_ascii_case("NA") {
             return Ok(None);
         }
@@ -1162,18 +1182,15 @@ impl Parser {
         if !(0.0..=10_000.0).contains(&frame_ms) || frame_ms == 0.0 {
             return Ok(None);
         }
-        let cpu_start_ms = optional_metric(
-            get(&["cpustarttime", "cpustarttimeinms"]),
-            "CPUStartTime",
-            u64::MAX as f64,
-        )?;
-        let cpu_busy_ms = optional_metric(get(&["cpubusy", "mscpubusy"]), "CPUBusy", 10_000.0)?;
-        let gpu_busy_ms = optional_metric(get(&["gpubusy", "msgpubusy"]), "GPUBusy", 10_000.0)?;
+        let cpu_start_ms =
+            optional_metric(get(&columns.cpu_start_ms), "CPUStartTime", u64::MAX as f64)?;
+        let cpu_busy_ms = optional_metric(get(&columns.cpu_busy_ms), "CPUBusy", 10_000.0)?;
+        let gpu_busy_ms = optional_metric(get(&columns.gpu_busy_ms), "GPUBusy", 10_000.0)?;
         Ok(Some(Frame {
             at,
             observed_at,
             // The frame outlives the input line, so this field keeps its owned String.
-            application: get(&["application"]).to_string(),
+            application: get(&columns.application).to_string(),
             pid,
             frame_ms,
             cpu_start_ms,
@@ -4081,6 +4098,43 @@ mod tests {
     /// file). The emitted column count is therefore the MEASURED 23, never an assumed one.
     /// shortcut: the rows are embedded, the untracked artifact is not opened by this test, so a
     /// fixture edit cannot fail it; the pinned SHA-16 above is the anchor.
+    #[test]
+    fn alias_selection_distinguishes_absent_from_present_empty_columns() {
+        let at = SystemTime::UNIX_EPOCH;
+        let mut p = Parser::default();
+        assert!(p
+            .parse_line(
+                "ProcessID,MsBetweenPresents,Application,MsCPUBusy,FrameTime,CPUBusy",
+                at,
+            )
+            .unwrap()
+            .is_none());
+        ROW_HEADER_HASH_PROBES.with(|calls| calls.set(Some(0)));
+        let short = p.parse_line("42,16,fixture.exe,8", at).unwrap().unwrap();
+        assert_eq!((short.frame_ms, short.cpu_busy_ms), (16.0, Some(8.0)));
+        assert!(p.parse_line("42,16,fixture.exe,8,", at).unwrap().is_none());
+        let full = p
+            .parse_line("42,16,fixture.exe,8,20,", at)
+            .unwrap()
+            .unwrap();
+        assert_eq!((full.frame_ms, full.cpu_busy_ms), (20.0, None));
+        assert!(p
+            .parse_line("42,16,fixture.exe,8,20,1,\"unterminated", at)
+            .is_err());
+
+        let mut duplicate = Parser::default();
+        duplicate
+            .parse_line("ProcessID,FrameTime, frametime ,Application", at)
+            .unwrap();
+        let got = duplicate
+            .parse_line("42,1,2,fixture.exe", at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.frame_ms, 2.0, "last case-folded duplicate header wins");
+        let calls = ROW_HEADER_HASH_PROBES.with(|calls| calls.replace(None).unwrap());
+        assert_eq!(calls, 0, "data rows must not hash column names");
+    }
+
     const PINNED_HEADER: &str = "Application,ProcessID,SwapChainAddress,PresentRuntime,SyncInterval,PresentFlags,AllowsTearing,PresentMode,CPUStartTime,FrameTime,CPUBusy,CPUWait,GPULatency,GPUTime,GPUBusy,GPUWait,DisplayLatency,DisplayedTime,AnimationError,AnimationTime,MsFlipDelay,AllInputToPhotonLatency,ClickToPhotonLatency";
     const PINNED_ROW_A: &str = "dwm.exe,2888,0x100000000,Other,-1,0,0,Hardware: Legacy Flip,762.9536,903.0195,903.0195,0.0000,0.0219,903.4377,1.5059,901.9318,905.3810,32.0586,NA,762.9536,NA,NA,NA";
     const PINNED_ROW_B: &str = "dwm.exe,2888,0x100000000,Other,-1,0,0,Hardware: Legacy Flip,1665.9731,32.0668,32.0668,0.0000,0.4401,31.6522,0.9821,30.6701,34.4201,967.9036,870.9609,1665.9731,NA,NA,NA";
