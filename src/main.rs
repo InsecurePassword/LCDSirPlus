@@ -4,7 +4,6 @@
 
 #![windows_subsystem = "windows"]
 
-mod alerts;
 mod app;
 mod backends;
 mod config;
@@ -281,6 +280,29 @@ fn run_hwinfo_inventory(result: Result<Vec<String>, String>) -> i32 {
     }
 }
 
+/// WO-U46H #5: the `--discord-clear-token` arm, seam-extracted so the
+/// credential-store scope is testable with an injected revoker against an
+/// isolated fixture (production `clear_token` never runs in a test). The CLI
+/// config is passed through and deliberately unused (`_config`): revocation
+/// takes no configuration, so a broken, missing, unreadable or unreachable
+/// configuration cannot block it - the shipped gate exited 2 on any config load
+/// error. Argument validation and the credential-store scope are unchanged.
+fn run_discord_clear_token(
+    _config: Option<std::path::PathBuf>,
+    revoke: impl FnOnce() -> Result<(), String>,
+) -> i32 {
+    match revoke() {
+        Ok(()) => {
+            println!("All LCDSirPlus Discord credentials removed.");
+            0
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            1
+        }
+    }
+}
+
 fn main() {
     let cli = match parse_args() {
         Ok(cli) => cli,
@@ -379,25 +401,16 @@ fn main() {
     }
 
     if cli.discord_clear_token {
-        let path = match runtime::resolve_config(cli.config.clone()) {
-            Ok(resolved) => resolved.path,
-            Err(error) => {
-                eprintln!("configuration resolution failed: {error}");
-                std::process::exit(2);
-            }
-        };
-        if let Err(error) = parser::load(&path) {
-            eprintln!("configuration error: {}", error);
-            std::process::exit(2);
-        }
-        match providers::discord::clear_token() {
-            Ok(()) => println!("All LCDSirPlus Discord credentials removed."),
-            Err(error) => {
-                eprintln!("error: {}", error);
-                std::process::exit(1);
-            }
-        }
-        return;
+        // WO-U46H #5: revocation is credential-store-scoped, so it is gated on
+        // nothing else. `clear_token` takes no configuration; the shipped arm
+        // loaded and validated the whole config graph first and exited 2 on any
+        // load error, which left a user with a broken (or unreachable) config
+        // unable to revoke credentials. Argument validation and the
+        // credential-store scope are unchanged.
+        std::process::exit(run_discord_clear_token(
+            cli.config.clone(),
+            providers::discord::clear_token,
+        ));
     }
 
     if cli.discord_authorize {
@@ -509,6 +522,75 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WO-U46H #5: `--discord-clear-token` is config-independent and stays inside
+    /// the credential store. The revoker runs against an isolated fixture store in
+    /// a private temp dir; production `clear_token` and the real
+    /// `%LOCALAPPDATA%\LCDSirPlus\discord-*.token` file are NEVER touched here.
+    #[test]
+    fn discord_clear_token_ignores_the_configuration_and_stays_in_the_credential_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "lcdsirplus-cli-clear-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("discord-123.token");
+        std::fs::write(&store, "fixture-credential").unwrap();
+        let broken = dir.join("lcdsirplus.txt");
+        std::fs::write(&broken, "unknown_setting 1\n").unwrap();
+
+        // The case the shipped gate refused: a config that fails to LOAD.
+        let fixture_store = store.clone();
+        let code = run_discord_clear_token(Some(broken.clone()), move || {
+            std::fs::remove_file(&fixture_store).map_err(|error| error.to_string())
+        });
+        assert_eq!(
+            code, 0,
+            "a config that fails to load cannot block revocation"
+        );
+        assert!(
+            !store.exists(),
+            "the fixture credential in the fixture store is gone"
+        );
+
+        // A config that cannot even be resolved, and no config at all.
+        assert_eq!(
+            run_discord_clear_token(
+                Some(r"\\unreachable.invalid\share\lcdsirplus.txt".into()),
+                || Ok(())
+            ),
+            0,
+            "an unresolvable config cannot block revocation"
+        );
+        assert_eq!(
+            run_discord_clear_token(None, || Ok(())),
+            0,
+            "revocation needs no config path at all"
+        );
+
+        // The store's own failure is still reported with the shipped exit code.
+        assert_eq!(
+            run_discord_clear_token(Some(broken), || Err("credential store is read-only".into())),
+            1,
+            "a credential-store failure keeps the shipped outcome"
+        );
+
+        // Argument validation and command scope are unchanged.
+        let cli = parse_args_from(["--discord-clear-token", "--config", "x.txt"]).unwrap();
+        assert!(cli.discord_clear_token && is_cli_invocation(&cli));
+        assert_eq!(
+            command_count(
+                &parse_args_from(["--discord-clear-token", "--validate-config"]).unwrap()
+            ),
+            2,
+            "the one-command rule still counts this command"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn diagnostics_ignore_unreachable_unc_config_without_calling_parser() {

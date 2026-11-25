@@ -4,7 +4,6 @@
 //! same display semantics: explicit availability/freshness states, canonical
 //! byte values that never round-trip through float64, and legacy percentage
 //! projections for the fixed bars.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -53,7 +52,6 @@ pub enum MetricKey {
     VRAMUtilization,
     VRAMUsed,
     VRAMTotal,
-    CPUCCDTemp,
     CPUPeakUtilization,
     VRMTemp,
     ChipsetTemp,
@@ -117,6 +115,9 @@ impl Reading {
         }
     }
 
+    // Only test caller left (src/telemetry.rs:2261, a #[cfg(test)] module outside this scope);
+    // delete this wrapper together with that caller.
+    #[allow(dead_code)]
     pub fn current_celsius(key: MetricKey, value: f64, hardware_id: &str, at: SystemTime) -> Self {
         Self::current_number(key, ValueKind::Celsius, value, hardware_id, at)
     }
@@ -168,6 +169,10 @@ impl Reading {
     }
 }
 
+// Kept: the only reader was the retired CPU-cache/frequency temperature surface, and the field is
+// named by a struct literal outside this unit's file scope (`src/app.rs:3803` keeps
+// `..Default::default()`). Follow-up: delete this field, these three types and that row together.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum HardwareKind {
@@ -178,6 +183,7 @@ pub enum HardwareKind {
     GPU,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum HardwareRole {
     #[default]
@@ -186,6 +192,7 @@ pub enum HardwareRole {
     Frequency,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 pub struct HardwareDescriptor {
     pub hardware_id: String,
@@ -196,6 +203,7 @@ pub struct HardwareDescriptor {
 /// Immutable canonical snapshot published by the readings arbitrator.
 #[derive(Clone, Debug, Default)]
 pub struct ReadingsSnapshot {
+    #[allow(dead_code)]
     pub hardware: Vec<HardwareDescriptor>,
     pub metrics: Vec<Reading>,
 }
@@ -231,6 +239,47 @@ impl Metric {
 
     pub fn invalid() -> Self {
         Metric::default()
+    }
+}
+
+/// RC-5 published device/recovery state for the human-facing surface (the
+/// `PROVIDER_STATUS`-family panel module and the log). Each arm has exactly
+/// one fixed label; the cause-coded arms carry an RC-1 cause code
+/// (`LossCause::short()`, code included where the cause has one) and never
+/// the transport `reason` free text, so a failure is named by code rather
+/// than by concatenated prose. All four non-healthy arms keep the existing
+/// preview-retained fallback: the panel is never blanked.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum DeviceStatus {
+    /// Connected: the module keeps the existing provider summary.
+    #[default]
+    Healthy,
+    /// (a) Device absent (RC-6 ladder terminal: no candidates).
+    Absent,
+    /// (b) Device present, connection failed: named RC-1 cause code.
+    LinkFailed { code: String },
+    /// (c) Recovery allowance consumed: no further automatic action.
+    AllowanceConsumed,
+    /// (d) Recovery action failed: named RC-1 cause code.
+    RecoveryFailed { code: String },
+}
+
+impl DeviceStatus {
+    pub const LABEL_HEALTHY: &'static str = "OK";
+    pub const LABEL_ABSENT: &'static str = "ABSENT";
+    pub const LABEL_ALLOWANCE: &'static str = "NO RETRY";
+    pub const PREFIX_LINK: &'static str = "LINK ";
+    pub const PREFIX_RECOVERY: &'static str = "RECOVER ";
+
+    /// Panel/log label: enum arm template plus the cause code, nothing else.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Healthy => Self::LABEL_HEALTHY.to_string(),
+            Self::Absent => Self::LABEL_ABSENT.to_string(),
+            Self::AllowanceConsumed => Self::LABEL_ALLOWANCE.to_string(),
+            Self::LinkFailed { code } => format!("{}{code}", Self::PREFIX_LINK),
+            Self::RecoveryFailed { code } => format!("{}{code}", Self::PREFIX_RECOVERY),
+        }
     }
 }
 
@@ -279,27 +328,27 @@ pub struct Speaker {
 pub struct DiscordState {
     pub connected: bool,
     pub authenticated: bool,
+    // Carried by the host projection `state_from_pod` (src/providers/discord.rs:907) from the
+    // byte-identical component ABI block; the renderer consumers were retired, so the compiler
+    // names these dead. Kept: removing them requires editing the ABI projection outside this scope.
+    #[allow(dead_code)]
     pub channel_id: String,
     pub channel_name: String,
     pub self_mute: bool,
+    #[allow(dead_code)]
     pub self_deaf: bool,
+    #[allow(dead_code)]
     pub voice_ping_ms: f64,
+    #[allow(dead_code)]
     pub connection_state: String,
     pub speakers: Vec<Speaker>,
+    #[allow(dead_code)]
     pub error: String,
+    #[allow(dead_code)]
     pub updated: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct Alert {
-    pub id: String,
-    pub title: String,
-    pub detail: String,
-    pub severity: i32,
-    pub acknowledged: bool,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HungTarget {
     pub hwnd: usize,
     pub pid: u32,
@@ -307,7 +356,28 @@ pub struct HungTarget {
     pub image_path: String,
     pub process_name: String,
     pub title: String,
+    /// TC-1 freshness stamp: the monotonic publish generation of the detector
+    /// publication that carried this target; `0` = unstamped, never actionable.
+    pub publish_generation: u64,
+    /// Monotonic publish time of that publication; `None` = unstamped.
+    pub publish_time: Option<Instant>,
 }
+
+impl PartialEq for HungTarget {
+    /// Identity/display equality only: the publish stamp is freshness metadata, so
+    /// the press-binding continuity checks and the action-boundary revalidation
+    /// keep their pre-TC-1 identity meaning across republishes.
+    fn eq(&self, other: &Self) -> bool {
+        self.hwnd == other.hwnd
+            && self.pid == other.pid
+            && self.creation_time == other.creation_time
+            && self.image_path == other.image_path
+            && self.process_name == other.process_name
+            && self.title == other.title
+    }
+}
+
+impl Eq for HungTarget {}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AcState {
@@ -325,127 +395,6 @@ pub struct SystemBattery {
     pub percent: Option<u8>,
     pub freshness: Freshness,
     pub sampled_at: Option<SystemTime>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum BottleneckState {
-    #[default]
-    Unavailable,
-    None,
-    Cpu,
-    Gpu,
-    Mem,
-    DiskIo,
-}
-
-impl BottleneckState {
-    pub fn token(self) -> Option<&'static str> {
-        match self {
-            Self::Unavailable => None,
-            Self::None => Some("NONE"),
-            Self::Cpu => Some("CPU"),
-            Self::Gpu => Some("GPU"),
-            Self::Mem => Some("RAM"),
-            Self::DiskIo => Some("DISK I/O"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct BottleneckReading {
-    pub state: BottleneckState,
-    pub freshness: Freshness,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BottleneckThresholds {
-    pub cpu_percent: f64,
-    pub gpu_percent: f64,
-    pub memory_percent: f64,
-    pub disk_mbps: f64,
-    pub sustain: Duration,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct BottleneckInputs {
-    pub cpu_peak_percent: Option<f64>,
-    pub gpu_percent: Option<f64>,
-    pub ram_percent: Option<f64>,
-    pub vram_percent: Option<f64>,
-    pub disk_mbps: Option<f64>,
-}
-
-#[derive(Debug, Default)]
-pub struct BottleneckDetector {
-    thresholds: Option<BottleneckThresholds>,
-    candidates: [Option<Instant>; 4],
-}
-
-impl BottleneckDetector {
-    pub fn update(
-        &mut self,
-        thresholds: BottleneckThresholds,
-        input: BottleneckInputs,
-        now: Instant,
-    ) -> BottleneckReading {
-        if self.thresholds != Some(thresholds) {
-            self.thresholds = Some(thresholds);
-            self.candidates = [None; 4];
-        }
-        let memory = match (input.ram_percent, input.vram_percent) {
-            (Some(ram), Some(vram)) => Some(ram.max(vram)),
-            (ram, None) => ram,
-            (None, vram) => vram,
-        };
-        let values = [
-            (
-                BottleneckState::Cpu,
-                input.cpu_peak_percent,
-                thresholds.cpu_percent,
-            ),
-            (
-                BottleneckState::Gpu,
-                input.gpu_percent,
-                thresholds.gpu_percent,
-            ),
-            (BottleneckState::Mem, memory, thresholds.memory_percent),
-            (
-                BottleneckState::DiskIo,
-                input.disk_mbps,
-                thresholds.disk_mbps,
-            ),
-        ];
-        let mut best = None;
-        for (index, (state, value, threshold)) in values.into_iter().enumerate() {
-            let ratio = value
-                .filter(|value| value.is_finite() && *value >= threshold)
-                .map(|value| value / threshold);
-            let Some(ratio) = ratio else {
-                self.candidates[index] = None;
-                continue;
-            };
-            let since = *self.candidates[index].get_or_insert(now);
-            if now.saturating_duration_since(since) >= thresholds.sustain
-                && best.is_none_or(|(_, best_ratio)| ratio > best_ratio)
-            {
-                best = Some((state, ratio));
-            }
-        }
-        if !input
-            .cpu_peak_percent
-            .is_some_and(|value| value.is_finite())
-            || !input.ram_percent.is_some_and(|value| value.is_finite())
-            || !input.disk_mbps.is_some_and(|value| value.is_finite())
-        {
-            return BottleneckReading::default();
-        }
-        BottleneckReading {
-            state: best
-                .map(|(state, _)| state)
-                .unwrap_or(BottleneckState::None),
-            freshness: Freshness::Current,
-        }
-    }
 }
 
 /// Full display input for one render tick.
@@ -475,11 +424,12 @@ pub struct Snapshot {
     pub controller: ControllerBattery,
     pub readings: ReadingsSnapshot,
     pub providers: HashMap<String, bool>,
-    pub alerts: Vec<Alert>,
+    /// RC-5: the device/recovery state published on the human-facing surface.
+    /// `Healthy` reproduces the pre-RC-5 provider summary exactly.
+    pub device_status: DeviceStatus,
     pub discord: DiscordState,
     pub hung: Vec<HungTarget>,
     pub system_battery: SystemBattery,
-    pub bottleneck: BottleneckReading,
 }
 
 /// Session duration helper shared by slot modules.
@@ -505,20 +455,6 @@ pub fn format_duration(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bottleneck_state_tokens_are_stable_display_text() {
-        for (state, token) in [
-            (BottleneckState::Unavailable, None),
-            (BottleneckState::None, Some("NONE")),
-            (BottleneckState::Cpu, Some("CPU")),
-            (BottleneckState::Gpu, Some("GPU")),
-            (BottleneckState::Mem, Some("RAM")),
-            (BottleneckState::DiskIo, Some("DISK I/O")),
-        ] {
-            assert_eq!(state.token(), token);
-        }
-    }
 
     #[test]
     fn lookup_empty_hardware_selects_first_in_order() {
@@ -565,214 +501,41 @@ mod tests {
     }
 
     #[test]
-    fn bottleneck_sustains_normalizes_and_resets() {
-        let thresholds = BottleneckThresholds {
-            cpu_percent: 90.0,
-            gpu_percent: 95.0,
-            memory_percent: 90.0,
-            disk_mbps: 500.0,
-            sustain: Duration::from_secs(2),
-        };
-        let at = Instant::now();
-        let mut detector = BottleneckDetector::default();
-        let both = BottleneckInputs {
-            cpu_peak_percent: Some(99.0),
-            gpu_percent: Some(100.0),
-            ram_percent: Some(20.0),
-            disk_mbps: Some(0.0),
-            ..Default::default()
-        };
-        assert_eq!(
-            detector.update(thresholds, both, at).state,
-            BottleneckState::None
-        );
-        assert_eq!(
-            detector
-                .update(thresholds, both, at + Duration::from_secs(2))
-                .state,
-            BottleneckState::Cpu
-        );
-        let clear = BottleneckInputs {
-            cpu_peak_percent: Some(1.0),
-            ram_percent: Some(1.0),
-            disk_mbps: Some(1.0),
-            ..Default::default()
-        };
-        assert_eq!(
-            detector
-                .update(thresholds, clear, at + Duration::from_secs(3))
-                .state,
-            BottleneckState::None
-        );
-        assert_eq!(
-            detector
-                .update(thresholds, BottleneckInputs::default(), at)
-                .state,
-            BottleneckState::Unavailable
-        );
-        assert_eq!(
-            detector
-                .update(
-                    thresholds,
-                    BottleneckInputs {
-                        cpu_peak_percent: Some(f64::NAN),
-                        ram_percent: Some(1.0),
-                        disk_mbps: Some(1.0),
-                        ..Default::default()
-                    },
-                    at,
-                )
-                .state,
-            BottleneckState::Unavailable
-        );
-        let changed = BottleneckThresholds {
-            cpu_percent: 99.0,
-            ..thresholds
-        };
-        assert_eq!(
-            detector
-                .update(changed, both, at + Duration::from_secs(4))
-                .state,
-            BottleneckState::None
-        );
-
-        let exact_tie = BottleneckInputs {
-            cpu_peak_percent: Some(90.0),
-            gpu_percent: Some(95.0),
-            ram_percent: Some(1.0),
-            disk_mbps: Some(1.0),
-            ..Default::default()
-        };
-        let immediate = BottleneckThresholds {
-            sustain: Duration::ZERO,
-            ..thresholds
-        };
-        assert_eq!(
-            BottleneckDetector::default()
-                .update(immediate, exact_tie, at)
-                .state,
-            BottleneckState::Cpu,
-            "normalized ties use stable CPU-first classification"
-        );
-    }
-
-    #[test]
-    fn bottleneck_classifies_gpu_memory_and_disk() {
-        let thresholds = BottleneckThresholds {
-            cpu_percent: 90.0,
-            gpu_percent: 95.0,
-            memory_percent: 90.0,
-            disk_mbps: 500.0,
-            sustain: Duration::ZERO,
-        };
-        let at = Instant::now();
-        for (expected, input) in [
-            (
-                BottleneckState::Gpu,
-                BottleneckInputs {
-                    cpu_peak_percent: Some(1.0),
-                    gpu_percent: Some(96.0),
-                    ram_percent: Some(1.0),
-                    disk_mbps: Some(1.0),
-                    ..Default::default()
-                },
-            ),
-            (
-                BottleneckState::Mem,
-                BottleneckInputs {
-                    cpu_peak_percent: Some(1.0),
-                    ram_percent: Some(1.0),
-                    vram_percent: Some(91.0),
-                    disk_mbps: Some(1.0),
-                    ..Default::default()
-                },
-            ),
-            (
-                BottleneckState::DiskIo,
-                BottleneckInputs {
-                    cpu_peak_percent: Some(1.0),
-                    ram_percent: Some(1.0),
-                    disk_mbps: Some(501.0),
-                    ..Default::default()
-                },
-            ),
-        ] {
-            assert_eq!(
-                BottleneckDetector::default()
-                    .update(thresholds, input, at)
-                    .state,
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn bottleneck_candidates_sustain_independently_across_winner_changes() {
-        let thresholds = BottleneckThresholds {
-            cpu_percent: 90.0,
-            gpu_percent: 90.0,
-            memory_percent: 90.0,
-            disk_mbps: 100.0,
-            sustain: Duration::from_secs(2),
-        };
-        let start = Instant::now();
-        let mut detector = BottleneckDetector::default();
-        let input = |cpu, gpu| BottleneckInputs {
-            cpu_peak_percent: Some(cpu),
-            gpu_percent: Some(gpu),
-            ram_percent: Some(1.0),
-            disk_mbps: Some(0.0),
-            ..Default::default()
-        };
-        assert_eq!(
-            detector.update(thresholds, input(95.0, 1.0), start).state,
-            BottleneckState::None
-        );
-        assert_eq!(
-            detector
-                .update(
-                    thresholds,
-                    input(95.0, 100.0),
-                    start + Duration::from_secs(1),
-                )
-                .state,
-            BottleneckState::None
-        );
-        assert_eq!(
-            detector
-                .update(
-                    thresholds,
-                    input(95.0, 100.0),
-                    start + Duration::from_secs(2),
-                )
-                .state,
-            BottleneckState::Cpu,
-            "brief ratio winner changes do not reset CPU sustain"
-        );
-        assert_eq!(
-            detector
-                .update(
-                    thresholds,
-                    input(95.0, 100.0),
-                    start + Duration::from_secs(3),
-                )
-                .state,
-            BottleneckState::Gpu
-        );
-        assert_eq!(
-            detector
-                .update(thresholds, input(95.0, 1.0), start + Duration::from_secs(4),)
-                .state,
-            BottleneckState::Cpu,
-            "only the stopped GPU candidate is cleared"
-        );
-    }
-
-    #[test]
     fn format_duration_matches_go_semantics() {
         assert_eq!(format_duration(Duration::from_secs(0)), "00:00");
         assert_eq!(format_duration(Duration::from_secs(59)), "00:59");
         assert_eq!(format_duration(Duration::from_secs(60)), "01:00");
         assert_eq!(format_duration(Duration::from_secs(3661)), "1:01");
+    }
+
+    #[test]
+    fn device_status_labels_are_four_distinct_arm_templates() {
+        let four = [
+            DeviceStatus::Absent,
+            DeviceStatus::LinkFailed {
+                code: "open-failed(0x80070002)".to_string(),
+            },
+            DeviceStatus::AllowanceConsumed,
+            DeviceStatus::RecoveryFailed {
+                code: "worker-stalled".to_string(),
+            },
+        ];
+        assert_eq!(four[0].label(), DeviceStatus::LABEL_ABSENT);
+        assert_eq!(
+            four[1].label(),
+            format!("{}open-failed(0x80070002)", DeviceStatus::PREFIX_LINK)
+        );
+        assert_eq!(four[2].label(), DeviceStatus::LABEL_ALLOWANCE);
+        assert_eq!(
+            four[3].label(),
+            format!("{}worker-stalled", DeviceStatus::PREFIX_RECOVERY)
+        );
+        for (index, left) in four.iter().enumerate() {
+            for right in four[index + 1..].iter() {
+                assert_ne!(left.label(), right.label(), "published labels must differ");
+            }
+        }
+        assert_eq!(DeviceStatus::default(), DeviceStatus::Healthy);
+        assert_eq!(DeviceStatus::Healthy.label(), DeviceStatus::LABEL_HEALTHY);
     }
 }

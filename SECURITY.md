@@ -87,7 +87,7 @@ behavior has not completed release testing, and there is no supported end-user
 test.
 
 Safe mode limits the dashboard to the clock, built-in CPU load, memory, preview,
-slot cycling, and alert acknowledgement. It disables optional dashboard data,
+and slot cycling. It disables optional dashboard data,
 Discord dashboard access, probes, startup changes, connection-recovery restarts,
 and the destructive action.
 The explicit Discord authorize and clear commands remain available.

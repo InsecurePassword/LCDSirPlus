@@ -2,6 +2,7 @@
 
 #![cfg(windows)]
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
@@ -12,8 +13,8 @@ use std::os::windows::fs::FileExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf, Prefix};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -35,7 +36,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use crate::config::Config;
-use crate::history::{mean, percentile_high};
+use crate::history::{mean, tail_means};
 use crate::json::Json;
 use crate::model::{GameStats, Metric};
 
@@ -58,14 +59,44 @@ const MAX_CATALOG_PATHS: usize = 64;
 const MAX_CATALOG_PATH_BYTES: usize = 32 * 1024;
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const LINE_QUEUE_CAPACITY: usize = 2048;
+// Per capture, charge the requested storage for compact queued UTF-8 text only.
+// Valid byte-heavy stalls can reject new rows before the item cap. In-flight,
+// stashed and parsed data, channel/allocator overhead and stats are not bounded by this.
+const LINE_QUEUE_BYTES: usize = 384 * 1024;
 const MAX_LINES_PER_TICK: usize = 512;
-// At most 128 MiB of CSV payload can wait in the bounded channel, below the prior 512 MiB bound.
+// Gross item-by-line product, not the tighter queued text budget.
 const _: () = assert!(LINE_QUEUE_CAPACITY * MAX_LINE_BYTES == 128 * 1024 * 1024);
 // 600 seconds at 1000 FPS plus the full queued backlog draining at one observed timestamp.
 const MAX_WINDOW_FRAMES: usize = 600 * 1_000 + LINE_QUEUE_CAPACITY;
 const _: () = assert!(MAX_WINDOW_FRAMES == 602_048);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const RETRY_DELAY: Duration = Duration::from_secs(10);
+/// WO-OPT02C (finding O1, slice 3): the bound of a worker park that has nothing to
+/// wait for, named from the shipped target-poll cadence (`TARGET_POLL`), not a magic
+/// number. It is a WAKE bound, never an adoption bound: the demand edge
+/// (`telemetry.rs:121-125` stores the word, then `wake_workers`), the config edge
+/// (`telemetry.rs:99-106`) and the shutdown edge (`telemetry.rs:88-96`, store ->
+/// unpark -> join) each `Thread::unpark` this worker's handle, which `telemetry.rs:2133-2149`
+/// owns in `Telemetry::threads`, so a publish lands without waiting for the park.
+const PRESENTMON_IDLE_BOUND: Duration = TARGET_POLL;
+/// WO-OPT02C: the floor of every presentmon worker park. The host timer resolution is
+/// ~15.6 ms, so a park shorter than this is a spin. Local constant mirroring
+/// `telemetry.rs::LOOP_MIN_PARK`; the value is deliberately not imported across files.
+const WORKER_MIN_PARK: Duration = Duration::from_millis(2);
+/// WO-OPT02C-PUMPCAP (F-AUD-OPT02C-1): the longest step of the live-capture pump.
+/// WO-OPT02C-PUMPCAP2 (S14): the pump step IS this constant, not a clamp of the
+/// deadline. Two measured facts fix that shape: a `min` cap alone leaves 64.2
+/// iterations/s in the past-`STALE_AFTER` shape, because `worker_idle_deadline`
+/// collapses a deadline set whose gates are already due to `WORKER_MIN_PARK` (2 ms)
+/// and a `min` cannot lift a collapsed set - the 50 ms step is what bounds that spin
+/// (F-AUD-OPT02C-2, measured 16.1/s); and `Thread::unpark` cannot interrupt a running
+/// `recv_timeout`, so in the running-capture shape this timeout IS the demand-adoption
+/// bound (100 ms app publish cadence + this step = the shipped 150 ms promise).
+/// Parity: the live-capture pump step is the shipped 50 ms step - the retired arm's
+/// `sleep(Duration::from_millis(50))` - only the no-capture branch parks to the
+/// deadline, and the running-capture shape gains NO wake-count reduction: its win is
+/// `sleep` -> data-driven pump plus the shipped `line_overflow` reset reachability.
+const PRESENTMON_PUMP_BOUND: Duration = Duration::from_millis(50);
 const STOP_TIMEOUT_MS: u32 = 2_000;
 const MAX_STDERR_BYTES: usize = 16 * 1024;
 const MAX_DIAGNOSTIC_CHARS: usize = 1024;
@@ -220,6 +251,16 @@ struct WorkloadScore {
 struct RankedCandidate {
     process: ProcessInfo,
     workload: Option<WorkloadScore>,
+}
+
+/// WO-OPT06 (A2): the only foreground input the ranking decision reads. `pid` is the value the
+/// shipped `foreground_process()` chain left behind on the ranking path: the real pid when the
+/// full identity query succeeded, and `0` - "no foreground preference" - on every path where that
+/// chain returned `Err` or a default (A1). It carries no identity, so it can never be used where
+/// a pid + creation-time identity is validated.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ForegroundInfo {
+    pid: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -730,13 +771,17 @@ impl ActivityTracker {
         resolve: &mut impl FnMut(u32) -> Result<(ProcessInfo, Option<ProcessHandle>), String>,
     ) -> Option<ProcessInfo> {
         let stream = StreamKey::new(frame.pid, &frame.application);
-        if let Some(key) = self.streams.get(&stream).cloned() {
-            if self.candidates.get(&key).is_some_and(valid) {
-                let activity = self.candidates.get_mut(&key)?;
+        if let Some(key) = self.streams.get(&stream) {
+            if let Some(activity) = self
+                .candidates
+                .get_mut(key)
+                .filter(|activity| valid(activity))
+            {
                 activity.record(frame);
                 return Some(activity.process.clone());
             }
-            self.remove_key(&key);
+            let invalid = key.clone();
+            self.remove_key(&invalid);
         }
         if *queries >= MAX_IDENTITY_QUERIES_PER_TICK {
             return None;
@@ -886,7 +931,9 @@ impl ActivityTracker {
     fn strongest(&mut self, now: Instant, foreground_pid: u32) -> ProcessInfo {
         self.ranked(
             now,
-            foreground_pid,
+            ForegroundInfo {
+                pid: foreground_pid,
+            },
             &ProcessInfo::default(),
             &CatalogState::Unavailable,
         )
@@ -919,36 +966,12 @@ impl ActivityTracker {
     fn ranked(
         &mut self,
         now: Instant,
-        foreground_pid: u32,
+        foreground: ForegroundInfo,
         current: &ProcessInfo,
         catalog: &CatalogState,
     ) -> Option<RankedCandidate> {
         self.prune(now);
-        if let Some(best) = self.best_workload(now, 0, catalog) {
-            if current.pid != 0 {
-                if let Some(workload) = self.workload_score(current) {
-                    if best.process != *current
-                        && best.workload?.value >= workload.value + SWITCH_MARGIN
-                    {
-                        return Some(best);
-                    }
-                    return Some(RankedCandidate {
-                        process: current.clone(),
-                        workload: Some(workload),
-                    });
-                }
-            }
-            if let Some(foreground) = self.best_workload(now, foreground_pid, catalog) {
-                if best.process == foreground.process
-                    || best.workload?.value - foreground.workload?.value < SWITCH_MARGIN
-                {
-                    return Some(foreground);
-                }
-            }
-            return Some(best);
-        }
-        self.best_activity(now, foreground_pid, catalog)
-            .or_else(|| self.best_activity(now, 0, catalog))
+        ranking_decision(self, now, foreground, current, catalog)
     }
 
     fn best_workload(
@@ -1019,17 +1042,93 @@ impl ActivityTracker {
     }
 }
 
+/// WO-OPT06 (A2): the presenting-ranking decision as a PURE function of the tracker's candidates
+/// and the `ForegroundInfo` the Windows layer built, so the eligibility and tie-break semantics
+/// are testable over foreground states a live desktop cannot produce on demand (foreground
+/// absent, foreground = self, = a present candidate, = a process outside the activity set, the
+/// shipped `Err`-shaped 0, a reused pid, and the tie-breaks). The body is the shipped `ranked`
+/// decision verbatim; only `self` became a `&ActivityTracker` parameter and the pid became
+/// `foreground.pid`. `ranked` keeps the shipped `prune` before it.
+fn ranking_decision(
+    activity: &ActivityTracker,
+    now: Instant,
+    foreground: ForegroundInfo,
+    current: &ProcessInfo,
+    catalog: &CatalogState,
+) -> Option<RankedCandidate> {
+    if let Some(best) = activity.best_workload(now, 0, catalog) {
+        if current.pid != 0 {
+            if let Some(workload) = activity.workload_score(current) {
+                if best.process != *current
+                    && best.workload?.value >= workload.value + SWITCH_MARGIN
+                {
+                    return Some(best);
+                }
+                return Some(RankedCandidate {
+                    process: current.clone(),
+                    workload: Some(workload),
+                });
+            }
+        }
+        if let Some(foreground) = activity.best_workload(now, foreground.pid, catalog) {
+            if best.process == foreground.process
+                || best.workload?.value - foreground.workload?.value < SWITCH_MARGIN
+            {
+                return Some(foreground);
+            }
+        }
+        return Some(best);
+    }
+    activity
+        .best_activity(now, foreground.pid, catalog)
+        .or_else(|| activity.best_activity(now, 0, catalog))
+}
+
+#[cfg(test)]
+thread_local! {
+    static PARSER_CLOCK_COUNT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROW_HEADER_HASH_PROBES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+struct Columns {
+    row_capacity: usize,
+    pid: [Option<usize>; 1],
+    application: [Option<usize>; 1],
+    frame_ms: [Option<usize>; 3],
+    cpu_start_ms: [Option<usize>; 2],
+    cpu_busy_ms: [Option<usize>; 2],
+    gpu_busy_ms: [Option<usize>; 2],
+}
+
 #[derive(Default)]
 struct Parser {
-    header: Option<HashMap<String, usize>>,
+    header: Option<Columns>,
 }
 
 impl Parser {
+    #[cfg(test)]
     fn parse_line(&mut self, line: &str, at: SystemTime) -> Result<Option<Frame>, String> {
+        self.parse_line_at(line, at, Instant::now())
+    }
+
+    fn parse_line_at(
+        &mut self,
+        line: &str,
+        at: SystemTime,
+        observed_at: Instant,
+    ) -> Result<Option<Frame>, String> {
         if line.len() > MAX_LINE_BYTES {
             return Err("PresentMon CSV line exceeds 64 KiB".into());
         }
-        let fields = csv_fields(line)?;
+        let capacity = self
+            .header
+            .as_ref()
+            .map_or(0, |columns| columns.row_capacity);
+        let fields = csv_fields(line, capacity)?;
         if fields.is_empty() {
             return Ok(None);
         }
@@ -1042,34 +1141,41 @@ impl Parser {
                 .enumerate()
                 .map(|(i, h)| (h.trim().to_ascii_lowercase(), i))
                 .collect();
-            if !["FrameTime", "MsBetweenPresents", "MsBetweenDisplayChange"]
+            if !["frametime", "msbetweenpresents", "msbetweendisplaychange"]
                 .iter()
-                .any(|name| header.contains_key(&name.to_ascii_lowercase()))
+                .any(|name| header.contains_key(*name))
             {
                 return Err(
                     "CSV header has no frame-time column (expected FrameTime for --v2_metrics)"
                         .into(),
                 );
             }
-            self.header = Some(header);
+            let index = |name: &str| header.get(name).copied();
+            self.header = Some(Columns {
+                row_capacity: fields.len().min(32),
+                pid: ["processid"].map(index),
+                application: ["application"].map(index),
+                frame_ms: ["frametime", "msbetweenpresents", "msbetweendisplaychange"].map(index),
+                cpu_start_ms: ["cpustarttime", "cpustarttimeinms"].map(index),
+                cpu_busy_ms: ["cpubusy", "mscpubusy"].map(index),
+                gpu_busy_ms: ["gpubusy", "msgpubusy"].map(index),
+            });
             return Ok(None);
         }
-        let get = |names: &[&str]| -> &str {
-            let header = self.header.as_ref().unwrap();
-            names
+        let columns = self.header.as_ref().unwrap();
+        // Only an absent cell allows the next alias; a present empty cell wins.
+        let get = |indices: &[Option<usize>]| -> &str {
+            indices
                 .iter()
-                .find_map(|name| {
-                    header
-                        .get(&name.to_ascii_lowercase())
-                        .and_then(|i| fields.get(*i))
-                })
+                .flatten()
+                .find_map(|i| fields.get(*i))
                 .map(|v| v.trim())
                 .unwrap_or("")
         };
-        let pid = get(&["ProcessID"])
+        let pid = get(&columns.pid)
             .parse::<u32>()
             .map_err(|e| format!("PresentMon ProcessID: {e}"))?;
-        let text = get(&["FrameTime", "MsBetweenPresents", "MsBetweenDisplayChange"]);
+        let text = get(&columns.frame_ms);
         if text.is_empty() || text.eq_ignore_ascii_case("NA") {
             return Ok(None);
         }
@@ -1082,17 +1188,15 @@ impl Parser {
         if !(0.0..=10_000.0).contains(&frame_ms) || frame_ms == 0.0 {
             return Ok(None);
         }
-        let cpu_start_ms = optional_metric(
-            get(&["CPUStartTime", "CPUStartTimeInMs"]),
-            "CPUStartTime",
-            u64::MAX as f64,
-        )?;
-        let cpu_busy_ms = optional_metric(get(&["CPUBusy", "MsCPUBusy"]), "CPUBusy", 10_000.0)?;
-        let gpu_busy_ms = optional_metric(get(&["GPUBusy", "MsGPUBusy"]), "GPUBusy", 10_000.0)?;
+        let cpu_start_ms =
+            optional_metric(get(&columns.cpu_start_ms), "CPUStartTime", u64::MAX as f64)?;
+        let cpu_busy_ms = optional_metric(get(&columns.cpu_busy_ms), "CPUBusy", 10_000.0)?;
+        let gpu_busy_ms = optional_metric(get(&columns.gpu_busy_ms), "GPUBusy", 10_000.0)?;
         Ok(Some(Frame {
             at,
-            observed_at: Instant::now(),
-            application: get(&["Application"]).to_string(),
+            observed_at,
+            // The frame outlives the input line, so this field keeps its owned String.
+            application: get(&columns.application).to_string(),
             pid,
             frame_ms,
             cpu_start_ms,
@@ -1119,28 +1223,129 @@ fn optional_metric(text: &str, name: &str, maximum: f64) -> Result<Option<f64>, 
     Ok((0.0..=maximum).contains(&value).then_some(value))
 }
 
-fn csv_fields(line: &str) -> Result<Vec<String>, String> {
-    let mut fields = Vec::new();
-    let mut field = String::new();
-    let mut chars = line.trim().chars().peekable();
+/// WO-OPT08 (A2): the row split borrows every field that contains no quote character, so a
+/// 23-column PresentMon row allocates only the `Vec` itself. A field with a quote is the ONE
+/// case that must be built, because unescaping changes its bytes (`""` becomes `"`), so the
+/// value cannot alias the input; it is owned for that field only. The quote toggle, the doubled
+/// quote escape, the `unterminated quoted ...` error, the line trim, the per-field content and
+/// the trailing field push are the shipped ones, in the shipped order.
+fn csv_fields(line: &str, capacity: usize) -> Result<Vec<Cow<'_, str>>, String> {
+    let trimmed = line.trim();
+    let mut fields: Vec<Cow<'_, str>> = Vec::with_capacity(capacity);
+    let mut start = 0usize;
+    let mut copied = 0usize;
+    let mut owned: Option<String> = None;
     let mut quoted = false;
-    while let Some(ch) = chars.next() {
+    let mut chars = trimmed.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
         match ch {
-            '"' if quoted && chars.peek() == Some(&'"') => {
-                field.push('"');
+            '"' if quoted && chars.peek().is_some_and(|&(_, next)| next == '"') => {
                 chars.next();
+                let text = owned.get_or_insert_with(String::new);
+                if copied < index {
+                    text.push_str(&trimmed[copied..index]);
+                }
+                text.push('"');
+                copied = index + 2;
             }
-            '"' => quoted = !quoted,
-            ',' if !quoted => fields.push(std::mem::take(&mut field)),
-            _ => field.push(ch),
+            '"' => {
+                quoted = !quoted;
+                // A quote changes this field's bytes, so from here it is the owned case.
+                let text = owned.get_or_insert_with(String::new);
+                if copied < index {
+                    text.push_str(&trimmed[copied..index]);
+                }
+                copied = index + 1;
+            }
+            ',' if !quoted => {
+                let value = match owned.take() {
+                    Some(mut text) => {
+                        if copied < index {
+                            text.push_str(&trimmed[copied..index]);
+                        }
+                        Cow::Owned(text)
+                    }
+                    None => Cow::Borrowed(&trimmed[start..index]),
+                };
+                fields.push(value);
+                start = index + 1;
+                copied = start;
+            }
+            _ => {}
         }
     }
     if quoted {
         return Err("unterminated quoted PresentMon CSV field".into());
     }
-    fields.push(field);
+    let end = trimmed.len();
+    fields.push(match owned.take() {
+        Some(mut text) => {
+            if copied < end {
+                text.push_str(&trimmed[copied..end]);
+            }
+            Cow::Owned(text)
+        }
+        None => Cow::Borrowed(&trimmed[start..]),
+    });
     Ok(fields)
 }
+
+/// Model-shape census counters (WO-OPT05 A1). The lane's precedent shape is
+/// `WORKER_TICKS`/`worker_tick_count` (`:1476-1492`) and the unit-56 `SNAPSHOT_CREATIONS` in
+/// `hid.rs`: a per-THREAD map counted at the named production site, so a census reads the
+/// calling test's own model calls and not the whole process (the shipped suite runs tests in
+/// parallel). One entry per test thread in the test binary, `cfg(test)` only, never compiled
+/// into the shipped artifact. They count CALLS, not time: no CPU is measured here and no CPU
+/// claim is made from these rows.
+#[cfg(test)]
+static MODEL_SHAPE_BUILDS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, (u64, u64)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn model_build_map(
+) -> &'static std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, (u64, u64)>> {
+    MODEL_SHAPE_BUILDS.get_or_init(std::sync::Mutex::default)
+}
+
+/// `(model builds, stale-path model builds)` for the calling thread. The discarded-stale count
+/// is derived in the census as `stale builds - publications`, both measured, so no counter
+/// needs a site in code that no longer discards anything.
+#[cfg(test)]
+fn model_shape_counts() -> (u64, u64) {
+    let map = model_build_map();
+    let map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.get(&std::thread::current().id())
+        .copied()
+        .unwrap_or((0, 0))
+}
+
+#[cfg(test)]
+fn model_shape_reset() {
+    let map = model_build_map();
+    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.insert(std::thread::current().id(), (0, 0));
+}
+
+#[cfg(test)]
+fn model_build_tick() {
+    let map = model_build_map();
+    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.entry(std::thread::current().id()).or_insert((0, 0)).0 += 1;
+}
+
+#[cfg(test)]
+fn stale_build_tick() {
+    let map = model_build_map();
+    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.entry(std::thread::current().id()).or_insert((0, 0)).1 += 1;
+}
+
+#[cfg(not(test))]
+fn model_build_tick() {}
+
+#[cfg(not(test))]
+fn stale_build_tick() {}
 
 struct Stats {
     frames: VecDeque<(Instant, f64)>,
@@ -1148,6 +1353,13 @@ struct Stats {
     stutters: i32,
     threshold: f64,
     window: Duration,
+    /// WO-OPT05 (A2.2): the window filter's reusable scratch. Cleared and refilled by
+    /// `model`, then sorted IN PLACE for the two tail means, so a warm `model` call
+    /// allocates no window vector, no 1 s vector and no sort clone. Retained capacity
+    /// only: `Vec::clear` never shrinks, so this is per-`Stats` private memory sized by
+    /// the window occupancy (reported in WO-OPT05-RECEIPT.md), never released to the
+    /// allocator.
+    scratch: Vec<f64>,
 }
 
 impl Stats {
@@ -1158,6 +1370,7 @@ impl Stats {
             stutters: 0,
             threshold,
             window,
+            scratch: Vec::new(),
         }
     }
 
@@ -1181,37 +1394,76 @@ impl Stats {
         Ok(())
     }
 
+    /// The published model. `&mut self` for ONE reason: the reusable `scratch` window
+    /// buffer, sorted in place. Nothing else on `Stats` is touched, so the numbers are
+    /// the same function of the same frames as the shipped `&self` form.
     fn model(
-        &self,
+        &mut self,
         now: SystemTime,
         observed_now: Instant,
         window: Duration,
         process: &str,
     ) -> GameStats {
+        model_build_tick();
         let cutoff = observed_now.checked_sub(window);
-        let frame_times: Vec<f64> = self
-            .frames
-            .iter()
-            .filter(|(at, _)| cutoff.is_none_or(|cutoff| *at >= cutoff))
-            .map(|(_, value)| *value)
-            .collect();
-        if frame_times.is_empty() {
+        let recent_cutoff = observed_now.checked_sub(Duration::from_secs(1));
+        // One scan: the window filter goes into the reused scratch buffer, and the last-1 s
+        // set is recorded as the CONTIGUOUS SUFFIX of it that starts at the first in-recent
+        // frame. `mean` then runs on a slice of the scratch: the same values in the same
+        // order as the shipped `mean(&recent)`, so it is bit-identical, with no vector.
+        // (A running sum is NOT exact here: `Iterator::sum` and a manual `+=` fold give
+        // different NaN payloads for `inf + -inf`, proved by the A3 matrix.)
+        self.scratch.clear();
+        let mut recent_start: Option<usize> = None;
+        let mut recent_in_window = 0usize;
+        let mut recent_outside_window = 0usize;
+        let mut last_window = 0.0f64;
+        for (at, value) in self.frames.iter() {
+            let in_window = cutoff.is_none_or(|cutoff| *at >= cutoff);
+            let in_recent = recent_cutoff.is_none_or(|cutoff| *at >= cutoff);
+            if in_window {
+                if in_recent {
+                    if recent_start.is_none() {
+                        recent_start = Some(self.scratch.len());
+                    }
+                    recent_in_window += 1;
+                }
+                self.scratch.push(*value);
+                last_window = *value;
+            } else if in_recent {
+                recent_outside_window += 1;
+            }
+        }
+        if self.scratch.is_empty() {
             return GameStats::default();
         }
-        let recent_cutoff = observed_now.checked_sub(Duration::from_secs(1));
-        let recent: Vec<f64> = self
-            .frames
-            .iter()
-            .filter(|(at, _)| recent_cutoff.is_none_or(|cutoff| *at >= cutoff))
-            .map(|(_, value)| *value)
-            .collect();
-        let current = if recent.is_empty() {
-            *frame_times.last().unwrap()
-        } else {
-            mean(&recent)
+        let current = match recent_start {
+            // The shipped fallback: an empty recent set takes the LAST frame time of the
+            // window in arrival order, never the sorted tail.
+            None if recent_outside_window == 0 => last_window,
+            Some(start)
+                if recent_outside_window == 0 && start + recent_in_window == self.scratch.len() =>
+            {
+                mean(&self.scratch[start..])
+            }
+            // A window narrower than 1 s, or non-monotonic stamps, makes the recent set
+            // reach outside the window: the shipped vector path is kept verbatim there.
+            _ => {
+                let recent: Vec<f64> = self
+                    .frames
+                    .iter()
+                    .filter(|(at, _)| recent_cutoff.is_none_or(|cutoff| *at >= cutoff))
+                    .map(|(_, value)| *value)
+                    .collect();
+                if recent.is_empty() {
+                    last_window
+                } else {
+                    mean(&recent)
+                }
+            }
         };
-        let one = percentile_high(&frame_times, 0.01);
-        let point_one = percentile_high(&frame_times, 0.001);
+        // A2.1: one ordering yields both tail means (see `history::tail_means`).
+        let (one, point_one) = tail_means(&mut self.scratch);
         GameStats {
             active: true,
             process_name: process.to_string(),
@@ -1233,12 +1485,13 @@ impl Stats {
 pub fn spawn(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
+    consumers: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
 ) -> (mpsc::Receiver<Update>, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("telemetry-presentmon".into())
-        .spawn(move || run(config, generation, shutdown, tx))
+        .spawn(move || run(config, generation, consumers, shutdown, tx))
         .expect("PresentMon telemetry thread");
     (rx, thread)
 }
@@ -1251,6 +1504,26 @@ fn current_request(config: &RwLock<Config>, generation: &AtomicU64) -> (u64, Con
             return (before, config);
         }
     }
+}
+
+/// WO-TEL-D2 (S5, U-8): the worker-loop head (WO-OPT02C: parked on its own deadline)
+/// reuses the cached `Arc<Config>`
+/// under an unchanged generation (no 20 Hz `Config` clone); a changed
+/// generation takes the module's shipped `current_request` rule copy, so the
+/// cached value belongs to the generation reported with it. Generation
+/// semantics are untouched.
+fn cached_request(
+    config: &RwLock<Config>,
+    generation: &AtomicU64,
+    cache: &mut (u64, Arc<Config>),
+) -> (u64, Arc<Config>) {
+    let before = generation.load(Ordering::SeqCst);
+    if before == cache.0 && before != 0 && generation.load(Ordering::SeqCst) == before {
+        return (before, Arc::clone(&cache.1));
+    }
+    let (generation, config) = current_request(config, generation);
+    *cache = (generation, Arc::new(config));
+    (generation, Arc::clone(&cache.1))
 }
 
 fn confirm_start_request(
@@ -1281,42 +1554,103 @@ fn confirm_start_request(
     Ok(())
 }
 
+/// EC-6: named child-exit causes observed at the presentmon child boundary.
+/// Stable short tokens (RC-1 vocabulary discipline, `CatalogUnavailableReason::code` style);
+/// the reason text carries class + numeric exit code only, never child argv or paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildExit {
+    Normal,
+    Failed(u32),
+    DidNotExitInTime,
+}
+
+/// `ExitStatus::code()` is always `Some` on Windows; the sentinel keeps a code-less (signal) death
+/// named as a failure instead of masking it as a normal exit. Not reachable on the pinned target.
+const NO_EXIT_CODE: u32 = u32::MAX;
+
+impl ChildExit {
+    fn classify(status: &ExitStatus) -> Self {
+        match status.code() {
+            Some(0) => Self::Normal,
+            Some(code) => Self::Failed(code as u32),
+            None => Self::Failed(NO_EXIT_CODE),
+        }
+    }
+
+    fn token(self) -> String {
+        match self {
+            Self::Normal => "exited_normal".into(),
+            Self::Failed(code) => format!("exited_failed_{code}"),
+            Self::DidNotExitInTime => "did_not_exit_in_time".into(),
+        }
+    }
+
+    fn reason(self) -> String {
+        format!("presentmon child {}", self.token())
+    }
+
+    /// Full provider-unavailable reason for a child that stopped while capturing (site 1).
+    fn capture_end_reason(self, target: &str) -> String {
+        format!(
+            "{} while capturing {target}; the target may have exited",
+            self.reason()
+        )
+    }
+}
+
 fn wait_bounded(
     timeout: Duration,
     mut exited: impl FnMut() -> Result<bool, String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let deadline = Instant::now() + timeout;
     loop {
         if exited()? {
-            return Ok(());
+            return Ok(true);
         }
         if Instant::now() >= deadline {
-            return Err(format!(
-                "exit was not confirmed within {} ms",
-                timeout.as_millis()
-            ));
+            return Ok(false);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn wait_child_bounded(child: &mut Child, timeout: Duration) -> Result<(), String> {
-    wait_bounded(timeout, || {
+fn wait_child_bounded(child: &mut Child, timeout: Duration) -> Result<ChildExit, String> {
+    let mut observed: Option<ExitStatus> = None;
+    let confirmed = wait_bounded(timeout, || {
         child
             .try_wait()
-            .map(|status| status.is_some())
+            .map(|status| {
+                let done = status.is_some();
+                if done {
+                    observed = status;
+                }
+                done
+            })
             .map_err(|error| format!("query child status: {error}"))
-    })
+    })?;
+    match (confirmed, observed) {
+        (true, Some(status)) => Ok(ChildExit::classify(&status)),
+        // confirmed only happens once a status was observed, so this arm is unreachable.
+        (true, None) => Ok(ChildExit::DidNotExitInTime),
+        (false, _) => Err(format!(
+            "exit was not confirmed within {} ms: {}",
+            timeout.as_millis(),
+            ChildExit::DidNotExitInTime.token()
+        )),
+    }
 }
 
-fn stop_child_bounded(child: &mut Child, timeout: Duration) -> Result<(), String> {
-    if child.try_wait().is_ok_and(|status| status.is_some()) {
-        return Ok(());
+fn stop_child_bounded(child: &mut Child, timeout: Duration) -> Result<ChildExit, String> {
+    if let Ok(Some(status)) = child.try_wait() {
+        return Ok(ChildExit::classify(&status));
     }
     if let Err(kill) = child.kill() {
         return match child.try_wait() {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => Err(format!("kill child: {kill}; child is still running")),
+            Ok(Some(status)) => Ok(ChildExit::classify(&status)),
+            Ok(None) => Err(format!(
+                "kill child: {kill}; child is still running: {}",
+                ChildExit::DidNotExitInTime.token()
+            )),
             Err(wait) => Err(format!("kill child: {kill}; confirm exit: {wait}")),
         };
     }
@@ -1336,23 +1670,120 @@ fn join_thread_bounded<T>(
     thread.join().map_err(|_| "reader panicked")
 }
 
+/// WO-OPT02C (C1.3): the worker's next wake, built ONLY from gates this file already
+/// computes. The earliest remaining deadline wins; a gate that is already due collapses
+/// to `WORKER_MIN_PARK` (never negative, never a spin); a gate further away than
+/// `PRESENTMON_IDLE_BOUND` is capped to it, because the demand / config / shutdown
+/// `unpark` edges are what make a long park safe; and an empty set (nothing to wait
+/// for) is the idle bound. Pure: no clocks read, no state touched, exact `Duration`s.
+fn worker_idle_deadline(deadlines: &[Option<Instant>], now: Instant) -> Duration {
+    let earliest = deadlines
+        .iter()
+        .flatten()
+        .fold(None, |acc: Option<Duration>, deadline| {
+            let remaining = deadline.saturating_duration_since(now);
+            Some(acc.map_or(remaining, |acc| acc.min(remaining)))
+        });
+    match earliest {
+        Some(remaining) if remaining <= WORKER_MIN_PARK => WORKER_MIN_PARK,
+        Some(remaining) => remaining.min(PRESENTMON_IDLE_BOUND),
+        None => PRESENTMON_IDLE_BOUND,
+    }
+}
+
+#[cfg(test)]
+static WORKER_TICKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, u64>>,
+> = std::sync::OnceLock::new();
+
+/// WO-OPT02C (C3 seam): test-only per-worker iteration counter, so the wake census and
+/// the dormancy tests measure THIS worker's loop and not the process. Bounded: one
+/// entry per worker thread in the test binary, never compiled into the release artifact.
+#[cfg(test)]
+fn worker_tick() {
+    let ticks = WORKER_TICKS.get_or_init(std::sync::Mutex::default);
+    let mut ticks = ticks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *ticks.entry(std::thread::current().id()).or_insert(0) += 1;
+}
+
+#[cfg(test)]
+fn worker_tick_count(thread: std::thread::ThreadId) -> u64 {
+    let ticks = WORKER_TICKS.get_or_init(std::sync::Mutex::default);
+    let ticks = ticks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ticks.get(&thread).copied().unwrap_or(0)
+}
+
+#[cfg(not(test))]
+fn worker_tick() {}
+
 fn run(
     config: Arc<RwLock<Config>>,
     generation: Arc<AtomicU64>,
+    consumers: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     tx: mpsc::Sender<Update>,
 ) {
     let mut capture = Capture::default();
     let mut current_generation = 0;
+    let mut request = (
+        0u64,
+        Arc::new(config.read().unwrap_or_else(|e| e.into_inner()).clone()),
+    );
     while !shutdown.load(Ordering::Relaxed) {
-        let (request_generation, cfg) = current_request(&config, &generation);
+        worker_tick();
+        let (request_generation, cfg) = cached_request(&config, &generation, &mut request);
         if request_generation != current_generation {
             if capture.stop_and_report_cleanup(&tx, request_generation, Instant::now()) {
-                std::thread::sleep(Duration::from_millis(50));
+                // WO-OPT02C (C1.3): the cleanup-pending retry parks on the gate this arm
+                // itself stamps - `stop_and_report_cleanup` -> `schedule_retry` sets
+                // `retry_after` (RETRY_DELAY) on a failed stop - capped to the idle bound.
+                std::thread::park_timeout(worker_idle_deadline(
+                    &[capture.retry_after],
+                    Instant::now(),
+                ));
                 continue;
             }
             capture = Capture::default();
             current_generation = request_generation;
+        }
+        // WO-TEL-D2 (S2, U-3): no displayed presentmon-backed module
+        // (`app.rs module_extended_consumers`, fall-through included) => ZERO
+        // target polls AND ZERO child-spawn retries: the reconcile gate (target
+        // selection, executable resolution, the child spawn retry ladder) is
+        // never reached. The park reuses the shipped disabled-arm shape:
+        // `stop_and_report_cleanup` once, one deduped `unavailable` publication
+        // (health: `providers["presentmon"]` false => the availability
+        // predicate `app.rs:745-763` keeps falling through, fed by publication,
+        // not by fresh polls), then the dormancy park (WO-OPT02C: the idle bound,
+        // not the retired 50 ms step). Demand return re-enters reconcile: the 1 s
+        // target-poll gate is due (`last_target_poll` stale), so selection runs on
+        // the worker tick the demand `unpark` edge drives (<=100 ms render cadence +
+        // an immediate wake).
+        if !crate::telemetry::demanded(consumers.load(Ordering::Relaxed), "presentmon") {
+            if capture.stop_and_report_cleanup(&tx, request_generation, Instant::now()) {
+                // WO-OPT02C (C1.3): same shipped retry gate as the generation arm.
+                std::thread::park_timeout(worker_idle_deadline(
+                    &[capture.retry_after],
+                    Instant::now(),
+                ));
+                continue;
+            }
+            capture.unavailable(&tx, request_generation, "no display consumer".into());
+            // WO-OPT02C (C1.3/C1.1): the zero-demand park has NOTHING in this file to
+            // wait for - the reconcile gates are behind the demand gate, so a
+            // target-poll deadline that is already due must NOT collapse the park
+            // (`last_target_poll` ages, it is never stamped here). The set is empty,
+            // so the park is the idle bound (`TARGET_POLL`), and the demand edge is
+            // what pays for it: `telemetry.rs::set_consumers` stores the word and
+            // `wake_workers` unparks this handle, so adoption is the publish cadence,
+            // not the park. The shipped narrative's "50 ms loop" is now "an immediate
+            // unpark", which is why the 150 ms re-arm bound stays an UPPER bound.
+            std::thread::park_timeout(worker_idle_deadline(&[], Instant::now()));
+            continue;
         }
         capture.reconcile(&cfg, request_generation, &tx, &|target, key| {
             confirm_start_request(
@@ -1365,7 +1796,29 @@ fn run(
                 key,
             )
         });
-        std::thread::sleep(Duration::from_millis(50));
+        // WO-OPT02C (C1.3/C1.4): the tail step is the worker's own deadline, not a 20 Hz
+        // tick. With a capture running, the line channel IS a real wake edge (the reader
+        // thread's send returns `recv_timeout`), so the CSV pump is data-driven and no
+        // queued line can age into the `line_overflow` reset; with no capture there is
+        // nothing to drain, so the worker parks to its gates.
+        if capture.capture_running() {
+            // WO-OPT02C-PUMPCAP2 (S14, F-AUD-OPT02C-1/-2): the plain form of the pump
+            // bound. `step.min(BOUND)` alone was measured at 64.2 iterations/s in the
+            // past-`STALE_AFTER` shape - `worker_idle_deadline` collapses a deadline set
+            // whose gates are permanently due (a frozen game, a stalled pipe) to
+            // `WORKER_MIN_PARK` and a `min` cannot lift it, so the bound is carried as a
+            // constant, not as a clamp of a deadline that is already gone. And because
+            // `Thread::unpark` cannot cut a running `recv_timeout`, this step is the
+            // demand-adoption bound of the running-capture shape. It is the shipped 50 ms
+            // step (base parity); the deadline stays where it pays, in the no-capture
+            // `park_timeout` branch below.
+            capture.pump_step(PRESENTMON_PUMP_BOUND);
+        } else {
+            // F-AUD-OPT02C2-3: the deadline is computed where it is consumed, so the
+            // running-capture branch cannot read it (no behavior change).
+            let step = capture.idle_deadline(&cfg, Instant::now());
+            std::thread::park_timeout(step);
+        }
     }
     let mut stderr = String::new();
     for _ in 0..3 {
@@ -1390,7 +1843,11 @@ fn run(
 struct Capture {
     child: Option<Child>,
     owned_session: Option<String>,
-    lines: Option<mpsc::Receiver<String>>,
+    lines: Option<LineReceiver>,
+    /// WO-OPT02C (C1.4): one line stashed by `pump_step` (the channel is the worker's
+    /// data edge, and `recv_timeout` CONSUMES), handed to the next `drain_with`, so the
+    /// data-driven step never drops a CSV line. Cleared with `lines` on every stop/start.
+    pump_line: Option<String>,
     line_overflow: Option<Arc<AtomicBool>>,
     reader: Option<std::thread::JoinHandle<()>>,
     stderr: Option<Arc<std::sync::Mutex<BoundedDiagnostic>>>,
@@ -1412,6 +1869,52 @@ struct Capture {
 }
 
 impl Capture {
+    /// WO-OPT02C (C1.3): this worker's own deadline set, from the stamps the shipped
+    /// gates already read: the target-poll cadence, the catalog refresh, the retry
+    /// cooldown, the staleness and expiry edges, the publish gate and the startup
+    /// timeout. `VERIFIER_BOUND` needs no term: the Authenticode verification runs
+    /// INSIDE `reconcile` (`run_bounded_verifier` blocks this thread in
+    /// `recv_timeout(VERIFIER_BOUND)`), so the worker is never parked with a pending
+    /// verifier; after a timeout the shipped decline is retried by the target-poll gate,
+    /// which IS in this set.
+    fn idle_deadline(&self, cfg: &Config, now: Instant) -> Duration {
+        worker_idle_deadline(
+            &[
+                self.last_target_poll.map(|last| last + TARGET_POLL),
+                self.catalog.checked_at.map(|last| last + CATALOG_REFRESH),
+                self.retry_after,
+                self.last_frame.map(|last| last + STALE_AFTER),
+                self.last_frame.map(|last| last + STALE_AFTER + STALE_AFTER),
+                self.last_publish
+                    .filter(|_| self.last_frame > self.last_publish)
+                    .map(|last| last + cfg.presentmon_interval),
+                self.started_at.map(|started| started + STARTUP_TIMEOUT),
+            ],
+            now,
+        )
+    }
+
+    /// WO-OPT02C (C1.4): a capture whose CSV pipe is live. Its lines must keep draining:
+    /// the `line_overflow` reset fires on loss (including queue saturation), so this is
+    /// the one shape with a data edge, not a timer.
+    fn capture_running(&self) -> bool {
+        self.child.is_some() && self.lines.is_some()
+    }
+
+    /// WO-OPT02C (C1.4): the inter-iteration step while a capture runs. The reader
+    /// thread's `send` is a real wake edge, so the worker waits on the channel to its own
+    /// deadline; the received line is stashed for the next `drain_with` (no CSV line is
+    /// dropped by the wait). With an empty queue the timeout IS the park.
+    fn pump_step(&mut self, step: Duration) {
+        let line = self
+            .lines
+            .as_ref()
+            .and_then(|lines| lines.recv_timeout(step).ok());
+        if line.is_some() {
+            self.pump_line = line;
+        }
+    }
+
     fn reconcile(
         &mut self,
         cfg: &Config,
@@ -1504,6 +2007,7 @@ impl Capture {
         if let Some(child) = &mut self.child {
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    let exit = ChildExit::classify(&status);
                     let target = if presenting {
                         "local frame presenters".into()
                     } else {
@@ -1514,13 +2018,7 @@ impl Capture {
                     self.failure(
                         tx,
                         generation,
-                        with_diagnostic(
-                            format!(
-                                "PresentMon exited ({status}) while capturing {}; the target may have exited",
-                                target
-                            ),
-                            stderr,
-                        ),
+                        with_diagnostic(exit.capture_end_reason(&target), stderr),
                     );
                     return;
                 }
@@ -1559,9 +2057,7 @@ impl Capture {
             self.activity
                 .apply_catalog(selection_catalog(cfg, &self.catalog.state));
             self.activity.validate_processes();
-            self.prepare_presenting(cfg, generation, tx, now, || {
-                foreground_process().map(|process| process.pid).unwrap_or(0)
-            });
+            self.prepare_presenting(cfg, generation, tx, now, foreground_ranking_pid);
         }
         if let Err(error) = self.drain(cfg, generation, tx, now) {
             let stderr = self.stop();
@@ -1590,33 +2086,40 @@ impl Capture {
             return;
         }
         if !presenting {
-            if let (Some(last), Some(stats)) = (self.last_frame, self.stats.as_ref()) {
+            if let (Some(last), true) = (self.last_frame, self.stats.is_some()) {
                 let idle = now.duration_since(last);
-                let Some((game, detail)) = stale_projection(
-                    stats,
-                    SystemTime::now(),
-                    now,
-                    cfg.presentmon_window,
-                    &self.target.name,
-                    idle,
-                ) else {
+                // WO-OPT05 (A2.3): the phase and the detail string are decided FIRST, so
+                // the model is built only on a real transition. The shipped shape is kept
+                // exactly: `idle <= STALE_AFTER` keeps the shipped early return, the two
+                // detail strings are verbatim, and the `last_unavailable` bookkeeping is
+                // the shipped write-then-send.
+                let Some(phase) = stale_phase(idle) else {
                     return;
                 };
-                if self.last_unavailable != detail {
-                    self.last_unavailable = detail.clone();
-                    let _ = tx.send(Update {
-                        generation,
-                        game,
-                        detail,
-                        ..Default::default()
-                    });
+                if stale_publishes(&self.last_unavailable, phase) {
+                    if let Some(stats) = self.stats.as_mut() {
+                        let detail = stale_detail(phase);
+                        let game = stale_game(
+                            stats,
+                            SystemTime::now(),
+                            now,
+                            cfg.presentmon_window,
+                            &self.target.name,
+                            phase,
+                        );
+                        self.last_unavailable = detail.to_string();
+                        let _ = tx.send(Update {
+                            generation,
+                            game,
+                            detail: detail.to_string(),
+                            ..Default::default()
+                        });
+                    }
                 }
             }
         }
         if presenting {
-            self.pick_presenter(cfg, now, || {
-                foreground_process().map(|process| process.pid).unwrap_or(0)
-            });
+            self.pick_presenter(cfg, now, foreground_ranking_pid);
             if self.target.pid == 0 {
                 self.unavailable(
                     tx,
@@ -1638,35 +2141,39 @@ impl Capture {
         if self.target.pid != 0 && !self.activity.contains(&self.target) {
             self.select_presenter(ProcessInfo::default(), cfg);
         }
-        let stale = self
-            .last_frame
-            .zip(self.stats.as_ref())
-            .and_then(|(last, stats)| {
-                let idle = now.duration_since(last);
-                stale_projection(
-                    stats,
-                    SystemTime::now(),
-                    now,
-                    cfg.presentmon_window,
-                    &self.target.name,
-                    idle,
-                )
-                .map(|projection| (idle, projection))
-            });
-        if let Some((idle, (game, detail))) = stale {
-            if self.last_unavailable != detail {
-                self.last_unavailable = detail.clone();
-                let _ = tx.send(Update {
-                    generation,
-                    game,
-                    detail,
-                    ..Default::default()
-                });
-            }
-            if idle > ACTIVITY_EXPIRY {
-                let expired = self.target.clone();
-                self.activity.remove(&expired);
-                self.select_presenter(ProcessInfo::default(), cfg);
+        if let (Some(last), true) = (self.last_frame, self.stats.is_some()) {
+            let idle = now.duration_since(last);
+            // WO-OPT05 (A2.3): the phase and the detail string are decided before any
+            // model exists, so a stale iteration that the shipped dedupe would discard
+            // builds nothing. The shipped `ACTIVITY_EXPIRY` action stays on EVERY
+            // projected iteration, transition or not, exactly as the shipped dedupe left
+            // it, and the fresh case stays a no-op (no early return here in the shipped form).
+            if let Some(phase) = stale_phase(idle) {
+                if stale_publishes(&self.last_unavailable, phase) {
+                    if let Some(stats) = self.stats.as_mut() {
+                        let detail = stale_detail(phase);
+                        let game = stale_game(
+                            stats,
+                            SystemTime::now(),
+                            now,
+                            cfg.presentmon_window,
+                            &self.target.name,
+                            phase,
+                        );
+                        self.last_unavailable = detail.to_string();
+                        let _ = tx.send(Update {
+                            generation,
+                            game,
+                            detail: detail.to_string(),
+                            ..Default::default()
+                        });
+                    }
+                }
+                if idle > ACTIVITY_EXPIRY {
+                    let expired = self.target.clone();
+                    self.activity.remove(&expired);
+                    self.select_presenter(ProcessInfo::default(), cfg);
+                }
             }
         }
         if self.target.pid == 0 {
@@ -1681,7 +2188,9 @@ impl Capture {
         }
         let Some(candidate) = self.activity.ranked(
             now,
-            foreground_pid(),
+            ForegroundInfo {
+                pid: foreground_pid(),
+            },
             &self.target,
             selection_catalog(cfg, &self.catalog.state),
         ) else {
@@ -1793,7 +2302,7 @@ impl Capture {
         let Some(stderr) = self.child.as_mut().and_then(|child| child.stderr.take()) else {
             return Err(self.stop_error("PresentMon stderr pipe unavailable".into()));
         };
-        let (line_tx, line_rx) = mpsc::sync_channel(LINE_QUEUE_CAPACITY);
+        let (line_tx, line_rx) = line_channel(LINE_QUEUE_CAPACITY);
         let overflow = Arc::new(AtomicBool::new(false));
         let reader_overflow = Arc::clone(&overflow);
         let reader = match std::thread::Builder::new()
@@ -1805,6 +2314,7 @@ impl Capture {
                 return Err(self.stop_error(format!("start PresentMon output reader: {error}")));
             }
         };
+        self.pump_line = None;
         self.lines = Some(line_rx);
         self.line_overflow = Some(overflow);
         self.reader = Some(reader);
@@ -1874,19 +2384,23 @@ impl Capture {
         let mut identity_queries = 0;
         let mut selected_invalid = false;
         for _ in 0..MAX_LINES_PER_TICK {
-            let line = match lines.try_recv() {
-                Ok(line) => line,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    return Err("PresentMon output reader disconnected".into());
-                }
+            // WO-OPT02C (C1.4): a line the data-driven step already took from the
+            // channel is drained first, so `pump_step` never loses CSV data.
+            let line = match self.pump_line.take() {
+                Some(line) => line,
+                None => match lines.try_recv() {
+                    Ok(line) => line,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err("PresentMon output reader disconnected".into());
+                    }
+                },
             };
-            let mut frame = match self.parser.parse_line(&line, SystemTime::now()) {
+            let frame = match self.parser.parse_line_at(&line, SystemTime::now(), now) {
                 Ok(Some(frame)) => frame,
                 Ok(None) => continue,
                 Err(error) => return Err(format!("PresentMon CSV invalid: {error}")),
             };
-            frame.observed_at = now;
             if presenting {
                 if !candidate_allowed(
                     frame.pid,
@@ -1948,7 +2462,12 @@ impl Capture {
                 .unwrap_or(true)
         {
             self.last_publish = Some(now);
-            let game = self.stats.as_ref().unwrap().model(
+            // WO-OPT05 A2.2: `as_mut()` is only for the scratch buffer. The mutable
+            // borrow of `self.stats` and the shared borrow of `self.target.name` are
+            // DISJOINT FIELDS of `Capture`, so the process name goes in by reference:
+            // no `to_string()`/`clone()` is added to this path (that allocation is the
+            // one this unit removes, not one to reintroduce).
+            let game = self.stats.as_mut().unwrap().model(
                 SystemTime::now(),
                 now,
                 cfg.presentmon_window,
@@ -1987,8 +2506,8 @@ impl Capture {
 
     fn stop_with(
         &mut self,
-        stop_child: impl FnOnce(&mut Child) -> Result<(), String>,
-        cleanup: impl FnOnce(&str) -> Result<(), String>,
+        stop_child: impl FnOnce(&mut Child) -> Result<ChildExit, String>,
+        mut cleanup: impl FnMut(&str) -> Result<(), String>,
     ) -> String {
         let mut shutdown = Vec::new();
         self.stop_diagnostic.clear();
@@ -1996,10 +2515,18 @@ impl Capture {
             if let Err(error) = stop_child(&mut child) {
                 self.stop_diagnostic = format!("teardown: {error}");
                 self.child = Some(child);
+                // WO-U46I (#13): an unconfirmed child stop keeps the child handle (the retry
+                // ladder owns that resource), but the ETW session is THIS instance's own named
+                // registration, and the presenting-mode child carries no `--terminate_on_proc_exit`
+                // (`presentmon_args`), so the session must not stay registered behind the retry.
+                // The cleanup is attempted here and its outcome is reported as a SEPARATE segment
+                // next to the child-stop outcome.
+                self.cleanup_owned_session(&mut cleanup);
                 return String::new();
             }
         }
         self.lines = None;
+        self.pump_line = None;
         self.line_overflow = None;
         let deadline = Instant::now() + Duration::from_millis(STOP_TIMEOUT_MS.into());
         if let Some(reader) = self.reader.take() {
@@ -2016,6 +2543,24 @@ impl Capture {
         if !shutdown.is_empty() {
             self.stop_diagnostic = format!("shutdown: {}", shutdown.join("; "));
         }
+        self.cleanup_owned_session(&mut cleanup);
+        self.target = ProcessInfo::default();
+        self.key.clear();
+        self.stats = None;
+        self.activity = ActivityTracker::default();
+        self.catalog = CatalogCache::default();
+        self.challenger = None;
+        self.last_frame = None;
+        self.last_publish = None;
+        self.started_at = None;
+        stderr
+    }
+
+    /// WO-U46I (#13): clean up exactly THIS instance's owned named session. Idempotent (a cleared
+    /// `owned_session` is never cleaned again) and never an unrelated session. The child-handle
+    /// ownership is a separate resource and is not part of this outcome; a refused cleanup keeps
+    /// the claim so `teardown_pending` schedules the retry, as shipped.
+    fn cleanup_owned_session(&mut self, cleanup: &mut impl FnMut(&str) -> Result<(), String>) {
         let cleanup_error = self
             .owned_session
             .as_deref()
@@ -2029,16 +2574,6 @@ impl Capture {
         } else {
             self.owned_session = None;
         }
-        self.target = ProcessInfo::default();
-        self.key.clear();
-        self.stats = None;
-        self.activity = ActivityTracker::default();
-        self.catalog = CatalogCache::default();
-        self.challenger = None;
-        self.last_frame = None;
-        self.last_publish = None;
-        self.started_at = None;
-        stderr
     }
 
     fn teardown_pending(&self) -> bool {
@@ -2115,33 +2650,70 @@ fn retry_pending(retry_after: Option<Instant>, now: Instant) -> bool {
     retry_after.map(|retry| now < retry).unwrap_or(false)
 }
 
-fn stale_projection(
-    stats: &Stats,
+/// Which stale arm a frame-idle age selects. The shipped bounds are unchanged:
+/// `idle <= STALE_AFTER` is fresh (no projection at all), `idle > 2 * STALE_AFTER` is the
+/// expired/unavailable arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StalePhase {
+    Stale,
+    Expired,
+}
+
+fn stale_phase(idle: Duration) -> Option<StalePhase> {
+    if idle <= STALE_AFTER {
+        return None;
+    }
+    Some(if idle > STALE_AFTER + STALE_AFTER {
+        StalePhase::Expired
+    } else {
+        StalePhase::Stale
+    })
+}
+
+/// The two shipped detail strings, verbatim.
+fn stale_detail(phase: StalePhase) -> &'static str {
+    match phase {
+        StalePhase::Stale => "capture stale: no frames for 5 seconds",
+        StalePhase::Expired => "capture unavailable: stale data expired",
+    }
+}
+
+/// WO-OPT05 (A2.3): the publication decision, computed BEFORE any model exists.
+/// `true` = the state/detail is a transition, so the model is genuinely needed;
+/// `false` = the shipped dedupe would throw the model away, so it is never built.
+fn stale_publishes(last_unavailable: &str, phase: StalePhase) -> bool {
+    last_unavailable != stale_detail(phase)
+}
+
+/// The shipped stale projection's payload, reached only on a transition. `stats` and
+/// `process` come from DISJOINT fields of `Capture` at both call sites (`self.stats`
+/// vs `self.target.name`), which is why no process-name clone appears on this path.
+/// The expired arm is the shipped `GameStats::default()`; the stale arm is the shipped
+/// model over `window + STALE_AFTER` with `metric.stale = metric.valid` folding.
+fn stale_game(
+    stats: &mut Stats,
     now: SystemTime,
     observed_now: Instant,
     window: Duration,
     process: &str,
-    idle: Duration,
-) -> Option<(GameStats, String)> {
-    if idle <= STALE_AFTER {
-        return None;
+    phase: StalePhase,
+) -> GameStats {
+    match phase {
+        StalePhase::Expired => GameStats::default(),
+        StalePhase::Stale => {
+            stale_build_tick();
+            let mut game = stats.model(now, observed_now, window + STALE_AFTER, process);
+            for metric in [
+                &mut game.fps,
+                &mut game.one_percent,
+                &mut game.point_one_low,
+                &mut game.frame_time_ms,
+            ] {
+                metric.stale = metric.valid;
+            }
+            game
+        }
     }
-    if idle > STALE_AFTER + STALE_AFTER {
-        return Some((
-            GameStats::default(),
-            "capture unavailable: stale data expired".into(),
-        ));
-    }
-    let mut game = stats.model(now, observed_now, window + STALE_AFTER, process);
-    for metric in [
-        &mut game.fps,
-        &mut game.one_percent,
-        &mut game.point_one_low,
-        &mut game.frame_time_ms,
-    ] {
-        metric.stale = metric.valid;
-    }
-    Some((game, "capture stale: no frames for 5 seconds".into()))
 }
 
 #[derive(Default)]
@@ -2203,8 +2775,120 @@ fn with_diagnostic(reason: String, diagnostic: String) -> String {
     }
 }
 
-fn read_output(mut reader: impl BufRead, tx: mpsc::SyncSender<String>, dropped: Arc<AtomicBool>) {
-    let mut line = Vec::new();
+#[derive(Default)]
+struct LineBudget {
+    bytes: AtomicUsize,
+    closed: AtomicBool,
+}
+
+struct QueuedLine {
+    budget: Arc<LineBudget>,
+    text: Option<Box<str>>,
+}
+
+impl QueuedLine {
+    fn take_text(&mut self) -> Option<Box<str>> {
+        let text = self.text.take()?;
+        self.budget.bytes.fetch_sub(text.len(), Ordering::Relaxed);
+        Some(text)
+    }
+
+    fn into_text(mut self) -> String {
+        self.take_text()
+            .expect("queued line owns text")
+            .into_string()
+    }
+}
+
+impl Drop for QueuedLine {
+    fn drop(&mut self) {
+        drop(self.take_text());
+    }
+}
+
+#[derive(Clone)]
+struct LineSender {
+    tx: mpsc::SyncSender<QueuedLine>,
+    budget: Arc<LineBudget>,
+}
+
+impl LineSender {
+    fn try_send(&self, line: &str) -> Result<(), mpsc::TrySendError<()>> {
+        let bytes = line.len();
+        if self
+            .budget
+            .bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                let next = used + bytes;
+                (next <= LINE_QUEUE_BYTES).then_some(next)
+            })
+            .is_err()
+        {
+            // This rejection skips try_send, so it must still observe receiver shutdown.
+            return Err(if self.budget.closed.load(Ordering::Acquire) {
+                mpsc::TrySendError::Disconnected(())
+            } else {
+                mpsc::TrySendError::Full(())
+            });
+        }
+        self.tx
+            .try_send(QueuedLine {
+                budget: Arc::clone(&self.budget),
+                text: Some(line.into()),
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => mpsc::TrySendError::Full(()),
+                mpsc::TrySendError::Disconnected(_) => mpsc::TrySendError::Disconnected(()),
+            })
+    }
+
+    #[cfg(test)]
+    fn send(&self, line: String) -> Result<(), mpsc::TrySendError<()>> {
+        self.try_send(&line)
+    }
+}
+
+struct LineReceiver {
+    rx: mpsc::Receiver<QueuedLine>,
+    budget: Arc<LineBudget>,
+}
+
+impl LineReceiver {
+    fn try_recv(&self) -> Result<String, mpsc::TryRecvError> {
+        self.rx.try_recv().map(QueuedLine::into_text)
+    }
+
+    fn recv_timeout(&self, step: Duration) -> Result<String, mpsc::RecvTimeoutError> {
+        self.rx.recv_timeout(step).map(QueuedLine::into_text)
+    }
+
+    #[cfg(test)]
+    fn into_iter(self) -> impl Iterator<Item = String> {
+        std::iter::from_fn(move || self.rx.recv().ok().map(QueuedLine::into_text))
+    }
+}
+
+impl Drop for LineReceiver {
+    fn drop(&mut self) {
+        // Publish closure before the channel drops any undelivered reservations.
+        self.budget.closed.store(true, Ordering::Release);
+    }
+}
+
+fn line_channel(capacity: usize) -> (LineSender, LineReceiver) {
+    let (tx, rx) = mpsc::sync_channel(capacity);
+    let budget = Arc::new(LineBudget::default());
+    (
+        LineSender {
+            tx,
+            budget: Arc::clone(&budget),
+        },
+        LineReceiver { rx, budget },
+    )
+}
+
+fn read_output(mut reader: impl BufRead, tx: LineSender, dropped: Arc<AtomicBool>) {
+    let mut partial = Vec::new();
     let mut overflow = false;
     loop {
         let buffer = match reader.fill_buf() {
@@ -2215,48 +2899,60 @@ fn read_output(mut reader: impl BufRead, tx: mpsc::SyncSender<String>, dropped: 
             }
         };
         if buffer.is_empty() {
-            if !overflow && !line.is_empty() {
-                if let Ok(text) = String::from_utf8(line) {
-                    send_line(&tx, &dropped, text);
-                } else {
-                    dropped.store(true, Ordering::Release);
-                }
+            if !overflow && !partial.is_empty() {
+                send_output_bytes(&tx, &dropped, &partial);
             }
             return;
         }
         let end = buffer
             .iter()
             .position(|byte| *byte == b'\n')
-            .map(|index| index + 1)
-            .unwrap_or(buffer.len());
-        if !overflow && line.len() + end <= MAX_LINE_BYTES {
-            line.extend_from_slice(&buffer[..end]);
+            .map_or(buffer.len(), |index| index + 1);
+        let complete = buffer[end - 1] == b'\n';
+        let mut connected = true;
+        if !overflow && partial.len() + end <= MAX_LINE_BYTES {
+            let head = &buffer[..end];
+            if complete {
+                // Complete rows only need one allocation, after validation and byte admission.
+                let mut bytes = if partial.is_empty() {
+                    head
+                } else {
+                    partial.extend_from_slice(head);
+                    &partial
+                };
+                while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+                    bytes = &bytes[..bytes.len() - 1];
+                }
+                connected = send_output_bytes(&tx, &dropped, bytes);
+            } else {
+                partial.extend_from_slice(head);
+            }
         } else {
             overflow = true;
             dropped.store(true, Ordering::Release);
         }
-        let complete = buffer.get(end.wrapping_sub(1)) == Some(&b'\n');
         reader.consume(end);
+        if !connected {
+            return;
+        }
         if complete {
-            if !overflow {
-                while matches!(line.last(), Some(b'\n' | b'\r')) {
-                    line.pop();
-                }
-                if let Ok(text) = String::from_utf8(std::mem::take(&mut line)) {
-                    if !send_line(&tx, &dropped, text) {
-                        return;
-                    }
-                } else {
-                    dropped.store(true, Ordering::Release);
-                }
-            }
-            line.clear();
+            partial.clear();
             overflow = false;
         }
     }
 }
 
-fn send_line(tx: &mpsc::SyncSender<String>, dropped: &AtomicBool, line: String) -> bool {
+fn send_output_bytes(tx: &LineSender, dropped: &AtomicBool, bytes: &[u8]) -> bool {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => send_line(tx, dropped, text),
+        Err(_) => {
+            dropped.store(true, Ordering::Release);
+            true
+        }
+    }
+}
+
+fn send_line(tx: &LineSender, dropped: &AtomicBool, line: &str) -> bool {
     match tx.try_send(line) {
         Ok(()) => true,
         Err(mpsc::TrySendError::Full(_)) => {
@@ -2434,7 +3130,15 @@ fn validate_executable(path: &Path) -> Result<PinnedExecutable, String> {
         return Err("path is not a PresentMon console executable".into());
     }
     let pinned = pin_canonical_executable(canonical)?;
-    verify_authenticode(&pinned.file, &pinned.path)?;
+    // WO-U46I (#3a): the signature check goes through the bounded wrapper, so the 50 ms worker
+    // never blocks on `WinVerifyTrustEx`. The wrapper receives an OWNED duplicate of the pinned
+    // handle, so the pinned-identity and SHA-256 checks below keep the shipped order and content.
+    verify_authenticode_bounded(
+        &pinned.path,
+        pinned.file.try_clone().map_err(|error| {
+            format!("open the pinned PresentMon for signature verification: {error}")
+        })?,
+    )?;
     if pinned.identity.size != PRESENTMON_SIZE
         || held_sha256(&pinned.file, pinned.identity.size)? != PRESENTMON_SHA256
     {
@@ -2709,6 +3413,85 @@ fn held_sha256(file: &File, size: u64) -> Result<String, String> {
     Ok(crate::sha256::hex(&hash.finish()))
 }
 
+/// WO-U46I (#3a): the 50 ms capture worker must not block on `WinVerifyTrustEx` — the trust call
+/// performs verification work with no OS bound, and it is reached from the capture start inside
+/// the worker loop. The check runs on a dedicated verifier thread and the worker waits a BOUNDED
+/// time. The gate slot bounds OUTSTANDING WORK per provider instance: at most one verifier thread
+/// is ever in flight, and a timeout fails closed while KEEPING the in-flight thread counted, so a
+/// later attempt declines instead of stranding a new thread per timeout. The gate is consumed by
+/// the verifier's COMPLETION, never by a timeout-ack, so nothing accumulates across polling,
+/// retries or reconfiguration. The bounded precedent is `providers/discord.rs:2205-2226`, whose
+/// single-outstanding flag is cleared ONLY by the verifier thread, so after one timeout the flag
+/// stays set forever (a permanent lockout); that latch defect is not replicated here.
+const VERIFIER_BOUND: Duration = Duration::from_secs(5);
+const VERIFIER_BUSY: &str =
+    "PresentMon Authenticode verifier is already running; capture not started";
+const VERIFIER_TIMEOUT: &str = "PresentMon Authenticode verification timed out; the verifier is \
+                                still running; capture not started";
+
+thread_local! {
+    /// One gate slot per provider instance: `run` (the capture worker thread) is the only caller,
+    /// and a reconfiguration reuses that thread, so the slot spans reconfigures by construction.
+    static AUTHENTICODE_GATE: std::cell::RefCell<Option<mpsc::Receiver<Result<(), String>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The gate state machine: Idle (`None`) / Running (a receiver slot). See the const block above.
+fn run_bounded_verifier<R, F>(
+    gate: &mut Option<mpsc::Receiver<R>>,
+    bound: Duration,
+    work: F,
+) -> Result<R, String>
+where
+    R: Send + 'static,
+    F: FnOnce() -> R + Send + 'static,
+{
+    if let Some(pending) = gate.as_ref() {
+        match pending.try_recv() {
+            // The previous verifier returned (or died): THIS completion consumes the gate, so the
+            // current attempt is entitled to spawn its own verification.
+            Ok(_) | Err(mpsc::TryRecvError::Disconnected) => *gate = None,
+            // Still in flight: decline without spawning, so the outstanding count stays one.
+            Err(mpsc::TryRecvError::Empty) => return Err(VERIFIER_BUSY.into()),
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    let Ok(_verifier) = std::thread::Builder::new()
+        .name("presentmon-authenticode".into())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+    else {
+        return Err(
+            "PresentMon Authenticode verifier thread could not start; capture not started".into(),
+        );
+    };
+    let receiver = gate.insert(rx);
+    match receiver.recv_timeout(bound) {
+        Ok(result) => {
+            *gate = None;
+            Ok(result)
+        }
+        // FAIL CLOSED with the thread counted: the slot keeps the receiver, so the next attempt
+        // declines until this verifier actually returns, and the diagnostic names the outcome.
+        Err(_) => Err(VERIFIER_TIMEOUT.into()),
+    }
+}
+
+/// The bounded wrapper the capture start calls. The inputs are OWNED by the verifier thread (a
+/// duplicated file handle + an owned path), so no borrow crosses and the worker never blocks on
+/// the OS call itself.
+fn verify_authenticode_bounded(path: &Path, file: File) -> Result<(), String> {
+    let path = path.to_path_buf();
+    AUTHENTICODE_GATE
+        .with(|gate| {
+            run_bounded_verifier(&mut gate.borrow_mut(), VERIFIER_BOUND, move || {
+                verify_authenticode(&file, &path)
+            })
+        })
+        .and_then(|result| result)
+}
+
 fn verify_authenticode(file: &File, path: &Path) -> Result<(), String> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Security::Cryptography::{
@@ -2875,6 +3658,116 @@ fn foreground_process() -> Result<ProcessInfo, String> {
     }
 }
 
+/// WO-OPT06 (A1): the value the presenting-ranking closures pass as the foreground preference.
+/// The shipped expression was `foreground_process().map(|p| p.pid).unwrap_or(0)`, so ranking saw
+/// `0` - "no preference" - on EVERY failure path of the full identity chain, and the pid only when
+/// that chain succeeded. This helper reproduces exactly that outcome with the cheapest queries that
+/// decide it, and drops the work ranking discards (the 64 KiB UTF-16 buffer, the image-path query,
+/// the creation-time query and the owned path/name strings).
+///
+/// Dropped rows 4-8 are safe for a pid under TWO conditions, and the comment states both, because
+/// the second is NOT re-checked per iteration (F-AUD-OPT06-1):
+/// (a) ENTRY: `ActivityTracker::record` admits a candidate only after `open_process_info`
+///     succeeded, so rows 4-8 passed at least once; and
+/// (b) CONTINUATION: every iteration that ranks runs `validate_processes` FIRST, and the
+///     foreground pid is filtered through the candidates.
+/// For a pid that never passed (a), `required_pid` filtering yields nothing = the shipped 0.
+/// For a pid that passed once and LATER denies the image query while still running, (b) does not
+/// catch it: `validate_processes` checks handle LIVENESS (`ProcessHandle::is_running`), not a
+/// re-validation of the image/creation-time identity. Shipped ranking then yields `0` (no
+/// preference) and this path yields the pid. That is the residual, measured as of 2026-11-23:
+/// row-4-shaped processes (OpenProcess succeeds, `QueryFullProcessImageNameW` fails, the production
+/// mask `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE`, `PROCESS_NAME_WIN32`) are **0 of
+/// ~417 pids** across three back-to-back probes (the auditor's own probe twice, the manager's
+/// interleaved). An earlier 2-of-420 sighting (`VGC.exe`, `LCore.exe`) is NOT reproducible: the
+/// round-1 probe's source is not preserved, `VGC.exe` is not running here, and `LCore.exe` answers
+/// the image query with BOTH the 32,768-unit and 260-unit buffers (last error 0). On a
+/// NON-ELEVATED host the protected/SYSTEM class fails at `OpenProcess` and lands in row 3a, so a
+/// genuine row-4 sighting needs an elevated or PPL-adjacent probe (denied at the QUERY) or the
+/// exit race. Population today: 0 - and 0 today proves NOTHING about an anti-cheat title, because
+/// the image-query policy is per-process and per-build. No such pid is presenting in any count, so
+/// no live pair exists here. Registered as F-AUD-OPT06-1 (P2) with the owner-manual
+/// repro (run a game under a protected driver and confirm the presenting choice is unchanged).
+/// WO-OPT07 (A1) RULED THAT ROW (NEQ), so the shipped 0 is BEHAVIOUR, not an equivalence, and the
+/// row stays OPEN for the owner: in the two branches where the foreground value is read -
+/// `best_workload(now, foreground.pid, ..)` here at :1064, reached from TWO producers,
+/// `prepare_presenting` -> `pick_presenter` with `self.target` = default (`current.pid == 0`: the
+/// startup state, the target-not-in-set reset at :2049-2051, the expiry reset at :2080-2084) AND
+/// `reconcile:2029-2030` -> `pick_presenter:2097` with `current.pid != 0` and NO workload score for
+/// the current target (:1052), so the divergence is WIDER than the first producer alone - and
+/// `best_activity(now, foreground.pid, ..)` at :1074 (producer: no candidate carries a workload
+/// score, i.e. a CSV without valid CPU/GPU occupancy (:640-645), fewer than 3 consecutive complete
+/// trace seconds, or per-second gaps) -
+/// the shipped 0 and the pid pick DIFFERENT winners, pinned by
+/// `ranking_foreground_divergent_row_flips_the_presenting_choice`. The round-1 closing proposal
+/// ("gate the ranking input on the pid being a CURRENT candidate, a tracked flag") is a NO-OP for
+/// this row and was dropped: the row's own premises make that predicate true (the pid was admitted
+/// at entry by (a) and is kept running by (b)), so the flag yields the pid, not the shipped 0; and
+/// for a pid OUTSIDE the candidate set the value is already outcome-equal to 0 through the
+/// `required_pid` filtering (:977, :1012). The only mechanism that reproduces the shipped 0 is
+/// re-running the identity query per ranking iteration, which restores the 5 allocations / 1
+/// over-256-byte block (65,536 B) / 4 small blocks per call measured in unit 58's A3 census - a
+/// revert of this unit, not a fix, so it is NOT done here. No proxy (name compare, creation-time
+/// re-read, handle cache) is substituted: a proxy that diverges is a silent behaviour change.
+/// Identity validation of candidates, targets, challengers and the selected presenter is NOT
+/// relaxed anywhere: only the ranking input is. The relaxation applies to EVERY pid on the
+/// dropped rows 4-8, and its outcome matches the shipped one for rows 1-3 (kept) and for every
+/// pid that is not a current candidate; for the divergent current-candidate row it does NOT
+/// match - that gap is F-AUD-OPT06-1, ruled NEQ above, and it is open to the owner's decision.
+fn foreground_ranking_pid() -> u32 {
+    ranking_foreground_pid_for(foreground_window_pid())
+}
+
+/// WO-OPT06 (A1): the composition, factored over a pid so every row of the failure-path table is
+/// testable against the shipped builder (`ranking_foreground_value_matches_the_shipped_identity_chain_on_reachable_pids`).
+fn ranking_foreground_pid_for(pid: u32) -> u32 {
+    ranking_foreground_pid(pid, foreground_process_openable(pid))
+}
+
+/// WO-OPT06 (A1): the outcome contract, pure so every row of the failure-path table is testable.
+/// `0` is the shipped `Err`/absent-window value (no foreground preference).
+fn ranking_foreground_pid(window_pid: u32, openable: bool) -> u32 {
+    if window_pid == 0 || !openable {
+        0
+    } else {
+        window_pid
+    }
+}
+
+/// WO-OPT06: the window-thread pid of the foreground window, `0` when there is no foreground
+/// window - the two shipped paths that already produced a default `ProcessInfo` (pid 0).
+fn foreground_window_pid() -> u32 {
+    unsafe {
+        let window = GetForegroundWindow();
+        if window.0.is_null() {
+            return 0;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(window, Some(&mut pid));
+        pid
+    }
+}
+
+/// WO-OPT06: the kept query - `OpenProcess` with the shipped access mask, closed on drop. The mask
+/// is identical to `open_process_info`'s so this probe fails exactly where the shipped chain's
+/// first query fails (access denied on an elevated/protected process, exited pid, invalid pid),
+/// which is the row that decides whether ranking sees the pid or `0`.
+fn foreground_process_openable(pid: u32) -> bool {
+    unsafe {
+        match OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        ) {
+            Ok(handle) => {
+                drop(ProcessHandle(handle));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 fn process_info(pid: u32) -> Result<ProcessInfo, String> {
     if pid == 0 {
         return Ok(ProcessInfo::default());
@@ -2972,6 +3865,99 @@ fn find_named_process(name: &str) -> Result<ProcessInfo, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// EC-8 (P1 §2 EC-8, acceptance 2): a generation bump while the worker is idle clears the
+    /// capture, and with it the publication-dedupe state, so the new generation republishes its
+    /// own provider state instead of staying suppressed behind the previous generation's detail.
+    /// PresentMon stays disabled: no child process is started and no ETW session is touched.
+    #[test]
+    fn presentmon_config_change_midflight_clears_capture_and_republishes_the_disabled_reason() {
+        let config = Arc::new(RwLock::new(Config {
+            presentmon_enabled: false,
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        // WO-TEL-D2 (U-3): demand the presentmon readings so the worker reaches
+        // `reconcile` (the shipped disabled-config path this test pins); demand
+        // 0 would park the worker before the config gate.
+        let consumers = Arc::new(AtomicU64::new(crate::telemetry::ALL_EXTENDED_CONSUMERS));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let thread = {
+            let config = Arc::clone(&config);
+            let generation = Arc::clone(&generation);
+            let consumers = Arc::clone(&consumers);
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || run(config, generation, consumers, shutdown, tx))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut published = None;
+        while published.is_none() && Instant::now() < deadline {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(100)) {
+                if update.generation == 1 {
+                    published = Some(update);
+                }
+            }
+        }
+        let published = published.expect("the worker publishes generation-1 provider state");
+        assert_eq!(published.detail, "disabled");
+        generation.fetch_add(1, Ordering::SeqCst);
+        let mut republished = None;
+        while republished.is_none() && Instant::now() < deadline {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(100)) {
+                if update.generation == 2 {
+                    republished = Some(update);
+                }
+            }
+        }
+        let update = republished.expect(
+            "a mid-flight generation bump clears the capture so the new generation republishes state",
+        );
+        assert_eq!(update.detail, "disabled");
+        assert!(!update.available && !update.error);
+        shutdown.store(true, Ordering::Relaxed);
+        thread.join().unwrap();
+    }
+
+    /// EC-8 (P1 §2 EC-8, acceptance 2): the generation gate that runs immediately before a
+    /// capture start refuses a request whose generation moved mid-flight, and a request whose
+    /// config content moved while the generation counter did not. Presenting mode only, so no
+    /// target enumeration, child process, or ETW session is involved.
+    #[test]
+    fn presentmon_config_change_midflight_refuses_the_capture_start_gate() {
+        let config = Config {
+            presentmon_enabled: true,
+            presentmon_target_mode: "presenting".into(),
+            ..Config::default()
+        };
+        let shared = RwLock::new(config.clone());
+        let generation = AtomicU64::new(2);
+        let shutdown = AtomicBool::new(false);
+        let target = ProcessInfo::default();
+        let key = capture_key(&config, &target);
+        assert!(
+            confirm_start_request(&shared, &generation, &shutdown, &config, 2, &target, &key)
+                .is_ok(),
+            "an unchanged generation and config must be accepted"
+        );
+        let error =
+            confirm_start_request(&shared, &generation, &shutdown, &config, 1, &target, &key)
+                .unwrap_err();
+        assert!(
+            error.contains("changed"),
+            "a generation that moved mid-flight must refuse the start: {error}"
+        );
+        let mut moved = config.clone();
+        moved.presentmon_interval += Duration::from_millis(1);
+        *shared.write().unwrap() = moved.clone();
+        let error =
+            confirm_start_request(&shared, &generation, &shutdown, &moved, 2, &target, &key)
+                .unwrap_err();
+        assert!(
+            error.contains("changed"),
+            "a config change with a stable generation counter must refuse the start: {error}"
+        );
+    }
 
     #[test]
     #[ignore = "reads the optional current-user NVIDIA App catalog"]
@@ -3110,6 +4096,518 @@ mod tests {
     }
 
     #[test]
+    fn alias_selection_distinguishes_absent_from_present_empty_columns() {
+        let at = SystemTime::UNIX_EPOCH;
+        let mut p = Parser::default();
+        assert!(p
+            .parse_line(
+                "ProcessID,MsBetweenPresents,Application,MsCPUBusy,FrameTime,CPUBusy",
+                at,
+            )
+            .unwrap()
+            .is_none());
+        ROW_HEADER_HASH_PROBES.with(|calls| calls.set(Some(0)));
+        let short = p.parse_line("42,16,fixture.exe,8", at).unwrap().unwrap();
+        assert_eq!((short.frame_ms, short.cpu_busy_ms), (16.0, Some(8.0)));
+        assert!(p.parse_line("42,16,fixture.exe,8,", at).unwrap().is_none());
+        let full = p
+            .parse_line("42,16,fixture.exe,8,20,", at)
+            .unwrap()
+            .unwrap();
+        assert_eq!((full.frame_ms, full.cpu_busy_ms), (20.0, None));
+        assert!(p
+            .parse_line("42,16,fixture.exe,8,20,1,\"unterminated", at)
+            .is_err());
+
+        let mut duplicate = Parser::default();
+        duplicate
+            .parse_line("ProcessID,FrameTime, frametime ,Application", at)
+            .unwrap();
+        let got = duplicate
+            .parse_line("42,1,2,fixture.exe", at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.frame_ms, 2.0, "last case-folded duplicate header wins");
+        let calls = ROW_HEADER_HASH_PROBES.with(|calls| calls.replace(None).unwrap());
+        assert_eq!(calls, 0, "data rows must not hash column names");
+    }
+
+    #[test]
+    fn ordinary_csv_row_needs_only_split_and_owned_application_allocations() {
+        let at = SystemTime::UNIX_EPOCH;
+        let mut parser = Parser::default();
+        assert!(parser.parse_line(PINNED_HEADER, at).unwrap().is_none());
+        let (frame, calls) = {
+            let _watch = crate::backends::alloc_count::window();
+            let frame = parser.parse_line(PINNED_ROW_A, at).unwrap().unwrap();
+            (frame, crate::backends::alloc_count::snapshot().4)
+        };
+        assert_eq!(
+            (frame.pid, frame.application.as_str(), frame.at),
+            (2888, "dwm.exe", at)
+        );
+        assert_eq!(frame.frame_ms.to_bits(), 903.0195f64.to_bits());
+        assert_eq!(frame.cpu_start_ms, Some(762.9536));
+        assert_eq!(frame.cpu_busy_ms, Some(903.0195));
+        assert_eq!(frame.gpu_busy_ms, Some(1.5059));
+        let wide = format!("{PINNED_ROW_A}{}", ",".repeat(128));
+        assert_eq!(
+            parser.parse_line(&wide, at).unwrap().unwrap().application,
+            "dwm.exe"
+        );
+        let bad = format!("{wide}\"unterminated");
+        assert!(parser
+            .parse_line(&bad, at)
+            .unwrap_err()
+            .contains("unterminated quoted"));
+        assert_eq!(
+            calls, 2,
+            "ordinary CSV split does not grow through intermediate buffers"
+        );
+    }
+
+    /// WO-OPT08 (A1): the 23-column header and the rows below are VERBATIM from the pinned
+    /// capture fixture
+    /// `artifacts/phase3/operational-soak/opt/fixtures-pinned/presentmon-pinned-live2.csv`
+    /// (80,341 B, SHA256-16 `FC228FCDD5D2553E`), whose SEGMENT 1/2 rows are byte-equal to the
+    /// live capture `fixtures-live/presentmon-live2.csv` (2,376,062 B, SHA256-16
+    /// `2F9F04C03AFBEE15`, 7,237 data rows, every row 23 fields, no quote character in the
+    /// file). The emitted column count is therefore the MEASURED 23, never an assumed one.
+    /// shortcut: the rows are embedded, the untracked artifact is not opened by this test, so a
+    /// fixture edit cannot fail it; the pinned SHA-16 above is the anchor.
+    const PINNED_HEADER: &str = "Application,ProcessID,SwapChainAddress,PresentRuntime,SyncInterval,PresentFlags,AllowsTearing,PresentMode,CPUStartTime,FrameTime,CPUBusy,CPUWait,GPULatency,GPUTime,GPUBusy,GPUWait,DisplayLatency,DisplayedTime,AnimationError,AnimationTime,MsFlipDelay,AllInputToPhotonLatency,ClickToPhotonLatency";
+    const PINNED_ROW_A: &str = "dwm.exe,2888,0x100000000,Other,-1,0,0,Hardware: Legacy Flip,762.9536,903.0195,903.0195,0.0000,0.0219,903.4377,1.5059,901.9318,905.3810,32.0586,NA,762.9536,NA,NA,NA";
+    const PINNED_ROW_B: &str = "dwm.exe,2888,0x100000000,Other,-1,0,0,Hardware: Legacy Flip,1665.9731,32.0668,32.0668,0.0000,0.4401,31.6522,0.9821,30.6701,34.4201,967.9036,870.9609,1665.9731,NA,NA,NA";
+    const PINNED_ROW_C: &str = "dwm.exe,2888,0x100000000,Other,-1,0,0,Hardware: Legacy Flip,1698.0399,968.9269,968.9269,0.0000,816.0883,152.8613,1.1246,151.7367,970.2569,50.0256,-935.8368,1698.0399,NA,NA,NA";
+    const PINNED_ROW_D: &str = "chrome.exe,27124,0x21DA824ED20,DXGI,0,0,0,Composed: Flip,2483.6828,26.5273,26.3925,0.1348,26.4675,1.2838,1.2838,0.0000,34.8653,206.9345,NA,2483.6828,NA,NA,NA";
+    const PINNED_ROW_QUOTED: &str = r#""Game, Inc. [""beta""]",2888,0x100000000,Other,-1,0,0,Hardware: Legacy Flip,762.9536,903.0195,903.0195,0.0000,0.0219,903.4377,1.5059,901.9318,905.3810,32.0586,NA,762.9536,NA,NA,NA"#;
+    const PINNED_ROW_NON_NUMERIC: &str = "dwm.exe,2888,0x100000000,Other,-1,0,0,Hardware: Legacy Flip,762.9536,not-a-number,903.0195,0.0000,0.0219,903.4377,1.5059,901.9318,905.3810,32.0586,NA,762.9536,NA,NA,NA";
+
+    /// WO-OPT08 (A1/A3): the per-row CSV path counted on the lane's `alloc_count` allocator.
+    /// Asserts are the counter's non-vacuity (a known 1,024 B block), the linearity of the
+    /// per-row cost (1/2/4 of the SAME row) and the row bound this unit ships against; the
+    /// numbers are PRINTS, because std's layout and growth law is not pinned (the F-AUD-OPT04-1
+    /// rule). No CPU is measured and no CPU claim is made - these are counts.
+    #[test]
+    fn row_split_allocation_cost_is_measured_on_pinned_fixture_rows() {
+        use crate::backends::alloc_count;
+
+        let measure = |run: &mut dyn FnMut()| -> alloc_count::Counts {
+            let _window = alloc_count::window();
+            alloc_count::watch_thread();
+            alloc_count::reset();
+            let before = alloc_count::snapshot();
+            run();
+            alloc_count::subtract(alloc_count::snapshot(), before)
+        };
+
+        // Non-vacuity of the counter: one known 1,024 B block is one over-256-byte allocation.
+        let control = measure(&mut || {
+            std::hint::black_box(vec![0u8; 1_024]);
+        });
+        assert_eq!(
+            control.4, 1,
+            "the counter sees the known 1,024 B block: {control:?}"
+        );
+        assert_eq!(
+            control.3, 1,
+            "the known block is the over-256-byte class: {control:?}"
+        );
+
+        // The header is accepted OUTSIDE every window, so the window measures the ROW path.
+        let mut parser = Parser::default();
+        parser
+            .parse_line(PINNED_HEADER, SystemTime::UNIX_EPOCH)
+            .unwrap();
+
+        let row1 = measure(&mut || {
+            std::hint::black_box(
+                parser
+                    .parse_line(PINNED_ROW_A, SystemTime::UNIX_EPOCH)
+                    .unwrap(),
+            );
+        });
+        let row2 = measure(&mut || {
+            for _ in 0..2 {
+                std::hint::black_box(
+                    parser
+                        .parse_line(PINNED_ROW_A, SystemTime::UNIX_EPOCH)
+                        .unwrap(),
+                );
+            }
+        });
+        let row4 = measure(&mut || {
+            for _ in 0..4 {
+                std::hint::black_box(
+                    parser
+                        .parse_line(PINNED_ROW_A, SystemTime::UNIX_EPOCH)
+                        .unwrap(),
+                );
+            }
+        });
+        let a = measure(&mut || {
+            std::hint::black_box(
+                parser
+                    .parse_line(PINNED_ROW_A, SystemTime::UNIX_EPOCH)
+                    .unwrap(),
+            );
+        });
+        let b = measure(&mut || {
+            std::hint::black_box(
+                parser
+                    .parse_line(PINNED_ROW_B, SystemTime::UNIX_EPOCH)
+                    .unwrap(),
+            );
+        });
+        let c = measure(&mut || {
+            std::hint::black_box(
+                parser
+                    .parse_line(PINNED_ROW_C, SystemTime::UNIX_EPOCH)
+                    .unwrap(),
+            );
+        });
+        let d = measure(&mut || {
+            std::hint::black_box(
+                parser
+                    .parse_line(PINNED_ROW_D, SystemTime::UNIX_EPOCH)
+                    .unwrap(),
+            );
+        });
+        let quoted = measure(&mut || {
+            std::hint::black_box(
+                parser
+                    .parse_line(PINNED_ROW_QUOTED, SystemTime::UNIX_EPOCH)
+                    .unwrap(),
+            );
+        });
+        let batch = measure(&mut || {
+            for _ in 0..20 {
+                for row in [PINNED_ROW_A, PINNED_ROW_B, PINNED_ROW_C, PINNED_ROW_D] {
+                    std::hint::black_box(parser.parse_line(row, SystemTime::UNIX_EPOCH).unwrap());
+                }
+            }
+        });
+        println!(
+            "WO-OPT08 A1 row-split (pixel, key, metadata<=256, over-256, total): control1024={control:?} row1={row1:?} row2={row2:?} row4={row4:?} rowA={a:?} rowB={b:?} rowC={c:?} rowD={d:?} quoted={quoted:?} batch80={batch:?} foreign={}",
+            alloc_count::foreign()
+        );
+
+        // Scaling: the per-row cost is linear, so 2 rows is exactly 2x and 4 rows exactly 4x.
+        assert_eq!(
+            row1.4,
+            row2.4 - row1.4,
+            "the 2nd row costs the same as the 1st"
+        );
+        assert_eq!(
+            row2.4,
+            row4.4 - row2.4,
+            "two more rows cost exactly 2x one row"
+        );
+        assert!(row1.4 > 0, "the row path allocates at all (non-vacuity)");
+        // The batch is the sum of its rows: the drain's per-row cost is stateless.
+        assert_eq!(
+            batch.4,
+            20 * (a.4 + b.4 + c.4 + d.4),
+            "the 80-row batch is exactly 20 x (A+B+C+D) allocations"
+        );
+        // The bound this unit ships against: 23 columns split without owning every field.
+        assert!(
+            a.4 <= 12,
+            "one 23-column row costs at most 12 allocations, measured: {a:?}"
+        );
+        assert!(
+            quoted.4 <= a.4 + 8,
+            "the escaped/quoted row costs at most 8 more than a plain row, measured: {quoted:?} vs {a:?}"
+        );
+    }
+
+    /// WO-OPT08 (A3): the shipped CSV outcomes over the pinned fixture matrix - real rows,
+    /// quoted commas with escaped quotes, aliases in a non-production header order, optional and
+    /// missing columns, whitespace, malformed rows (unterminated quote, too few columns,
+    /// non-numeric metric, repeated header, trailing separator) and the no-frame-time-column
+    /// error. Every row here is a PINNED SHIPPED OUTCOME; the test drives production
+    /// `Parser::parse_line` only.
+    #[test]
+    fn parser_replays_the_pinned_fixture_matrix_with_identical_outcomes() {
+        let at = SystemTime::UNIX_EPOCH;
+        let mut parser = Parser::default();
+        assert!(parser.parse_line(PINNED_HEADER, at).unwrap().is_none());
+
+        let a = parser.parse_line(PINNED_ROW_A, at).unwrap().unwrap();
+        assert_eq!(a.application, "dwm.exe");
+        assert_eq!(a.pid, 2888);
+        assert_eq!(a.frame_ms, 903.0195);
+        assert_eq!(a.cpu_start_ms, Some(762.9536));
+        assert_eq!(a.cpu_busy_ms, Some(903.0195));
+        assert_eq!(a.gpu_busy_ms, Some(1.5059));
+        assert_eq!(a.at, at);
+        let b = parser.parse_line(PINNED_ROW_B, at).unwrap().unwrap();
+        assert_eq!(
+            (b.frame_ms, b.cpu_start_ms, b.cpu_busy_ms, b.gpu_busy_ms),
+            (32.0668, Some(1665.9731), Some(32.0668), Some(0.9821))
+        );
+        let c = parser.parse_line(PINNED_ROW_C, at).unwrap().unwrap();
+        assert_eq!(
+            (c.frame_ms, c.cpu_start_ms, c.cpu_busy_ms, c.gpu_busy_ms),
+            (968.9269, Some(1698.0399), Some(968.9269), Some(1.1246))
+        );
+        let d = parser.parse_line(PINNED_ROW_D, at).unwrap().unwrap();
+        assert_eq!(d.application, "chrome.exe");
+        assert_eq!(
+            (d.pid, d.frame_ms, d.cpu_busy_ms, d.gpu_busy_ms),
+            (27124, 26.5273, Some(26.3925), Some(1.2838))
+        );
+
+        // SEGMENT 5: an embedded comma AND escaped quotes inside the Application field.
+        let quoted = parser.parse_line(PINNED_ROW_QUOTED, at).unwrap().unwrap();
+        assert_eq!(quoted.application, "Game, Inc. [\"beta\"]");
+        assert_eq!(quoted.pid, 2888);
+        assert_eq!(quoted.frame_ms, 903.0195);
+        assert_eq!(quoted.gpu_busy_ms, Some(1.5059));
+
+        // SEGMENT 6: the malformed tail keeps the shipped outcomes.
+        assert_eq!(
+            parser
+                .parse_line(r#""unterminated, 1, 2, 3"#, at)
+                .unwrap_err(),
+            "unterminated quoted PresentMon CSV field"
+        );
+        assert!(parser
+            .parse_line("a,b", at)
+            .unwrap_err()
+            .contains("PresentMon ProcessID"));
+        assert!(parser
+            .parse_line(PINNED_ROW_NON_NUMERIC, at)
+            .unwrap_err()
+            .contains("PresentMon frame metric"));
+        // A repeated header row is a data row once the header is accepted, as shipped.
+        assert!(parser
+            .parse_line(PINNED_HEADER, at)
+            .unwrap_err()
+            .contains("PresentMon ProcessID"));
+        // A trailing separator adds one empty field and changes nothing else.
+        let trailing = parser
+            .parse_line(&format!("{PINNED_ROW_A},"), at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                trailing.application.as_str(),
+                trailing.pid,
+                trailing.frame_ms,
+                trailing.gpu_busy_ms
+            ),
+            ("dwm.exe", 2888, 903.0195, Some(1.5059))
+        );
+
+        // Aliases: the header order is NOT the production order, and names arrive in any case.
+        let mut alias = Parser::default();
+        alias
+            .parse_line(
+                "GPUBusy,ProcessID,FrameTime,Application,CPUBusy,CPUStartTime",
+                at,
+            )
+            .unwrap();
+        let frame = alias
+            .parse_line("1.25,77,8.5,game.exe,9.5,100.5", at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                frame.application.as_str(),
+                frame.pid,
+                frame.frame_ms,
+                frame.cpu_start_ms,
+                frame.cpu_busy_ms,
+                frame.gpu_busy_ms
+            ),
+            ("game.exe", 77, 8.5, Some(100.5), Some(9.5), Some(1.25))
+        );
+        // Mixed case and header names carrying whitespace: the shipped gate at :1093 needs a
+        // field equal to "ProcessID" ignoring CASE only (an untrimmed " processid " header is
+        // NOT accepted), while the map keys and the row values ARE trimmed.
+        let mut mixed_case = Parser::default();
+        mixed_case
+            .parse_line(
+                " APPLICATION ,PROCESSID, CpuStartTimeInMs ,MsCPUBusy,MsGPUBusy, FrameTime",
+                at,
+            )
+            .unwrap();
+        let frame = mixed_case
+            .parse_line(" game.exe , 78 , 1234.5 , 7 , 3 , 8.33 ", at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                frame.application.as_str(),
+                frame.pid,
+                frame.frame_ms,
+                frame.cpu_start_ms,
+                frame.cpu_busy_ms,
+                frame.gpu_busy_ms
+            ),
+            ("game.exe", 78, 8.33, Some(1234.5), Some(7.0), Some(3.0))
+        );
+        // MsBetweenPresents wins over MsBetweenDisplayChange when FrameTime is absent.
+        let mut ladder = Parser::default();
+        ladder
+            .parse_line(
+                "ProcessID,MsBetweenDisplayChange,MsBetweenPresents,Application",
+                at,
+            )
+            .unwrap();
+        assert_eq!(
+            ladder
+                .parse_line("7,20.0,11.5,other.exe", at)
+                .unwrap()
+                .unwrap()
+                .frame_ms,
+            11.5
+        );
+
+        // Optional/missing columns: the shipped empty-string/None outcomes.
+        let mut sparse = Parser::default();
+        sparse.parse_line("ProcessID,FrameTime", at).unwrap();
+        let frame = sparse.parse_line("42,16.5", at).unwrap().unwrap();
+        assert_eq!(frame.application, "");
+        assert!(
+            frame.cpu_start_ms.is_none()
+                && frame.cpu_busy_ms.is_none()
+                && frame.gpu_busy_ms.is_none()
+        );
+        // The shipped header gate: an UNTRIMMED " processid " name is not accepted, so the
+        // stream stays headerless and every row produces no frame.
+        let mut gate = Parser::default();
+        assert!(gate
+            .parse_line(" APPLICATION , processid , FrameTime", at)
+            .unwrap()
+            .is_none());
+        assert!(gate.parse_line("game.exe,42,8.5", at).unwrap().is_none());
+        // A header with no frame-time column keeps the shipped error row.
+        let mut no_metric = Parser::default();
+        assert!(no_metric
+            .parse_line("Application,ProcessID,DisplayedTime", at)
+            .unwrap_err()
+            .contains("expected FrameTime for --v2_metrics"));
+        // A line over the shipped 64 KiB bound is the shipped error, before any split.
+        let mut oversized = Parser::default();
+        assert!(oversized
+            .parse_line(&"x".repeat(MAX_LINE_BYTES + 1), at)
+            .unwrap_err()
+            .contains("exceeds 64 KiB"));
+    }
+
+    #[test]
+    fn drained_frames_need_no_discarded_parser_clock() {
+        let (line_tx, line_rx) = line_channel(LINE_QUEUE_CAPACITY);
+        line_tx.send(PINNED_HEADER.into()).unwrap();
+        for row in [
+            PINNED_ROW_A,
+            PINNED_ROW_B,
+            "dwm.exe,2888,,,,,,,,NA",
+            PINNED_ROW_NON_NUMERIC,
+        ] {
+            line_tx.send(row.into()).unwrap();
+        }
+        let mut capture = Capture::default();
+        capture.lines = Some(line_rx);
+        capture.target = ProcessInfo {
+            pid: 2888,
+            creation_time: 1,
+            name: "dwm.exe".into(),
+            image_path: String::new(),
+        };
+        let cfg = Config {
+            presentmon_target_mode: "foreground".into(),
+            ..Config::default()
+        };
+        capture.stats = Some(Stats::new(30.0, cfg.presentmon_window));
+        let (tx, rx) = mpsc::channel();
+        let stamp = Instant::now() + Duration::from_secs(5);
+        PARSER_CLOCK_COUNT.with(|count| count.set(Some(0)));
+        let error = capture.drain(&cfg, 1, &tx, stamp).unwrap_err();
+        let observed = PARSER_CLOCK_COUNT.with(|count| count.replace(None).unwrap());
+        assert!(error.contains("PresentMon frame metric"));
+        assert!(rx.try_recv().is_err(), "malformed batch is not published");
+        let stats = capture.stats.as_ref().unwrap();
+        assert!(stats
+            .frames
+            .iter()
+            .eq(&[(stamp, 903.0195), (stamp, 32.0668)]));
+        assert_eq!(capture.last_frame, Some(stamp));
+        assert!(stats.session_start.is_some());
+        assert_eq!(
+            observed, 0,
+            "the drain must not sample a clock it overwrites"
+        );
+    }
+
+    /// WO-OPT08 (A3): the pinned rows through the shipped drain - the statistics see the
+    /// DRAIN's batch timestamp, supplied to the parser, and the
+    /// sample-loss flag and the per-tick bound keep firing.
+    #[test]
+    fn pinned_fixture_rows_keep_the_drain_timestamp_and_sample_loss() {
+        let (line_tx, line_rx) = line_channel(LINE_QUEUE_CAPACITY);
+        line_tx.send(PINNED_HEADER.into()).unwrap();
+        for row in [PINNED_ROW_A, PINNED_ROW_B, PINNED_ROW_NON_NUMERIC] {
+            line_tx.send(row.into()).unwrap();
+        }
+        let mut capture = Capture::default();
+        capture.lines = Some(line_rx);
+        capture.line_overflow = Some(Arc::new(AtomicBool::new(false)));
+        capture.target = ProcessInfo {
+            pid: 2888,
+            creation_time: 1,
+            name: "dwm.exe".into(),
+            image_path: String::new(),
+        };
+        capture.stats = Some(Stats::new(30.0, Duration::from_secs(60)));
+        let (updates, _rx) = mpsc::channel();
+        let cfg = Config {
+            presentmon_target_mode: "foreground".into(),
+            ..Config::default()
+        };
+        // A `now` 5 s in the future: only the drain's stamp can land in the statistics.
+        let now = Instant::now() + Duration::from_secs(5);
+        assert!(capture
+            .drain(&cfg, 1, &updates, now)
+            .unwrap_err()
+            .contains("PresentMon frame metric"));
+        let frames = &capture.stats.as_ref().unwrap().frames;
+        assert_eq!(
+            frames.len(),
+            2,
+            "the two valid rows are kept, the bad one is not"
+        );
+        assert_eq!(
+            frames.back(),
+            Some(&(now, 32.0668)),
+            "the drain's stamp wins"
+        );
+        assert_eq!(
+            frames.front(),
+            Some(&(now, 903.0195)),
+            "the drain's stamp wins"
+        );
+        assert_eq!(capture.last_frame, Some(now));
+
+        // Sample-loss detection: a set overflow flag is reported over drained rows.
+        let (line_tx, line_rx) = line_channel(LINE_QUEUE_CAPACITY);
+        line_tx.send(PINNED_HEADER.into()).unwrap();
+        line_tx.send(PINNED_ROW_A.into()).unwrap();
+        capture.lines = Some(line_rx);
+        capture.parser = Parser::default();
+        capture.stats = Some(Stats::new(30.0, Duration::from_secs(60)));
+        capture.line_overflow = Some(Arc::new(AtomicBool::new(true)));
+        assert_eq!(
+            capture
+                .drain(&cfg, 1, &updates, Instant::now())
+                .unwrap_err(),
+            "PresentMon output overflowed; statistics reset"
+        );
+    }
+
+    #[test]
     fn child_stderr_capture_is_bounded_sanitized_and_preserves_exit_context() {
         let mut child = Command::new("cmd.exe")
             .args([
@@ -3128,12 +4626,23 @@ mod tests {
         let reader = std::thread::spawn(move || read_diagnostic(stderr, reader_output));
         let status = child.wait().unwrap();
         reader.join().unwrap();
-        let detail = with_diagnostic(
-            format!("PresentMon exited ({status})"),
-            diagnostic_text(&output.lock().unwrap()),
-        );
         assert_eq!(status.code(), Some(5));
+        // EC-6: the bounded observation site classifies the real exit and names the code.
+        assert_eq!(
+            wait_child_bounded(&mut child, Duration::ZERO),
+            Ok(ChildExit::Failed(5))
+        );
+        let reason = ChildExit::Failed(5).capture_end_reason("game.exe");
+        assert!(reason.contains("exited_failed_5"), "{reason}");
+        let detail = with_diagnostic(reason, diagnostic_text(&output.lock().unwrap()));
         assert!(detail.contains("access denied"));
+        // privacy: the classification adds class + code only, never the child's argv or path.
+        for leak in ["cmd.exe", "exit /B", "echo", "\\", "/C"] {
+            assert!(
+                !detail.contains(leak),
+                "child detail leaked {leak:?}: {detail}"
+            );
+        }
 
         let output = Arc::new(std::sync::Mutex::new(BoundedDiagnostic::default()));
         read_diagnostic(
@@ -3420,6 +4929,58 @@ mod tests {
         );
         let reset = capture.stats.as_ref().unwrap();
         assert!(reset.frames.is_empty() && reset.session_start.is_none() && reset.stutters == 0);
+    }
+
+    #[test]
+    fn presenting_warm_stream_does_not_clone_its_stored_key() {
+        let process = ProcessInfo {
+            pid: 42,
+            creation_time: 1,
+            name: "fixture.exe".into(),
+            image_path: "C:\\synthetic\\fixture.exe".into(),
+        };
+        let observed_at = Instant::now();
+        let frame = Frame {
+            pid: process.pid,
+            application: "Fixture.EXE".into(),
+            observed_at,
+            frame_ms: 16.0,
+            ..Default::default()
+        };
+        let mut activity = ActivityTracker::default();
+        assert_eq!(
+            activity.record_test_process(&frame, &process),
+            Some(process.clone())
+        );
+        let mut queries = 0;
+        let mut validations = 0;
+        let (identity, calls) = {
+            let _window = crate::backends::alloc_count::window();
+            let identity = activity.record(
+                &frame,
+                &process,
+                &CatalogState::Unavailable,
+                &mut queries,
+                &mut |_| {
+                    validations += 1;
+                    true
+                },
+                &mut |_| panic!("a valid cached stream must not request process identity"),
+            );
+            (identity, crate::backends::alloc_count::snapshot().4)
+        };
+        assert_eq!(identity, Some(process.clone()));
+        assert_eq!((queries, validations), (0, 1));
+        assert_eq!(activity.streams.len(), 1);
+        assert_eq!(activity.candidates.len(), 1);
+        let retained = &activity.candidates[&CandidateKey::new(&process)];
+        assert_eq!(retained.last_seen(), Some(observed_at));
+        assert_eq!(retained.buckets.len(), 1);
+        assert_eq!(retained.buckets[0].rows, 2);
+        assert_eq!(
+            calls, 3,
+            "warm stream only owns its lookup spelling and returned identity"
+        );
     }
 
     fn record_workload_second(
@@ -3901,7 +5462,7 @@ mod tests {
             image_path: r"C:\Tools\Desktop.exe".into(),
         };
         let admitted = |cfg: &Config, process: &ProcessInfo, frame_name: &str| {
-            let (line_tx, line_rx) = mpsc::sync_channel(4);
+            let (line_tx, line_rx) = line_channel(4);
             line_tx
                 .send("Application,ProcessID,FrameTime".into())
                 .unwrap();
@@ -3972,7 +5533,7 @@ mod tests {
             modified: 4,
         });
         capture.catalog.checked_at = Some(Instant::now());
-        capture.stop_with(|_| Ok(()), |_| Ok(()));
+        capture.stop_with(|_| Ok(ChildExit::Normal), |_| Ok(()));
         assert!(matches!(capture.catalog.state, CatalogState::Unavailable));
         assert!(capture.catalog.metadata.is_none() && capture.catalog.checked_at.is_none());
     }
@@ -4352,6 +5913,584 @@ mod tests {
         assert_eq!(selected.target, comparable_foreground);
     }
 
+    /// WO-OPT06 (A1): the shipped ranking expression is
+    /// `foreground_process().map(|p| p.pid).unwrap_or(0)`, so ranking saw `0` (no preference) on
+    /// every failure path of the full identity chain. This is the outcome contract that the
+    /// ranking-only relaxation must keep, stated per row. The rows whose shipped `Err` happens
+    /// AFTER `OpenProcess` succeeded (image-path query, image name, creation-time query) are the
+    /// rows whose query this unit drops. Their outcome contract is `0` on a pid that is not a
+    /// candidate, which is the case these rows produce at ENTRY. The CONTINUATION case - a pid
+    /// that passed identity once, later denies the image query while still running and is a
+    /// current candidate - is NOT covered by the dropped queries; it is registered as
+    /// F-AUD-OPT06-1 (P2) in the `foreground_ranking_pid` header, measured 0 of ~417 pids today,
+    /// and closed by the follow-up unit's current-candidate flag. The eligibility row of
+    /// `ranking_decision_keeps_the_shipped_foreground_eligibility_and_tie_breaks` proves the
+    /// entry-shaped case: such a pid is not an activity candidate, so `0` and the pid give the
+    /// same decision.
+    #[test]
+    fn ranking_foreground_pid_contract_covers_every_shipped_failure_path() {
+        let rows = [
+            (
+                "no foreground window (GetForegroundWindow null)",
+                0u32,
+                true,
+                0u32,
+            ),
+            ("no foreground window, chain would also fail", 0, false, 0),
+            ("window-thread pid 0 (GetWindowThreadProcessId)", 0, true, 0),
+            (
+                "OpenProcess access denied: elevated/protected game process",
+                4242,
+                false,
+                0,
+            ),
+            (
+                "OpenProcess on an exited pid (pid died between reads)",
+                4243,
+                false,
+                0,
+            ),
+            ("OpenProcess on an invalid pid", 4244, false, 0),
+            (
+                "shipped chain Ok: image, name and creation time all valid",
+                4245,
+                true,
+                4245,
+            ),
+        ];
+        // F-AUD-OPT06-A-4: the row print used to carry a hand-modeled `shipped=` column and a
+        // literal `EQUAL=True`. The contract rows are compared to literal expectations by the
+        // assert above; the REAL shipped-vs-new comparison, computed from the shipped builder,
+        // lives in `ranking_foreground_value_matches_the_shipped_identity_chain_on_reachable_pids`.
+        for (label, window_pid, openable, expected) in rows {
+            assert_eq!(
+                ranking_foreground_pid(window_pid, openable),
+                expected,
+                "A1 row: {label}"
+            );
+            println!(
+                "A1-ROW {label} window_pid={window_pid} openable={openable} contract={expected}"
+            );
+        }
+    }
+
+    /// WO-OPT06 (A1, the trap guard): for every pid this machine can reach, the new chain must
+    /// hand ranking the SAME value the shipped full-identity chain handed it. `process_info` is the
+    /// shipped builder `foreground_process()` uses, so its `Ok`/`Err` shape is the shipped
+    /// outcome. Any row where the two disagree is a behavior change, so this test is the STOP
+    /// condition of the unit, not a style check.
+    #[test]
+    fn ranking_foreground_value_matches_the_shipped_identity_chain_on_reachable_pids() {
+        let mut mismatches = 0usize;
+        for pid in [std::process::id(), 0, 4, 0x0011_0000, u32::MAX] {
+            let shipped = process_info(pid).map(|process| process.pid).unwrap_or(0);
+            let openable = foreground_process_openable(pid);
+            let new = ranking_foreground_pid_for(pid);
+            if shipped != new {
+                mismatches += 1;
+            }
+            println!(
+                "A1-EQUIV pid={pid} shipped={shipped} new={new} openable={openable} shipped-chain={} MATCH={}",
+                if shipped == 0 && pid != 0 { "Err" } else { "Ok" },
+                shipped == new
+            );
+        }
+        assert_eq!(
+            mismatches, 0,
+            "the ranking-only relaxation must return 0 exactly where the shipped chain returned Err"
+        );
+    }
+
+    /// WO-OPT06 (A2): the ranking decision on the pure layer, over foreground states a live
+    /// desktop cannot produce on demand. Every row compares the shipped value with the value the
+    /// new chain produces for that row, so the eligibility and tie-break semantics are pinned
+    /// without a game, an elevated process or a real presenter.
+    #[test]
+    fn ranking_decision_keeps_the_shipped_foreground_eligibility_and_tie_breaks() {
+        let base = Instant::now();
+        let game = ProcessInfo {
+            pid: 42,
+            creation_time: 1,
+            name: "Background.exe".into(),
+            image_path: String::new(),
+        };
+        let low_ui = ProcessInfo {
+            pid: 7,
+            creation_time: 2,
+            name: "ForegroundUI.exe".into(),
+            image_path: String::new(),
+        };
+        let comparable = ProcessInfo {
+            pid: 8,
+            creation_time: 3,
+            name: "ForegroundWork.exe".into(),
+            image_path: String::new(),
+        };
+        let mut activity = ActivityTracker::default();
+        for second in 0..=3 {
+            let observed_at = base + Duration::from_secs(second);
+            record_workload_second(&mut activity, &game, observed_at, second, 120, 0.20, 0.90);
+            record_workload_second(&mut activity, &low_ui, observed_at, second, 280, 0.01, 0.04);
+            record_workload_second(
+                &mut activity,
+                &comparable,
+                observed_at,
+                second,
+                120,
+                0.18,
+                0.90,
+            );
+        }
+        let now = base + Duration::from_secs(3);
+        let catalog = CatalogState::Unavailable;
+        let none = ProcessInfo::default();
+        let decide = |pid: u32, current: &ProcessInfo| -> ProcessInfo {
+            ranking_decision(&activity, now, ForegroundInfo { pid }, current, &catalog)
+                .map(|candidate| candidate.process)
+                .expect("the fixture always ranks a candidate")
+        };
+        // foreground absent (the shipped no-window / pid-0 / OpenProcess-denied rows all land here).
+        assert_eq!(
+            decide(0, &none),
+            game,
+            "absent foreground takes the global best"
+        );
+        // foreground = this process, which is not in the activity set.
+        assert_eq!(
+            decide(std::process::id(), &none),
+            game,
+            "a foreground pid outside the activity set must not change the pick"
+        );
+        // foreground = a present candidate whose workload is far below the best.
+        assert_eq!(
+            decide(low_ui.pid, &none),
+            game,
+            "a present foreground below the switch margin does not win"
+        );
+        // foreground = a present candidate within the margin: the shipped preference.
+        assert_eq!(
+            decide(comparable.pid, &none),
+            comparable,
+            "a comparable foreground candidate wins, the shipped preference"
+        );
+        // stickiness: the current presenter keeps a within-margin seat against the global best.
+        assert_eq!(
+            decide(low_ui.pid, &comparable),
+            comparable,
+            "the current presenter is not displaced by a weak foreground"
+        );
+        assert_eq!(
+            decide(comparable.pid, &low_ui),
+            game,
+            "the global best displaces a weak current presenter"
+        );
+
+        // The no-workload (activity-only) branch and its tie-breaks, where the foreground input
+        // is the whole decision: Beta/Alpha tie on score and the shipped order picks Alpha.
+        let tie_at = base + Duration::from_secs(20);
+        let mut plain = ActivityTracker::default();
+        for (pid, application) in [(20u32, "Beta.exe"), (30u32, "Alpha.exe")] {
+            plain.record_test(
+                &Frame {
+                    pid,
+                    application: application.into(),
+                    observed_at: tie_at,
+                    frame_ms: 16.0,
+                    ..Default::default()
+                },
+                pid as u64,
+            );
+        }
+        let decide_activity = |pid: u32| -> ProcessInfo {
+            ranking_decision(&plain, tie_at, ForegroundInfo { pid }, &none, &catalog)
+                .map(|candidate| candidate.process)
+                .expect("the tie fixture always ranks a candidate")
+        };
+        assert_eq!(
+            decide_activity(0).name,
+            "Alpha.exe",
+            "the shipped tie-break order"
+        );
+        assert_eq!(
+            decide_activity(20).name,
+            "Beta.exe",
+            "the foreground pid is the tie-break preference, so a 0-vs-pid difference is observable"
+        );
+        assert_eq!(
+            decide_activity(999).name,
+            "Alpha.exe",
+            "a foreground pid outside the activity set yields the shipped 0 outcome"
+        );
+        println!(
+            "A2-MATRIX workload-best={} foreground-preference={} weak-foreground={} self-outside-set=Alpha.exe tie-foreground=Beta.exe tie-outside-set=Alpha.exe",
+            game.name, comparable.name, low_ui.name
+        );
+    }
+
+    /// WO-OPT07 (A1): F-AUD-OPT06-1 pinned as (NEQ), over exactly the state dimensions
+    /// `ranking_decision` reads. The divergent row is a pid that passed the identity chain at ENTRY
+    /// (`ActivityTracker::record` resolves through `open_process_info`, :781), is a CURRENT
+    /// candidate kept by `validate_processes` (handle LIVENESS only, :855-862), is presenting, and
+    /// LATER denies the image query while running: shipped ranking saw `0` (no foreground
+    /// preference), this tree's ranking input sees the pid. The branches that read the value, each
+    /// with the code path that produces it:
+    ///  - workload branch at :1064, reached with `current.pid == 0` (producer:
+    ///    `prepare_presenting` :2087-2088 calls `pick_presenter` while `self.target` is the
+    ///    default - the shipped "waiting for an active frame presenter" state) AND with
+    ///    `current.pid != 0` and no workload score for the current target (producer: `reconcile`
+    ///    :2029-2030 -> `pick_presenter` :2097, guarded at :1052): `0` takes the global best and
+    ///    the pid takes the within-margin foreground candidate. FLIP.
+    ///  - activity branch, no workload score in the window (producer: the shipped CSV carries no
+    ///    valid CPU/GPU occupancy for the buckets, the shape
+    ///    `missing_workload_uses_deterministic_activity_and_foreground_fallback` pins): the
+    ///    foreground is read at :1074. FLIP.
+    ///  - stickiness branch, `current.pid != 0` WITH a workload score (:1051-1063 returns before
+    ///    the foreground is ever consulted): both values give the same winner. NO FLIP.
+    ///  - foreground pid outside the candidate set: `required_pid` filtering (:977, :1012) yields
+    ///    nothing, so both values give the same winner. NO FLIP - and that is the entire domain of
+    ///    the round-1 "tracked current-candidate flag" proposal: outcome-equal to `0` for a
+    ///    non-candidate, and TRUE (so it keeps the pid) for the divergent row, which is a candidate
+    ///    by premise. The flag is a NO-OP; it is not implemented.
+    #[test]
+    fn ranking_foreground_divergent_row_flips_the_presenting_choice() {
+        let base = Instant::now();
+        // The shipped fixture vocabulary: the global-best presenter and a foreground presenter
+        // inside SWITCH_MARGIN of it (0.835 vs 0.824 on unit 58's workload formula).
+        let game = ProcessInfo {
+            pid: 42,
+            creation_time: 1,
+            name: "BestPresenter.exe".into(),
+            image_path: String::new(),
+        };
+        let near = ProcessInfo {
+            pid: 8,
+            creation_time: 2,
+            name: "NearMargin.exe".into(),
+            image_path: String::new(),
+        };
+        let mut activity = ActivityTracker::default();
+        for second in 0..=3 {
+            let observed_at = base + Duration::from_secs(second);
+            record_workload_second(&mut activity, &game, observed_at, second, 120, 0.20, 0.90);
+            record_workload_second(&mut activity, &near, observed_at, second, 120, 0.18, 0.90);
+        }
+        let now = base + Duration::from_secs(3);
+        let catalog = CatalogState::Unavailable;
+        let none = ProcessInfo::default();
+        let decide = |pid: u32, current: &ProcessInfo| -> ProcessInfo {
+            ranking_decision(&activity, now, ForegroundInfo { pid }, current, &catalog)
+                .map(|candidate| candidate.process)
+                .expect("the fixture always ranks a candidate")
+        };
+        assert_eq!(
+            activity.candidates.len(),
+            2,
+            "both presenters are CURRENT candidates, the divergent row's premise (b)"
+        );
+        let workload_with_0 = decide(0, &none);
+        let workload_with_pid = decide(near.pid, &none);
+        assert_eq!(
+            workload_with_0, game,
+            "the shipped row-4 outcome: foreground 0 takes the global best workload"
+        );
+        assert_eq!(
+            workload_with_pid, near,
+            "this tree's outcome: the within-margin foreground pid keeps the shipped preference"
+        );
+        assert_ne!(
+            workload_with_0, workload_with_pid,
+            "A1 (NEQ): the workload-branch presenting choice differs between 0 and the pid"
+        );
+        // A foreground pid outside the candidate set: already outcome-equal to 0, the whole domain
+        // of the dropped tracked-flag proposal.
+        assert_eq!(
+            decide(std::process::id(), &none),
+            workload_with_0,
+            "a foreground pid that is not a current candidate is outcome-equal to the shipped 0"
+        );
+        // The stickiness branch never consults the foreground value, so it cannot diverge.
+        assert_eq!(
+            decide(0, &near),
+            decide(game.pid, &near),
+            "a current presenter with a workload score is decided without the foreground input"
+        );
+        // The activity-only branch (no workload score) and its tie-breaks.
+        let tie_at = base + Duration::from_secs(20);
+        let mut plain = ActivityTracker::default();
+        for (pid, application) in [(20u32, "Beta.exe"), (30u32, "Alpha.exe")] {
+            plain.record_test(
+                &Frame {
+                    pid,
+                    application: application.into(),
+                    observed_at: tie_at,
+                    frame_ms: 16.0,
+                    ..Default::default()
+                },
+                pid as u64,
+            );
+        }
+        let decide_activity = |pid: u32| -> ProcessInfo {
+            ranking_decision(&plain, tie_at, ForegroundInfo { pid }, &none, &catalog)
+                .map(|candidate| candidate.process)
+                .expect("the tie fixture always ranks a candidate")
+        };
+        let activity_with_0 = decide_activity(0);
+        let activity_with_pid = decide_activity(20);
+        assert_eq!(
+            activity_with_0.name, "Alpha.exe",
+            "the shipped tie-break order at foreground 0"
+        );
+        assert_eq!(
+            activity_with_pid.name, "Beta.exe",
+            "the foreground pid is the activity-branch preference"
+        );
+        assert_ne!(
+            activity_with_0.name, activity_with_pid.name,
+            "A1 (NEQ): the activity-branch presenting choice differs between 0 and the pid"
+        );
+        println!(
+            "A1-NEQ workload fg0={} fgpid={} noncandidate={} sticky0={} stickypid={} activity fg0={} fgpid={} candidates={}",
+            workload_with_0.name,
+            workload_with_pid.name,
+            decide(std::process::id(), &none).name,
+            decide(0, &near).name,
+            decide(game.pid, &near).name,
+            activity_with_0.name,
+            activity_with_pid.name,
+            activity.candidates.len()
+        );
+    }
+
+    /// WO-OPT06 (A2): an exited/reused pid between the two reads. Ranking filters by pid only, as
+    /// shipped, so the winner is always a TRACKED identity (pid + creation time) and never a bare
+    /// pid: the downstream candidate/target/challenger identity validation - untouched by this
+    /// unit - is what rejects a stale instance.
+    #[test]
+    fn ranking_decision_never_adopts_an_untracked_pid_identity() {
+        let base = Instant::now();
+        let old = ProcessInfo {
+            pid: 42,
+            creation_time: 1,
+            name: "Exited.exe".into(),
+            image_path: String::new(),
+        };
+        let reused = ProcessInfo {
+            pid: 42,
+            creation_time: 9,
+            name: "Reused.exe".into(),
+            image_path: String::new(),
+        };
+        let mut activity = ActivityTracker::default();
+        for (process, count) in [(&old, 4u32), (&reused, 6u32)] {
+            for tick in 0..count {
+                activity.record_test(
+                    &Frame {
+                        pid: process.pid,
+                        application: process.name.clone(),
+                        observed_at: base + Duration::from_millis(tick as u64 * 10),
+                        frame_ms: 16.0,
+                        ..Default::default()
+                    },
+                    process.creation_time,
+                );
+            }
+        }
+        assert_eq!(activity.candidates.len(), 2, "both instances are tracked");
+        let winner = ranking_decision(
+            &activity,
+            base,
+            ForegroundInfo { pid: 42 },
+            &ProcessInfo::default(),
+            &CatalogState::Unavailable,
+        )
+        .map(|candidate| candidate.process)
+        .expect("the reused pid is tracked");
+        assert_ne!(
+            winner.creation_time, 0,
+            "ranking hands on a tracked identity"
+        );
+        assert!(
+            winner == old || winner == reused,
+            "the winner is one of the tracked instances, never a bare pid"
+        );
+        println!(
+            "A2-REUSED pid=42 tracked={} winner={} winner-creation_time={}",
+            activity.candidates.len(),
+            winner.name,
+            winner.creation_time
+        );
+    }
+
+    /// A3 base-shape fixture (test-harness-fixture): the shipped identity builder's blocks,
+    /// measured on the same pid, so the byte totals of the ranking path's base side are MEASURED
+    /// decomposition prints and not std-layout asserts.
+    fn base_ranking_identity_bytes(pid: u32) -> Option<(usize, usize, usize, usize)> {
+        unsafe {
+            let handle = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                false,
+                pid,
+            )
+            .ok()?;
+            let handle = ProcessHandle(handle);
+            let mut path = vec![0u16; 32_768];
+            let mut len = path.len() as u32;
+            QueryFullProcessImageNameW(
+                handle.0,
+                PROCESS_NAME_WIN32,
+                windows::core::PWSTR(path.as_mut_ptr()),
+                &mut len,
+            )
+            .ok()?;
+            if len == 0 || len as usize > path.len() {
+                return None;
+            }
+            path.truncate(len as usize);
+            let text = String::from_utf16_lossy(&path);
+            let name = Path::new(&text)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_string();
+            let image_path = text.to_string();
+            Some((
+                std::mem::size_of::<u16>() * 32_768,
+                text.capacity(),
+                name.capacity(),
+                image_path.capacity(),
+            ))
+        }
+    }
+
+    /// WO-OPT06 (A3): the allocation census of the relaxation, on the lane's counting allocator.
+    /// The asserts are the classes ranking discards (the 64 KiB buffer and the owned path/name
+    /// strings) going to ZERO, the base side being non-zero, the scaling of the 64 KiB class with
+    /// calls, and the counter's non-vacuity on a known single block. Byte totals are PRINTS: std's
+    /// layout and growth law is not pinned (the unit-56 F-AUD-OPT04-1 rule). No CPU is measured and
+    /// no CPU claim is made; the per-second figure is a count RATE at the shipped 50 ms cadence.
+    #[test]
+    fn ranking_foreground_identity_cost_is_measured_and_the_ranking_path_drops_it() {
+        use crate::backends::alloc_count;
+
+        let measure = |run: &mut dyn FnMut()| -> alloc_count::Counts {
+            let _window = alloc_count::window();
+            alloc_count::watch_thread();
+            alloc_count::reset();
+            let before = alloc_count::snapshot();
+            run();
+            alloc_count::subtract(alloc_count::snapshot(), before)
+        };
+
+        // Non-vacuity of the counter: a known single block of 1,024 B (over the 256 B class).
+        let known = measure(&mut || {
+            std::hint::black_box(vec![0u8; 1_024]);
+        });
+        assert_eq!(known.4, 1, "the counting allocator sees the known block");
+        assert_eq!(known.3, 1, "1,024 B is one over-256-byte block");
+        // The shipped buffer's own shape: one block of exactly 65,536 B.
+        let buffer = measure(&mut || {
+            std::hint::black_box(vec![0u16; 32_768]);
+        });
+        let buffer_bytes = std::mem::size_of::<u16>() * 32_768;
+        assert_eq!(buffer.4, 1, "the shipped 64 KiB buffer is one block");
+        assert_eq!(
+            buffer.3, 1,
+            "the shipped 64 KiB buffer is the over-256-byte class"
+        );
+        assert_eq!(buffer_bytes, 65_536, "the shipped buffer is 64 KiB");
+
+        // base: the identity builder the shipped ranking closure paid, on a pid whose chain
+        // succeeds (the self pid), and the shipped expression as written on the live desktop.
+        let self_pid = std::process::id();
+        let base1 = measure(&mut || {
+            std::hint::black_box(
+                process_info(self_pid)
+                    .map(|process| process.pid)
+                    .unwrap_or(0),
+            );
+        });
+        let base3 = measure(&mut || {
+            for _ in 0..3 {
+                std::hint::black_box(
+                    process_info(self_pid)
+                        .map(|process| process.pid)
+                        .unwrap_or(0),
+                );
+            }
+        });
+        let base_foreground = measure(&mut || {
+            std::hint::black_box(foreground_process().map(|process| process.pid).unwrap_or(0));
+        });
+        // changed: the ranking path of this unit.
+        let changed1 = measure(&mut || {
+            std::hint::black_box(foreground_ranking_pid());
+        });
+        let changed20 = measure(&mut || {
+            for _ in 0..20 {
+                std::hint::black_box(foreground_ranking_pid());
+            }
+        });
+
+        assert!(base1.4 > 0, "the shipped shape allocates at all");
+        assert!(
+            base1.3 > 0,
+            "the shipped shape pays the 64 KiB-class block ranking discards"
+        );
+        assert!(
+            base1.2 > 0,
+            "the shipped shape pays the owned path/name string blocks ranking discards"
+        );
+        assert_eq!(
+            base3.3,
+            base1.3 * 3,
+            "the 64 KiB-class count scales with the number of shipped calls"
+        );
+        assert_eq!(
+            changed1.3, 0,
+            "the ranking path pays no 64 KiB buffer / over-256-byte block"
+        );
+        assert_eq!(
+            changed1.2, 0,
+            "the ranking path pays no owned image-path or name string block"
+        );
+        assert_eq!(changed1.4, 0, "the ranking path allocates nothing per call");
+        assert_eq!(
+            changed20.4, 0,
+            "20 ranking iterations (the shipped 50 ms cadence) allocate nothing"
+        );
+
+        let bytes =
+            base_ranking_identity_bytes(self_pid).expect("the self pid's identity is queryable");
+        assert_eq!(
+            bytes.0, 65_536,
+            "the measured 64 KiB buffer of the shipped shape"
+        );
+        assert!(
+            bytes.1 > 0 && bytes.2 > 0 && bytes.3 > 0,
+            "the shipped shape's owned strings are sized"
+        );
+        let base_bytes = bytes.0 + bytes.1 + bytes.2 + bytes.3;
+        println!(
+            "A3-ALLOC base-per-call total={} gt256={} le256={} | base-3-calls total={} gt256={} le256={} | base-foreground-expression total={} gt256={} le256={} | changed-per-call total={} gt256={} le256={} | changed-20-calls total={} gt256={} le256={} | NONVACUOUS known-1024B-block={} SIXTYFOURKIB-BYTES={}",
+            base1.4, base1.3, base1.2,
+            base3.4, base3.3, base3.2,
+            base_foreground.4, base_foreground.3, base_foreground.2,
+            changed1.4, changed1.3, changed1.2,
+            changed20.4, changed20.3, changed20.2,
+            known.4,
+            bytes.0
+        );
+        println!(
+            "A3-BYTES base-per-call buffer={} utf16-name-string={} name-string={} image-path-string={} TOTAL={} B (measured decomposition, PRINT not assert) | changed-per-call=0 B",
+            bytes.0, bytes.1, bytes.2, bytes.3, base_bytes
+        );
+        println!(
+            "A3-RATE cadence=button_poll 50 ms (config.rs:279) iterations=20/s => shipped ranking turnover {} B/s and {} over-256-byte blocks/s; this unit's ranking path 0 B/s and 0 blocks/s. RATE of counts, NOT CPU.",
+            base_bytes * 20,
+            base1.3 * 20
+        );
+    }
+
     #[test]
     fn workload_switch_requires_margin_and_consecutive_completed_windows() {
         let cfg = Config::default();
@@ -4441,7 +6580,7 @@ mod tests {
         capture.activity.validate_with(|_| true);
         let (updates, rx) = mpsc::channel();
 
-        let (line_tx, line_rx) = mpsc::sync_channel(4);
+        let (line_tx, line_rx) = line_channel(4);
         line_tx
             .send("Application,ProcessID,FrameTime".into())
             .unwrap();
@@ -4544,7 +6683,7 @@ mod tests {
         assert_eq!(capture.target, other);
         assert!(rx.recv().unwrap().detail.contains("stale data expired"));
 
-        let (line_tx, line_rx) = mpsc::sync_channel(4);
+        let (line_tx, line_rx) = line_channel(4);
         line_tx
             .send("Application,ProcessID,FrameTime".into())
             .unwrap();
@@ -4620,7 +6759,7 @@ mod tests {
             window: 2,
             wins: 1,
         });
-        capture.stop_with(|_| Ok(()), |_| Ok(()));
+        capture.stop_with(|_| Ok(ChildExit::Normal), |_| Ok(()));
         assert!(
             capture.target.pid == 0
                 && capture.stats.is_none()
@@ -4673,11 +6812,195 @@ mod tests {
     fn output_reader_discards_oversize_lines_and_recovers() {
         let mut input = vec![b'x'; MAX_LINE_BYTES + 1];
         input.extend_from_slice(b"\nvalid\n");
-        let (tx, rx) = mpsc::sync_channel(2);
+        let (tx, rx) = line_channel(2);
         let dropped = Arc::new(AtomicBool::new(false));
         read_output(std::io::Cursor::new(input), tx, Arc::clone(&dropped));
         assert_eq!(rx.into_iter().collect::<Vec<_>>(), vec!["valid"]);
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn line_queue_slot_is_no_larger_than_a_string() {
+        assert!(std::mem::size_of::<QueuedLine>() <= std::mem::size_of::<String>());
+    }
+
+    #[test]
+    fn output_reader_preserves_split_utf8_crlf_and_unterminated_tail() {
+        for capacity in [1, 2, 3, 8, 8192] {
+            let (tx, rx) = line_channel(10);
+            let dropped = Arc::new(AtomicBool::new(false));
+            read_output(
+                BufReader::with_capacity(capacity, &b"a\r\r\n\r\n\xc3\xa9\nend\r"[..]),
+                tx,
+                Arc::clone(&dropped),
+            );
+            assert_eq!(
+                rx.into_iter().collect::<Vec<_>>(),
+                ["a", "", "\u{e9}", "end\r"]
+            );
+            assert!(!dropped.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn output_reader_recovers_after_split_overlong_and_invalid_lines() {
+        for capacity in [4095, 8192, MAX_LINE_BYTES + 16] {
+            let mut bytes = vec![b'x'; MAX_LINE_BYTES - 1];
+            bytes.push(b'\n');
+            bytes.extend(std::iter::repeat_n(b'x', MAX_LINE_BYTES));
+            bytes.extend_from_slice(b"\n\xff\nok\n\xff");
+            let (tx, rx) = line_channel(10);
+            let dropped = Arc::new(AtomicBool::new(false));
+            read_output(
+                BufReader::with_capacity(capacity, &bytes[..]),
+                tx,
+                Arc::clone(&dropped),
+            );
+            assert_eq!(
+                rx.into_iter().collect::<Vec<_>>(),
+                ["x".repeat(MAX_LINE_BYTES - 1), "ok".to_owned()]
+            );
+            assert!(dropped.load(Ordering::Acquire));
+        }
+    }
+
+    fn fill_and_reject_byte_heavy_csv(line_tx: &LineSender, overflow: &Arc<AtomicBool>) {
+        let mut input = String::from("Application,ProcessID,FrameTime,Note\n");
+        for index in 0..6 {
+            let prefix = format!("game.exe,42,{}.0,", 16 + index);
+            let bytes = if index < 5 { 65_535 } else { 65_505 };
+            let padding = bytes - prefix.len();
+            input.push_str(&prefix);
+            input.push_str(&"\u{e9}".repeat(padding / 2));
+            if padding % 2 != 0 {
+                input.push('x');
+            }
+            input.push('\n');
+        }
+        // The header and six rows use exactly the byte ceiling, excluding the seven LF bytes.
+        assert_eq!(input.len() - 7, 393_216);
+        assert!(!overflow.load(Ordering::Acquire));
+        read_output(
+            std::io::Cursor::new(input),
+            line_tx.clone(),
+            Arc::clone(overflow),
+        );
+        assert!(!overflow.load(Ordering::Acquire), "exact fit was rejected");
+        read_output(
+            std::io::Cursor::new(b"game.exe,42,90.0,rejected"),
+            line_tx.clone(),
+            Arc::clone(overflow),
+        );
+        assert!(
+            overflow.load(Ordering::Acquire),
+            "the short EOF tail must be rejected by bytes, below the item cap"
+        );
+    }
+
+    #[test]
+    fn output_reader_byte_ceiling_rejects_new_and_recovers_after_stop() {
+        let (line_tx, line_rx) = line_channel(LINE_QUEUE_CAPACITY);
+        let overflow = Arc::new(AtomicBool::new(false));
+        fill_and_reject_byte_heavy_csv(&line_tx, &overflow);
+
+        let cfg = Config {
+            presentmon_target_mode: "foreground".into(),
+            ..Config::default()
+        };
+        let install = |capture: &mut Capture, lines, overflow| {
+            capture.lines = Some(lines);
+            capture.line_overflow = Some(overflow);
+            capture.parser = Parser::default();
+            capture.target = ProcessInfo {
+                pid: 42,
+                creation_time: 1,
+                name: "game.exe".into(),
+                image_path: String::new(),
+            };
+            capture.stats = Some(Stats::new(30.0, cfg.presentmon_window));
+        };
+        let (updates, rx) = mpsc::channel();
+        let mut capture = Capture::default();
+        install(&mut capture, line_rx, Arc::clone(&overflow));
+        capture.pump_step(Duration::ZERO);
+        assert_eq!(
+            capture.pump_line.as_deref(),
+            Some("Application,ProcessID,FrameTime,Note")
+        );
+        read_output(
+            std::io::Cursor::new(b"game.exe,42,22.0,accepted"),
+            line_tx.clone(),
+            Arc::clone(&overflow),
+        );
+        assert!(overflow.load(Ordering::Acquire));
+        let now = Instant::now();
+        assert_eq!(
+            capture.drain(&cfg, 1, &updates, now).unwrap_err(),
+            "PresentMon output overflowed; statistics reset"
+        );
+        let frames = &capture.stats.as_ref().unwrap().frames;
+        assert!(frames
+            .iter()
+            .map(|(_, value)| *value)
+            .eq([16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0]));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert_eq!(line_tx.budget.bytes.load(Ordering::Relaxed), 0);
+
+        read_output(
+            std::io::Cursor::new(b"queued\nrows\n"),
+            line_tx.clone(),
+            Arc::clone(&overflow),
+        );
+        capture.pump_step(Duration::ZERO);
+        assert_eq!(capture.pump_line.as_deref(), Some("queued"));
+        assert_eq!(line_tx.budget.bytes.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            capture.stop_with(|_| unreachable!(), |_| unreachable!()),
+            ""
+        );
+        assert!(capture.lines.is_none() && capture.pump_line.is_none());
+        assert!(capture.line_overflow.is_none() && capture.stats.is_none());
+        assert_eq!(line_tx.budget.bytes.load(Ordering::Relaxed), 0);
+
+        let (fresh_tx, fresh_rx) = line_channel(LINE_QUEUE_CAPACITY);
+        let fresh_overflow = Arc::new(AtomicBool::new(false));
+        assert!(!send_line(&line_tx, &fresh_overflow, "stale"));
+        assert_eq!(line_tx.budget.bytes.load(Ordering::Relaxed), 0);
+        read_output(
+            std::io::Cursor::new(b"Application,ProcessID,FrameTime\ngame.exe,42,16.0\n"),
+            fresh_tx.clone(),
+            Arc::clone(&fresh_overflow),
+        );
+        assert!(!fresh_overflow.load(Ordering::Acquire));
+        install(&mut capture, fresh_rx, fresh_overflow);
+        capture.drain(&cfg, 2, &updates, now).unwrap();
+        let update = rx.try_recv().unwrap();
+        assert_eq!(update.generation, 2);
+        assert!(update.available && !update.error && update.game.fps.valid);
+    }
+
+    #[test]
+    fn line_mailbox_releases_failed_sends_and_observes_close_even_when_over_budget() {
+        let (tx, rx) = line_channel(1);
+        let dropped = AtomicBool::new(false);
+        assert!(send_line(&tx, &dropped, "one"));
+        assert!(send_line(&tx, &dropped, "two"));
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(tx.budget.bytes.load(Ordering::Relaxed), 3);
+        drop(rx);
+        assert_eq!(tx.budget.bytes.load(Ordering::Relaxed), 0);
+
+        let (tx, rx) = line_channel(LINE_QUEUE_CAPACITY);
+        fill_and_reject_byte_heavy_csv(&tx, &Arc::new(AtomicBool::new(false)));
+        // Hold raw guards to model removal in flight, before the receiver returns the text.
+        let in_flight: Vec<_> = (0..7).map(|_| rx.rx.try_recv().unwrap()).collect();
+        drop(rx);
+        assert_eq!(tx.budget.bytes.load(Ordering::Relaxed), 393_216);
+        let dropped = AtomicBool::new(false);
+        assert!(!send_line(&tx, &dropped, "stale"));
+        assert!(!dropped.load(Ordering::Acquire));
+        drop(in_flight);
+        assert_eq!(tx.budget.bytes.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -4686,7 +7009,7 @@ mod tests {
         let header = "Application,ProcessID,FrameTime,MsBetweenPresents,DisplayedTime,GPUTime,GPUBusy,GPUWait\n";
         let row = "Palworld-Win64-Shipping.exe,4242,16.667,16.667,16.667,4.100,3.900,0.200\n";
         let input = format!("{header}{}", row.repeat(BURST_FRAMES));
-        let (line_tx, line_rx) = mpsc::sync_channel(LINE_QUEUE_CAPACITY);
+        let (line_tx, line_rx) = line_channel(LINE_QUEUE_CAPACITY);
         let keep_connected = line_tx.clone();
         let overflow = Arc::new(AtomicBool::new(false));
 
@@ -4726,7 +7049,7 @@ mod tests {
 
     #[test]
     fn output_reader_is_bounded_and_reports_saturation_without_blocking() {
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = line_channel(1);
         let dropped = Arc::new(AtomicBool::new(false));
         let reader_dropped = Arc::clone(&dropped);
         let reader = std::thread::spawn(move || {
@@ -4743,7 +7066,7 @@ mod tests {
 
     #[test]
     fn drain_is_tick_bounded_and_malformed_rows_fail_statistics() {
-        let (line_tx, line_rx) = mpsc::sync_channel(LINE_QUEUE_CAPACITY);
+        let (line_tx, line_rx) = line_channel(LINE_QUEUE_CAPACITY);
         line_tx
             .send("Application,ProcessID,FrameTime".into())
             .unwrap();
@@ -4772,7 +7095,7 @@ mod tests {
         );
         assert!(capture.lines.as_ref().unwrap().try_recv().is_ok());
 
-        let (line_tx, line_rx) = mpsc::sync_channel(2);
+        let (line_tx, line_rx) = line_channel(2);
         line_tx
             .send("Application,ProcessID,FrameTime".into())
             .unwrap();
@@ -4787,7 +7110,7 @@ mod tests {
 
     #[test]
     fn drain_reports_disconnection_after_prior_frames() {
-        let (line_tx, line_rx) = mpsc::sync_channel(2);
+        let (line_tx, line_rx) = line_channel(2);
         line_tx
             .send("Application,ProcessID,FrameTime".into())
             .unwrap();
@@ -4816,7 +7139,7 @@ mod tests {
 
     #[test]
     fn output_reader_exits_when_shutdown_drops_its_mailbox() {
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = line_channel(1);
         drop(rx);
         let dropped = Arc::new(AtomicBool::new(false));
         let reader =
@@ -4838,27 +7161,75 @@ mod tests {
             })
             .unwrap();
 
-        let (stale, _) = stale_projection(
-            &stats,
+        // WO-OPT05: the shipped `stale_projection` is now the `stale_phase` gate plus the
+        // transition-gated `stale_game` builder. Same arms, same bounds, same values.
+        let stale_arm = stale_phase(Duration::from_secs(6)).expect("6 s idle is stale");
+        let stale = stale_game(
+            &mut stats,
             frame_at + Duration::from_secs(6),
             observed + Duration::from_secs(6),
             Duration::from_secs(5),
             "game.exe",
-            Duration::from_secs(6),
-        )
-        .unwrap();
+            stale_arm,
+        );
         assert!(stale.active && stale.fps.valid && stale.fps.stale);
 
-        let (expired, _) = stale_projection(
-            &stats,
+        let expired_arm = stale_phase(Duration::from_secs(11)).expect("11 s idle is expired");
+        let expired = stale_game(
+            &mut stats,
             frame_at + Duration::from_secs(11),
             observed + Duration::from_secs(11),
             Duration::from_secs(5),
             "game.exe",
-            Duration::from_secs(11),
-        )
-        .unwrap();
+            expired_arm,
+        );
         assert!(!expired.active && !expired.fps.valid);
+
+        // The shipped bounds and the two verbatim detail strings, at the new seams.
+        assert_eq!(stale_phase(Duration::from_secs(4)), None);
+        assert_eq!(
+            stale_phase(Duration::from_secs(5)),
+            None,
+            "idle == STALE_AFTER is fresh"
+        );
+        assert_eq!(
+            stale_phase(Duration::from_secs(6)),
+            Some(StalePhase::Stale),
+            "idle in (5 s, 10 s] is the stale arm"
+        );
+        assert_eq!(
+            stale_phase(Duration::from_secs(10)),
+            Some(StalePhase::Stale),
+            "idle == 2 * STALE_AFTER is still the stale arm"
+        );
+        assert_eq!(
+            stale_phase(Duration::from_secs(11)),
+            Some(StalePhase::Expired),
+            "idle > 2 * STALE_AFTER is the expired arm"
+        );
+        assert_eq!(
+            stale_detail(StalePhase::Stale),
+            "capture stale: no frames for 5 seconds"
+        );
+        assert_eq!(
+            stale_detail(StalePhase::Expired),
+            "capture unavailable: stale data expired"
+        );
+        assert!(
+            stale_publishes("", StalePhase::Stale),
+            "an empty ledger publishes the stale detail"
+        );
+        assert!(
+            !stale_publishes("capture stale: no frames for 5 seconds", StalePhase::Stale),
+            "the shipped dedupe: an unchanged detail publishes nothing, so no model is built"
+        );
+        assert!(
+            stale_publishes(
+                "capture stale: no frames for 5 seconds",
+                StalePhase::Expired
+            ),
+            "the stale -> expired edge is a transition"
+        );
     }
 
     #[test]
@@ -4867,7 +7238,7 @@ mod tests {
             presentmon_target_mode: "foreground".into(),
             ..Config::default()
         };
-        let (line_tx, line_rx) = mpsc::sync_channel(4);
+        let (line_tx, line_rx) = line_channel(4);
         line_tx
             .send("Application,ProcessID,FrameTime".into())
             .unwrap();
@@ -5002,13 +7373,16 @@ mod tests {
     fn failed_cleanup_is_retained_and_gates_retry() {
         let mut capture = Capture::default();
         capture.owned_session = Some("LCDSirPlus-42-owned".into());
-        capture.stop_with(|_| Ok(()), |_| Err("injected failure".into()));
+        capture.stop_with(
+            |_| Ok(ChildExit::Normal),
+            |_| Err("injected failure".into()),
+        );
         #[rustfmt::skip]
         assert_eq!(capture.owned_session.as_deref(), Some("LCDSirPlus-42-owned"));
         capture.schedule_retry(Instant::now());
         assert!(retry_pending(capture.retry_after, Instant::now()));
         #[rustfmt::skip]
-        capture.stop_with(|_| Ok(()), |name| { assert_eq!(name, "LCDSirPlus-42-owned"); Ok(()) });
+        capture.stop_with(|_| Ok(ChildExit::Normal), |name| { assert_eq!(name, "LCDSirPlus-42-owned"); Ok(()) });
     }
 
     #[test]
@@ -5026,17 +7400,43 @@ mod tests {
             name: "game.exe".into(),
             image_path: String::new(),
         };
+        let cleanup_names: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         capture.stop_with(
-            |_| Err("forced kill/wait timeout".into()),
-            |_| panic!("ETW cleanup must wait for confirmed child exit"),
+            |_| {
+                Err(format!(
+                    "kill child: forced kill; child is still running: {}",
+                    ChildExit::DidNotExitInTime.token()
+                ))
+            },
+            |name| {
+                cleanup_names.lock().unwrap().push(name.to_string());
+                Ok(())
+            },
         );
         assert!(capture.child.is_some() && capture.reader.is_some());
+        // WO-U46I (#13) supersedes the shipped coupling "ETW cleanup must wait for a confirmed
+        // child exit": the named ETW session is THIS instance's own registration (and the
+        // presenting-mode child carries no `--terminate_on_proc_exit`), so a child that survives
+        // the bounded confirm must not leave it registered. The cleanup now runs in the same arm
+        // that retains the child, on the owned name only, as a SEPARATE reported outcome. The
+        // child/reader/target retention and the EC-6 token claims below are unchanged.
         assert_eq!(
-            capture.owned_session.as_deref(),
-            Some("LCDSirPlus-42-owned")
+            cleanup_names.lock().unwrap().as_slice(),
+            ["LCDSirPlus-42-owned".to_string()],
+            "(#13) the owned session is cleaned up on the retained-child path, exactly once"
+        );
+        assert_eq!(
+            capture.owned_session, None,
+            "(#13) a completed cleanup clears the claim"
         );
         assert_eq!(capture.target.pid, 42);
-        assert!(capture.stop_diagnostic.contains("forced kill/wait timeout"));
+        // EC-6 acceptance (2): a child that survives the bounded confirm keeps its existing class,
+        // and that class is the stable did_not_exit_in_time token.
+        assert!(capture.stop_diagnostic.contains("forced kill"));
+        assert!(capture.stop_diagnostic.contains("child is still running"));
+        assert!(capture
+            .stop_diagnostic
+            .contains(&ChildExit::DidNotExitInTime.token()));
         let error = capture
             .start(
                 &executable,
@@ -5092,10 +7492,119 @@ mod tests {
         let started = Instant::now();
         assert!(take_diagnostic(Some(Arc::clone(&diagnostic)), false).is_empty());
         assert!(started.elapsed() < Duration::from_millis(20));
-        assert!(wait_bounded(Duration::ZERO, || Ok(false))
-            .unwrap_err()
-            .contains("exit was not confirmed"));
+        assert_eq!(
+            wait_bounded(Duration::ZERO, || Ok(false)),
+            Ok(false),
+            "a bounded confirm that never observes an exit reports an unconfirmed loop"
+        );
+        assert_eq!(wait_bounded(Duration::ZERO, || Ok(true)), Ok(true));
         drop(guard);
+    }
+
+    fn synthetic_cmd_child(command: &str) -> Child {
+        Command::new("cmd.exe")
+            .args(["/D", "/C", command])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap()
+    }
+
+    fn synthetic_exit_status(code: u8) -> ExitStatus {
+        let mut child = synthetic_cmd_child(&format!("exit /B {code}"));
+        child.wait().unwrap()
+    }
+
+    fn synthetic_long_running_child() -> Child {
+        synthetic_cmd_child("ping -n 20 127.0.0.1 >nul")
+    }
+
+    #[test]
+    fn child_exit_classification_names_the_synthetic_exit_code() {
+        // EC-6 acceptance (1): a child that exits with code X yields a reason that names X.
+        let failing = synthetic_exit_status(101);
+        assert_eq!(failing.code(), Some(101));
+        let exit = ChildExit::classify(&failing);
+        assert_eq!(exit, ChildExit::Failed(101));
+        assert_eq!(exit.token(), "exited_failed_101");
+        assert_eq!(exit.reason(), "presentmon child exited_failed_101");
+        assert!(exit.capture_end_reason("game.exe").contains("101"));
+
+        // EC-6 acceptance (4): the exit-code-0 path keeps its semantics, named as a normal exit.
+        let clean = synthetic_exit_status(0);
+        assert_eq!(clean.code(), Some(0));
+        assert_eq!(ChildExit::classify(&clean), ChildExit::Normal);
+        assert_eq!(ChildExit::Normal.token(), "exited_normal");
+    }
+
+    #[test]
+    fn child_exit_tokens_are_stable_and_privacy_bounded() {
+        let cases = [
+            (ChildExit::Normal, "exited_normal"),
+            (ChildExit::Failed(5), "exited_failed_5"),
+            (ChildExit::Failed(NO_EXIT_CODE), "exited_failed_4294967295"),
+            (ChildExit::DidNotExitInTime, "did_not_exit_in_time"),
+        ];
+        for (exit, token) in cases {
+            assert_eq!(exit.token(), token);
+            assert_eq!(exit.reason(), format!("presentmon child {token}"));
+            // The classification text carries class + numeric code only: no child argv, path,
+            // session name or target identity.
+            for leak in [
+                "\\",
+                "/",
+                ":",
+                "cmd",
+                "exe",
+                "LCDSirPlus-",
+                "--process_id",
+                "game",
+            ] {
+                assert!(
+                    !exit.reason().contains(leak),
+                    "{} leaks {leak:?}",
+                    exit.reason()
+                );
+            }
+        }
+        // A code-less death is named as a failure, never masked as a normal exit.
+        assert_eq!(ChildExit::Failed(NO_EXIT_CODE), ChildExit::Failed(u32::MAX));
+    }
+
+    #[test]
+    fn wait_child_bounded_names_did_not_exit_in_time_when_the_confirm_expires() {
+        let mut child = synthetic_long_running_child();
+        let error = wait_child_bounded(&mut child, Duration::from_millis(1))
+            .expect_err("a running child cannot confirm its exit within 1 ms");
+        assert!(
+            error.contains("exit was not confirmed within 1 ms"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&ChildExit::DidNotExitInTime.token()),
+            "{error}"
+        );
+        for leak in ["cmd.exe", "ping", "\\", "/C"] {
+            assert!(
+                !error.contains(leak),
+                "timeout reason leaked {leak:?}: {error}"
+            );
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn stop_child_bounded_classifies_the_confirmed_exit_after_kill() {
+        let mut child = synthetic_long_running_child();
+        let exit = stop_child_bounded(&mut child, Duration::from_millis(STOP_TIMEOUT_MS.into()))
+            .expect("the bounded confirm must confirm the kill");
+        let status = child.wait().unwrap();
+        assert_eq!(exit, ChildExit::classify(&status));
+        assert!(!matches!(exit, ChildExit::DidNotExitInTime));
+        assert!(!exit.token().contains('\\') && !exit.token().contains('/'));
     }
 
     #[test]
@@ -5171,8 +7680,2277 @@ mod tests {
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicU64::new(1));
-        let (_updates, thread) = spawn(config, generation, Arc::clone(&shutdown));
+        let (_updates, thread) = spawn(
+            config,
+            generation,
+            // WO-TEL-D2 (U-3): demand 0 parks the worker in the new gate arm;
+            // shutdown then joins it through the same lifecycle (zero child work).
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&shutdown),
+        );
         shutdown.store(true, Ordering::Relaxed);
         assert!(thread.join().is_ok());
+    }
+
+    /// WO-TEL-D2 (S2, U-3) STRUCTURAL pin (TEL-B `include_str!` occurrence
+    /// form; name/doc are honest: this inspects shipped source, the worker's
+    /// real-thread child behavior needs hardware and stays in the ignored
+    /// native tests). Claims: the worker loop reads the demand word exactly
+    /// once; the demand gate precedes `capture.reconcile(`; the park arm stops
+    /// a running child (`stop_and_report_cleanup`) and publishes the deduped
+    /// unavailable reason, parked on the worker's own deadline (WO-OPT02C re-baselines
+    /// the shipped 4x 50 ms needle to a 4x `park_timeout(` needle); the child-spawn machinery
+    /// (`resolve_executable`, `.spawn()`, the `TARGET_POLL` selection) occurs
+    /// ZERO times inside the `run` slice — it lives behind the gate, inside
+    /// reconcile, which the demand-0 path never reaches.
+    #[test]
+    fn presentmon_run_gate_stops_target_poll_and_child_spawn_at_zero_demand() {
+        let source = include_str!("presentmon.rs").replace("\r\n", "\n");
+        let start = source.find("fn run(\n").expect("the shipped worker exists");
+        // Slice the WORKER LOOP BODY: from the shipped `fn run(` head to the
+        // loop-end marker (the shutdown drain), so the slice is the loop, not
+        // the following `impl Capture` block (where the gated machinery lives).
+        let rest = &source[start..];
+        let end = rest
+            .find("\n    let mut stderr = String::new();")
+            .expect("the shipped loop-end marker closes the worker loop");
+        let run = &rest[..end];
+        assert_eq!(
+            run.matches("crate::telemetry::demanded(").count(),
+            1,
+            "the demand read exists exactly once in the worker loop"
+        );
+        assert_eq!(
+            run.matches("consumers.load(Ordering::Relaxed)").count(),
+            1,
+            "the worker reads the published consumer word once per loop iteration"
+        );
+        let gate = run
+            .find("if !crate::telemetry::demanded(")
+            .expect("the demand gate");
+        let reconcile = run.find("capture.reconcile(").expect("the reconcile call");
+        assert!(
+            gate < reconcile,
+            "the gate precedes the reconcile path: demand 0 performs no target poll and no child-spawn retry"
+        );
+        assert!(
+            run.contains("stop_and_report_cleanup(&tx, request_generation, Instant::now())"),
+            "the park stops a running child once (shipped cleanup arm)"
+        );
+        assert!(
+            run.contains("\"no display consumer\""),
+            "the park publishes the deduped unavailable reason (health-fed availability predicate stays consistent)"
+        );
+        assert_eq!(
+            run.matches("resolve_executable").count(),
+            0,
+            "the run loop never resolves the executable itself"
+        );
+        assert_eq!(
+            run.matches(".spawn()").count(),
+            0,
+            "the run loop never spawns a child (the CreateProcess retry ladder lives behind the gate)"
+        );
+        assert_eq!(
+            run.matches("capture.unavailable(").count(),
+            1,
+            "the park arm publishes the unavailable state through the dedupe exactly once per iteration"
+        );
+        assert_eq!(
+            run.matches("std::thread::park_timeout(").count(),
+            4,
+            "WO-OPT02C S3 (the re-baselined 4x needle): generation cleanup, demand park (cleanup-pending), demand park (settled) and the main loop each park on the worker's own deadline"
+        );
+        assert_eq!(
+            run.matches("std::thread::sleep(Duration::from_millis(50))")
+                .count(),
+            0,
+            "WO-OPT02C S3: the 50 ms step is retired from every worker arm, so the shipped 150 ms re-arm bound is edge-driven, not a step size"
+        );
+    }
+
+    /// WO-OPT02C (C3) fixture: the production QUIET shape of the worker, run on a real
+    /// thread with no child and no ETW (the shipped config gate parks the capture path),
+    /// so no PresentMon.exe and no LCDSirPlus instance is involved. `presentmon_enabled`
+    /// false makes the demanded leg publish a DISTINCT deduped reason ("disabled"), which
+    /// is the observable adoption signal on the worker's own channel.
+    type DormancyWorker = (
+        Arc<RwLock<Config>>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+        Arc<AtomicBool>,
+        mpsc::Receiver<Update>,
+        std::thread::JoinHandle<()>,
+    );
+
+    fn dormancy_worker(consumers: u64) -> DormancyWorker {
+        let config = Arc::new(RwLock::new(Config {
+            presentmon_enabled: false,
+            ..Config::default()
+        }));
+        let generation = Arc::new(AtomicU64::new(1));
+        let consumers = Arc::new(AtomicU64::new(consumers));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let worker = {
+            let config = Arc::clone(&config);
+            let generation = Arc::clone(&generation);
+            let consumers = Arc::clone(&consumers);
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::Builder::new()
+                .name("telemetry-presentmon-test".into())
+                .spawn(move || run(config, generation, consumers, shutdown, tx))
+                .expect("the presentmon worker under test")
+        };
+        (config, generation, consumers, shutdown, rx, worker)
+    }
+
+    /// WO-OPT02C (C3.1): the demand wake edge adopts a parked worker. The word is written
+    /// and THEN unparked, exactly as `telemetry.rs:121-125` (`set_consumers` ->
+    /// `wake_workers`, whose handle list carries this worker).
+    /// RED ON BASE: the base arm sleeps the shipped 50 ms, so the worker iterates ~4 times
+    /// inside the 200 ms dormancy window and the first assert below fails.
+    /// WO-FLAKE-HARDEN (F-AUD-P3B-3): that first assert is a RATE bound now, not an exact-zero
+    /// equality - `Thread::park_timeout` MAY RETURN SPURIOUSLY, so the exact-zero form demanded
+    /// a guarantee the platform does not give (unit-54 audit r2 went red on it). The window, the
+    /// 20 ms adoption budget and every shipped bound are UNCHANGED.
+    #[test]
+    fn the_presentmon_demand_edge_wakes_a_parked_worker() {
+        let (_config, _generation, consumers, shutdown, rx, worker) = dormancy_worker(0);
+        let id = worker.thread().id();
+        let parked = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the zero-demand park publishes the deduped unavailable row");
+        assert_eq!(parked.detail, "no display consumer");
+        let at = Instant::now();
+        let settled = worker_tick_count(id);
+        std::thread::sleep(Duration::from_millis(200));
+        let window = at.elapsed();
+        // WO-FLAKE-HARDEN (F-AUD-P3B-3): the zero-iteration equality is replaced by a RATE
+        // bound with a documented margin, normalized by the MEASURED window (under full-suite
+        // load this lane's `sleep(200 ms)` was measured inflating past the worker's 1 s park
+        // deadline, which is what made the exact-zero form, and a plain count bound, unstable).
+        // Delivered rate: 1/s - the park is `worker_idle_deadline(&[])` = TARGET_POLL = 1 s
+        // (the C3.2 census measures 1 iteration in 2 s). Spurious wakes: each costs ONE
+        // iteration and then re-arms a 1 s park, and the host's floor is the 2 ms
+        // `WORKER_MIN_PARK` inside the ~15.6 ms timer granularity, so ~1 wake/s is the
+        // observed census. Bound = 2 iterations per measured second + 2 absolute slack = ~3x
+        // the delivered rate. Discriminating power: the base arm sleeps 50 ms + the host
+        // granularity => ~20 iterations/s (WO-OPT02C audit: 4 in 200 ms, ~40 in 2 s), i.e.
+        // 10x the bound, so the row stays RED on base at any window length.
+        let window_iters = worker_tick_count(id) - settled;
+        let bound = (2 * (window.as_millis() / 1_000) + 2) as u64;
+        assert!(
+            window_iters <= bound,
+            "a parked worker iterates at most 2/s + 2 slack inside the measured dormancy window ({window_iters} iterations in {window:?}, bound {bound}: the 1 s deadline park is 1/s and every extra iteration is a spurious wake that re-arms a 1 s park; base steps 50 ms => ~20/s)"
+        );
+        let started = Instant::now();
+        consumers.store(
+            crate::telemetry::extended_consumer_bit("presentmon"),
+            Ordering::Relaxed,
+        );
+        worker.thread().unpark();
+        let adopted = rx
+            .recv_timeout(Duration::from_millis(20))
+            .expect("the demand edge adopted the word inside 20 ms");
+        let adopted_after = started.elapsed();
+        assert_eq!(
+            adopted.detail, "disabled",
+            "the demanded worker re-enters reconcile and reaches the shipped config gate"
+        );
+        assert!(
+            adopted_after < Duration::from_millis(20),
+            "the wake drove adoption in {adopted_after:?} (budget 20 ms, inside the retired 50 ms step)"
+        );
+        assert!(
+            worker_tick_count(id) > settled,
+            "the wake drove the adoption iteration"
+        );
+        println!(
+            "WO-OPT02C-WAKES demand edge: adoption {adopted_after:?} after the unpark (budget 20 ms, retired step 50 ms); the pre-edge 200 ms window held {} iterations",
+            worker_tick_count(id) - settled - 1
+        );
+        shutdown.store(true, Ordering::Release);
+        worker.thread().unpark();
+        assert!(worker.join().is_ok());
+    }
+
+    /// WO-OPT02C (C3.2): the idle step is the worker's deadline, not the retired tick.
+    /// RED ON BASE: the base loop is 20 wakes/s (~40 in the 2 s window); the assertion
+    /// caps at 10.
+    #[test]
+    fn the_presentmon_worker_idle_step_is_the_deadline_not_the_tick() {
+        let (_config, _generation, _consumers, shutdown, rx, worker) = dormancy_worker(0);
+        let id = worker.thread().id();
+        let parked = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the zero-demand park publishes the deduped unavailable row");
+        assert_eq!(parked.detail, "no display consumer");
+        let window = Duration::from_millis(2_000);
+        let before = worker_tick_count(id);
+        std::thread::sleep(window);
+        let ticks = worker_tick_count(id) - before;
+        println!(
+            "WO-OPT02C-WAKES presentmon quiet shape (collection not due, no demand): {ticks} iterations in {window:?} = {:.1} wakes/s (base 50 ms step = 20/s; target ~1/s = TARGET_POLL)",
+            ticks as f64 * 1000.0 / window.as_millis() as f64
+        );
+        shutdown.store(true, Ordering::Release);
+        worker.thread().unpark();
+        assert!(worker.join().is_ok());
+        assert!(
+            ticks >= 1,
+            "the worker stays alive (it is dormant, not stopped)"
+        );
+        assert!(
+            ticks <= 10,
+            "the idle step is the deadline, not the retired 20/s tick: {ticks} iterations in {window:?} (base gives ~40; the shipped wake census number is this count / 2 s)"
+        );
+    }
+
+    /// WO-OPT02C (C3.3): the shutdown wake edge exits a parked worker inside the shipped
+    /// step budget. The teardown path is `telemetry.rs:88-96`: store -> `wake_workers` ->
+    /// join, and that join (`telemetry.rs:93`) is UNBOUNDED, so this edge is what keeps
+    /// teardown finite. Join budgets read at delivery: `telemetry.rs:93` unbounded;
+    /// `presentmon.rs` `join_thread_bounded` = `STOP_TIMEOUT_MS` 2 s (reader threads, not
+    /// this worker); the worker joins in the tests (`owner_thread_stops_and_joins_after_shutdown`,
+    /// `presentmon_config_change_midflight_...`) are unbounded and assert no budget.
+    /// PARITY GUARD: base is already fast here (a 50 ms sleep), so the 50 ms assert is
+    /// GREEN on base too; the no-edge leg (3 workers, spurious-wake bound 1 while the measured
+    /// window is inside the 1 s deadline park) is the discriminating row.
+    #[test]
+    fn the_presentmon_shutdown_edge_exits_a_parked_worker() {
+        let (_config, _generation, _consumers, shutdown, rx, worker) = dormancy_worker(0);
+        let parked = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the zero-demand park publishes the deduped unavailable row");
+        assert_eq!(parked.detail, "no display consumer");
+        // S13 P3 (F-AUD-OPT02C-3): the `elapsed()` read sits AFTER the join, so
+        // `latency` is the JOIN latency the row claims, not the store + unpark cost.
+        // The 50 ms budget is the shipped one; no budget moved.
+        let started = Instant::now();
+        shutdown.store(true, Ordering::Release);
+        worker.thread().unpark();
+        assert!(
+            worker.join().is_ok(),
+            "the worker exits on the shipped shutdown edge"
+        );
+        let latency = started.elapsed();
+        assert!(
+            latency < Duration::from_millis(50),
+            "observed join latency {latency:?} must stay inside the retired 50 ms step, the last pinned teardown cadence (the `telemetry.rs:93` join itself has NO budget, so the unpark edge is the bound)"
+        );
+        // The edge is load-bearing: the same park with NO shutdown wake exits only at the
+        // worker's deadline, so `wake_workers` is what pays for the long park.
+        // WO-FLAKE-HARDEN (F-AUD-P3B-3): the old form asserted ONE worker was NOT finished
+        // after 200 ms, i.e. ZERO spurious wakeups, which `park_timeout` does not promise (the
+        // flag is already stored, so any wake ends the park). Rate form: 3 dormant workers, the
+        // flag stored, NO edge posted, and the count that exited inside the MEASURED window is
+        // bounded, not required to be zero. Discriminating power: the base arm sleeps 50 ms + the
+        // host's ~15.6 ms granularity, so ALL 3 have exited inside any window shorter than the
+        // 1 s deadline (WO-OPT02C audit: "base no-edge leg exits at 50 ms") - 3 > 1.
+        let mut edgeless = Vec::new();
+        for _ in 0..3 {
+            edgeless.push(dormancy_worker(0));
+        }
+        for (_, _, _, _, parked_rx, _) in &edgeless {
+            let parked2 = parked_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the zero-demand park publishes the deduped row");
+            assert_eq!(parked2.detail, "no display consumer");
+        }
+        let at = Instant::now();
+        for (_, _, _, shutdown2, _, _) in &edgeless {
+            shutdown2.store(true, Ordering::Release);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let window = at.elapsed();
+        let woke_without_edge = edgeless
+            .iter()
+            .filter(|(_, _, _, _, _, worker2)| worker2.is_finished())
+            .count();
+        // Reap BEFORE the assert, so a RED cannot leak a worker thread.
+        for (_, _, _, _, _, worker2) in &edgeless {
+            worker2.thread().unpark();
+        }
+        for (_, _, _, _, _, worker2) in edgeless {
+            assert!(
+                worker2.join().is_ok(),
+                "the parked workers exit once the edge is posted"
+            );
+        }
+        // The bound is a function of the MEASURED window: while the window is inside the 1 s
+        // deadline park, ONE of the 3 may exit on a spurious wake, because each exit needs its own
+        // wake. Measured census on this lane: the shipped single-worker form reddened once in four
+        // full-suite runs (unit-54 audit, F-AUD-P3B-3) and the 3-worker form recorded 0 exits in
+        // 30 worker-windows across the 10-round baseline (logs\stress-baseline-*.log), so the
+        // per-window wake probability is small and bound 1 leaves one full event of slack. A
+        // window that inflated PAST the 1 s deadline (this lane does that under full-suite load)
+        // is not an observation of the park at all, because the deadline expires on its own, so
+        // the row asserts nothing there and says so in the census print.
+        // Discriminating power: the base arm sleeps 50 ms + the host's ~15.6 ms granularity, so
+        // in any window shorter than the 1 s deadline ALL 3 have exited (WO-OPT02C audit: "base
+        // no-edge leg exits at 50 ms") - 3 > 1, so the row stays RED on base.
+        let allowed = if window < PRESENTMON_IDLE_BOUND { 1 } else { 3 };
+        assert!(
+            woke_without_edge <= allowed,
+            "RED ON BASE: at most {allowed} of 3 parked workers may end a deadline park inside a measured window of {window:?} (bound 1 is the spurious-wake margin while the window is inside the 1 s park; base's 50 ms step ends all 3, which is why base needs no edge)"
+        );
+        println!(
+            "WO-OPT02C-WAKES shutdown edge: parked worker joined in {latency:?} (parity bound 50 ms, the retired step; the telemetry.rs:93 join carries NO budget); no-edge leg measured_window={window:?} finished_without_edge={woke_without_edge}/3 bound={allowed} (0 proves the edge is what pays for the long park; allowed=3 only when load inflated the window past the 1 s deadline, which is not an observation of the park)"
+        );
+    }
+
+    /// WO-OPT02C (C3.4): the shipped promise. GREEN ON BASE AND delivered: demand
+    /// adoption stays inside the 150 ms upper bound (the app's 100 ms publish cadence
+    /// plus the wake).
+    #[test]
+    fn the_presentmon_demand_edge_adopts_within_the_shipped_bound() {
+        let (_config, _generation, consumers, shutdown, rx, worker) = dormancy_worker(0);
+        let parked = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the zero-demand park publishes the deduped unavailable row");
+        assert_eq!(parked.detail, "no display consumer");
+        let started = Instant::now();
+        consumers.store(
+            crate::telemetry::extended_consumer_bit("presentmon"),
+            Ordering::Relaxed,
+        );
+        worker.thread().unpark();
+        let mut adopted = None;
+        while adopted.is_none() && started.elapsed() <= Duration::from_millis(150) {
+            if let Ok(update) = rx.recv_timeout(Duration::from_millis(150)) {
+                adopted = Some(update);
+            }
+        }
+        let adopted = adopted.expect("the demand is adopted inside the shipped 150 ms bound");
+        let adopted_after = started.elapsed();
+        assert_eq!(adopted.detail, "disabled");
+        assert!(
+            adopted_after <= Duration::from_millis(150),
+            "re-arm happened in {adopted_after:?}, inside the shipped 150 ms upper bound"
+        );
+        shutdown.store(true, Ordering::Release);
+        worker.thread().unpark();
+        assert!(worker.join().is_ok());
+    }
+
+    /// WO-OPT02C (C3.5): the deadline math as exact `Duration`s - no clocks read, no
+    /// re-implementation of the arm.
+    #[test]
+    fn worker_idle_deadline_is_the_earliest_gate_with_the_local_floor() {
+        let now = Instant::now();
+        let bound = PRESENTMON_IDLE_BOUND;
+        assert_eq!(
+            bound, TARGET_POLL,
+            "the idle bound is NAMED from TARGET_POLL"
+        );
+        assert_eq!(WORKER_MIN_PARK, Duration::from_millis(2));
+        // Nothing to wait for => the idle bound.
+        assert_eq!(worker_idle_deadline(&[], now), bound);
+        // Far gate => the bound (the cap is what the edges pay for).
+        assert_eq!(
+            worker_idle_deadline(&[Some(now + Duration::from_secs(30))], now),
+            bound
+        );
+        // Near gate => exactly the remaining time.
+        let near = now + Duration::from_millis(300);
+        assert_eq!(
+            worker_idle_deadline(&[Some(near)], now),
+            Duration::from_millis(300)
+        );
+        // Past gate => the local floor, never negative, never zero.
+        let past = now - Duration::from_millis(500);
+        assert_eq!(worker_idle_deadline(&[Some(past)], now), WORKER_MIN_PARK);
+        assert!(worker_idle_deadline(&[Some(past)], now) > Duration::ZERO);
+        // The earliest gate wins, and a `None` gate contributes nothing.
+        assert_eq!(
+            worker_idle_deadline(&[Some(near), Some(past)], now),
+            WORKER_MIN_PARK
+        );
+        assert_eq!(
+            worker_idle_deadline(&[None, Some(near)], now),
+            Duration::from_millis(300)
+        );
+        // The shipped shipped-cadence gates stay inside the bound: the 1 s target poll is
+        // the bound itself, the 5 s / 10 s gates are capped to it.
+        assert_eq!(
+            worker_idle_deadline(&[Some(now + RETRY_DELAY), Some(now + CATALOG_REFRESH)], now),
+            bound
+        );
+    }
+
+    /// WO-OPT02C (C3.6): structural pins in repo form - the four arms park on the
+    /// deadline, the retired step is absent, the 10 ms pumps stay (they are bounded child
+    /// and reader polls, not idle waits), and the two wake edges keep their order.
+    /// S14 (F-AUD-OPT02C-6): the pump needle is re-baselined to the shipped call form
+    /// `capture.pump_step(PRESENTMON_PUMP_BOUND)`; every other assertion here - the 4x
+    /// `park_timeout(` count, the 0x retired step, the branch containment and the three
+    /// wake-edge order pins - is unchanged.
+    #[test]
+    fn presentmon_worker_arms_park_and_the_wake_edges_keep_their_order() {
+        let source = include_str!("presentmon.rs").replace("\r\n", "\n");
+        let start = source.find("fn run(\n").expect("the worker exists");
+        let rest = &source[start..];
+        let end = rest
+            .find("\n    let mut stderr = String::new();")
+            .expect("the loop-end marker closes the worker loop");
+        let run = &rest[..end];
+        assert_eq!(
+            run.matches("std::thread::park_timeout(").count(),
+            4,
+            "all four retired 50 ms arms park"
+        );
+        assert_eq!(
+            run.matches("std::thread::sleep(Duration::from_millis(50))")
+                .count(),
+            0,
+            "no arm keeps the retired 50 ms step"
+        );
+        assert_eq!(
+            run.matches("worker_idle_deadline(").count(),
+            3,
+            "the three timer-only arms build their park from the deadline helper"
+        );
+        assert!(
+            run.contains("capture.pump_step(PRESENTMON_PUMP_BOUND)")
+                && run.contains("capture.capture_running()"),
+            "the tail arm's live-capture step is the data edge, with the park as its no-capture branch"
+        );
+        // C1.4 as shipped: the two 10 ms arms stay (bounded pumps on a child and on
+        // reader threads, each with its own shipped deadline).
+        assert!(
+            source.contains("fn wait_bounded(")
+                && source[..source.find("fn wait_bounded(").unwrap() + 700]
+                    .contains("std::thread::sleep(Duration::from_millis(10))"),
+            "the bounded child-exit pump keeps its 10 ms confirm cadence (no wake edge exists for a child process)"
+        );
+        assert!(
+            source
+                .find("fn join_thread_bounded(")
+                .map(|at| &source[at..at + 400])
+                .is_some_and(|body| body.contains("std::thread::sleep(Duration::from_millis(10))")),
+            "the bounded reader-join pump keeps its 10 ms cadence (the deadline is STOP_TIMEOUT_MS and the readers own no edge to this worker)"
+        );
+        // The wake edges, pinned in the sliced sequence form.
+        let runtime = include_str!("../telemetry.rs").replace("\r\n", "\n");
+        let runtime = runtime
+            .split("mod tests {")
+            .next()
+            .expect("the telemetry runtime has a production region");
+        let publish = runtime
+            .find("pub fn set_consumers(&self, consumers: u64)")
+            .expect("the demand-publish site");
+        let body = &runtime[publish..publish + 240];
+        assert!(
+            body.find("self.consumers.swap(consumers, Ordering::Relaxed)")
+                .expect("the demand-word write")
+                < body
+                    .find("self.wake_workers()")
+                    .expect("the demand wake edge"),
+            "the demand site writes the word, then posts the wake"
+        );
+        let drop = runtime
+            .find("fn drop(&mut self)")
+            .expect("the teardown path");
+        let body = &runtime[drop..drop + 320];
+        assert!(
+            body.find("self.shutdown.store(true, Ordering::Relaxed)")
+                .expect("the shutdown store")
+                < body.find("self.wake_workers()").expect("the shutdown wake")
+                && body.find("self.wake_workers()").expect("the shutdown wake")
+                    < body.find(".join()").expect("the worker join"),
+            "shutdown stores, unparks, and only then joins, so no join blocks on a park"
+        );
+    }
+
+    /// WO-U46I (#13) PRE-RED: the `stop_with` early-return arm (an unconfirmed child stop) restored
+    /// the child handle and returned, skipping the ETW cleanup of the session THIS instance created.
+    /// The child handle is a per-capture resource whose retry is owned by the retention ladder; the
+    /// named ETW session is a system-wide registration, so leaving it registered on every unconfirmed
+    /// stop is the defect. The fix attempts the cleanup in the same arm and reports the child-stop and
+    /// session-cleanup outcomes as SEPARATE segments; ownership, retention and the retry ladder stay.
+    /// Pre-fix: the cleanup seam is never called => RED at step (i).
+    #[test]
+    fn presentmon_child_stop_failure_still_cleans_the_owned_session() {
+        use std::sync::atomic::AtomicUsize;
+        let child = Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut capture = Capture::default();
+        capture.child = Some(child);
+        capture.owned_session = Some("LCDSirPlus-99-owned".into());
+        let calls = AtomicUsize::new(0);
+        let names: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        capture.stop_with(
+            |_| Err("injected child stop failure: child is still running".to_string()),
+            |name| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                names.lock().unwrap().push(name.to_string());
+                Ok(())
+            },
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "(i) the owned ETW session is cleaned up exactly once even when the child stop is unconfirmed"
+        );
+        assert_eq!(
+            names.lock().unwrap().as_slice(),
+            ["LCDSirPlus-99-owned".to_string()],
+            "(ii) cleanup runs on THIS instance's owned session name, never an unrelated session"
+        );
+        assert!(
+            capture.child.is_some(),
+            "(iii) the child-handle retention on a stop failure is unchanged (the retry ladder owns it)"
+        );
+        assert_eq!(
+            capture.owned_session, None,
+            "(iv) a completed cleanup clears the ownership claim"
+        );
+        assert!(
+            capture
+                .stop_diagnostic
+                .contains("teardown: injected child stop failure"),
+            "(v) the child-stop outcome is named on its own: {}",
+            capture.stop_diagnostic
+        );
+        assert!(
+            !capture.stop_diagnostic.contains("ETW cleanup:"),
+            "(v) a successful session cleanup adds no cleanup outcome: {}",
+            capture.stop_diagnostic
+        );
+        // (vi) idempotence: the cleared session is never cleaned a second time.
+        capture.stop_with(
+            |_| Err("injected child stop failure again".to_string()),
+            |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "(vi) a second stop does not repeat the completed cleanup"
+        );
+        assert!(
+            capture.child.is_some(),
+            "(vi) the child handle stays retained across repeats"
+        );
+        // (vii) a cleanup failure is reported as a SEPARATE outcome next to the child-stop outcome,
+        // and the session claim is kept for the retry (the shipped `teardown_pending` rule).
+        capture.owned_session = Some("LCDSirPlus-99-owned".into());
+        capture.stop_with(
+            |_| Err("child stop failed".to_string()),
+            |_| Err("session stop refused".to_string()),
+        );
+        assert!(
+            capture
+                .stop_diagnostic
+                .contains("teardown: child stop failed"),
+            "(vii) the child-stop outcome: {}",
+            capture.stop_diagnostic
+        );
+        assert!(
+            capture
+                .stop_diagnostic
+                .contains("ETW cleanup: session stop refused"),
+            "(vii) the session-cleanup outcome is reported separately: {}",
+            capture.stop_diagnostic
+        );
+        assert_eq!(
+            capture.owned_session.as_deref(),
+            Some("LCDSirPlus-99-owned"),
+            "(vii) a refused cleanup keeps the session claim so the retry re-attempts it"
+        );
+    }
+
+    /// WO-U46I (#3a) PRE-RED, STRUCTURAL FORM (the runtime form needs the gate runner, which has
+    /// no home pre-fix, and the WO bans real certificate hangs / real OS thread exhaustion): the
+    /// capture start in the 50 ms worker loop must not run `WinVerifyTrustEx` synchronously. The
+    /// shipped shape calls the unbounded verifier straight from `validate_executable`, so one
+    /// revocation/OCSP stall blocks the worker (and the provider) with no bound. The fix routes the
+    /// check through a bounded wrapper with a one-outstanding-thread gate. Pre-fix: the synchronous
+    /// call site is present and the wrapper is absent => RED (the anchor panics on the missing
+    /// runner, the same loud form the WO discloses).
+    #[test]
+    fn presentmon_verifier_call_site_is_bounded() {
+        let source = include_str!("presentmon.rs").replace("\r\n", "\n");
+        let body = |head: &str| -> String {
+            let start = source
+                .find(head)
+                .unwrap_or_else(|| panic!("(#3a) the source carries `{head}`"));
+            let end = source[start..]
+                .find("\n}")
+                .unwrap_or_else(|| panic!("`{head}` closes at column zero"))
+                + start
+                + 2;
+            source[start..end].to_string()
+        };
+        let validate = body("fn validate_executable(path: &Path)");
+        assert!(
+            !validate.contains("verify_authenticode(&pinned.file, &pinned.path)"),
+            "(#3a) the 50 ms worker path must not call the unbounded verifier synchronously"
+        );
+        assert!(
+            validate.contains("verify_authenticode_bounded("),
+            "(#3a) the Authenticode check runs through the bounded wrapper"
+        );
+        assert!(
+            validate.contains("held_sha256(&pinned.file, pinned.identity.size)"),
+            "(#3a) the SHA-256 and pinned-identity checks keep their shipped place"
+        );
+        let bounded = validate
+            .find("verify_authenticode_bounded(")
+            .unwrap_or(usize::MAX);
+        let hashed = validate
+            .find("held_sha256(&pinned.file")
+            .unwrap_or(usize::MAX);
+        assert!(
+            bounded < hashed,
+            "(#3a) the existing check ORDER is unchanged: signature, then pinned size + SHA-256"
+        );
+        let wrapper = body("fn verify_authenticode_bounded(");
+        assert!(
+            wrapper.contains("run_bounded_verifier("),
+            "(#3a) the wrapper delegates to the gate runner that owns the bound"
+        );
+        let runner = body("fn run_bounded_verifier<");
+        assert!(
+            runner.contains("recv_timeout"),
+            "(#3a) the worker waits a BOUNDED time for the verifier thread"
+        );
+        assert!(
+            runner.contains("TryRecvError::Empty"),
+            "(#3a) an in-flight verifier DECLINES a new attempt: at most one thread is outstanding"
+        );
+        assert!(
+            runner.contains("*gate = None"),
+            "(#3a) the gate is cleared by the verifier's COMPLETION, never by a timeout-ack"
+        );
+        assert!(
+            !runner.contains(".expect("),
+            "(#3a) the runner never panics on a spawn failure: it fails closed"
+        );
+    }
+
+    /// WO-U46I (#3a) BEHAVIORAL + THREAD CENSUS, WO-47A DETERMINISTIC ORACLE: the gate runner facing
+    /// a WEDGED verifier (the deterministic seam; the WO bans real certificate hangs). The first
+    /// attempt times out and FAILS CLOSED with the shipped diagnostic; every later attempt while that
+    /// verifier is in flight declines with `VERIFIER_BUSY`, and the census shows the outstanding
+    /// verifier-thread count stays exactly ONE - no thread is stranded per timeout and nothing
+    /// accumulates. When the wedged verifier returns, the gate is consumed by that COMPLETION (never
+    /// by a timeout-ack) and the next attempt spawns exactly ONE new thread and ends cleared.
+    ///
+    /// WO-47A (FLAKE-2): the completion is reached by a HANDSHAKE observed under the gate, never by a
+    /// yield census. Every decline asserts the gate CONTRACT (`VERIFIER_BUSY`, `entered == 1`, slot
+    /// owned); the released verifier JOINS IN on a test-controlled completion channel and its result
+    /// is then observed as the PAYLOAD the runner puts on the gate channel. How many declines precede
+    /// a completion is scheduling and carries NO assertion - the registered red row (`declines=101`
+    /// on a tree that ran green 5x, with `entered=1 gate_owned=true`, i.e. the property HELD) was
+    /// exactly that count-as-oracle defect. Every wait here is the shipped `VERIFIER_BOUND` liveness
+    /// budget and fails closed naming the census; no sleep, no cap, no suppression.
+    #[test]
+    fn presentmon_bounded_verifier_keeps_one_outstanding_thread() {
+        use std::sync::atomic::AtomicUsize;
+        let entered = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let mut gate: Option<mpsc::Receiver<Result<(), String>>> = None;
+        let bound = Duration::from_millis(20);
+        let counted = Arc::clone(&entered);
+        let first = run_bounded_verifier(&mut gate, bound, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let _ = release_rx.recv();
+            // The body is done: report to the test, then return so the runner's own thread sends
+            // this result on the GATE channel - the completion the gate carries.
+            let _ = done_tx.send(());
+            Ok(())
+        });
+        let detail = first.expect_err("(#3a) a wedged verifier makes the attempt fail closed");
+        assert!(
+            detail.contains("timed out"),
+            "(#3a) the timeout is the recorded diagnostic: {detail}"
+        );
+        assert_eq!(
+            detail.as_str(),
+            VERIFIER_TIMEOUT,
+            "(#3a) the fail-closed diagnostic is the shipped timeout constant"
+        );
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "(#3a) exactly one verifier thread entered"
+        );
+        assert!(
+            gate.is_some(),
+            "(#3a) the timeout keeps the in-flight thread COUNTED"
+        );
+        // WO-47A: a FIXED number of attempts, each asserting the GATE OUTCOME under the in-flight
+        // verifier. The verifier is parked on the release, so this census is deterministic: every
+        // attempt declines as in-flight and NO new thread enters.
+        for attempt in 2..=6 {
+            let declined = run_bounded_verifier(&mut gate, bound, || Ok(()))
+                .expect_err("(#3a) an attempt declines while a verifier is in flight");
+            assert_eq!(
+                declined.as_str(),
+                VERIFIER_BUSY,
+                "(#3a) attempt {attempt} declines as in-flight, never with another outcome"
+            );
+            assert_eq!(
+                entered.load(Ordering::SeqCst),
+                1,
+                "(#3a) census: NO new verifier thread per timeout (attempt {attempt})"
+            );
+        }
+        let released = release_tx.send(());
+        assert!(
+            released.is_ok(),
+            "(#3a) the release reaches the wedged verifier's own receiver: {released:?}"
+        );
+        // WO-47A THE HANDSHAKE, OBSERVED UNDER THE GATE (no yield count, no sleep, no cap):
+        // (1) the released verifier joins in on its own completion channel;
+        // (2) the runner's thread puts the verification result on the gate channel, and the test
+        //     observes THAT completion as the payload of the slot it owns;
+        // (3) the completion consumes the slot, exactly as the runner's contract does;
+        // (4) the first attempt after the completion spawns exactly ONE new thread, and the runner
+        //     clears the gate on that completion (the "reports results and clears the gate" leg).
+        let joined = done_rx.recv_timeout(VERIFIER_BOUND);
+        assert!(
+            joined.is_ok(),
+            "(#3a) the released verifier reports its body's completion to the test: {joined:?}"
+        );
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "(#3a) census: the in-flight verifier is still the ONLY thread after the join"
+        );
+        let slot = gate
+            .take()
+            .expect("(#3a) the in-flight verifier keeps the slot counted until its completion");
+        let completion = slot.recv_timeout(VERIFIER_BOUND);
+        assert_eq!(
+            completion.expect("(#3a) the released verifier's result arrives on the gate channel"),
+            Ok(()),
+            "(#3a) the completion the gate carries IS the verifier's own result"
+        );
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "(#3a) census: consuming the completion adds no verifier thread (the decline count that
+             preceded it is scheduling, never a bound on outstanding threads)"
+        );
+        let counted = Arc::clone(&entered);
+        let outcome = run_bounded_verifier(&mut gate, VERIFIER_BOUND, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let outcome =
+            outcome.expect("(#3a) the completion consumed the gate, so the next attempt spawns");
+        assert!(
+            outcome.is_ok(),
+            "(#3a) the new verification is answered: {outcome:?}"
+        );
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            2,
+            "(#3a) exactly one new thread, for the new attempt"
+        );
+        assert!(
+            gate.is_none(),
+            "(#3a) a completed verification clears the gate"
+        );
+    }
+
+    /// WO-U46I (#3a): a verifier that COMPLETES reports its own result and clears the gate, so a
+    /// later attempt re-verifies (the discord precedent's latch, whose gate stays set forever
+    /// after a timeout, is not replicated). A verifier thread that DIES is counted, fails closed,
+    /// and its completion (the disconnected channel) releases the gate for the next attempt.
+    #[test]
+    fn presentmon_bounded_verifier_reports_results_and_clears_the_gate() {
+        let mut gate: Option<mpsc::Receiver<Result<(), String>>> = None;
+        let accepted = run_bounded_verifier(&mut gate, VERIFIER_BOUND, || Ok(()))
+            .expect("(#3a) a verifier that completes is answered inside the bound");
+        assert!(
+            accepted.is_ok(),
+            "(#3a) the verification result is the caller's outcome"
+        );
+        assert!(gate.is_none(), "(#3a) the gate is cleared by completion");
+        let rejected = run_bounded_verifier(&mut gate, VERIFIER_BOUND, || {
+            Err("PresentMon Authenticode signature is not valid: 0x800b0109".into())
+        })
+        .expect("(#3a) a rejecting verifier is answered inside the bound");
+        assert_eq!(
+            rejected.expect_err("(#3a) the signature failure reaches the capture start"),
+            "PresentMon Authenticode signature is not valid: 0x800b0109",
+            "(#3a) the shipped diagnostic text is preserved, not synthesized"
+        );
+        assert!(
+            gate.is_none(),
+            "(#3a) a completed rejection also clears the gate (re-verification stays possible)"
+        );
+        let dead = run_bounded_verifier(&mut gate, VERIFIER_BOUND, || {
+            panic!("( #3a) injected verifier thread death: the runner must fail closed")
+        });
+        assert!(
+            dead.is_err(),
+            "(#3a) a verifier thread that dies fails the attempt closed"
+        );
+        assert!(
+            gate.is_some(),
+            "(#3a) the dead thread stays counted until its completion is observed"
+        );
+        let revived = run_bounded_verifier(&mut gate, VERIFIER_BOUND, || Ok(()))
+            .expect("(#3a) the dead verifier's completion releases the gate for the next attempt");
+        assert!(revived.is_ok(), "(#3a) the next attempt re-verifies");
+        assert!(
+            gate.is_none(),
+            "(#3a) the gate ends cleared: no permanent latch"
+        );
+    }
+
+    /// WO-OPT02C-PUMPCAP (S13) fixture: the shipped tail arm of `run` on a LIVE child
+    /// and a LIVE line channel carrying zero lines - the capture-running shape the
+    /// audit measured (F-AUD-OPT02C-1/-2). The production loop has no capture-injection
+    /// seam, so this seam executes the arm's own expression (`idle_deadline` +
+    /// `pump_step`), which IS the step the worker blocks in. The child is
+    /// `cmd.exe /C ping` with `CREATE_NO_WINDOW` (no visible window), killed and waited
+    /// by the test itself: no PresentMon, no ETW session, no LCDSirPlus instance.
+    fn pumpcap_probe_capture(stale: bool) -> (LineSender, Capture, Config) {
+        let child = Command::new("cmd.exe")
+            .args(["/C", "ping", "-n", "120", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("the hidden probe child");
+        let (tx, rx) = line_channel(LINE_QUEUE_CAPACITY);
+        let mut capture = Capture::default();
+        capture.child = Some(child);
+        capture.lines = Some(rx);
+        let now = Instant::now();
+        capture.last_target_poll = Some(now);
+        capture.catalog.checked_at = Some(now);
+        capture.started_at = Some(now);
+        capture.last_frame = Some(if stale {
+            now - STALE_AFTER - Duration::from_secs(1)
+        } else {
+            now
+        });
+        (tx, capture, Config::default())
+    }
+
+    /// WO-OPT02C-PUMPCAP (S13) fixture teardown: reap the probe child THIS test launched AND
+    /// its descendant tree. The probe is `cmd.exe /C ping -n 120 127.0.0.1`, so killing only
+    /// the DIRECT child (F-AUD-OPT02C2-2) left the `ping` grandchild orphaned and alive for
+    /// its full 120 s. Every leg is scoped to this `Child`'s own pid, read from `Child::id()`
+    /// (the pid the OS gave THIS test): never a name, never a pattern, so no process this test
+    /// did not launch can be touched. The tree-kill runs FIRST - a dead parent is no longer
+    /// enumerable - and its own report names each terminated descendant as
+    /// `(child process of PID <probe pid>)`, which is the probe-attributed pid set; the
+    /// hygiene leg then reads each one back with the read-only `tasklist /FI "PID eq <pid>"`
+    /// filter and asserts it is gone, so NO probe-attributable `ping` survives the reap.
+    /// (`tasklist` has no `PARENT_PID` filter and a name-only `ping` census cannot attribute
+    /// a pid to this test in-process without a Toolhelp snapshot feature this crate does not
+    /// enable; the raw `ping`/`cmd` name counts are censused per test window by
+    /// WO-P3BUNDLE-scripts\Do-U54-Gate.ps1.)
+    fn pumpcap_reap_capture(capture: &mut Capture) {
+        if let Some(mut child) = capture.child.take() {
+            let pid = child.id();
+            let tree = pumpcap_probe_tool("taskkill.exe", &["/T", "/F", "/PID", &pid.to_string()]);
+            let report = String::from_utf8_lossy(&tree.stdout).into_owned();
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(child);
+            let attributed = format!("(child process of PID {pid})");
+            let descendants: Vec<u32> = report
+                .lines()
+                .filter(|line| line.contains(&attributed))
+                .filter_map(|line| {
+                    line.split("PID ")
+                        .nth(1)
+                        .and_then(|tail| tail.split_whitespace().next())
+                        .and_then(|digits| digits.parse().ok())
+                })
+                .collect();
+            assert!(
+                tree.status.success(),
+                "the pid-scoped tree kill of the probe child pid {pid} succeeded (F-AUD-OPT02C2-2): {report}"
+            );
+            assert!(
+                !descendants.is_empty(),
+                "the tree kill enumerated the probe's OWN descendant (the `ping -n 120` grandchild) as a child of pid {pid}, so the tree is what was reaped: {report}"
+            );
+            for probe_pid in descendants.iter().chain(std::iter::once(&pid)) {
+                assert!(
+                    pumpcap_pid_gone(*probe_pid),
+                    "no probe-attributable process survives the reap: pid {probe_pid} (probe child {pid} and its `ping` grandchild) is gone (F-AUD-OPT02C2-2)"
+                );
+            }
+        }
+        capture.lines = None;
+    }
+
+    /// Run a pid-scoped process tool - the tree kill, and the read-only pid filter probe -
+    /// with no window. Every `pid` argument comes from `Child::id()` of the probe THIS test
+    /// spawned, or from that tree kill's own report of the probe's descendants.
+    fn pumpcap_probe_tool(program: &str, tool_args: &[&str]) -> std::process::Output {
+        Command::new(program)
+            .args(tool_args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .expect("the pid-scoped process tool runs")
+    }
+
+    /// The read-only hygiene probe: `tasklist /FI "PID eq <pid>"` reports no matching task.
+    fn pumpcap_pid_gone(pid: u32) -> bool {
+        let probe = pumpcap_probe_tool("tasklist.exe", &["/FI", &format!("PID eq {pid}"), "/NH"]);
+        probe.status.success()
+            && String::from_utf8_lossy(&probe.stdout).contains("No tasks are running")
+    }
+
+    /// The capped pump step expression, in ONE place so the seam and the shipped arm
+    /// cannot drift (S14: `run`'s running-capture branch pumps the plain
+    /// `PRESENTMON_PUMP_BOUND`; the `min`/`max` here is algebraically that same constant,
+    /// so the seam measures the shipped 50 ms step, and the structural pin of the shipped
+    /// call form lives in the test below).
+    fn pumpcap_capped_step(capture: &Capture, cfg: &Config) -> Duration {
+        capture
+            .idle_deadline(cfg, Instant::now())
+            .min(PRESENTMON_PUMP_BOUND)
+            .max(PRESENTMON_PUMP_BOUND)
+    }
+
+    /// WO-OPT02C-PUMPCAP S13.1 (F-AUD-OPT02C-1, P2, measured 1000 ms expression /
+    /// 1011 ms observed at `8fc5a470`): in the capture-running / child-silent shape the
+    /// pump step is capped to `PRESENTMON_PUMP_BOUND`, so a demand LOWERING posted in
+    /// the middle of an in-flight pump is adopted inside the shipped 150 ms bound.
+    /// RED ON THE FROZEN 02C TREE: the step is
+    /// `recv_timeout(min(earliest gate, PRESENTMON_IDLE_BOUND = TARGET_POLL))` = 1000 ms,
+    /// and `Thread::unpark` cannot cut a running `recv_timeout` (audit probe
+    /// pump_iters=1 vs park_iters=2), so adoption lands at ~1.1 s.
+    #[test]
+    fn the_presentmon_pump_step_is_capped_while_the_child_is_silent() {
+        let (_tx, mut capture, cfg) = pumpcap_probe_capture(false);
+        let demand = Arc::new(AtomicU64::new(crate::telemetry::extended_consumer_bit(
+            "presentmon",
+        )));
+        let start = Instant::now();
+        let store_at = Arc::new(AtomicU64::new(u64::MAX));
+        // The demand is lowered 5 ms into the first in-flight pump, exactly the shape of
+        // `telemetry.rs:121-125` (`set_consumers` writes the word, then `wake_workers`
+        // unparks): the word is visible while the pump is still blocking.
+        let edge = Arc::clone(&demand);
+        let stamp = Arc::clone(&store_at);
+        let lower = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            edge.store(0, Ordering::Relaxed);
+            stamp.store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        });
+        let window = Duration::from_millis(1_200);
+        let mut iterations = 0u64;
+        let mut worst = Duration::ZERO;
+        let mut adopted_after = None;
+        while start.elapsed() < window {
+            let step = pumpcap_capped_step(&capture, &cfg);
+            let at = Instant::now();
+            capture.pump_step(step);
+            worst = worst.max(at.elapsed());
+            iterations += 1;
+            // The worker reads the demand word once per iteration, at the top of the loop.
+            if !crate::telemetry::demanded(demand.load(Ordering::Relaxed), "presentmon") {
+                adopted_after =
+                    Some(start.elapsed() - Duration::from_micros(store_at.load(Ordering::Relaxed)));
+                break;
+            }
+        }
+        pumpcap_reap_capture(&mut capture);
+        lower.join().ok();
+        let adopted_after = adopted_after.expect("the lowered demand is adopted inside the window");
+        println!(
+            "WO-OPT02C-PUMPCAP shape3 (capture running, child silent): worst_step {worst:?} (bound {PRESENTMON_PUMP_BOUND:?}), {iterations} iterations in {window:?}, demand lowering adopted in {adopted_after:?} (shipped bound 150 ms; frozen 02C measured 1011 ms)",
+        );
+        assert!(
+            worst <= PRESENTMON_PUMP_BOUND + Duration::from_millis(20),
+            "the pump step is capped: {worst:?} exceeds 50 ms + the ~15.6 ms host timer granularity (frozen 02C: 1011 ms, F-AUD-OPT02C-1)"
+        );
+        assert!(
+            adopted_after <= Duration::from_millis(150),
+            "a demand lowering posted in-flight is adopted inside the shipped 150 ms bound: {adopted_after:?} (frozen 02C: ~1.1 s, F-AUD-OPT02C-1)"
+        );
+        assert!(iterations >= 1, "the shape is live: the pump ran");
+    }
+
+    /// WO-OPT02C-PUMPCAP S13.2 (F-AUD-OPT02C-2, P2, measured ~500 iterations/s at
+    /// `8fc5a470`): a running capture whose staleness gates are permanently due must not
+    /// spin the worker. This is the unit-50-class anti-spin census for the shape the
+    /// wake census never looked at. RED ON THE FROZEN 02C TREE: the deadline set
+    /// collapses to `WORKER_MIN_PARK` (2 ms) => ~500 iterations/s, 25x the retired 20/s,
+    /// each iteration calling `reconcile`.
+    #[test]
+    fn a_stale_running_capture_does_not_spin_the_worker() {
+        let (_tx, mut capture, cfg) = pumpcap_probe_capture(true);
+        let window = Duration::from_millis(800);
+        let start = Instant::now();
+        let mut iterations = 0u64;
+        let mut worst = Duration::ZERO;
+        while start.elapsed() < window {
+            let step = pumpcap_capped_step(&capture, &cfg);
+            let at = Instant::now();
+            capture.pump_step(step);
+            worst = worst.max(at.elapsed());
+            iterations += 1;
+        }
+        pumpcap_reap_capture(&mut capture);
+        let elapsed = start.elapsed();
+        let per_second = iterations as f64 * 1000.0 / elapsed.as_millis() as f64;
+        println!(
+            "WO-OPT02C-PUMPCAP shape4 (capture running, past STALE_AFTER): {iterations} iterations in {elapsed:?} = {per_second:.1} iterations/s (worst step {worst:?}); frozen 02C ~500/s, the retired base arm 20/s",
+        );
+        assert!(
+            per_second <= 25.0,
+            "a stale running capture does not spin the worker: {per_second:.1} iterations/s over {elapsed:?} (retired base 20/s; the 2 ms `WORKER_MIN_PARK` floor is right for a DUE gate and wrong for a stale capture; frozen 02C ~500/s, F-AUD-OPT02C-2)"
+        );
+    }
+
+    /// WO-OPT02C-PUMPCAP S13.3: the cap must not starve the shipped `line_overflow`
+    /// reset routine - the pump is how a queued line reaches the drain and ages the
+    /// bounded queue. Structural pin of the capped call in the sliced `run` body (repo
+    /// form), plus the behavioral leg: one live line handed to the capped pump arrives
+    /// in `pump_line`, the input of the shipped `drain_with` the 5 drain tests pin.
+    #[test]
+    fn the_presentmon_pump_cap_keeps_the_line_overflow_reset_reachable() {
+        assert_eq!(
+            PRESENTMON_PUMP_BOUND,
+            Duration::from_millis(50),
+            "the pump bound is the shipped 50 ms step: never slower (the `line_overflow` reset must stay reachable, and 20/s is the retired cadence), and the cap that ends the 1000 ms in-flight pump"
+        );
+        let source = include_str!("presentmon.rs").replace("\r\n", "\n");
+        let start = source.find("fn run(\n").expect("the worker exists");
+        let rest = &source[start..];
+        let end = rest
+            .find("\n    let mut stderr = String::new();")
+            .expect("the loop-end marker closes the worker loop");
+        let run = &rest[..end];
+        let at = run
+            .find("capture.pump_step(")
+            .expect("the tail arm pumps the live capture");
+        let call = &run[at..at + 90];
+        assert!(
+            call.contains("capture.pump_step(PRESENTMON_PUMP_BOUND)"),
+            "S14: the pump call IS the pump bound, the plain form of the cap and the floor: {call}"
+        );
+        assert!(
+            run[..at].contains("if capture.capture_running()"),
+            "the capped pump is the running-capture arm; the no-capture arm keeps the deadline park"
+        );
+        let (tx, mut capture, cfg) = pumpcap_probe_capture(true);
+        tx.send("probe-capped-pump-line".to_string())
+            .expect("the line is queued on the worker's data edge");
+        let step = pumpcap_capped_step(&capture, &cfg);
+        let at = Instant::now();
+        capture.pump_step(step);
+        let took = at.elapsed();
+        pumpcap_reap_capture(&mut capture);
+        assert_eq!(
+            capture.pump_line.as_deref(),
+            Some("probe-capped-pump-line"),
+            "the capped pump hands the queued line to the shipped drain, so the `line_overflow` reset stays reachable"
+        );
+        assert!(
+            took <= PRESENTMON_PUMP_BOUND + Duration::from_millis(20),
+            "a queued line is taken on the capped step, not after it: {took:?}"
+        );
+    }
+    // ==== WO-OPT05 (unit 57): the A1 shape census and the A3 numerical-equality matrix ====
+
+    use crate::history::{mean, percentile_high};
+
+    /// The shipped shape's two `Vec` collect sites, counted here (test-only) because the
+    /// changed production path has none: a production counter with no site would be a
+    /// dead-code warning, and a counter that can only read 0 is vacuous. Per-thread, the
+    /// `WORKER_TICKS` shape, so the parallel suite cannot contaminate a census read.
+    static TEST_VEC_COLLECTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, u64>>,
+    > = std::sync::OnceLock::new();
+
+    fn test_vec_collect_map(
+    ) -> &'static std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, u64>> {
+        TEST_VEC_COLLECTS.get_or_init(std::sync::Mutex::default)
+    }
+
+    fn test_vec_collect_tick() {
+        let map = test_vec_collect_map();
+        let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(std::thread::current().id()).or_insert(0) += 1;
+    }
+
+    fn test_vec_collect_count() -> u64 {
+        let map = test_vec_collect_map();
+        let map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.get(&std::thread::current().id()).copied().unwrap_or(0)
+    }
+
+    fn test_vec_collect_reset() {
+        let map = test_vec_collect_map();
+        let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.insert(std::thread::current().id(), 0);
+    }
+
+    /// The unit-56 `Stats::model` body, kept VERBATIM as the numerical oracle the changed
+    /// path is compared against (A3) and as the base side of the A1 shape census. The two
+    /// collect ticks mark its two window vectors; nothing else was touched.
+    /// test-harness-fixture: never reached by production code.
+    fn base_model_shape(
+        stats: &Stats,
+        now: SystemTime,
+        observed_now: Instant,
+        window: Duration,
+        process: &str,
+    ) -> GameStats {
+        let cutoff = observed_now.checked_sub(window);
+        test_vec_collect_tick();
+        let frame_times: Vec<f64> = stats
+            .frames
+            .iter()
+            .filter(|(at, _)| cutoff.is_none_or(|cutoff| *at >= cutoff))
+            .map(|(_, value)| *value)
+            .collect();
+        if frame_times.is_empty() {
+            return GameStats::default();
+        }
+        let recent_cutoff = observed_now.checked_sub(Duration::from_secs(1));
+        test_vec_collect_tick();
+        let recent: Vec<f64> = stats
+            .frames
+            .iter()
+            .filter(|(at, _)| recent_cutoff.is_none_or(|cutoff| *at >= cutoff))
+            .map(|(_, value)| *value)
+            .collect();
+        let current = if recent.is_empty() {
+            *frame_times.last().unwrap()
+        } else {
+            mean(&recent)
+        };
+        let one = percentile_high(&frame_times, 0.01);
+        let point_one = percentile_high(&frame_times, 0.001);
+        GameStats {
+            active: true,
+            process_name: process.to_string(),
+            game_name: Path::new(process)
+                .file_stem()
+                .and_then(|v| v.to_str())
+                .unwrap_or(process)
+                .to_string(),
+            fps: Metric::valid(1000.0 / current, now),
+            one_percent: Metric::valid(1000.0 / one, now),
+            point_one_low: Metric::valid(1000.0 / point_one, now),
+            frame_time_ms: Metric::valid(current, now),
+            stutters: stats.stutters,
+            session_start: stats.session_start,
+        }
+    }
+
+    /// One measured shape of the model path: builds, stale builds, sorts, clones, collects.
+    fn shape_counts() -> (u64, u64, u64, u64, u64) {
+        let (builds, stale_builds) = model_shape_counts();
+        let (sorts, clones) = crate::history::model_census_counts();
+        (
+            builds,
+            stale_builds,
+            sorts,
+            clones,
+            test_vec_collect_count(),
+        )
+    }
+
+    fn shape_reset() {
+        model_shape_reset();
+        crate::history::model_census_reset();
+        test_vec_collect_reset();
+    }
+
+    /// Every published field compared by BIT PATTERN, so `NaN`/`+-inf` are equal to
+    /// themselves and a tail mean that moved into the NaN class is caught, not tolerated.
+    fn assert_game_stats_bits(base: &GameStats, changed: &GameStats, case: &str) {
+        let metric = |m: &Metric| (m.value.to_bits(), m.valid, m.stale, m.updated);
+        assert_eq!(changed.active, base.active, "{case}: active");
+        assert_eq!(
+            changed.process_name, base.process_name,
+            "{case}: process_name"
+        );
+        assert_eq!(changed.game_name, base.game_name, "{case}: game_name");
+        for (name, b, c) in [
+            ("fps", &base.fps, &changed.fps),
+            ("one_percent", &base.one_percent, &changed.one_percent),
+            ("point_one_low", &base.point_one_low, &changed.point_one_low),
+            ("frame_time_ms", &base.frame_time_ms, &changed.frame_time_ms),
+        ] {
+            assert_eq!(metric(b), metric(c), "{case}: {name} bit pattern");
+        }
+        assert_eq!(changed.stutters, base.stutters, "{case}: stutters");
+        assert_eq!(
+            changed.session_start, base.session_start,
+            "{case}: session_start"
+        );
+    }
+
+    /// A frame stamp `offset_ms` away from `observed` (negative = older).
+    fn observed_at(observed: Instant, offset_ms: i64) -> Instant {
+        let magnitude = Duration::from_millis(offset_ms.unsigned_abs());
+        if offset_ms >= 0 {
+            observed.checked_add(magnitude)
+        } else {
+            observed.checked_sub(magnitude)
+        }
+        .expect("fixture offset is inside the monotonic clock")
+    }
+
+    /// A `Stats` whose frames, stutter count and session start are the fixture's, loaded by
+    /// direct field assignment (the shape the shipped capacity test uses).
+    fn fixture_stats(window: Duration, stutters: i32, frames: &[(i64, f64)]) -> Stats {
+        let observed = Instant::now();
+        let mut stats = Stats::new(30.0, window);
+        stats.stutters = stutters;
+        stats.session_start = Some(SystemTime::UNIX_EPOCH);
+        stats.frames = frames
+            .iter()
+            .map(|(offset, value)| (observed_at(observed, *offset), *value))
+            .collect();
+        stats
+    }
+
+    fn secs(seconds: u64) -> Duration {
+        Duration::from_secs(seconds)
+    }
+
+    /// `count` frames one millisecond apart, the newest at offset -1 ms.
+    fn spread(count: usize, value_at: impl Fn(usize) -> f64) -> Vec<(i64, f64)> {
+        (0..count)
+            .map(|index| (index as i64 - count as i64, value_at(index)))
+            .collect()
+    }
+
+    /// The reconciliation stamp: one tick after the newest stored frame.
+    fn now_after(stats: &Stats, gap: Duration) -> Instant {
+        stats
+            .frames
+            .back()
+            .map(|(at, _)| *at)
+            .unwrap_or(Instant::now())
+            + gap
+    }
+
+    /// One A3 case: `(name, window, stutters, frames as (offset ms, frame_ms))`.
+    type MatrixCase = (&'static str, Duration, i32, Vec<(i64, f64)>);
+
+    fn a3_matrix() -> Vec<MatrixCase> {
+        vec![
+            ("empty-window", secs(60), 0, vec![]),
+            ("one-frame", secs(60), 0, vec![(0, 16.0)]),
+            (
+                "all-duplicate",
+                secs(60),
+                3,
+                vec![
+                    (-500, 16.0),
+                    (-400, 16.0),
+                    (-300, 16.0),
+                    (-200, 16.0),
+                    (-100, 16.0),
+                    (0, 16.0),
+                ],
+            ),
+            (
+                "recent-empty-window-not",
+                secs(60),
+                0,
+                vec![(-30_000, 16.0), (-29_000, 20.0), (-28_000, 30.0)],
+            ),
+            (
+                "window-cutoff-exact",
+                secs(60),
+                0,
+                vec![(-59_999, 42.0), (-59_998, 20.0), (0, 10.0)],
+            ),
+            (
+                "window-cutoff-one-tick-off",
+                secs(60),
+                0,
+                vec![(-60_000, 42.0), (-59_998, 20.0), (0, 10.0)],
+            ),
+            (
+                "recent-cutoff-exact",
+                secs(60),
+                0,
+                vec![(-999, 24.0), (0, 16.0)],
+            ),
+            (
+                "recent-cutoff-one-tick-off",
+                secs(60),
+                0,
+                vec![(-1_000, 24.0), (0, 16.0)],
+            ),
+            ("len1", secs(60), 0, vec![(0, 7.0)]),
+            ("len2", secs(60), 0, vec![(-100, 3.0), (0, 9.0)]),
+            (
+                "len3",
+                secs(60),
+                0,
+                vec![(-200, 5.0), (-100, 1.0), (0, 3.0)],
+            ),
+            (
+                "len4",
+                secs(60),
+                1,
+                vec![(-300, 4.0), (-200, 2.0), (-100, 8.0), (0, 6.0)],
+            ),
+            (
+                "len5",
+                secs(60),
+                5,
+                vec![(-400, 5.0), (-300, 3.0), (-200, 9.0), (-100, 1.0), (0, 7.0)],
+            ),
+            ("len99", secs(60), 0, spread(99, |index| (index + 1) as f64)),
+            (
+                "len100",
+                secs(60),
+                0,
+                spread(100, |index| (index + 1) as f64),
+            ),
+            (
+                "len101",
+                secs(60),
+                0,
+                spread(101, |index| (index + 1) as f64),
+            ),
+            (
+                "len1000",
+                secs(60),
+                0,
+                spread(1_000, |index| (index % 97) as f64),
+            ),
+            (
+                "len1001",
+                secs(60),
+                0,
+                spread(1_001, |index| (index % 89) as f64),
+            ),
+            (
+                "len1001-ascending",
+                secs(60),
+                0,
+                spread(1_001, |index| index as f64),
+            ),
+            (
+                "unsorted-descending",
+                secs(60),
+                0,
+                spread(50, |index| (50 - index) as f64),
+            ),
+            (
+                "unsorted-sawtooth",
+                secs(60),
+                2,
+                spread(60, |index| {
+                    if index % 3 == 0 {
+                        1.0
+                    } else {
+                        40.0 + index as f64
+                    }
+                }),
+            ),
+            (
+                "nan-first",
+                secs(60),
+                0,
+                vec![(-500, f64::NAN), (-400, 16.0), (0, 16.0)],
+            ),
+            (
+                "nan-last",
+                secs(60),
+                0,
+                vec![(-500, 16.0), (-400, 16.0), (0, f64::NAN)],
+            ),
+            (
+                "nan-middle",
+                secs(60),
+                0,
+                vec![(-500, 16.0), (-300, f64::NAN), (0, 16.0)],
+            ),
+            ("nan-only", secs(60), 0, spread(40, |_| f64::NAN)),
+            (
+                "nan-early-1-percent-tail",
+                secs(60),
+                0,
+                spread(100, |index| if index == 0 { f64::NAN } else { 16.0 }),
+            ),
+            (
+                "nan-early-01-percent-tail",
+                secs(60),
+                0,
+                spread(1_000, |index| if index < 3 { f64::NAN } else { 16.0 }),
+            ),
+            (
+                "nan-duplicate-run",
+                secs(60),
+                0,
+                spread(200, |index| {
+                    if index < 2 {
+                        f64::NAN
+                    } else if index % 2 == 0 {
+                        16.0
+                    } else {
+                        33.0
+                    }
+                }),
+            ),
+            (
+                "nan-at-every-tenth",
+                secs(60),
+                0,
+                spread(300, |index| if index % 10 == 0 { f64::NAN } else { 16.0 }),
+            ),
+            (
+                "inf-and-nan",
+                secs(60),
+                0,
+                vec![
+                    (-900, f64::INFINITY),
+                    (-800, f64::NEG_INFINITY),
+                    (-700, f64::NAN),
+                    (0, 16.0),
+                ],
+            ),
+            (
+                "positive-infinity",
+                secs(60),
+                0,
+                vec![(-500, f64::INFINITY), (-400, 16.0), (0, 16.0)],
+            ),
+            (
+                "negative-infinity",
+                secs(60),
+                0,
+                vec![(-500, f64::NEG_INFINITY), (-400, 16.0), (0, 16.0)],
+            ),
+            (
+                "zero-frame-times",
+                secs(60),
+                0,
+                vec![(-500, 0.0), (-400, 0.0), (0, 0.0)],
+            ),
+            (
+                "window-shorter-than-recent",
+                Duration::from_millis(500),
+                0,
+                vec![(-2_000, 7.0), (-1_000, 11.0), (-400, 5.0), (-100, 9.0)],
+            ),
+            (
+                "window-one-ms",
+                Duration::from_millis(1),
+                0,
+                spread(20, |index| (index * 3) as f64),
+            ),
+            (
+                "non-monotonic-stamps",
+                secs(60),
+                0,
+                vec![(-100, 5.0), (-2_000, 9.0), (0, 7.0), (-500, 12.0)],
+            ),
+            (
+                "empty-recent-fallback",
+                secs(60),
+                0,
+                vec![(-30_000, 42.0), (-29_000, 7.0), (-28_000, 3.0)],
+            ),
+            (
+                "stutters-passthrough",
+                secs(60),
+                i32::MAX,
+                spread(10, |index| (index + 1) as f64),
+            ),
+            (
+                "default-window-occupancy-60fps",
+                secs(60),
+                12,
+                (0..3_600usize)
+                    .map(|index| {
+                        (
+                            -((3_600 - index) as i64) * 17,
+                            if index % 4 == 0 { 16.7 } else { 33.3 },
+                        )
+                    })
+                    .collect(),
+            ),
+            ("old-frames-plus-recent", secs(60), 0, {
+                let mut frames: Vec<(i64, f64)> = (0..100usize)
+                    .map(|index| ((index * 500) as i64 - 60_000, (101 + index) as f64))
+                    .collect();
+                frames.extend((1..=100i64).map(|index| (-index, index as f64)));
+                frames
+            }),
+        ]
+    }
+
+    /// A3: the changed model is BIT-IDENTICAL to the shipped shape on every case. The
+    /// reconciliation stamp is swept over three gaps so the `recent`-empty fallback and the
+    /// recent/window cutoffs are crossed inside each fixture.
+    #[test]
+    fn stats_model_is_bit_identical_to_the_shipped_shape() {
+        let now_wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let matrix = a3_matrix();
+        let mut equal_rows = 0usize;
+        for (name, window, stutters, frames) in &matrix {
+            for (gap_label, gap) in [
+                ("gap-1ms", Duration::from_millis(1)),
+                ("gap-5s", Duration::from_secs(5)),
+                ("gap-2s", Duration::from_secs(2)),
+            ] {
+                let mut stats = fixture_stats(*window, *stutters, frames);
+                let observed_now = now_after(&stats, gap);
+                let base = base_model_shape(&stats, now_wall, observed_now, *window, "game.exe");
+                let changed = stats.model(now_wall, observed_now, *window, "game.exe");
+                assert_game_stats_bits(&base, &changed, &format!("{name} {gap_label}"));
+                equal_rows += 1;
+                // F-AUD-OPT06-A-4: the literal `BIT-EQUAL=True` claim is gone; the
+                // `assert_game_stats_bits` above is the evidence.
+                println!(
+                    "A3-CASE {name} {gap_label} frames={} window={:?} base=(fps={:.6},1%={:.6},0.1%={:.6},ft={:.6},active={}) changed=(fps={:.6},1%={:.6},0.1%={:.6},ft={:.6},active={})",
+                    frames.len(),
+                    window,
+                    base.fps.value,
+                    base.one_percent.value,
+                    base.point_one_low.value,
+                    base.frame_time_ms.value,
+                    base.active,
+                    changed.fps.value,
+                    changed.one_percent.value,
+                    changed.point_one_low.value,
+                    changed.frame_time_ms.value,
+                    changed.active,
+                );
+            }
+        }
+        assert_eq!(equal_rows, matrix.len() * 3, "every A3 case ran");
+    }
+
+    /// A1: the model-shape census. Every number is MEASURED by the counting seams
+    /// (`MODEL_BUILDS`/`STALE_BUILDS` at production `cfg(test)` sites,
+    /// `MODEL_SORTS`/`MODEL_CLONES` in `history.rs`, `TEST_VEC_COLLECTS` for the shipped
+    /// shape's two vectors) and by the lane's `alloc_count` counting allocator. The base
+    /// side is the same measurement over `base_model_shape`, the verbatim unit-56 body.
+    /// No CPU is measured and no CPU claim is made from these rows.
+    #[test]
+    fn model_shape_census_reports_sorts_clones_and_allocations() {
+        use crate::backends::alloc_count;
+
+        let measure = |run: &mut dyn FnMut()| -> alloc_count::Counts {
+            let _window = alloc_count::window();
+            alloc_count::watch_thread();
+            alloc_count::reset();
+            let before = alloc_count::snapshot();
+            run();
+            alloc_count::subtract(alloc_count::snapshot(), before)
+        };
+
+        // The default 60 s window at 60/120/240/360 FPS is ORDINARY OCCUPANCY; 600 s is
+        // the LEGAL MAXIMUM; 600 s at 1000 FPS is the cap's own basis; 602,048 frames is
+        // the SOURCE CAP (`MAX_WINDOW_FRAMES`). No cap row is a claim about observed load.
+        let sizes: Vec<(&str, usize, Duration, &str)> = vec![
+            ("1-frame", 1, secs(60), "ordinary occupancy (minimum)"),
+            ("60s@60fps", 3_600, secs(60), "ordinary occupancy"),
+            ("60s@120fps", 7_200, secs(60), "ordinary occupancy"),
+            ("60s@240fps", 14_400, secs(60), "ordinary occupancy"),
+            ("60s@360fps", 21_600, secs(60), "ordinary occupancy"),
+            (
+                "600s@60fps",
+                36_000,
+                secs(600),
+                "legal-max window, ordinary density",
+            ),
+            (
+                "600s@1000fps",
+                600_000,
+                secs(600),
+                "legal-max window at 1000 FPS, the cap's basis (cap-adjacent, not observed)",
+            ),
+            (
+                "MAX_WINDOW_FRAMES",
+                MAX_WINDOW_FRAMES,
+                secs(600),
+                "SOURCE CAP 602,048 frames (not an observed load)",
+            ),
+        ];
+        let now_wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for (label, frames, window, status) in sizes {
+            let period_ns = (window.as_nanos() as u64) / (frames as u64);
+            let observed = Instant::now();
+            let mut stats = Stats::new(30.0, window);
+            stats.frames = (0..frames)
+                .map(|index| {
+                    (
+                        observed - Duration::from_nanos(period_ns * (frames as u64 - index as u64)),
+                        16.0,
+                    )
+                })
+                .collect();
+            // Warm-up: the scratch capacity is paid once, then excluded (A2.2).
+            let _ = stats.model(now_wall, observed, window, "game.exe");
+
+            shape_reset();
+            let base_allocs = measure(&mut || {
+                let _ = base_model_shape(&stats, now_wall, observed, window, "game.exe");
+            });
+            let base = shape_counts();
+
+            shape_reset();
+            let changed_allocs = measure(&mut || {
+                let _ = stats.model(now_wall, observed, window, "game.exe");
+            });
+            let changed = shape_counts();
+
+            // Attribution: std's STABLE sort (the shipped comparator and sort kind that
+            // A2.1 must keep) allocates its own merge scratch. A bare `tail_means` over the
+            // same length names that block, so the model's over-256-byte count is measured
+            // against it, not assumed away.
+            shape_reset();
+            let mut sort_buffer = vec![16.0f64; frames];
+            let sort_probe = measure(&mut || {
+                let _ = crate::history::tail_means(&mut sort_buffer);
+            });
+
+            println!(
+                "A1-MODEL {label} frames={frames} window={window:?} status={status} SHAPED-BASELINE model-calls=1 sorts={} clones={} vec-collects={} vec-allocs={} alloc-total={} alloc-gt256={} alloc-le256={}",
+                base.2,
+                base.3,
+                base.4,
+                base.3 + base.4,
+                base_allocs.4,
+                base_allocs.3,
+                base_allocs.2
+            );
+            println!(
+                "A1-MODEL {label} frames={frames} window={window:?} status={status} THIS-TREE builds={} sorts={} clones={} vec-collects={} vec-allocs={} alloc-total={} alloc-gt256={} alloc-le256={}",
+                changed.0,
+                changed.2,
+                changed.3,
+                changed.4,
+                changed.3 + changed.4,
+                changed_allocs.4,
+                changed_allocs.3,
+                changed_allocs.2
+            );
+            println!(
+                "A1-SORTSCRATCH {label} frames={frames} bare-tail_means alloc-total={} alloc-gt256={} alloc-le256={} (std stable sort, the shipped comparator and sort kind)",
+                sort_probe.4, sort_probe.3, sort_probe.2
+            );
+            println!(
+                "A1-SCRATCH {label} frames={frames} window={window:?} retained-scratch={} B ({} f64 slots, private memory, not CPU)",
+                stats.scratch.capacity() * size_of::<f64>(),
+                stats.scratch.capacity()
+            );
+
+            // The base side of the census (the shipped shape, measured on this tree).
+            assert_eq!(
+                base.2, 2,
+                "the shipped shape sorts the window twice ({label})"
+            );
+            assert_eq!(
+                base.3, 2,
+                "the shipped shape clones the window twice ({label})"
+            );
+            assert_eq!(base.4, 2, "the shipped shape builds two vectors ({label})");
+            if frames >= 100 {
+                assert!(
+                    base_allocs.3 >= 3,
+                    "the shipped shape allocates over-256-byte blocks ({label})"
+                );
+            }
+            assert!(
+                base_allocs.4 >= changed_allocs.4 + 3,
+                "the shipped shape pays at least three more allocations: the window vector, \
+                 the 1 s vector and the two sort clones ({label})"
+            );
+            // The A3 counter claims, measured on this tree.
+            assert_eq!(changed.0, 1, "one model call ({label})");
+            assert_eq!(changed.2, 1, "A3 counter: sorts per model == 1 ({label})");
+            assert_eq!(
+                changed.3, 0,
+                "A3 counter: to_vec clones per model == 0 ({label})"
+            );
+            assert_eq!(
+                changed.4, 0,
+                "A3 counter: window/1 s vectors per model == 0 ({label})"
+            );
+            assert_eq!(
+                changed_allocs.2, 2,
+                "a warm model call allocates exactly the two GameStats name strings ({label})"
+            );
+            assert_eq!(
+                changed_allocs.3, sort_probe.3,
+                "a warm model call pays no over-256-byte allocation beyond std's stable-sort scratch ({label})"
+            );
+            assert!(
+                changed_allocs.4 < base_allocs.4,
+                "the warm model call allocates fewer blocks than the shipped shape ({label})"
+            );
+        }
+    }
+
+    /// The counting seams are NOT vacuous: a known tick of each is seen by the reader, so a
+    /// census row that reads 0 means "the site did not run", not "the counter is dead".
+    #[test]
+    fn model_shape_counters_are_not_vacuous() {
+        shape_reset();
+        model_build_tick();
+        stale_build_tick();
+        test_vec_collect_tick();
+        crate::history::model_sort_tick();
+        crate::history::model_clone_tick();
+        let counts = shape_counts();
+        println!(
+            "A1-NONVACUOUS known-ticks builds={} stale={} sorts={} clones={} collects={}",
+            counts.0, counts.1, counts.2, counts.3, counts.4
+        );
+        assert_eq!(
+            counts,
+            (1, 1, 1, 1, 1),
+            "each counter must see exactly one known tick"
+        );
+        shape_reset();
+        assert_eq!(
+            shape_counts(),
+            (0, 0, 0, 0, 0),
+            "the reset clears every counter"
+        );
+    }
+
+    /// A1: the stale-window census over the CURRENT cadence. It drives the shipped
+    /// reconciliation loop, so it measures the shipped and the changed shape on the same
+    /// seam; the cadence is read from `idle_deadline` (the unit-52 shape), not assumed.
+    #[test]
+    fn stale_window_census_counts_reconciliations_and_discarded_models() {
+        let cfg = Config {
+            presentmon_target_mode: "foreground".into(),
+            ..Config::default()
+        };
+        let (line_tx, line_rx) = line_channel(4);
+        line_tx
+            .send("Application,ProcessID,FrameTime".into())
+            .unwrap();
+        line_tx.send("game.exe,42,16.0".into()).unwrap();
+        let (updates, rx) = mpsc::channel();
+        let mut capture = Capture::default();
+        capture.lines = Some(line_rx);
+        capture.target = ProcessInfo {
+            pid: 42,
+            creation_time: 1,
+            name: "game.exe".into(),
+            image_path: String::new(),
+        };
+        capture.stats = Some(Stats::new(30.0, cfg.presentmon_window));
+        capture
+            .drain(&cfg, 1, &updates, Instant::now())
+            .expect("the fresh frame drains");
+        assert!(rx.recv().unwrap().available, "the fresh frame publishes");
+
+        // The CURRENT cadence, measured from the shipped deadline set.
+        let mut probe = Capture::default();
+        probe.last_frame = Some(Instant::now() - Duration::from_secs(6));
+        println!(
+            "A1-CADENCE stale-idle-6s running-capture-pump-step={:?} no-capture-idle-deadline={:?} (the handoff's nominal 50 ms loop is HISTORICAL: unit 52 parks on last_frame+STALE_AFTER and +2*STALE_AFTER)",
+            PRESENTMON_PUMP_BOUND,
+            probe.idle_deadline(&cfg, Instant::now())
+        );
+
+        shape_reset();
+        // The shipped stale window: idle 6.00..9.85 s at the 50 ms pump cadence = 78
+        // reconciliations, the first of which is the fresh -> stale transition. The bound
+        // stays strictly inside (5 s, 10 s]: `reconcile` stamps its own `now`, so the
+        // effective idle drifts by microseconds and a nominal 10.000 s row would cross
+        // into the expired arm.
+        let steps = 78usize;
+        let mut publications = 0usize;
+        for index in 0..steps {
+            let idle = Duration::from_secs(6) + Duration::from_millis(50 * index as u64);
+            let last = Instant::now() - idle;
+            capture.last_frame = Some(last);
+            capture.last_publish = Some(last);
+            capture.last_target_poll = Some(Instant::now());
+            capture.reconcile(&cfg, 1, &updates, &|_, _| unreachable!());
+            if rx.try_recv().is_ok() {
+                publications += 1;
+            }
+        }
+        let stale_window = shape_counts();
+        println!(
+            "A1-STALE window=idle-6.00-to-9.85s cadence=50ms reconciliations={steps} THIS-TREE model-builds={} stale-model-builds={} publications={} discarded={} (the shipped shape at HEAD, same seam and cadence, is measured in the u57-census-base log)",
+            stale_window.0,
+            stale_window.1,
+            publications,
+            stale_window.1.saturating_sub(publications as u64)
+        );
+        assert_eq!(publications, 1, "the stale detail publishes exactly once");
+        assert_eq!(
+            stale_window.1, 1,
+            "A3 counter: exactly one model per fresh -> stale transition"
+        );
+        assert_eq!(
+            stale_window.1 - publications as u64,
+            0,
+            "A3 counter: stale reconciliations that build a model to discard == 0"
+        );
+
+        // The stale -> unavailable(expired) edge: idle 11..15 s, same cadence.
+        shape_reset();
+        let mut expired_publications = 0usize;
+        for index in 0..steps {
+            let idle = Duration::from_secs(11) + Duration::from_millis(50 * index as u64);
+            let last = Instant::now() - idle;
+            capture.last_frame = Some(last);
+            capture.last_publish = Some(last);
+            capture.last_target_poll = Some(Instant::now());
+            capture.reconcile(&cfg, 1, &updates, &|_, _| unreachable!());
+            if rx.try_recv().is_ok() {
+                expired_publications += 1;
+            }
+        }
+        let expired_window = shape_counts();
+        println!(
+            "A1-STALE window=idle-11.00-to-14.85s cadence=50ms reconciliations={steps} THIS-TREE model-builds={} stale-model-builds={} publications={} discarded={} (the expired arm builds no model in either shape)",
+            expired_window.0,
+            expired_window.1,
+            expired_publications,
+            expired_window.1.saturating_sub(expired_publications as u64)
+        );
+        assert_eq!(
+            expired_publications, 1,
+            "the expired detail publishes exactly once"
+        );
+        assert_eq!(
+            expired_window.1, 0,
+            "A3 counter: the expired arm builds no model, so it discards none"
+        );
+    }
+
+    /// A2.3 + A3: the shipped publication sequence end to end, on the seams the shipped
+    /// tests use. `fresh -> stale -> unavailable(expired) -> fresh`, both detail strings
+    /// verbatim, the `metric.stale = metric.valid` folding, and the `last_unavailable`
+    /// bookkeeping including the shipped frame-site clear.
+    #[test]
+    fn stale_publication_sequence_is_the_shipped_shape_and_builds_no_discarded_model() {
+        let cfg = Config {
+            presentmon_target_mode: "foreground".into(),
+            ..Config::default()
+        };
+        let (line_tx, line_rx) = line_channel(4);
+        line_tx
+            .send("Application,ProcessID,FrameTime".into())
+            .unwrap();
+        line_tx.send("game.exe,42,16.0".into()).unwrap();
+        let (updates, rx) = mpsc::channel();
+        let mut capture = Capture::default();
+        capture.lines = Some(line_rx);
+        capture.target = ProcessInfo {
+            pid: 42,
+            creation_time: 1,
+            name: "game.exe".into(),
+            image_path: String::new(),
+        };
+        capture.stats = Some(Stats::new(30.0, cfg.presentmon_window));
+        shape_reset();
+        capture
+            .drain(&cfg, 1, &updates, Instant::now())
+            .expect("the fresh frame drains");
+        let fresh = rx.recv().unwrap();
+        assert!(
+            fresh.available && !fresh.error && fresh.game.fps.valid && !fresh.game.fps.stale,
+            "the fresh publish is valid and not stale"
+        );
+        assert_eq!(fresh.detail, "game.exe");
+
+        // fresh -> stale: 78 iterations at the 50 ms cadence, one publication.
+        let stale_at = Instant::now() - Duration::from_secs(6);
+        let mut stale_update = None;
+        for index in 0..78 {
+            let last = stale_at - Duration::from_millis(50 * index);
+            capture.last_frame = Some(last);
+            capture.last_publish = Some(last);
+            capture.last_target_poll = Some(Instant::now());
+            capture.reconcile(&cfg, 1, &updates, &|_, _| unreachable!());
+            while let Ok(update) = rx.try_recv() {
+                assert!(
+                    stale_update.is_none(),
+                    "the stale detail is published once, at the transition"
+                );
+                stale_update = Some(update);
+            }
+        }
+        let stale = stale_update.expect("the fresh -> stale edge published");
+        assert_eq!(stale.detail, "capture stale: no frames for 5 seconds");
+        assert!(stale.game.active && stale.game.fps.valid && stale.game.fps.stale);
+        assert!(stale.game.one_percent.stale && stale.game.point_one_low.stale);
+        assert!(stale.game.frame_time_ms.stale);
+        assert!(stale.game.one_percent.valid && stale.game.point_one_low.valid);
+        let mid = shape_counts();
+        println!(
+            "A2-3 STALE-SEQUENCE fresh->stale model-builds={} stale-model-builds={} publications=1",
+            mid.0, mid.1
+        );
+        assert_eq!(mid.1, 1, "the 78 stale iterations built ONE model");
+
+        // stale -> unavailable(expired): 78 iterations, one publication, no model at all.
+        shape_reset();
+        let expired_at = Instant::now() - Duration::from_secs(11);
+        let mut expired_update = None;
+        for index in 0..78 {
+            let last = expired_at - Duration::from_millis(50 * index);
+            capture.last_frame = Some(last);
+            capture.last_publish = Some(last);
+            capture.last_target_poll = Some(Instant::now());
+            capture.reconcile(&cfg, 1, &updates, &|_, _| unreachable!());
+            while let Ok(update) = rx.try_recv() {
+                assert!(
+                    expired_update.is_none(),
+                    "the expired detail is published once, at the transition"
+                );
+                expired_update = Some(update);
+            }
+        }
+        let expired = expired_update.expect("the stale -> expired edge published");
+        assert_eq!(expired.detail, "capture unavailable: stale data expired");
+        assert!(!expired.game.active && !expired.game.fps.valid);
+        let after_expired = shape_counts();
+        println!(
+            "A2-3 STALE-SEQUENCE stale->expired model-builds={} stale-model-builds={} publications=1",
+            after_expired.0, after_expired.1
+        );
+        assert_eq!(after_expired.1, 0, "the expired arm built no model");
+
+        // The fresh edge clears the ledger at the shipped site and republishes.
+        line_tx.send("game.exe,42,16.0".into()).unwrap();
+        capture.last_target_poll = Some(Instant::now());
+        capture.reconcile(&cfg, 1, &updates, &|_, _| unreachable!());
+        let fresh_again = rx.recv().unwrap();
+        assert!(fresh_again.available, "a new frame returns to fresh");
+        assert_eq!(fresh_again.detail, "game.exe");
+        assert!(rx.try_recv().is_err(), "the fresh edge publishes once");
+        assert!(
+            capture.last_unavailable.is_empty(),
+            "the shipped frame site clears the unavailable ledger"
+        );
+        println!(
+            "A2-3 STALE-SEQUENCE fresh->stale->expired->fresh published=3 total-model-builds={} stale-model-builds={}",
+            after_expired.0, after_expired.1
+        );
+    }
+
+    /// A2.2: a warm `model` call allocates NOTHING on the window path, and no process-name
+    /// clone was added. Measured with the lane's counting allocator; what remains is the
+    /// two owned `GameStats` name strings (which the shipped shape also pays) and std's own
+    /// stable-sort merge scratch, named by the `tail_means` attribution probe.
+    #[test]
+    fn warm_model_call_allocates_no_window_vector_and_no_name_clone() {
+        use crate::backends::alloc_count;
+        let window = Config::default().presentmon_window;
+        let frames = 3_600usize;
+        let period_ns = (window.as_nanos() as u64) / (frames as u64);
+        let observed = Instant::now();
+        let mut stats = Stats::new(30.0, window);
+        stats.frames = (0..frames)
+            .map(|index| {
+                (
+                    observed - Duration::from_nanos(period_ns * (frames as u64 - index as u64)),
+                    16.0,
+                )
+            })
+            .collect();
+        let now_wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let _ = stats.model(now_wall, observed, window, "game.exe");
+        let warm = {
+            let _window = alloc_count::window();
+            alloc_count::watch_thread();
+            alloc_count::reset();
+            let before = alloc_count::snapshot();
+            let _ = stats.model(now_wall, observed, window, "game.exe");
+            alloc_count::subtract(alloc_count::snapshot(), before)
+        };
+        let base_warm = {
+            let _window = alloc_count::window();
+            alloc_count::watch_thread();
+            alloc_count::reset();
+            let before = alloc_count::snapshot();
+            let _ = base_model_shape(&stats, now_wall, observed, window, "game.exe");
+            alloc_count::subtract(alloc_count::snapshot(), before)
+        };
+        let mut sort_buffer = vec![16.0f64; frames];
+        let sort_probe = {
+            let _window = alloc_count::window();
+            alloc_count::watch_thread();
+            alloc_count::reset();
+            let before = alloc_count::snapshot();
+            let _ = crate::history::tail_means(&mut sort_buffer);
+            alloc_count::subtract(alloc_count::snapshot(), before)
+        };
+        println!(
+            "A2-2-ALLOC default-window frames=3600 window={:?} SHAPED-BASELINE total={} gt256={} le256={} | THIS-TREE total={} gt256={} le256={} | SORT-PROBE total={} gt256={} le256={}",
+            window,
+            base_warm.4,
+            base_warm.3,
+            base_warm.2,
+            warm.4,
+            warm.3,
+            warm.2,
+            sort_probe.4,
+            sort_probe.3,
+            sort_probe.2
+        );
+        println!(
+            "A2-2-SCRATCH default-window frames=3600 retained-scratch={} B ({} f64 slots)",
+            stats.scratch.capacity() * size_of::<f64>(),
+            stats.scratch.capacity()
+        );
+        assert_eq!(
+            warm.2, 2,
+            "a warm model call allocates exactly the two GameStats name strings, so no \
+             process-name clone was added to this path"
+        );
+        assert_eq!(
+            warm.3, sort_probe.3,
+            "a warm model call pays no over-256-byte allocation beyond std's stable-sort scratch"
+        );
+        assert_eq!(
+            warm.4,
+            sort_probe.4 + 2,
+            "a warm model call is the sort's own scratch plus the two name strings"
+        );
+        assert!(
+            base_warm.3 >= 3 && base_warm.4 > warm.4,
+            "the shipped shape allocated the window/clone blocks this unit removed"
+        );
+    }
+
+    /// A2.1/A3 counters, stated as the acceptance assertions for this tree.
+    #[test]
+    fn model_shape_is_one_sorting_no_clone_and_no_scratch_vector() {
+        let window = Config::default().presentmon_window;
+        let observed = Instant::now();
+        let mut stats = Stats::new(30.0, window);
+        stats.frames = (0..3_600usize)
+            .map(|index| {
+                (
+                    observed - Duration::from_nanos(index as u64 * 16_666_667),
+                    16.0,
+                )
+            })
+            .rev()
+            .collect();
+        let now_wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let _ = stats.model(now_wall, observed, window, "game.exe");
+        shape_reset();
+        let _ = stats.model(now_wall, observed, window, "game.exe");
+        let counts = shape_counts();
+        println!(
+            "A1-AFTER model-per-call builds={} sorts={} clones={} vec-collects={} vec-allocs={}",
+            counts.0,
+            counts.2,
+            counts.3,
+            counts.4,
+            counts.3 + counts.4
+        );
+        assert_eq!(counts.0, 1, "one model call");
+        assert_eq!(counts.2, 1, "A3 counter: sorts per model == 1");
+        assert_eq!(counts.3, 0, "A3 counter: to_vec clones per model == 0");
+        assert_eq!(counts.4, 0, "A3 counter: window/1 s vectors per model == 0");
+        assert!(
+            stats.scratch.capacity() >= 3_600,
+            "the scratch keeps its capacity after a warm call (retained memory)"
+        );
+        println!(
+            "A1-AFTER retained-scratch={} B at the default 60 s window",
+            stats.scratch.capacity() * size_of::<f64>()
+        );
+    }
+
+    /// A3: the tail means pinned BY ABSOLUTE VALUE to the shipped definition, so a
+    /// mutation of the SHARED arithmetic (a `floor` where the shipped code says `ceil`, a
+    /// dropped `clamp`, a whole-window mean for the 1 s mean, a dropped last-window
+    /// fallback) goes RED even where the base fixture and the changed model share the code.
+    /// The shipped arithmetic: `n = ceil(len * p)` clamped to `[1, len]`, the mean over the
+    /// highest `n` of a STABLE ordering, `fps = 1000 / mean`. Every `want` is hand-derived.
+    #[test]
+    fn model_tail_means_match_the_shipped_arithmetic_by_value() {
+        let now_wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(1.0);
+        let check = |name: &str, got: f64, want: f64| {
+            assert!(
+                close(got, want),
+                "{name}: the model published {got}, the shipped arithmetic gives {want}"
+            );
+            // F-AUD-OPT06-A-4: this print used to claim `MATCH=True` as a literal. The assert
+            // above is the evidence; a print must not dress up as one.
+            println!("A3-VALUE {name} model={:.12} shipped={:.12}", got, want);
+        };
+        let model_at = |stats: &mut Stats, gap: Duration| -> GameStats {
+            let observed_now = now_after(stats, gap);
+            let window = stats.window;
+            stats.model(now_wall, observed_now, window, "game.exe")
+        };
+
+        // len 100, values 1..=100, all inside the 1 s recent window.
+        // 1%: n = ceil(100 * 0.01) = 1 -> tail {100} -> 1000/100.
+        // 0.1%: n = ceil(100 * 0.001) = 1 -> tail {100} -> 1000/100.
+        // recent mean = 50.5 -> fps = 1000/50.5.
+        let mut stats = fixture_stats(secs(60), 0, &spread(100, |i| (i + 1) as f64));
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("len100-1percent", game.one_percent.value, 10.0);
+        check("len100-01percent", game.point_one_low.value, 10.0);
+        check("len100-fps", game.fps.value, 1000.0 / 50.5);
+        check("len100-frametime", game.frame_time_ms.value, 50.5);
+
+        // len 101, values 1..=101. 1%: n = ceil(1.01) = 2 (a `floor` lands on 1) ->
+        // tail {100,101} mean 100.5. 0.1%: n = ceil(0.101) = 1 -> 1000/101.
+        let mut stats = fixture_stats(secs(60), 0, &spread(101, |i| (i + 1) as f64));
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("len101-1percent", game.one_percent.value, 1000.0 / 100.5);
+        check("len101-01percent", game.point_one_low.value, 1000.0 / 101.0);
+        check("len101-fps", game.fps.value, 1000.0 / 51.0);
+
+        // len 1001, values 0..=1000, offsets -1001..-1 ms: the 1 s recent window drops the
+        // oldest frame (the boundary the shipped filter pins) and keeps 1..=1000.
+        // 1%: n = ceil(10.01) = 11 (a `floor` lands on 10) -> tail 990..=1000 mean 995.
+        // 0.1%: n = ceil(1.001) = 2 (a `floor` lands on 1) -> tail {999,1000} mean 999.5.
+        let mut stats = fixture_stats(secs(60), 0, &spread(1_001, |i| i as f64));
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("len1001-1percent", game.one_percent.value, 1000.0 / 995.0);
+        check(
+            "len1001-01percent",
+            game.point_one_low.value,
+            1000.0 / 999.5,
+        );
+        check("len1001-fps", game.fps.value, 1000.0 / 500.5);
+
+        // The clamp, by value: len 1 -> n = ceil(0.01) = 1 -> the only frame.
+        let mut stats = fixture_stats(secs(60), 0, &[(0, 25.0)]);
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("len1-1percent", game.one_percent.value, 40.0);
+        check("len1-01percent", game.point_one_low.value, 40.0);
+        check("len1-fps", game.fps.value, 40.0);
+
+        // The stable-ordering requirement, by value: a NaN at the head of 100 equal frames
+        // stays OUT of the 1% tail (n = 1), so the 1% low is exactly 1000/16. An unstable
+        // sort may permute the NaN into the tail and publish NaN.
+        let mut stats = fixture_stats(
+            secs(60),
+            0,
+            &spread(100, |i| if i == 0 { f64::NAN } else { 16.0 }),
+        );
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("nan-head-100-1percent", game.one_percent.value, 62.5);
+        check("nan-head-100-01percent", game.point_one_low.value, 62.5);
+        let mut stats = fixture_stats(
+            secs(60),
+            0,
+            &spread(1_000, |i| if i < 3 { f64::NAN } else { 16.0 }),
+        );
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("nan-head-1000-01percent", game.point_one_low.value, 62.5);
+
+        // The 1 s mean is the RECENT set, not the whole window: the last 1 s is 1..=100
+        // (mean 50.5) while the whole 60 s window tops out at 200,199.
+        let mut frames: Vec<(i64, f64)> = (0..100usize)
+            .map(|index| ((index * 500) as i64 - 60_000, (101 + index) as f64))
+            .collect();
+        frames.extend((1..=100i64).map(|index| (-index, index as f64)));
+        let mut stats = fixture_stats(secs(60), 0, &frames);
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("recent-not-whole-window-fps", game.fps.value, 1000.0 / 50.5);
+        check(
+            "whole-window-1percent",
+            game.one_percent.value,
+            1000.0 / 199.5,
+        );
+
+        // The empty-recent fallback is the LAST frame time OF THE WINDOW in arrival order
+        // (not the sorted tail): with a 5 s gap the recent set is empty, the newest
+        // in-window frame is 3.0 and the sorted tail is 42.0.
+        let mut stats = fixture_stats(
+            secs(60),
+            0,
+            &[(-30_000, 42.0), (-29_000, 7.0), (-28_000, 3.0)],
+        );
+        let game = model_at(&mut stats, Duration::from_secs(5));
+        check(
+            "empty-recent-fallback-frametime",
+            game.frame_time_ms.value,
+            3.0,
+        );
+        check("empty-recent-fallback-fps", game.fps.value, 1000.0 / 3.0);
+        check(
+            "empty-recent-tail-1percent",
+            game.one_percent.value,
+            1000.0 / 42.0,
+        );
+        check(
+            "empty-recent-tail-01percent",
+            game.point_one_low.value,
+            1000.0 / 42.0,
+        );
+
+        // The two filters stay INDEPENDENT: with a window shorter than 1 s the recent set
+        // legitimately includes frames outside the window (the shipped shape).
+        // window 500 ms, observed_now = -99 ms: window = {-400, -100} = {5, 9};
+        // recent (>= -1099 ms) = {-1000, -400, -100} = {11, 5, 9} -> mean 25/3.
+        let mut stats = fixture_stats(
+            Duration::from_millis(500),
+            0,
+            &[(-2_000, 7.0), (-1_000, 11.0), (-400, 5.0), (-100, 9.0)],
+        );
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check(
+            "independent-filters-frametime",
+            game.frame_time_ms.value,
+            25.0 / 3.0,
+        );
+        check(
+            "independent-filters-1percent",
+            game.one_percent.value,
+            1000.0 / 9.0,
+        );
+
+        // The window cutoff boundary, by value: the frame exactly at `now - window` is IN,
+        // one tick earlier is OUT, and that changes the published 1% low.
+        let mut stats = fixture_stats(secs(60), 0, &[(-59_999, 42.0), (0, 10.0)]);
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check(
+            "cutoff-exact-in-window-1percent",
+            game.one_percent.value,
+            1000.0 / 42.0,
+        );
+        check("cutoff-exact-fps", game.fps.value, 100.0);
+        let mut stats = fixture_stats(secs(60), 0, &[(-60_000, 42.0), (0, 10.0)]);
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check(
+            "cutoff-out-of-window-1percent",
+            game.one_percent.value,
+            100.0,
+        );
+        check(
+            "cutoff-out-of-window-frametime",
+            game.frame_time_ms.value,
+            10.0,
+        );
+
+        // The 1 s recent boundary, by value: observed_now = newest + 1 ms, so the recent
+        // cutoff is -999 ms: a frame at -999 is exactly in, -1000 is one tick out.
+        let mut stats = fixture_stats(secs(60), 0, &[(-999, 42.0), (-100, 8.0), (0, 10.0)]);
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("recent-exact-in-frametime", game.frame_time_ms.value, 20.0);
+        let mut stats = fixture_stats(secs(60), 0, &[(-1_000, 42.0), (-100, 8.0), (0, 10.0)]);
+        let game = model_at(&mut stats, Duration::from_millis(1));
+        check("recent-out-frametime", game.frame_time_ms.value, 9.0);
     }
 }

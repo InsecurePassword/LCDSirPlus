@@ -74,6 +74,12 @@ impl NetProvider {
         NetProvider::default()
     }
 
+    /// A period with no consumer is unobserved, not a long sampling interval.
+    pub fn reset(&mut self) {
+        self.prev = None;
+        self.prev_at = None;
+    }
+
     /// Sample throughput. `Ok(None)` means a baseline was captured but no
     /// rate exists yet; a real idle delta is `Ok(Some(0, 0))`.
     pub fn update(&mut self) -> Result<Option<NetThroughput>, String> {
@@ -190,5 +196,43 @@ mod tests {
             recovered.sampled_at,
             sampled_at + std::time::Duration::from_secs(4)
         );
+    }
+    #[test]
+    fn inactive_interval_is_not_reported_as_current_throughput() {
+        let mut provider = NetProvider::new();
+        let t = std::time::Instant::now();
+        let wall = std::time::SystemTime::UNIX_EPOCH;
+        let counters = |n| {
+            Ok(SystemCounters {
+                entries: vec![(1, n, n)],
+            })
+        };
+        assert!(provider
+            .update_from(counters(0), t, wall)
+            .unwrap()
+            .is_none());
+        assert!(provider
+            .update_from(counters(100), t + std::time::Duration::from_secs(1), wall)
+            .unwrap()
+            .is_some());
+        provider.reset();
+        assert!(provider
+            .update_from(
+                counters(600_000_100),
+                t + std::time::Duration::from_secs(61),
+                wall
+            )
+            .unwrap()
+            .is_none());
+        let resumed = provider
+            .update_from(
+                counters(600_000_100),
+                t + std::time::Duration::from_secs(62),
+                wall,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.in_bps, 0.0);
+        assert_eq!(resumed.out_bps, 0.0);
     }
 }

@@ -3,7 +3,7 @@
 Verifies that two isolated release builds are byte-identical.
 
 .DESCRIPTION
-Copies the source to a temporary detached tree and performs two offline builds with the pinned Rust toolchain. SourceRoot must remain unchanged. On success, creates LCDSirPlus.exe, lcdsirplus.txt, and REPRODUCIBILITY.json in the existing empty OutputDir; temporary build trees are removed.
+Copies the source to a temporary detached tree and performs two offline builds with the pinned Rust toolchain. SourceRoot must remain unchanged. On success, creates LCDSirPlus.exe, lcdsirplus_discord.dll, lcdsirplus.txt, and REPRODUCIBILITY.json in the existing empty OutputDir; temporary build trees are removed.
 
 .PARAMETER SourceRoot
 Existing local, non-reparse source directory to build.
@@ -141,9 +141,10 @@ function Invoke-ReproducibleBuild {
     $info.FileName = $cargoPath
     $info.WorkingDirectory = $Root
     $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
-    foreach ($argument in @('build', '--release', '--locked', '--offline')) { $info.ArgumentList.Add($argument) }
+    foreach ($argument in @('build', '--workspace', '--release', '--locked', '--offline', '-j', '1')) { $info.ArgumentList.Add($argument) }
     $info.Environment.Clear()
     $inherited = @(
         'APPDATA', 'COMSPEC', 'HOMEDRIVE', 'HOMEPATH', 'INCLUDE', 'LIB', 'LIBPATH',
@@ -243,6 +244,11 @@ try {
 
     $sourceExe = Join-Path $targetSource 'release\LCDSirPlus.exe'
     $detachedExe = Join-Path $targetDetached 'release\LCDSirPlus.exe'
+    $sourceDll = Join-Path $targetSource 'release\lcdsirplus_discord.dll'
+    $detachedDll = Join-Path $targetDetached 'release\lcdsirplus_discord.dll'
+    $sourceDllIdentity = Get-FileIdentity $sourceDll
+    $detachedDllIdentity = Get-FileIdentity $detachedDll
+    Assert-FilesEqual $sourceDll $detachedDll 'release Discord components are not byte-identical'
     $sourceConfig = Join-Path $targetSource 'release\lcdsirplus.txt'
     $detachedConfig = Join-Path $targetDetached 'release\lcdsirplus.txt'
     $sourceExeIdentity = Get-FileIdentity $sourceExe
@@ -279,6 +285,7 @@ try {
     }
 
     [IO.File]::Copy($sourceExe, (Join-Path $output 'LCDSirPlus.exe'), $false)
+    [IO.File]::Copy($sourceDll, (Join-Path $output 'lcdsirplus_discord.dll'), $false)
     [IO.File]::Copy($sourceConfig, (Join-Path $output 'lcdsirplus.txt'), $false)
     $evidence = [ordered]@{
         schema_version = 2
@@ -301,13 +308,14 @@ try {
                 host = 'x86_64-pc-windows-msvc'
             }
             powershell = $PSVersionTable.PSVersion.ToString()
-            command = 'cargo build --release --locked --offline'
+            command = 'cargo build --workspace --release --locked --offline -j 1'
             controlled_environment = $true
             brepro = $true
         }
         builds = @($sourceBuild, $detachedBuild)
         outputs = [ordered]@{
             executable = [ordered]@{ source = $sourceExeIdentity; detached = $detachedExeIdentity; full_bytes_equal = $true }
+            discord_component = [ordered]@{ source = $sourceDllIdentity; detached = $detachedDllIdentity; full_bytes_equal = $true }
             config = [ordered]@{ source = $sourceConfigIdentity; detached = $detachedConfigIdentity; full_bytes_equal = $true }
         }
         resources = [ordered]@{

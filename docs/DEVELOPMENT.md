@@ -28,17 +28,23 @@ Microsoft `windows` crate and the vendored `winres` build dependency.
 Run from the repository root:
 
 ```powershell
-cargo build
-cargo build --release
-cargo fmt --check
-cargo clippy --all-targets
-cargo test --release --locked
-pwsh -NoProfile -File .\scripts\Test.ps1
+cargo build --workspace -j 1
+cargo build --workspace --release --locked -j 1
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -j 1
+cargo test --workspace --release --locked -j 1
+pwsh -NoProfile -NonInteractive -WindowStyle Hidden -File .\scripts\Test.ps1
 ```
 
 `scripts/Test.ps1` checks PowerShell syntax, dependency notices, product
 identity, module documentation order, formatting, zero Clippy warnings, tests,
 release build, public commands, virtual G13 output, and process lifecycle.
+Every process the gate launches appears with a hidden window: syntax-check
+children run `-WindowStyle Hidden -NonInteractive`, and the GUI lifecycle smoke
+launches under a smoke configuration with `preview_mode never` and
+`start_minimized 1`, so automation shows no desktop window. The
+invalid-configuration smoke is the one exception: its native startup-error
+dialog is the assertion.
 `-ReleaseOnly` stops after release tests and does not package.
 
 Public scripts expose PowerShell help. From the repository root, inspect the
@@ -161,10 +167,10 @@ manual checks where automation cannot reproduce them.
 
 ## Update documentation
 
-`modules.md` is the canonical quick reference for all 53 values. Its table must
+`modules.md` is the canonical quick reference for all 50 values. Its table must
 contain exactly the `src/config.rs` values in code order and be mirrored exactly
-in the instruction manual/PDF. The parser/document inventory has 123 accepted
-entries, the default template has 96 active keys, and exactly five advanced
+in the instruction manual/PDF. The parser/document inventory has 105 accepted
+entries, the default template has 79 active keys, and exactly four advanced
 compatibility-only keys are ignored. `scripts/Test.ps1` checks these inventories,
 source order, row parity, and required links.
 
@@ -184,3 +190,12 @@ under vendor terms. LibreHardwareMonitor is MPL-2.0. NVIDIA and AMD interfaces
 come from vendor-installed drivers. None of those projects endorses
 LCDSirPlus. Update `THIRD_PARTY_LICENSES.txt` only through the separate legal
 and dependency review process.
+
+## PR 1 paired build verification
+
+The supported build and test commands select the whole workspace. The application
+and `lcdsirplus_discord.dll` are a paired output; both are covered by the
+reproducibility evidence and staged package inventories. `Test.ps1` respects
+`CARGO_TARGET_DIR` and performs a credentials-free ABI handshake against the DLL
+beside the built EXE. Missing-DLL tests use an explicitly absent fixture path;
+do not move DLLs out of `deps` to make a suite pass.

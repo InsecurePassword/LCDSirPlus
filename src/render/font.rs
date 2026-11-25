@@ -154,20 +154,67 @@ pub fn fit_text(text: &str, max_width: i32, scale: i32) -> String {
         return text.to_string();
     }
     const ELLIPSIS: &str = "...";
-    let mut r: Vec<char> = text.chars().collect();
-    while !r.is_empty() {
-        r.pop();
-        let candidate: String = r.iter().collect::<String>() + ELLIPSIS;
-        if text_width(&candidate, scale) <= max_width {
-            return candidate;
-        }
+    if text_width(ELLIPSIS, scale) > max_width {
+        return String::new();
     }
-    String::new()
+    let cells = (i64::from(max_width) / i64::from(scale.max(1)) + 1) / 4;
+    let prefix_count = cells as usize - ELLIPSIS.len();
+    let prefix_len = text
+        .char_indices()
+        .nth(prefix_count)
+        .map_or(text.len(), |(offset, _)| offset);
+    let mut result = String::with_capacity(prefix_len + ELLIPSIS.len());
+    result.push_str(&text[..prefix_len]);
+    result.push_str(ELLIPSIS);
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipped_text_keeps_legacy_scalars_with_one_output_allocation() {
+        fn old_fit(text: &str, width: i32, scale: i32) -> String {
+            if text_width(text, scale) <= width {
+                return text.to_string();
+            }
+            let mut chars: Vec<char> = text.chars().collect();
+            while !chars.is_empty() {
+                chars.pop();
+                let candidate = chars.iter().collect::<String>() + "...";
+                if text_width(&candidate, scale) <= width {
+                    return candidate;
+                }
+            }
+            String::new()
+        }
+
+        for text in ["", "A", "AB", "long label", "é👋a\u{301}…℃", "a👋👋\u{301}"] {
+            for scale in [-1, 0, 1, 2, 8] {
+                for width in -2..=130 {
+                    assert_eq!(
+                        fit_text(text, width, scale),
+                        old_fit(text, width, scale),
+                        "{text:?}, width {width}, scale {scale}"
+                    );
+                }
+            }
+        }
+
+        let long = "é👋a\u{301}…℃".repeat(64);
+        let expected = old_fit(&long, 35, 1);
+        let (actual, allocations) = {
+            let _watch = crate::backends::alloc_count::window();
+            let actual = fit_text(std::hint::black_box(&long), 35, 1);
+            (actual, crate::backends::alloc_count::snapshot().4)
+        };
+        assert_eq!(actual, expected);
+        assert_eq!(
+            allocations, 1,
+            "a clipped text result needs one output allocation"
+        );
+    }
 
     #[test]
     fn width_matches_go_formula() {

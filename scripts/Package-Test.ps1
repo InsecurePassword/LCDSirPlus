@@ -525,7 +525,7 @@ function Test-InstallerStatic {
     }
     $sourceFiles = @([regex]::Matches($iss, '(?m)^Source: "\{#PayloadRoot\}\\([^\"]+)"; DestDir:') | ForEach-Object { $_.Groups[1].Value.Replace('\', '/') })
     $expectedFiles = @(
-        'LCDSirPlus.exe', 'PresentMon.exe', 'lcdsirplus.default.txt', 'lcdsirplus.layout', 'SOURCE-COMMIT.txt',
+        'LCDSirPlus.exe', 'lcdsirplus_discord.dll', 'PresentMon.exe', 'lcdsirplus.default.txt', 'lcdsirplus.layout', 'SOURCE-COMMIT.txt',
         'README.md', 'modules.md', 'RELEASE-NOTES.md', 'SECURITY.md', 'LICENSE', 'THIRD_PARTY_LICENSES.txt',
         'docs/CONFIGURATION.md', 'docs/INSTRUCTION-MANUAL.md',
         'docs/LCDSirPlus-Instruction-Manual.pdf', 'licenses/PresentMon/LICENSE.txt',
@@ -583,7 +583,7 @@ function Get-UninstallRegistration {
 
 function Invoke-QualificationProcess {
     param([string]$FilePath, [string[]]$Arguments, [string]$Label = 'qualification process')
-    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -Wait -PassThru
+    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -Wait -PassThru -WindowStyle Hidden
     try {
         Write-Host ("{0}: exit {1}" -f $Label, $process.ExitCode)
         return $process.ExitCode
@@ -749,7 +749,7 @@ function Assert-QualificationInstall {
         $owner.TaskName -cne $startupTaskName) {
         throw 'Apps & Features registration or owner metadata file mismatch'
     }
-    foreach ($relative in @('LCDSirPlus.exe', 'PresentMon.exe', 'lcdsirplus.default.txt', 'lcdsirplus.layout',
+    foreach ($relative in @('LCDSirPlus.exe', 'lcdsirplus_discord.dll', 'PresentMon.exe', 'lcdsirplus.default.txt', 'lcdsirplus.layout',
         'README.md', 'modules.md', 'RELEASE-NOTES.md', 'SECURITY.md', 'LICENSE', 'THIRD_PARTY_LICENSES.txt', 'SOURCE-COMMIT.txt', 'docs\CONFIGURATION.md',
         'docs\INSTRUCTION-MANUAL.md', 'docs\LCDSirPlus-Instruction-Manual.pdf',
         'licenses\PresentMon\LICENSE.txt', 'licenses\PresentMon\THIRD_PARTY.txt',
@@ -1512,13 +1512,22 @@ try {
     $portableEntries = @(Read-VerifiedManifest $portable)
     [void]@(Read-VerifiedManifest $source)
     $portableFiles = @(
-        'LCDSirPlus.exe', 'PresentMon.exe', 'lcdsirplus.txt', 'LICENSE', 'THIRD_PARTY_LICENSES.txt', 'SOURCE-COMMIT.txt', 'README.md', 'modules.md',
+        'LCDSirPlus.exe', 'lcdsirplus_discord.dll', 'PresentMon.exe', 'lcdsirplus.txt', 'LICENSE', 'THIRD_PARTY_LICENSES.txt', 'SOURCE-COMMIT.txt', 'README.md', 'modules.md',
         'RELEASE-NOTES.md', 'SECURITY.md', 'docs/CONFIGURATION.md',
         'docs/INSTRUCTION-MANUAL.md',
         'docs/LCDSirPlus-Instruction-Manual.pdf',
         'licenses/PresentMon/LICENSE.txt', 'licenses/PresentMon/THIRD_PARTY.txt'
     )
     Assert-ExpectedInventory $portableEntries $portableFiles 'portable'
+    $componentPath = Join-Path $portable 'lcdsirplus_discord.dll'
+    $component = Assert-RegularSingleLinkFile $componentPath
+    $componentHash = (Get-FileHash -LiteralPath $componentPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if (-not $reproducibilityJson.outputs.discord_component.full_bytes_equal -or
+        $reproducibilityJson.outputs.discord_component.source.sha256 -cne $componentHash -or
+        $reproducibilityJson.outputs.discord_component.detached.sha256 -cne $componentHash -or
+        $reproducibilityJson.outputs.discord_component.source.bytes -ne $component.Size) {
+        throw 'Discord component does not match the reproducible paired build'
+    }
     $portableSourceIdentity = Assert-SourceIdentityMarker -Path (Join-Path $portable 'SOURCE-COMMIT.txt') -ExpectedIdentity $ExpectedCommit
     Assert-ThirdPartyNoticeManifest -Root $portable -Entries $portableEntries
     Assert-PresentMonPayload $portable

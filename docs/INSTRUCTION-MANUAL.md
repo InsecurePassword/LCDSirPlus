@@ -23,7 +23,7 @@ Start here: [verify a download](#verify-a-download),
 - [Connect devices and network data](#connect-devices-and-network-data)
 - [Understand PROVIDER_STATUS](#understand-provider_status)
 - [Connect Discord](#connect-discord)
-- [Use alerts and safe mode](#use-alerts-and-safe-mode)
+- [Use safe mode](#use-safe-mode)
 - [Run command-line tools](#run-command-line-tools)
 - [Check a Logitech G13](#check-a-logitech-g13)
 - [Fix common problems](#fix-common-problems)
@@ -39,7 +39,7 @@ Start here: [verify a download](#verify-a-download),
 - `OFFLINE`: a supported device is disconnected or turned off.
 - `DISABLED`: the feature or safe mode turned the data source off.
 - `IDLE`: no active PresentMon game session.
-- `CLEAR`: no alert or no available temporary button option.
+- `CLEAR`: no available temporary button option.
 - `DOWN`: one or more tracked sources are disabled, unconfigured,
   disconnected, or unavailable. Optional sources you do not use can count as
   down, so this is not necessarily a failure.
@@ -112,7 +112,7 @@ Updates and repairs do not replace it.
 3. Right-click empty space and select **Open in Terminal**.
 4. Run `.\LCDSirPlus.exe --preview`.
 
-Keep `LCDSirPlus.exe`, `PresentMon.exe`, `lcdsirplus.txt`, `SECURITY.md`,
+Keep `LCDSirPlus.exe`, `lcdsirplus_discord.dll`, `PresentMon.exe`, `lcdsirplus.txt`, `SECURITY.md`,
 `RELEASE-NOTES.md`, `modules.md`, and the `docs` folder together.
 Portable use creates no installer-owned shortcuts.
 
@@ -221,12 +221,11 @@ Each slot is an ordered list for one physical button and preview area:
 slot_0  HEADSET_BATTERY CPU_TEMP CONTROLLER_BATTERY
 slot_1  FPS_CURRENT NET_BOTH NET_GRAPH FRAME_TIME SESSION_TIME
 slot_2  PROC_HANG FPS_1LOW DISK_IO DISK_IO_GRAPH GPU_TEMP PING JITTER AUDIO
-slot_3  BOTTLENECK THERMALS POWER_LIMIT
+slot_3  THERMALS POWER_LIMIT
 ```
 
 A short physical press moves forward. Preview left-click moves forward and
-right-click moves backward. Button 4 first acknowledges the highest active
-alert. `PROC_HANG` can appear only once across all slots.
+right-click moves backward. `PROC_HANG` can appear only once across all slots.
 
 ### Button option guide
 
@@ -258,14 +257,12 @@ In an installed or portable package, open `modules.md` beside `LCDSirPlus.exe`.
 | `SESSION_SUMMARY` | Shows session time and stutters. What you need: PresentMon, included in the 0.3.0 package. |
 | `CLOCK` | Shows time using the Windows Short time format. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `GAME_NAME` | Shows the selected game or app filename. What you need: PresentMon, included in the 0.3.0 package. A filename may appear under either persist setting; set `presentmon_enabled 0` to prevent this exposure. |
-| `ALERTS` | Shows unacknowledged active alerts or CLEAR. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `PROVIDER_STATUS` | Shows unavailable tracked data sources or OK. What you need: Built into Windows and LCDSirPlus; no extra software. |
+| `DISCORD` | Shows selected Discord voice speakers and optional channel title without taking over the screen. What you need: Discord Desktop and an authorized configured application. |
 | `CPU_LOAD` | Shows total CPU use. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `RAM_USAGE` | Shows memory use and capacity. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `GPU_LOAD` | Shows GPU use. What you need: An NVIDIA or AMD graphics driver. |
 | `VRAM_USAGE` | Shows video memory use and capacity. What you need: An NVIDIA or AMD graphics driver. |
-| `CPU_CACHE_TEMP` | Shows N/A. What you need: Not available in version 0.3.0. |
-| `CPU_FREQ_TEMP` | Shows N/A. What you need: Not available in version 0.3.0. |
 | `CPU_LOAD_GRAPH` | Shows CPU use for 30 seconds. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `GPU_LOAD_GRAPH` | Shows GPU use for 30 seconds. What you need: An NVIDIA or AMD graphics driver. |
 | `CPU_TEMP_GRAPH` | Shows CPU temperature for 30 seconds. What you need: HWiNFO or LibreHardwareMonitor, installed and set up separately. |
@@ -286,7 +283,6 @@ In an installed or portable package, open `modules.md` beside `LCDSirPlus.exe`.
 | `NET_HEALTH` | Shows ping, jitter, and packet loss. What you need: The optional network probe, enabled and configured separately. |
 | `SYSTEM_BATTERY` | Shows AC, battery, and charging. What you need: Built into Windows and LCDSirPlus; no extra software. |
 | `HARD_FAULTS` | Shows memory-to-disk pressure. What you need: Built into Windows and LCDSirPlus; no extra software. |
-| `BOTTLENECK` | Shows CPU, GPU, RAM, or disk. With current NONE, the next eligible option appears temporarily or the slot shows CLEAR. What you need: Built-in system readings; GPU results also need a supported graphics driver. |
 | `PROC_HANG` | Shows a hung-window target. With no target, including while disabled, the next eligible option appears temporarily or the slot shows CLEAR. What you need: Not supported for end users in version 0.3.0; leave `hang_enabled 0`. |
 
 ## Show game FPS
@@ -314,7 +310,7 @@ presentmon_persist      0
 display without changing the stored choice. For example, with
 `slot_2 FPS_CURRENT GPU_TEMP`, a closed game can make the slot show GPU
 temperature; FPS returns when game data becomes available. A temporary result
-is never `PROC_HANG` or `BOTTLENECK`, and an all-unavailable list shows `CLEAR`.
+is never `PROC_HANG`, and an all-unavailable list shows `CLEAR`.
 Set `presentmon_deferred 0` to keep the selected inactive panel visible instead.
 
 `presentmon_persist 0` is the normal game preference. When a valid NVIDIA App
@@ -399,7 +395,9 @@ LCDSirPlus accepts only a local LibreHardwareMonitor address. It does not enable
 the web server or request a firewall exception. Do not expose this server to
 other computers.
 
-`CPU_CACHE_TEMP` and `CPU_FREQ_TEMP` are not available in this release.
+`CPU_CACHE_TEMP` and `CPU_FREQ_TEMP` are retired: no data source published them, so
+a button slot naming either one is rejected with the normal unknown-option
+diagnostic and the last valid configuration stays active.
 
 ## Connect devices and network data
 
@@ -455,10 +453,24 @@ Safe mode reports only its healthy safe-mode state, so the button option shows
 `OK`. Add `PROVIDER_STATUS` to any slot if you want this summary; during normal
 use, `DOWN` can reflect intentionally unused sources as described above.
 
-An inactive `PROC_HANG` or `BOTTLENECK` selection temporarily shows the next
-eligible option without changing the stored selection. Neither option is used
-as the other's temporary replacement. If no eligible option is available, the
-slot shows `CLEAR`.
+When the hung-window feature is enabled (`hang_enabled 1`, test users only; keep
+`hang_enabled 0` as noted below), a check cycle that could not evaluate its probes
+replaces the `OK` label with the named cause `probe-indeterminate-<N>`. `N` is the
+number of window checks that could not be evaluated during this update cycle; the
+lost checks never become a hung target, so the row names the loss instead of
+silently reading `OK`. The count reports only the checks the cycle lost: it says
+nothing about whether a hung target was published, and the label shows only when
+the slot has nothing more important to show.
+The label never means a hung target, and it never means `DOWN`, which counts
+unavailable data sources. The row shows only the highest-priority cause:
+device state first, then `N DOWN`, then `probe-indeterminate-<N>`, then `OK`. In
+a four-slot row the first three slots show `probe-...` and
+the last shows `probe-i...`; the full cause `probe-indeterminate-<N>` is in the
+normal log.
+
+An inactive `PROC_HANG` selection temporarily shows the next
+eligible option without changing the stored selection. If no eligible option is
+available, the slot shows `CLEAR`.
 
 ## Connect Discord
 
@@ -501,8 +513,13 @@ Discord display needs Discord Desktop and your own application:
    }
    ```
 
-9. Approve the prompt in Discord and join a voice channel. When someone speaks,
-   their name should appear automatically on the LCD or preview.
+9. Approve the prompt in Discord and join a voice channel. Add `DISCORD` to a
+   button slot and select it to display voice activity. The compact pane shows
+   speaking names (fitted to the slot), a `+N` count for omitted speakers, and
+   optionally the channel as its title. Self visibility, linger and maximum
+   speaker settings still apply. Without a selected `DISCORD` pane, monitoring
+   stops and the optional DLL unloads; authorization commands remain explicit.
+   Speaking never replaces another pane or takes over the dashboard.
 
 Discord's **Public Client** switch does not remove the secret requirement for
 this workflow. Windows protects the secret and access records for the current
@@ -523,14 +540,13 @@ Windows account. Authorize each Discord account separately.
 Local deletion and remote revocation are separate; do both after suspected
 exposure.
 
-## Use alerts and safe mode
+## Use safe mode
 
-Temperature and memory alerts are independent. Only current readings create an
-alert. `memory_warning` and `vmem_warning` default to `100` and trigger at or
-above that value. Button 4 acknowledges the highest active alert.
-
-`warning 1` flashes the selected temperature button area and suppresses its
-full-screen temperature alert. `warning 0` keeps the full-screen alert.
+LCDSirPlus does not classify ordinary readings into warnings. There is no alert,
+threshold, episode, linger, flash, full-screen warning, acknowledgement step, or
+bottleneck verdict to configure, and button 4 only cycles its own slot. The
+`PROC_HANG` hung-window feature below is the single attention path, and it is
+off by default in this release.
 
 Start safe mode with:
 
@@ -539,7 +555,7 @@ Start safe mode with:
 ```
 
 Safe mode limits the dashboard to the clock, built-in CPU load, memory, the
-preview, slot cycling, and alert acknowledgement. It disables every optional
+preview, and slot cycling. It disables every optional
 dashboard data source, Discord dashboard access, network probes, startup
 changes, and the destructive hung-window action. The explicit
 `--discord-authorize` and `--discord-clear-token` commands remain available;
@@ -548,6 +564,11 @@ safe mode does not silently authorize or remove credentials.
 Do not enable the hung-window action in this release. Its physical behavior has
 not been release-tested, and there is no supported end-user test. It can
 terminate a program and lose unsaved work. Keep `hang_enabled 0`.
+
+When the action is enabled for a controlled test, a terminate attempt that reaches
+the bounded completion timeout suppresses a repeated press on the same window: the
+press is refused for identities whose last action on the current publish generation reached `wait-timeout`.
+The window becomes pressable again when a new check cycle republishes it.
 
 ## Create diagnostics safely
 
@@ -717,11 +738,14 @@ Repeat the HWiNFO or LibreHardwareMonitor setup above. Use your own exact HWiNFO
 labels or LibreHardwareMonitor sensor path. Remember the HWiNFO64 Free 12-hour
 limit. Do not trust a stale temperature.
 
-### Discord speakers do not appear
+### Discord speakers do not appear on the panel
 
-Confirm the Application ID, tester access, active-account authorization, voice
-channel, and `discord_show_self` choice. Discord Desktop must run under the same
-Windows account. Never share credential files.
+This is the expected behavior. The panel no longer switches to a speaker view on
+its own; only the hung-window feature may take over the display without your
+button press. Your Discord integration is still active when it is configured:
+check the `Discord` row under `PROVIDER_STATUS`, and confirm the Application ID,
+tester access, active-account authorization, and voice channel. Discord Desktop
+must run under the same Windows account. Never share credential files.
 
 ## Update or uninstall
 

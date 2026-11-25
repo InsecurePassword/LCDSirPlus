@@ -62,6 +62,21 @@ function Assert-FileIdentity {
     if ($actualHash -cne $Hash) { throw "$Label SHA256 mismatch: expected $Hash, got $actualHash" }
 }
 
+function Set-TlsFloor {
+    # Same minimal, host-appropriate TLS policy as scripts/Acquire-PresentMon.ps1: this script
+    # declares `#Requires -Version 5.1`, where Invoke-WebRequest has no -SslProtocol / -HttpVersion
+    # (measured: absent on 5.1.26100.9818, present on 7.6.10), so the policy is set on the
+    # ServicePointManager for the download only and restored by the caller in `finally`.
+    # Tls12 | Tls13 is the strongest expression both hosts support; Ssl3/Tls/Tls11 are left out.
+    $previous = [Net.ServicePointManager]::SecurityProtocol
+    $floor = [Net.SecurityProtocolType]::Tls12
+    if ([Enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') {
+        $floor = $floor -bor [Net.SecurityProtocolType]::Tls13
+    }
+    [Net.ServicePointManager]::SecurityProtocol = $floor
+    return $previous
+}
+
 function Assert-InstallerSignature {
     param([string]$Path)
     $signature = Get-AuthenticodeSignature -FilePath $Path
@@ -144,7 +159,7 @@ if ($VerifyOnly -or $ExtractVerified) {
     $succeeded = $false
     try {
         $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/CURRENTUSER', '/PORTABLE=1', ('/DIR="' + $output + '"'))
-        $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
+        $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
         try {
             if ($process.ExitCode -ne 0) { throw "Inno Setup portable extraction failed with exit code $($process.ExitCode)" }
         }
@@ -168,7 +183,9 @@ if ([IO.File]::Exists($installer)) {
     return
 }
 $download = Join-Path $cacheRoot ('.innosetup-6.7.3-' + [Guid]::NewGuid().ToString('N') + '.exe')
+$previousTls = $null
 try {
+    $previousTls = Set-TlsFloor
     Invoke-WebRequest -Uri $expected.Url -OutFile $download -UseBasicParsing -TimeoutSec $downloadTimeoutSeconds
     Assert-FileIdentity $download $expected.Size $expected.Hash 'Downloaded Inno Setup installer'
     Assert-InstallerSignature $download
@@ -178,5 +195,6 @@ try {
     Write-Host "Inno Setup 6.7.3 installer acquired and verified: $installer" -ForegroundColor Green
 }
 finally {
+    if ($null -ne $previousTls) { [Net.ServicePointManager]::SecurityProtocol = $previousTls }
     if ([IO.File]::Exists($download)) { Remove-Item -LiteralPath $download -Force }
 }

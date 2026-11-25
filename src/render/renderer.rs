@@ -3,16 +3,17 @@
 //! are release invariants requiring explicit review when changed.
 #![allow(clippy::too_many_arguments)] // Direct drawing signatures cover legacy and Rust layouts.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use super::font::{fit_text, text_width};
 use super::Frame;
 use crate::history::Series;
 use crate::model::{
-    session_duration, AcState, Availability, Freshness, HardwareKind, HardwareRole, HeadsetBattery,
-    HungTarget, Metric, MetricKey, ReadingsSnapshot, Snapshot, Speaker, ValueKind, WIDTH,
+    session_duration, AcState, Availability, DeviceStatus, DiscordState, Freshness, HeadsetBattery,
+    HungTarget, Metric, MetricKey, ReadingsSnapshot, Snapshot, ValueKind, WIDTH,
 };
+use crate::telemetry::PROBE_INDETERMINATE;
 
 /// Overlay knobs the renderer reads from configuration.
 #[derive(Clone, Copy, Debug)]
@@ -28,8 +29,6 @@ pub struct OverlayOptions {
     pub fps_graph_ceiling: f64,
     pub cpu_temp_max_c: f64,
     pub gpu_temp_max_c: f64,
-    pub warning: bool,
-    pub warning_phase: bool,
 }
 
 impl Default for OverlayOptions {
@@ -46,8 +45,6 @@ impl Default for OverlayOptions {
             fps_graph_ceiling: 240.0,
             cpu_temp_max_c: 90.0,
             gpu_temp_max_c: 90.0,
-            warning: false,
-            warning_phase: false,
         }
     }
 }
@@ -58,7 +55,6 @@ pub struct View {
     pub hung_index: usize,
     pub hung_detail: bool,
     pub hung_hold: f64,
-    pub alert_acknowledged: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -83,35 +79,18 @@ impl Renderer {
     pub fn render(&mut self, s: &Snapshot, opts: OverlayOptions, v: &View) -> Frame {
         self.now = s.now;
         self.capture(s);
+        // WO-REMOVE-ALERTS: the full-screen takeovers are deleted — the non-hang
+        // critical-alert overlay and the speaker-triggered Discord overlay — so every
+        // frame is the user's selected dashboard. The hung-process target and action
+        // progress are presented by the `PROC_HANG` slot arm (`hang_slot`), the one
+        // attention path the product keeps, and it draws inside this same frame.
         let mut f = Frame::new();
-        if !s.hung.is_empty()
-            && v.slot_modules
-                .iter()
-                .any(|module| module.eq_ignore_ascii_case("PROC_HANG"))
-        {
-            self.dashboard(&mut f, s, v, &opts);
-            return f;
-        }
-        if let Some(alert) = highest_critical(&s.alerts, &v.alert_acknowledged, opts.warning) {
-            alert_overlay(&mut f, alert);
-            return f;
-        }
-        let speakers = visible_speakers(
-            &s.discord,
-            s.now,
-            opts.discord_linger,
-            opts.discord_show_self,
-        );
-        if !speakers.is_empty() {
-            discord_overlay(&mut f, &s.discord, &speakers, &opts);
-            return f;
-        }
         self.dashboard(&mut f, s, v, &opts);
         f
     }
 
     fn capture(&mut self, s: &Snapshot) {
-        let items: [(&'static str, Metric); 13] = [
+        let items: [(&'static str, Metric); 11] = [
             ("frame", s.game.frame_time_ms),
             ("fps", s.game.fps),
             ("netin", s.network_in),
@@ -142,14 +121,6 @@ impl Renderer {
                     MetricKey::DiskWriteBytesPerSec,
                     ValueKind::ByteRate,
                 ),
-            ),
-            (
-                "cachetemp",
-                canonical_cpu_domain_temperature(&s.readings, HardwareRole::Cache),
-            ),
-            (
-                "freqtemp",
-                canonical_cpu_domain_temperature(&s.readings, HardwareRole::Frequency),
             ),
         ];
         for (key, metric) in items {
@@ -233,13 +204,6 @@ impl Renderer {
         }
         for i in 0..4usize {
             self.slot(f, i, &v.slot_modules[i], s, opts, v);
-            if opts.warning
-                && opts.warning_phase
-                && slot_temperature_warning(&v.slot_modules[i], s, opts)
-            {
-                let (x, w) = slot_bounds(i);
-                f.invert_rect(x, 26, w, 17);
-            }
         }
     }
 
@@ -528,24 +492,6 @@ impl Renderer {
                 MetricKey::VRAMUsed,
                 MetricKey::VRAMTotal,
             ),
-            "CPU_CACHE_TEMP" => self.numeric_slot(
-                f,
-                left,
-                width,
-                "CACHE T",
-                canonical_cpu_domain_temperature(&s.readings, HardwareRole::Cache),
-                0,
-                "\u{00B0}",
-            ),
-            "CPU_FREQ_TEMP" => self.numeric_slot(
-                f,
-                left,
-                width,
-                "FREQ T",
-                canonical_cpu_domain_temperature(&s.readings, HardwareRole::Frequency),
-                0,
-                "\u{00B0}",
-            ),
             "NET_IN" => self.network_numeric_slot(f, left, width, "NET IN", s.network_in),
             "NET_OUT" => self.network_numeric_slot(f, left, width, "NET OUT", s.network_out),
             "NET_BOTH" => self.network_numeric_slot(
@@ -612,8 +558,11 @@ impl Renderer {
                 "GAME",
                 &first_non_empty(&[&s.game.game_name, &s.game.process_name], "N/A"),
             ),
-            "ALERTS" => alert_slot(f, left, width, &s.alerts),
-            "PROVIDER_STATUS" => provider_slot(f, left, width, &s.providers),
+            "PROVIDER_STATUS" => provider_slot(f, left, width, &s.providers, &s.device_status),
+            "DISCORD" => {
+                let (title, value) = discord_slot_text(&s.discord, s.now, opts, width);
+                self.text_slot(f, left, width, &title, &value);
+            }
             "CPU_LOAD_GRAPH" => self.fixed_graph_slot(
                 f,
                 left,
@@ -767,7 +716,6 @@ impl Renderer {
                 &system_battery_text(s.system_battery),
             ),
             "HARD_FAULTS" => hard_faults_slot(f, left, width, &s.readings),
-            "BOTTLENECK" => self.text_slot(f, left, width, "BOTTLENECK", bottleneck_text(s)),
             "PROC_HANG" => hang_slot(f, i, &s.hung, v),
             "CLEAR" => self.text_slot(f, left, width, "STATUS", "CLEAR"),
             other => {
@@ -835,8 +783,11 @@ impl Renderer {
         let Some(samples) = self.hist.get(key) else {
             return;
         };
-        let values =
-            samples.second_bins(self.now.or(m.updated).unwrap_or(SystemTime::UNIX_EPOCH), 30);
+        let mut values = [None; 30];
+        samples.second_bins_into(
+            self.now.or(m.updated).unwrap_or(SystemTime::UNIX_EPOCH),
+            &mut values,
+        );
         let count = 30.min(w as usize);
         let start_x = x + (w - count as i32) / 2;
         for (offset, sample) in values[values.len() - count..].iter().enumerate() {
@@ -883,8 +834,10 @@ impl Renderer {
             .now
             .or(network_in.updated.max(network_out.updated))
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        let in_values = in_samples.second_bins(end, 30);
-        let out_values = out_samples.second_bins(end, 30);
+        let mut in_values = [None; 30];
+        in_samples.second_bins_into(end, &mut in_values);
+        let mut out_values = [None; 30];
+        out_samples.second_bins_into(end, &mut out_values);
         let count = 30.min(w as usize);
         let start_x = x + (w - count as i32) / 2;
         let in_start = in_values.len() - count;
@@ -1022,8 +975,11 @@ impl Renderer {
         let Some(samples) = self.hist.get(key) else {
             return;
         };
-        let vals =
-            samples.second_bins(self.now.or(m.updated).unwrap_or(SystemTime::UNIX_EPOCH), 30);
+        let mut vals = [None; 30];
+        samples.second_bins_into(
+            self.now.or(m.updated).unwrap_or(SystemTime::UNIX_EPOCH),
+            &mut vals,
+        );
         let min = vals
             .iter()
             .flatten()
@@ -1070,7 +1026,8 @@ impl Renderer {
         let Some(series) = self.hist.get(key) else {
             return;
         };
-        let bins = series.second_bins(end, 30);
+        let mut bins = [None; 30];
+        series.second_bins_into(end, &mut bins);
         let start_x = x + (w - 30) / 2;
         for (column, value) in bins.into_iter().enumerate() {
             let Some(value) = value else { continue };
@@ -1154,19 +1111,21 @@ impl Renderer {
         ) else {
             return;
         };
-        let reads = reads.second_bins(end, 30);
-        let writes = writes.second_bins(end, 30);
+        let mut reads_bins = [None; 30];
+        reads.second_bins_into(end, &mut reads_bins);
+        let mut writes_bins = [None; 30];
+        writes.second_bins_into(end, &mut writes_bins);
         let start_x = x + (w - 30) / 2;
         let baseline = 37;
         f.h_line(start_x, start_x + 29, baseline, true);
         for column in 0..30 {
-            if let Some(value) = reads[column] {
+            if let Some(value) = reads_bins[column] {
                 let h = graph_height(value, ceiling_mbps * 1_000_000.0, 4);
                 if h > 0 {
                     f.v_line(start_x + column as i32, baseline - h, baseline - 1, true);
                 }
             }
-            if let Some(value) = writes[column] {
+            if let Some(value) = writes_bins[column] {
                 let h = graph_height(value, ceiling_mbps * 1_000_000.0, 5);
                 if h > 0 {
                     f.v_line(start_x + column as i32, baseline + 1, baseline + h, true);
@@ -1565,38 +1524,6 @@ fn hard_faults_slot(f: &mut Frame, x: i32, w: i32, readings: &ReadingsSnapshot) 
     }
 }
 
-fn bottleneck_text(s: &Snapshot) -> &'static str {
-    if s.bottleneck.freshness == Freshness::Stale {
-        "STALE"
-    } else {
-        s.bottleneck.state.token().unwrap_or("N/A")
-    }
-}
-
-fn current_at_or_above(metric: Metric, threshold: f64) -> bool {
-    metric_state(metric) == DisplayState::Current && metric.value >= threshold
-}
-
-fn slot_temperature_warning(module: &str, s: &Snapshot, opts: &OverlayOptions) -> bool {
-    match module.to_ascii_uppercase().as_str() {
-        "CPU_TEMP" | "CPU_TEMP_GRAPH" => current_at_or_above(s.cpu_temp, opts.cpu_temp_max_c),
-        "CPU_CACHE_TEMP" => current_at_or_above(
-            canonical_cpu_domain_temperature(&s.readings, HardwareRole::Cache),
-            opts.cpu_temp_max_c,
-        ),
-        "CPU_FREQ_TEMP" => current_at_or_above(
-            canonical_cpu_domain_temperature(&s.readings, HardwareRole::Frequency),
-            opts.cpu_temp_max_c,
-        ),
-        "GPU_TEMP" | "GPU_TEMP_GRAPH" => current_at_or_above(s.gpu_temp, opts.gpu_temp_max_c),
-        "THERMALS" => {
-            current_at_or_above(s.cpu_temp, opts.cpu_temp_max_c)
-                || current_at_or_above(s.gpu_temp, opts.gpu_temp_max_c)
-        }
-        _ => false,
-    }
-}
-
 fn format_network_rate(bytes_per_second: f64) -> String {
     if !bytes_per_second.is_finite() {
         return "N/A".into();
@@ -1741,52 +1668,87 @@ fn canonical_percent_metric(
     metric
 }
 
-fn canonical_cpu_domain_temperature(readings: &ReadingsSnapshot, role: HardwareRole) -> Metric {
-    if role != HardwareRole::Cache && role != HardwareRole::Frequency {
-        return Metric::invalid();
-    }
-    let mut hardware_id = String::new();
-    let mut matches = 0;
-    for descriptor in &readings.hardware {
-        if descriptor.kind != HardwareKind::CPUDomain || descriptor.role != role {
-            continue;
-        }
-        matches += 1;
-        if matches > 1 || descriptor.hardware_id.is_empty() {
-            return Metric::invalid();
-        }
-        hardware_id = descriptor.hardware_id.clone();
-    }
-    if matches != 1 {
-        return Metric::invalid();
-    }
-
-    let mut reading_matches = 0;
-    let mut reading = None;
-    for candidate in &readings.metrics {
-        if candidate.key != MetricKey::CPUCCDTemp || candidate.hardware_id != hardware_id {
-            continue;
-        }
-        reading_matches += 1;
-        if reading_matches > 1 {
-            return Metric::invalid();
-        }
-        reading = Some(candidate);
-    }
-    let Some(reading) = reading else {
-        return Metric::invalid();
+/// Explicitly selected voice information. Never changes the dashboard or owns input.
+/// Names are fitted to a single slot; any omitted speakers retain an explicit +N suffix.
+fn discord_slot_text(
+    state: &DiscordState,
+    now: Option<SystemTime>,
+    opts: &OverlayOptions,
+    width: i32,
+) -> (String, String) {
+    let title = if opts.discord_show_channel && !state.channel_name.is_empty() {
+        state.channel_name.clone()
+    } else {
+        "DISCORD".to_string()
     };
-    let state = display_state_kind(reading, ValueKind::Celsius);
-    if state == DisplayState::Unavailable
-        || !reading.number.is_finite()
-        || !(-50.0..=200.0).contains(&reading.number)
-    {
-        return Metric::invalid();
+    if !state.connected {
+        return (title, "OFFLINE".into());
     }
-    let mut metric = reading.legacy_metric();
-    metric.valid = true;
-    metric.stale = state == DisplayState::Stale;
-    metric
+    if !state.authenticated {
+        return (title, "AUTH".into());
+    }
+    let mut speakers: Vec<_> = state
+        .speakers
+        .iter()
+        .filter(|speaker| {
+            (opts.discord_show_self || !speaker.is_self)
+                && (speaker.speaking
+                    || speaker.stopped_at.zip(now).is_some_and(|(stopped, now)| {
+                        now.duration_since(stopped)
+                            .is_ok_and(|age| age <= opts.discord_linger)
+                    }))
+        })
+        .collect();
+    speakers.sort_by(|a, b| {
+        b.speaking
+            .cmp(&a.speaking)
+            .then_with(|| a.started_at.cmp(&b.started_at))
+            .then_with(|| a.user_id.cmp(&b.user_id))
+    });
+    if speakers.is_empty() {
+        return (
+            title,
+            if state.self_mute { "MUTED" } else { "QUIET" }.into(),
+        );
+    }
+    let limit = opts.discord_max_speakers.clamp(1, 4).min(speakers.len());
+    let mut names = String::new();
+    let mut included = 0;
+    for speaker in speakers.iter().take(limit) {
+        let name = if speaker.name.is_empty() {
+            "?"
+        } else {
+            &speaker.name
+        };
+        let proposed = if names.is_empty() {
+            name.to_string()
+        } else {
+            format!("{names}/{name}")
+        };
+        let omitted = speakers.len() - included - 1;
+        let suffix = if omitted > 0 {
+            format!("+{omitted}")
+        } else {
+            String::new()
+        };
+        if included > 0 && text_width(&proposed, 1) + text_width(&suffix, 1) > width {
+            break;
+        }
+        names = proposed;
+        included += 1;
+    }
+    let omitted = speakers.len() - included;
+    let suffix = if omitted > 0 {
+        format!("+{omitted}")
+    } else {
+        String::new()
+    };
+    let value = format!(
+        "{}{}",
+        fit_text(&names, (width - text_width(&suffix, 1)).max(0), 1),
+        suffix
+    );
+    (title, value)
 }
 
 fn slot_bounds(i: usize) -> (i32, i32) {
@@ -1889,42 +1851,55 @@ fn controller_slot(f: &mut Frame, x: i32, w: i32, b: &crate::model::ControllerBa
     );
 }
 
-fn alert_slot(f: &mut Frame, x: i32, w: i32, alerts: &[crate::model::Alert]) {
-    f.text_centered(x, w, 27, "ALERTS", 1, true);
-    let mut n = 0;
-    let mut max = 0;
-    for a in alerts {
-        if !a.acknowledged {
-            n += 1;
-            if a.severity > max {
-                max = a.severity;
-            }
-        }
-    }
-    if n == 0 {
-        f.text_centered(x, w, 35, "CLEAR", 1, true);
-    } else {
-        f.text_centered(x, w, 35, &format_alert_summary(n, max, w), 1, true);
-    }
-}
-
-fn format_alert_summary(count: i32, severity: i32, max_width: i32) -> String {
-    let text = format!("{count} L {severity}");
-    if text_width(&text, 1) <= max_width {
-        text
-    } else {
-        format!(">9 L {}", severity.clamp(0, 9))
-    }
-}
-
-fn provider_slot(f: &mut Frame, x: i32, w: i32, providers: &HashMap<String, bool>) {
+fn provider_slot(
+    f: &mut Frame,
+    x: i32,
+    w: i32,
+    providers: &HashMap<String, bool>,
+    status: &DeviceStatus,
+) {
     f.text_centered(x, w, 27, "STATUS", 1, true);
+    // RC-5: the device/recovery label replaces the provider summary only while
+    // the device is not healthy, so the four loss/recovery states are distinct
+    // on the panel. Row and font are the existing ones: no new geometry, and
+    // text always lands, so the preview-retained fallback never blanks.
+    if status != &DeviceStatus::Healthy {
+        f.text_centered(x, w, 35, &fit_text(&status.label(), w, 1), 1, true);
+        return;
+    }
     let bad = providers.values().filter(|&&available| !available).count();
     if bad == 0 {
+        // WO-QA-03 (TC-4 F-b, display-only): a hang cycle that lost probes it could not
+        // evaluate publishes the NAMED token `probe-indeterminate-<N>` (single rendering
+        // site: `providers/hang.rs` L110-112) on the provider-health record. It lands with
+        // available = true, so `bad` stays 0 and the surface would otherwise read `OK` —
+        // "no timeout observed" — while the detector lost probes. Drawing the token here
+        // is what makes "N probes lost" self-name, and it never invents a target.
+        // Precedence keeps every other label: RC-5 device state > `N DOWN` (other causes
+        // stay named, so this branch masks nothing) > token > `OK`.
+        // shortcut: the token is 21 chars = 83 px (font.rs `text_width`), and a four-slot
+        // interior is 39/40 px, so `fit_text` draws "probe-i..." there and the count is
+        // not legible - exactly the RC-5 label's truncation discipline (L1935). Upgrade
+        // when the count must be legible on-screen: a wider status slot.
+        if let Some(reason) = hang_loss_cause(providers) {
+            f.text_centered(x, w, 35, &fit_text(&reason, w, 1), 1, true);
+            return;
+        }
         f.text_centered(x, w, 35, "OK", 1, true);
     } else {
         f.text_centered(x, w, 35, &format!("{} DOWN", bad), 1, true);
     }
+}
+
+/// WO-QA-03: the hang detector's named loss cause carried on the provider-health record
+/// (`telemetry::apply_hang_update`), i.e. the exact token string the panel draws. A
+/// lookup only: the availability bit of that entry stays `true` by construction, so it
+/// is never counted as a down provider.
+fn hang_loss_cause(providers: &HashMap<String, bool>) -> Option<String> {
+    providers
+        .keys()
+        .find(|name| name.starts_with(PROBE_INDETERMINATE))
+        .cloned()
 }
 
 fn first_non_empty(values: &[&str], fallback: &str) -> String {
@@ -2022,103 +1997,10 @@ fn compact_iec_number(value: &str) -> String {
     }
 }
 
-fn visible_speakers(
-    d: &crate::model::DiscordState,
-    now: Option<SystemTime>,
-    linger: Duration,
-    show_self: bool,
-) -> Vec<Speaker> {
-    if !d.connected || !d.authenticated {
-        return Vec::new();
-    }
-    let Some(now) = now else {
-        return Vec::new();
-    };
-    let mut out: Vec<Speaker> = d
-        .speakers
-        .iter()
-        .filter(|s| {
-            if s.is_self && !show_self {
-                return false;
-            }
-            s.speaking
-                || s.stopped_at
-                    .map(|stopped| now.duration_since(stopped).unwrap_or(Duration::ZERO) <= linger)
-                    .unwrap_or(false)
-        })
-        .cloned()
-        .collect();
-    out.sort_by(|a, b| {
-        b.speaking
-            .cmp(&a.speaking)
-            .then_with(|| b.started_at.cmp(&a.started_at))
-            .then_with(|| a.user_id.cmp(&b.user_id))
-    });
-    out
-}
-
-fn discord_overlay(
-    f: &mut Frame,
-    d: &crate::model::DiscordState,
-    speakers: &[Speaker],
-    opts: &OverlayOptions,
-) {
-    f.rect(0, 0, 160, 43, true);
-    let mut title = "DISCORD".to_string();
-    if opts.discord_show_channel && !d.channel_name.is_empty() {
-        title = fit_text(&d.channel_name, 154, 1);
-    }
-    f.text_centered(3, 154, 2, &title, 1, true);
-    let max = opts.discord_max_speakers.min(speakers.len());
-    if max == 1 {
-        let name = fit_text(&speakers[0].name, 152, 2);
-        f.text_centered(4, 152, 16, &name, 2, true);
-    } else {
-        let mut y = 11;
-        for speaker in speakers.iter().take(max) {
-            let name = fit_text(&speaker.name, 152, 1);
-            f.text_centered(4, 152, y, &name, 1, true);
-            y += 8;
-        }
-    }
-    if speakers.len() > max {
-        f.text_right(156, 36, &format!("+{}", speakers.len() - max), true);
-    }
-}
-
-fn highest_critical<'a>(
-    alerts: &'a [crate::model::Alert],
-    ack: &HashSet<String>,
-    suppress_temperature: bool,
-) -> Option<&'a crate::model::Alert> {
-    let mut best: Option<&crate::model::Alert> = None;
-    for a in alerts {
-        if a.severity < 2
-            || a.acknowledged
-            || ack.contains(&a.id)
-            || (suppress_temperature && matches!(a.id.as_str(), "cpu-temp" | "gpu-temp"))
-        {
-            continue;
-        }
-        match best {
-            None => best = Some(a),
-            Some(b) if a.severity > b.severity => best = Some(a),
-            _ => {}
-        }
-    }
-    best
-}
-
-fn alert_overlay(f: &mut Frame, a: &crate::model::Alert) {
-    f.rect(0, 0, 160, 43, true);
-    f.text_centered(3, 154, 3, &fit_text(&a.title, 154, 2), 2, true);
-    f.text_centered(3, 154, 30, &fit_text(&a.detail, 154, 1), 1, true);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Alert, ControllerBattery, GameStats, Reading};
+    use crate::model::{ControllerBattery, GameStats, Reading};
     use std::time::{Duration, SystemTime};
 
     const GOLDEN_NORMAL: &str = "a2f36db6c54c09adcd459756677a6fc348f181d01e0810a9c7e4d9c3c998c20c";
@@ -2129,9 +2011,111 @@ mod tests {
         "c6bf7ef1e919ef47dfc7ed13ef9a9f937253e47a449fe8558f00adf98a881701";
     const GOLDEN_LAYOUT_3: &str =
         "ef1dbde8de40632b213b7c149789a716165719b0ab4f40ab80aa508930b6ff8b";
+    /// RC-5: healthy `PROVIDER_STATUS` four-slot view (pre-RC-5 summary path).
+    const GOLDEN_PROVIDER_STATUS_HEALTHY: &str =
+        "c1ed6b7a540cdf073dbd3de03c347a09baeda2e1045d968855e3ecb9bb2100cd";
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn graph_history_replay_preserves_pixels_across_wrap_and_rollback() {
+        let stamp = |ms| at(1_800_000_000) + Duration::from_millis(ms);
+        let mut renderer = Renderer::new();
+        let mut snapshot = audit_snapshot();
+        let samples = |key: &str| {
+            let mut s = Series::new(320);
+            for i in 0..400 {
+                if i % 17 != 0 {
+                    let t = stamp(i * 275);
+                    let value = (i % 85 + 5) as f64;
+                    let v = if key.starts_with("net") || key.starts_with("disk") {
+                        value * 92_000.0
+                    } else {
+                        value
+                    };
+                    s.add(t, v);
+                    if i % 31 == 0 {
+                        s.add(t, v * 1.25);
+                    }
+                }
+            }
+            assert_eq!(s.snapshot().len(), 320);
+            s
+        };
+        for key in ["netin", "netout", "diskread", "diskwrite", "frame", "fps"] {
+            let series = samples(key);
+            renderer.hist.insert(key, series);
+        }
+        let run = |renderer: &mut Renderer, snapshot: &mut Snapshot, step: usize| {
+            let mut frame = Frame::new();
+            let end = stamp([80_125, 109_999, 100_251, 115_001, 140_000][step]);
+            renderer.now = Some(end);
+            snapshot.now = Some(end);
+            renderer.network_graph_slot(
+                &mut frame,
+                1,
+                38,
+                "I",
+                snapshot.network_in,
+                "netin",
+                100.0,
+            );
+            renderer.network_dual_graph_slot(
+                &mut frame,
+                41,
+                38,
+                snapshot.network_in,
+                snapshot.network_out,
+                100.0,
+                100.0,
+            );
+            if step.is_multiple_of(2) {
+                renderer.graph_slot(
+                    &mut frame,
+                    81,
+                    38,
+                    "FT",
+                    snapshot.game.frame_time_ms,
+                    "frame",
+                    "MS",
+                );
+            } else {
+                renderer.fixed_graph_slot(
+                    &mut frame,
+                    81,
+                    38,
+                    "FPS",
+                    snapshot.game.fps,
+                    "fps",
+                    180.0,
+                    "",
+                );
+            }
+            renderer.disk_graph_slot(&mut frame, 121, 38, snapshot, 600.0);
+            frame
+        };
+
+        let mut digest = 0xcbf29ce484222325u64;
+        for step in 0..5 {
+            let frame = run(&mut renderer, &mut snapshot, step);
+            assert!(frame.pixels.iter().any(|&x| x != 0));
+            for pixel in frame.pixels {
+                digest = (digest ^ u64::from(pixel)).wrapping_mul(0x100000001b3);
+            }
+        }
+        let later = stamp(25_250);
+        renderer.hist.get_mut("diskread").unwrap().add(later, 500.0);
+        assert_eq!(renderer.hist["diskread"].snapshot().len(), 1);
+        let frame = run(&mut renderer, &mut snapshot, 2);
+        for pixel in frame.pixels {
+            digest = (digest ^ u64::from(pixel)).wrapping_mul(0x100000001b3);
+        }
+        assert_eq!(
+            digest, 0xc0d9_0823_9410_3fb4,
+            "baseline graph replay pixels"
+        );
     }
 
     fn sample_snapshot() -> Snapshot {
@@ -2215,16 +2199,6 @@ mod tests {
             percent: 100,
         };
         snapshot.providers.insert("discord".into(), false);
-        snapshot.alerts = vec![
-            Alert {
-                severity: 3,
-                ..Default::default()
-            },
-            Alert {
-                severity: 2,
-                ..Default::default()
-            },
-        ];
         snapshot.system_battery = crate::model::SystemBattery {
             ac: AcState::Online,
             battery_present: Some(true),
@@ -2232,25 +2206,7 @@ mod tests {
             freshness: Freshness::Current,
             ..Default::default()
         };
-        snapshot.bottleneck = crate::model::BottleneckReading {
-            state: crate::model::BottleneckState::Gpu,
-            freshness: Freshness::Current,
-        };
-        snapshot.readings.hardware = vec![
-            crate::model::HardwareDescriptor {
-                hardware_id: "domain-cache".into(),
-                kind: HardwareKind::CPUDomain,
-                role: HardwareRole::Cache,
-            },
-            crate::model::HardwareDescriptor {
-                hardware_id: "domain-frequency".into(),
-                kind: HardwareKind::CPUDomain,
-                role: HardwareRole::Frequency,
-            },
-        ];
         snapshot.readings.metrics.extend([
-            Reading::current_celsius(MetricKey::CPUCCDTemp, 69.0, "domain-cache", now),
-            Reading::current_celsius(MetricKey::CPUCCDTemp, 65.0, "domain-frequency", now),
             Reading::current_number(MetricKey::VRMTemp, ValueKind::Celsius, 58.0, "vrm", now),
             Reading::current_number(
                 MetricKey::ChipsetTemp,
@@ -2350,12 +2306,6 @@ mod tests {
         snapshot.providers = (0..100)
             .map(|index| (format!("provider-{index}"), false))
             .collect();
-        snapshot.alerts = (0..100)
-            .map(|_| Alert {
-                severity: 3,
-                ..Default::default()
-            })
-            .collect();
         for reading in &mut snapshot.readings.metrics {
             match reading.kind {
                 ValueKind::Percent => reading.number = 100.0,
@@ -2395,9 +2345,7 @@ mod tests {
         snapshot.game.process_name.clear();
         snapshot.headset.stale = true;
         snapshot.controller = ControllerBattery::default();
-        snapshot.alerts.clear();
         snapshot.system_battery.freshness = Freshness::Stale;
-        snapshot.bottleneck.freshness = Freshness::Stale;
         snapshot
     }
 
@@ -2471,6 +2419,220 @@ mod tests {
         let zero_frame = render_dashboard(&zero);
         assert!(!zero_frame.equal(&render_dashboard(&unavailable)));
         assert!(!zero_frame.equal(&render_dashboard(&stale)));
+    }
+
+    /// RC-5: the provider-status module is the human-facing device surface. The
+    /// four states must each light the panel (preview-retained fallback), render
+    /// distinctly, and leave the healthy provider summary pixel-exact.
+    #[test]
+    fn device_status_states_render_distinctly_and_never_blank_the_panel() {
+        let view = View {
+            slot_modules: [
+                "PROVIDER_STATUS".to_string(),
+                "PROVIDER_STATUS".to_string(),
+                "PROVIDER_STATUS".to_string(),
+                "PROVIDER_STATUS".to_string(),
+            ],
+            ..Default::default()
+        };
+        let render = |snapshot: &Snapshot| {
+            Renderer::new().render(snapshot, OverlayOptions::default(), &view)
+        };
+        let statuses = [
+            DeviceStatus::Absent,
+            DeviceStatus::LinkFailed {
+                code: "call-timeout".to_string(),
+            },
+            DeviceStatus::AllowanceConsumed,
+            DeviceStatus::RecoveryFailed {
+                code: "worker-stalled".to_string(),
+            },
+        ];
+        // F-1: the whole-frame `pixels.any()` blanking check was trivially true,
+        // because the `STATUS` header on row 27 is drawn unconditionally
+        // (renderer.rs:1928). The human-facing surface is the row-35 label band
+        // (glyph rows 35..=39 at scale 1), so assert that band instead: it must
+        // carry lit pixels in every state, must replace the healthy
+        // provider-summary band (taken from the pinned healthy frame), and must
+        // differ per state. The band is the slot interiors only, so the layout-1
+        // slot dividers (`v_line` on columns 39/79/119, rows 26..=42,
+        // renderer.rs:182-184) cannot satisfy it, and rows start at 35 so the
+        // row-25 rule cannot either.
+        let band = |frame: &Frame| -> Vec<bool> {
+            let mut pixels = Vec::new();
+            for (left, right) in [(0, 38), (40, 78), (80, 118), (120, 159)] {
+                for y in 35..=39 {
+                    for x in left..=right {
+                        pixels.push(frame.get(x, y));
+                    }
+                }
+            }
+            pixels
+        };
+        let healthy = render(&sample_snapshot());
+        assert_eq!(
+            healthy.hash_hex(),
+            GOLDEN_PROVIDER_STATUS_HEALTHY,
+            "healthy provider summary changed"
+        );
+        let healthy_band = band(&healthy);
+        assert!(
+            healthy_band.iter().any(|&pixel| pixel),
+            "the pinned healthy frame must light the row-35 band"
+        );
+        let frames: Vec<Frame> = statuses
+            .iter()
+            .map(|status| {
+                let mut snapshot = sample_snapshot();
+                snapshot.device_status = status.clone();
+                render(&snapshot)
+            })
+            .collect();
+        for (status, frame) in statuses.iter().zip(frames.iter()) {
+            let label_band = band(frame);
+            assert!(
+                label_band.iter().any(|&pixel| pixel),
+                "the row-35 label band is blank for {status:?}"
+            );
+            assert_ne!(
+                label_band, healthy_band,
+                "the row-35 band must replace the healthy summary for {status:?}"
+            );
+        }
+        let bands: Vec<Vec<bool>> = frames.iter().map(band).collect();
+        for (index, left) in bands.iter().enumerate() {
+            for right in bands[index + 1..].iter() {
+                assert!(!left.eq(right), "the four labels must differ in row 35");
+            }
+        }
+        for (index, left) in frames.iter().enumerate() {
+            for right in frames[index + 1..].iter() {
+                assert!(!left.equal(right), "the four states must render distinctly");
+            }
+        }
+    }
+
+    /// WO-QA-03 (TC-4 follow-up F-b, display-only): acceptance (1) rendered layer — the
+    /// token that `telemetry::apply_hang_update` carries on the provider-health record
+    /// (built by the provider's single rendering site) lands on the operator-visible
+    /// hang-provider availability surface and DISCRIMINATES: it is not `OK` ("no timeout
+    /// observed"), not a counted `N DOWN`, and not an RC-5 device label.
+    #[test]
+    fn the_loss_cause_token_replaces_the_healthy_status_label() {
+        const TOKEN: &str = "probe-indeterminate-3";
+        let view = View {
+            slot_modules: [
+                "PROVIDER_STATUS".to_string(),
+                "PROVIDER_STATUS".to_string(),
+                "PROVIDER_STATUS".to_string(),
+                "PROVIDER_STATUS".to_string(),
+            ],
+            ..Default::default()
+        };
+        let render = |snapshot: &Snapshot| {
+            Renderer::new().render(snapshot, OverlayOptions::default(), &view)
+        };
+        // The RC-5 row-35 label band: slot interiors, glyph rows 35..=39 at scale 1.
+        let band = |frame: &Frame| -> Vec<bool> {
+            let mut pixels = Vec::new();
+            for (left, right) in [(0, 38), (40, 78), (80, 118), (120, 159)] {
+                for y in 35..=39 {
+                    for x in left..=right {
+                        pixels.push(frame.get(x, y));
+                    }
+                }
+            }
+            pixels
+        };
+        // The record exactly as the telemetry carry emits it: the token entry available =
+        // true beside an available provider, so the panel has nothing down and the targets
+        // are empty (`sample_snapshot` publishes no hung target).
+        let mut loss = sample_snapshot();
+        loss.providers.insert("Hung window detector".into(), true);
+        loss.providers.insert(TOKEN.into(), true);
+        assert!(loss.hung.is_empty(), "the loss cause publishes no target");
+        assert_eq!(
+            hang_loss_cause(&loss.providers).as_deref(),
+            Some(TOKEN),
+            "the panel draws the named token string"
+        );
+        let normal = sample_snapshot();
+        let healthy = render(&normal);
+        assert_eq!(
+            healthy.hash_hex(),
+            GOLDEN_PROVIDER_STATUS_HEALTHY,
+            "the normal-state availability surface is byte-stable"
+        );
+        assert_eq!(
+            hang_loss_cause(&normal.providers),
+            None,
+            "the normal record carries no token: `OK` stays 'no timeout observed'"
+        );
+        let frame = render(&loss);
+        assert_ne!(
+            frame.hash_hex(),
+            healthy.hash_hex(),
+            "the named cause must change the surface"
+        );
+        let loss_band = band(&frame);
+        assert!(
+            loss_band.iter().any(|&pixel| pixel),
+            "the row-35 label band is blank for the loss cause"
+        );
+        assert_ne!(
+            loss_band,
+            band(&healthy),
+            "the loss cause must replace the healthy `OK` band"
+        );
+
+        // Distinct from every other unavailable label on this surface.
+        let mut down = sample_snapshot();
+        down.providers.insert("hwinfo".into(), false);
+        assert_eq!(
+            hang_loss_cause(&down.providers),
+            None,
+            "a plain provider failure carries no token"
+        );
+        assert_ne!(
+            band(&render(&down)),
+            loss_band,
+            "the token is distinct from the counted `N DOWN` label"
+        );
+        let mut device = sample_snapshot();
+        device.device_status = DeviceStatus::Absent;
+        assert_ne!(
+            band(&render(&device)),
+            loss_band,
+            "the token is distinct from the RC-5 device label"
+        );
+        let mut device_with_token = device.clone();
+        device_with_token
+            .providers
+            .insert("Hung window detector".into(), true);
+        device_with_token.providers.insert(TOKEN.into(), true);
+        assert_eq!(
+            band(&render(&device_with_token)),
+            band(&render(&device)),
+            "RC-5 device state keeps precedence over the loss cause"
+        );
+
+        // Legibility under the panel's own fit discipline: the token is 21 chars, so
+        // 4*21-1 = 83 px (font.rs L96-103), and a four-slot interior is 39/40 px.
+        assert_eq!(
+            fit_text(TOKEN, 83, 1),
+            TOKEN,
+            "the full token draws in an 83-px surface"
+        );
+        assert_eq!(
+            fit_text(TOKEN, 39, 1),
+            "probe-i...",
+            "shortcut: the four-slot 39-px width truncates the drawn token, so the count is not legible there"
+        );
+        assert_eq!(
+            fit_text(TOKEN, 159, 1),
+            TOKEN,
+            "the full-width surface (159 px) always draws the token whole"
+        );
     }
 
     #[test]
@@ -2878,112 +3040,6 @@ mod tests {
     }
 
     #[test]
-    fn discord_overlay_draws_border() {
-        let mut s = sample_snapshot();
-        s.discord.connected = true;
-        s.discord.authenticated = true;
-        s.discord.speakers.push(Speaker {
-            user_id: "1".into(),
-            name: "Nezumi".into(),
-            speaking: true,
-            started_at: s.now,
-            ..Default::default()
-        });
-        let f = Renderer::new().render(&s, OverlayOptions::default(), &View::default());
-        assert!(f.get(0, 0) && f.get(159, 42), "missing overlay border");
-    }
-
-    #[test]
-    fn discord_visibility_order_linger_self_and_restoration() {
-        let mut s = sample_snapshot();
-        let dashboard = render_dashboard(&s);
-        let now = s.now.unwrap();
-        s.discord.connected = true;
-        s.discord.authenticated = true;
-        s.discord.channel_name = "General".into();
-        s.discord.speakers = vec![
-            Speaker {
-                user_id: "2".into(),
-                name: "Older".into(),
-                speaking: true,
-                started_at: Some(now - Duration::from_secs(2)),
-                ..Default::default()
-            },
-            Speaker {
-                user_id: "1".into(),
-                name: "Newer".into(),
-                speaking: true,
-                started_at: Some(now - Duration::from_secs(1)),
-                ..Default::default()
-            },
-            Speaker {
-                user_id: "self".into(),
-                name: "Self".into(),
-                speaking: true,
-                is_self: true,
-                started_at: Some(now),
-                ..Default::default()
-            },
-            Speaker {
-                user_id: "linger".into(),
-                name: "Linger".into(),
-                stopped_at: Some(now - Duration::from_millis(700)),
-                ..Default::default()
-            },
-        ];
-        let visible = visible_speakers(&s.discord, s.now, Duration::from_millis(700), false);
-        assert_eq!(
-            visible
-                .iter()
-                .map(|speaker| speaker.user_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["1", "2", "linger"]
-        );
-        assert_eq!(
-            visible_speakers(&s.discord, s.now, Duration::from_millis(699), false).len(),
-            2
-        );
-        assert_eq!(
-            visible_speakers(&s.discord, s.now, Duration::from_millis(700), true).len(),
-            4
-        );
-
-        let one = Renderer::new().render(
-            &s,
-            OverlayOptions {
-                discord_max_speakers: 1,
-                discord_show_channel: true,
-                ..Default::default()
-            },
-            &golden_view(),
-        );
-        let many = Renderer::new().render(
-            &s,
-            OverlayOptions {
-                discord_max_speakers: 2,
-                discord_show_channel: true,
-                ..Default::default()
-            },
-            &golden_view(),
-        );
-        assert!(
-            !one.equal(&many),
-            "one/two speaker and +N layouts must differ"
-        );
-
-        for speaker in &mut s.discord.speakers {
-            speaker.speaking = false;
-            speaker.stopped_at = Some(now - Duration::from_millis(701));
-        }
-        assert!(
-            Renderer::new()
-                .render(&s, OverlayOptions::default(), &golden_view())
-                .equal(&dashboard),
-            "expired overlay must restore the exact dashboard"
-        );
-    }
-
-    #[test]
     fn iec_formatting_matches_go() {
         let cases = [
             (20u64 << 30, 32u64 << 30, 38, "20/32GiB"),
@@ -3250,50 +3306,6 @@ mod tests {
     }
 
     #[test]
-    fn ccd_temperature_modules_resolve_roles_and_fail_closed() {
-        let at = at(1_800_100_000);
-        let readings = ReadingsSnapshot {
-            hardware: vec![
-                crate::model::HardwareDescriptor {
-                    hardware_id: "domain-frequency".into(),
-                    kind: HardwareKind::CPUDomain,
-                    role: HardwareRole::Frequency,
-                },
-                crate::model::HardwareDescriptor {
-                    hardware_id: "domain-cache".into(),
-                    kind: HardwareKind::CPUDomain,
-                    role: HardwareRole::Cache,
-                },
-            ],
-            metrics: vec![
-                Reading::current_celsius(MetricKey::CPUCCDTemp, 71.0, "domain-cache", at),
-                Reading::current_celsius(MetricKey::CPUCCDTemp, 63.0, "domain-frequency", at),
-            ],
-        };
-        let cache = canonical_cpu_domain_temperature(&readings, HardwareRole::Cache);
-        let frequency = canonical_cpu_domain_temperature(&readings, HardwareRole::Frequency);
-        assert!(cache.valid && !cache.stale && cache.value == 71.0);
-        assert!(frequency.valid && !frequency.stale && frequency.value == 63.0);
-
-        // Ambiguity, wrong kind, invalid values all fail closed.
-        let mut ambiguous = readings.clone();
-        ambiguous.hardware.push(crate::model::HardwareDescriptor {
-            hardware_id: "domain-cache-2".into(),
-            kind: HardwareKind::CPUDomain,
-            role: HardwareRole::Cache,
-        });
-        assert!(!canonical_cpu_domain_temperature(&ambiguous, HardwareRole::Cache).valid);
-
-        let mut wrong_kind = readings.clone();
-        wrong_kind.metrics[0].kind = ValueKind::Percent;
-        assert!(!canonical_cpu_domain_temperature(&wrong_kind, HardwareRole::Cache).valid);
-
-        let mut nan = readings.clone();
-        nan.metrics[0].number = f64::NAN;
-        assert!(!canonical_cpu_domain_temperature(&nan, HardwareRole::Cache).valid);
-    }
-
-    #[test]
     fn headset_states_render_distinctly() {
         let mut r = Renderer::new();
         let mut s = sample_snapshot();
@@ -3367,33 +3379,12 @@ mod tests {
         assert_eq!(single.hash_hex(), render_dashboard(&s).hash_hex());
     }
 
+    /// WO-REMOVE-ALERTS: the alert/discord takeover paths are deleted, so the hung-process
+    /// panel is the only attention surface. A bound press draws its progress inside the
+    /// selected dashboard, renders identically through a fresh renderer (nothing competes for
+    /// the frame any more), and clearing the target restores the exact pre-press dashboard.
     #[test]
-    fn critical_alert_overrides_discord_and_dashboard() {
-        let mut s = sample_snapshot();
-        s.discord.connected = true;
-        s.discord.authenticated = true;
-        s.discord.speakers.push(Speaker {
-            user_id: "1".into(),
-            name: "Nezumi".into(),
-            speaking: true,
-            started_at: s.now,
-            ..Default::default()
-        });
-        let base = render_dashboard(&s);
-        s.alerts.push(Alert {
-            id: "cpu".into(),
-            title: "CPU HOT".into(),
-            detail: "95C".into(),
-            severity: 2,
-            acknowledged: false,
-        });
-        let alert_frame = render_dashboard(&s);
-        assert!(!alert_frame.equal(&base));
-        assert!(alert_frame.get(0, 0) && alert_frame.get(159, 42));
-    }
-
-    #[test]
-    fn hung_hold_overrides_alert_and_discord_then_restores_exact_dashboard() {
+    fn hung_hold_is_the_only_attention_surface_and_restores_exact_dashboard() {
         let mut normal = sample_snapshot();
         let view = golden_view();
         let mut renderer = Renderer::new();
@@ -3406,18 +3397,6 @@ mod tests {
             image_path: r"c:\games\game.exe".into(),
             process_name: "game.exe".into(),
             title: "Game".into(),
-        });
-        normal.alerts.push(Alert {
-            severity: 2,
-            title: "CRITICAL".into(),
-            ..Default::default()
-        });
-        normal.discord.connected = true;
-        normal.discord.authenticated = true;
-        normal.discord.speakers.push(Speaker {
-            user_id: "1".into(),
-            name: "speaker".into(),
-            speaking: true,
             ..Default::default()
         });
         let mut hold_view = view.clone();
@@ -3425,18 +3404,80 @@ mod tests {
         hold_view.hung_hold = 0.5;
         let with_priority = renderer.render(&normal, OverlayOptions::default(), &hold_view);
 
-        let mut only_hung = normal.clone();
-        only_hung.alerts.clear();
-        only_hung.discord = Default::default();
-        let expected = Renderer::new().render(&only_hung, OverlayOptions::default(), &hold_view);
+        let expected = Renderer::new().render(&normal, OverlayOptions::default(), &hold_view);
         assert!(with_priority.equal(&expected));
         assert!((81..100).all(|x| with_priority.get(x, 26)));
 
         normal.hung.clear();
-        normal.alerts.clear();
-        normal.discord = Default::default();
         let restored = renderer.render(&normal, OverlayOptions::default(), &view);
         assert!(restored.equal(&dashboard));
+    }
+
+    /// WO-REMOVE-ALERTS (S5, "display-only data retained"): extreme readings — temperatures at
+    /// and above the graph ceilings, full RAM/VRAM, a nearly empty headset battery and a low
+    /// system battery — render the ordinary dashboard. No frame border (the deleted full-screen
+    /// takeover), no pane inversion (the deleted threshold flash) and no modal surface exist;
+    /// the graph ceiling is a scale, not a threshold, and the bars/numbers stay real readings.
+    #[test]
+    fn extreme_readings_render_the_dashboard_with_no_takeover_no_border_and_no_inversion() {
+        let mut s = sample_snapshot();
+        let at = s.now.unwrap();
+        s.cpu_temp = Metric::valid(150.0, at);
+        s.gpu_temp = Metric::valid(145.0, at);
+        s.headset = crate::model::HeadsetBattery {
+            present: true,
+            online: true,
+            percent: 1,
+            ..Default::default()
+        };
+        s.system_battery = crate::model::SystemBattery {
+            ac: AcState::Offline,
+            battery_present: Some(true),
+            percent: Some(2),
+            freshness: Freshness::Current,
+            ..Default::default()
+        };
+        for reading in &mut s.readings.metrics {
+            if matches!(
+                reading.key,
+                MetricKey::RAMUtilization | MetricKey::VRAMUtilization
+            ) {
+                reading.number = 100.0;
+            }
+        }
+        let view = View {
+            slot_modules: [
+                "CPU_TEMP".into(),
+                "GPU_TEMP".into(),
+                "THERMALS".into(),
+                "SYSTEM_BATTERY".into(),
+            ],
+            ..Default::default()
+        };
+        // `cpu_temp_max_c`/`gpu_temp_max_c` are graph ceilings: they no longer gate a warning,
+        // so a value above them draws the ordinary temperature module and the scaled graph.
+        let frame = Renderer::new().render(
+            &s,
+            OverlayOptions {
+                cpu_temp_max_c: 90.0,
+                gpu_temp_max_c: 90.0,
+                ..Default::default()
+            },
+            &view,
+        );
+        assert!(
+            !(frame.get(0, 0) && frame.get(159, 42)),
+            "a full-screen takeover border must not be drawn"
+        );
+        let plain = Renderer::new().render(&s, OverlayOptions::default(), &view);
+        assert!(
+            plain.equal(&frame),
+            "the ceiling knobs must not change the drawn pixels"
+        );
+        assert!(
+            frame.pixels.iter().any(|&pixel| pixel != 0),
+            "the panel is never blanked by the readings"
+        );
     }
 
     #[test]
@@ -3470,7 +3511,8 @@ mod tests {
 
     #[test]
     fn canonical_registry_dispatches_all_modules_with_bounded_frames() {
-        assert_eq!(crate::config::MODULES.len(), 53);
+        // ALERTS and BOTTLENECK remain retired; DISCORD is an explicitly selected, noninterrupting pane.
+        assert_eq!(crate::config::MODULES.len(), 50);
         let normal = audit_snapshot();
         let edge = edge_snapshot();
         let status = status_snapshot();
@@ -3561,21 +3603,6 @@ mod tests {
             assert_row(&frame, 27, expected);
             assert_space(&frame, 27, expected, 3);
         }
-
-        let alerts = vec![
-            Alert {
-                severity: 3,
-                ..Default::default()
-            },
-            Alert {
-                severity: 2,
-                ..Default::default()
-            },
-        ];
-        let mut frame = Frame::new();
-        alert_slot(&mut frame, 1, 38, &alerts);
-        assert_row(&frame, 35, "2 L 3");
-        assert_space(&frame, 35, "2 L 3", 3);
 
         let mut frame = Frame::new();
         thermals_slot(
@@ -3702,7 +3729,6 @@ mod tests {
             format_network_graph_rate("I", f64::MAX, 38),
             format_network_graph_rate("O", 0.0, 38),
             format_disk_graph_rates(1_250_000.0, 842_000.0, 38),
-            format_alert_summary(i32::MAX, 3, 38),
         ] {
             assert!(text_width(&text, 1) <= 38, "formatter overflow: {text}");
         }
@@ -3713,7 +3739,6 @@ mod tests {
             format_disk_graph_rates(1_250_000.0, 842_000.0, 38),
             "R 1M/W 1M"
         );
-        assert_eq!(format_alert_summary(i32::MAX, 3, 38), ">9 L 3");
     }
 
     #[test]
@@ -3784,132 +3809,6 @@ mod tests {
     }
 
     #[test]
-    fn warning_is_inclusive_current_and_inverts_only_its_slot_pane() {
-        let mut snapshot = sample_snapshot();
-        snapshot.cpu_temp.value = 90.0;
-        let view = View {
-            slot_modules: [
-                "CPU_TEMP".into(),
-                "CLOCK".into(),
-                "CLOCK".into(),
-                "CLOCK".into(),
-            ],
-            ..Default::default()
-        };
-        let base = Renderer::new().render(
-            &snapshot,
-            OverlayOptions {
-                warning: true,
-                cpu_temp_max_c: 90.0,
-                ..Default::default()
-            },
-            &view,
-        );
-        let flashed = Renderer::new().render(
-            &snapshot,
-            OverlayOptions {
-                warning: true,
-                warning_phase: true,
-                cpu_temp_max_c: 90.0,
-                ..Default::default()
-            },
-            &view,
-        );
-        for y in 0..43 {
-            for x in 0..160 {
-                assert_eq!(
-                    flashed.get(x, y),
-                    if x < 40 && y >= 26 {
-                        !base.get(x, y)
-                    } else {
-                        base.get(x, y)
-                    }
-                );
-            }
-        }
-        snapshot.cpu_temp.stale = true;
-        let stale = Renderer::new().render(
-            &snapshot,
-            OverlayOptions {
-                warning: true,
-                warning_phase: true,
-                cpu_temp_max_c: 90.0,
-                ..Default::default()
-            },
-            &view,
-        );
-        let stale_base = Renderer::new().render(
-            &snapshot,
-            OverlayOptions {
-                warning: true,
-                cpu_temp_max_c: 90.0,
-                ..Default::default()
-            },
-            &view,
-        );
-        assert!(stale.equal(&stale_base));
-
-        snapshot.cpu_temp.stale = false;
-        let category_disabled = Renderer::new().render(
-            &snapshot,
-            OverlayOptions {
-                warning: false,
-                warning_phase: true,
-                cpu_temp_max_c: 90.0,
-                ..Default::default()
-            },
-            &view,
-        );
-        let disabled_base = Renderer::new().render(
-            &snapshot,
-            OverlayOptions {
-                warning: false,
-                cpu_temp_max_c: 90.0,
-                ..Default::default()
-            },
-            &view,
-        );
-        assert!(category_disabled.equal(&disabled_base));
-    }
-
-    #[test]
-    fn warning_suppresses_only_temperature_full_screen_alerts() {
-        let mut snapshot = sample_snapshot();
-        let dashboard = render_dashboard(&snapshot);
-        snapshot.alerts.push(Alert {
-            id: "cpu-temp".into(),
-            severity: 3,
-            title: "CPU HOT".into(),
-            ..Default::default()
-        });
-        let suppressed = Renderer::new().render(
-            &snapshot,
-            OverlayOptions {
-                warning: true,
-                ..Default::default()
-            },
-            &golden_view(),
-        );
-        assert!(suppressed.equal(&dashboard));
-        snapshot.alerts.push(Alert {
-            id: "memory".into(),
-            severity: 2,
-            title: "MEMORY HIGH".into(),
-            ..Default::default()
-        });
-        let other = Renderer::new().render(
-            &snapshot,
-            OverlayOptions {
-                warning: true,
-                ..Default::default()
-            },
-            &golden_view(),
-        );
-        assert!(!other.equal(&dashboard));
-        assert!(other.get(0, 0) && other.get(159, 42));
-    }
-
-    #[test]
     fn expansion_state_formatters_are_truthful_and_compact() {
         assert_eq!(format_byte_rate(1_250_000.0), "1.2MB/s");
         assert_eq!(format_byte_rate(0.0), "0B/s");
@@ -3941,25 +3840,6 @@ mod tests {
         );
         assert_eq!(graph_height(200.0, 100.0, 7), 7);
         assert_eq!(graph_height(-1.0, 100.0, 7), 0);
-    }
-
-    #[test]
-    fn bottleneck_text_maps_every_state_and_stale_precedence() {
-        let mut snapshot = Snapshot::default();
-        snapshot.bottleneck.freshness = Freshness::Current;
-        for (state, expected) in [
-            (crate::model::BottleneckState::Unavailable, "N/A"),
-            (crate::model::BottleneckState::None, "NONE"),
-            (crate::model::BottleneckState::Cpu, "CPU"),
-            (crate::model::BottleneckState::Gpu, "GPU"),
-            (crate::model::BottleneckState::Mem, "RAM"),
-            (crate::model::BottleneckState::DiskIo, "DISK I/O"),
-        ] {
-            snapshot.bottleneck.state = state;
-            assert_eq!(bottleneck_text(&snapshot), expected);
-        }
-        snapshot.bottleneck.freshness = Freshness::Stale;
-        assert_eq!(bottleneck_text(&snapshot), "STALE");
     }
 
     #[test]
@@ -4097,6 +3977,27 @@ mod tests {
                 || ((1..39).contains(&(index % WIDTH)) && (27..43).contains(&(index / WIDTH)))
         }));
 
+        // Compare the same graph label and input with and without two populated series.
+        let mut label_only = Renderer::new();
+        let mut label_frame = Frame::new();
+        let mut reused_graph = Frame::new();
+        label_only.disk_graph_slot(&mut label_frame, 1, 38, &latest, 1000.0);
+        let graph_allocations = {
+            let _watch = crate::backends::alloc_count::window();
+            renderer.disk_graph_slot(&mut reused_graph, 1, 38, &latest, 1000.0);
+            crate::backends::alloc_count::snapshot().4
+        };
+        let label_allocations = {
+            let _watch = crate::backends::alloc_count::window();
+            label_only.disk_graph_slot(&mut label_frame, 1, 38, &latest, 1000.0);
+            crate::backends::alloc_count::snapshot().4
+        };
+        assert_eq!(reused_graph.pixels, graph.pixels);
+        assert_eq!(
+            graph_allocations, label_allocations,
+            "the dual history graph must not allocate beyond its label"
+        );
+
         let unavailable = Snapshot::default();
         let mut stale = snapshot(1_000.0, 2_000.0, at(30));
         stale.readings.metrics[0].freshness = Freshness::Stale;
@@ -4117,5 +4018,97 @@ mod tests {
         assert_eq!(format_disk_rate('W', 842_000.0, 38), "W 842KB/s");
         assert_eq!(format_disk_rate('R', 999_999.0, 38), "R 1MB/s");
         assert_eq!(format_disk_rate('R', f64::MAX, 38), "R >99GB/s");
+    }
+    #[test]
+    fn selected_discord_changes_only_its_slot_and_never_takes_over() {
+        let mut snapshot = Snapshot {
+            now: Some(SystemTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let opts = OverlayOptions::default();
+        let mut view = View {
+            slot_modules: ["CLOCK", "DISCORD", "CLOCK", "CLOCK"].map(str::to_string),
+            ..Default::default()
+        };
+        let before = Renderer::new().render(&snapshot, opts, &view);
+        snapshot.discord = DiscordState {
+            connected: true,
+            authenticated: true,
+            channel_name: "Room".into(),
+            speakers: vec![crate::model::Speaker {
+                user_id: "1".into(),
+                name: "Alice".into(),
+                speaking: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let after = Renderer::new().render(&snapshot, opts, &view);
+        assert_ne!(before.hash_hex(), after.hash_hex());
+        let (left, width) = slot_bounds(1);
+        for y in 0..crate::model::HEIGHT {
+            for x in 0..crate::model::WIDTH {
+                if y < 26 || x < left as usize || x >= (left + width) as usize {
+                    assert_eq!(
+                        before.pixels[y * crate::model::WIDTH + x],
+                        after.pixels[y * crate::model::WIDTH + x]
+                    );
+                }
+            }
+        }
+        view.slot_modules[1] = "CLOCK".into();
+        let configured_away = Renderer::new().render(&snapshot, opts, &view);
+        snapshot.discord = DiscordState::default();
+        assert_eq!(
+            configured_away.hash_hex(),
+            Renderer::new().render(&snapshot, opts, &view).hash_hex()
+        );
+    }
+
+    #[test]
+    fn selected_discord_honors_linger_self_channel_and_overflow() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let mut state = DiscordState {
+            connected: true,
+            authenticated: true,
+            channel_name: "Chat".into(),
+            ..Default::default()
+        };
+        state.speakers = vec![
+            crate::model::Speaker {
+                user_id: "1".into(),
+                name: "Self".into(),
+                is_self: true,
+                speaking: true,
+                ..Default::default()
+            },
+            crate::model::Speaker {
+                user_id: "2".into(),
+                name: "Amy".into(),
+                speaking: false,
+                stopped_at: Some(now - Duration::from_millis(100)),
+                ..Default::default()
+            },
+        ];
+        let opts = OverlayOptions {
+            discord_show_channel: true,
+            discord_max_speakers: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            discord_slot_text(&state, Some(now), &opts, 37),
+            ("Chat".into(), "Amy".into())
+        );
+        assert_eq!(
+            discord_slot_text(&state, Some(now + Duration::from_secs(1)), &opts, 37).1,
+            "QUIET"
+        );
+        let show_self = OverlayOptions {
+            discord_show_self: true,
+            ..opts
+        };
+        assert!(discord_slot_text(&state, Some(now), &show_self, 37)
+            .1
+            .ends_with("+1"));
     }
 }

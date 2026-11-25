@@ -249,12 +249,21 @@ fn best(
     score: impl Fn(&Sensor) -> i32,
     validate: impl Fn(&Sensor) -> bool,
 ) -> Option<Sensor> {
-    let mut usable: Vec<&Sensor> = sensors
-        .iter()
-        .filter(|s| filter(s) && validate(s))
-        .collect();
-    usable.sort_by(|a, b| score(b).cmp(&score(a)).then_with(|| a.id.cmp(&b.id)));
-    usable.first().map(|s| (*s).clone())
+    let mut usable = sensors.iter().filter(|s| filter(s) && validate(s));
+    let first = usable.next()?;
+    let Some(second) = usable.next() else {
+        return Some(first.clone());
+    };
+    let mut winner = first;
+    let mut best_rank = score(first);
+    for sensor in std::iter::once(second).chain(usable) {
+        let rank = score(sensor);
+        if rank > best_rank || (rank == best_rank && sensor.id < winner.id) {
+            winner = sensor;
+            best_rank = rank;
+        }
+    }
+    Some(winner.clone())
 }
 
 fn cpu_temp_name_score(name: &str) -> i32 {
@@ -359,6 +368,82 @@ pub fn sample_extended(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lhm_eligible_singleton_does_not_need_a_score() {
+        let rows = [
+            sensor("/amdcpu/0/temperature/0", "CPU CORE", 45.0, true),
+            sensor("/amdcpu/0/temperature/1", "CPU PACKAGE", 999.0, true),
+        ];
+        let scores = std::cell::Cell::new(0);
+        let chosen = best(
+            &rows,
+            |s| s.hardware_type == "cpu",
+            |s| {
+                scores.set(scores.get() + 1);
+                cpu_temp_name_score(&s.name)
+            },
+            |s| valid_temperature(s.value),
+        );
+        assert_eq!(chosen.unwrap().id, rows[0].id);
+        assert_eq!(scores.get(), 0, "one eligible sensor needs no score");
+    }
+
+    #[test]
+    fn lhm_winner_scores_usable_rows_once_and_keeps_first_complete_tie() {
+        let mut sensors = (1..=96)
+            .rev()
+            .map(|i| {
+                let id = format!("/amdcpu/0/temperature/{i:03}");
+                sensor(&id, "CPU CORE", 60.0 + f64::from(i) / 100.0, true)
+            })
+            .collect::<Vec<_>>();
+        sensors.push(sensor("/amdcpu/0/temperature/001", "CPU CORE", 99.0, true));
+        sensors.push(sensor(
+            "/amdcpu/0/temperature/000",
+            "CPU PACKAGE",
+            999.0,
+            true,
+        ));
+        sensors.push(sensor(
+            "/gpu-nvidia/0/temperature/000",
+            "CPU PACKAGE",
+            42.0,
+            true,
+        ));
+        let scores = std::cell::Cell::new(0);
+        let winner = best(
+            &sensors,
+            |s| s.hardware_type == "cpu" && s.kind == "temperature",
+            |s| {
+                scores.set(scores.get() + 1);
+                cpu_temp_name_score(&s.name)
+            },
+            |s| valid_temperature(s.value),
+        )
+        .unwrap();
+        assert_eq!(winner.id, "/amdcpu/0/temperature/001");
+        assert_eq!(winner.value, 60.01);
+        assert_eq!(
+            scores.get(),
+            97,
+            "score each eligible candidate exactly once"
+        );
+    }
+
+    #[test]
+    fn lhm_legacy_fallback_and_preferred_vendor_presence_are_unchanged() {
+        let sensors = [
+            sensor("/amdcpu/0/temperature/0", "Unrecognized Ä", 43.0, false),
+            sensor("/gpu-nvidia/0/load/0", "GPU Load", 70.0, true),
+            sensor("/gpu-amd/0/temperature/0", "GPU Core", 51.0, true),
+        ];
+        let selected = select_extended(&sensors, &Default::default(), &Default::default());
+        assert_eq!(selected.legacy.cpu_temp.unwrap().value, 43.0);
+        assert!(selected.legacy.gpu_temp.is_none());
+        assert!(selected.legacy.errors.is_empty());
+        assert!(selected.errors.is_empty());
+    }
 
     fn sensor(id: &str, name: &str, value: f64, valid: bool) -> Sensor {
         let segments: Vec<&str> = id.split('/').collect();
